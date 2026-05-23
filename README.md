@@ -15,9 +15,9 @@ When the last track of an album finishes, it automatically marks that record as 
 
 ## Hardware
 
-- Raspberry Pi 4 (2GB+ recommended)
-- USB audio interface (e.g. Behringer UFO202) connected to your turntable preamp
-- HDMI LCD screen (5" or 7", 800×480 typical)
+- Raspberry Pi 4 Model B (4GB recommended)
+- USB audio interface (e.g. Behringer UCA222) connected to your turntable preamp's line-level output
+- HDMI LCD screen — built and tested with Waveshare 7" HDMI LCD (H) at 1024×600
 
 ## Setup
 
