@@ -1,0 +1,48 @@
+audio:
+  # Run: python -c "import sounddevice; print(sounddevice.query_devices())"
+  # to find your USB audio interface device name
+  device_name: "USB Audio Codec"
+  sample_rate: 44100
+  chunk_seconds: 15
+  overlap_seconds: 5
+  # RMS energy below this = silence (tune to your room noise floor)
+  silence_threshold_rms: 0.01
+  # Seconds of continuous silence before we consider the session ended
+  session_end_silence_seconds: 45
+
+discogs:
+  # Get your token at: https://www.discogs.com/settings/developers
+  user_token: "YOUR_DISCOGS_TOKEN_HERE"
+  username: "your_discogs_username"
+  # Must match your custom field name exactly (case-sensitive)
+  listened_field_name: "Listened to?"
+  # Value to set when an album is fully played
+  listened_field_value: "Yes"
+
+display:
+  width: 800
+  height: 480
+  fullscreen: true
+  background_color: [10, 10, 10]
+  font_color: [240, 240, 240]
+  accent_color: [180, 140, 80]
+  # Show a subtle indicator when metadata came from fallback (not Discogs)
+  show_source_indicator: true
+  cover_art_cache_dir: "src/display/assets/cache"
+
+recognition:
+  # Options: "shazamio" | "acrcloud" | "audd"
+  backend: "shazamio"
+  poll_interval_seconds: 30
+  # How many consecutive matching results before we commit a track change
+  confirmation_required: 2
+
+  # Only needed if backend is "acrcloud"
+  acrcloud:
+    access_key: "YOUR_ACRCLOUD_KEY"
+    access_secret: "YOUR_ACRCLOUD_SECRET"
+    host: "identify-eu-west-1.acrcloud.com"
+
+  # Only needed if backend is "audd"
+  audd:
+    api_token: "YOUR_AUDD_TOKEN"
