@@ -20,8 +20,9 @@ discogs:
   listened_field_value: "Yes"
 
 display:
-  width: 800
-  height: 480
+  # Default resolution matches Waveshare 7" HDMI LCD (H) — adjust if using a different screen
+  width: 1024
+  height: 600
   fullscreen: true
   background_color: [10, 10, 10]
   font_color: [240, 240, 240]
