@@ -19,7 +19,9 @@ class Rect:
 class NowPlayingLayout:
     """Layout for the main now-playing screen.
 
-    Proportions assume 800x480 default; renderer scales if resolution differs.
+    All proportions are relative to the display dimensions passed into
+    get_now_playing_layout(), so this works at any resolution. Default
+    target is 1024x600 (Waveshare 7" HDMI LCD H).
     """
     cover_art: Rect       # Large album art panel
     artist_text: Rect     # Artist name
