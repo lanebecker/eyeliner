@@ -8,6 +8,7 @@ shazamio>=0.7.0
 
 # Discogs
 python3-discogs-client>=2.6.0
+requests>=2.31.0  # Used directly in discogs_client.py (transitive dep of discogs-client)
 
 # Cover art fallback
 musicbrainzngs>=0.7.1
