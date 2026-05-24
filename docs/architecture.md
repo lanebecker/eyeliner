@@ -2,8 +2,8 @@
 
 A Raspberry Pi 4 listens to a turntable via a USB audio interface, identifies
 tracks using Shazam, looks up pressing details in Discogs, displays the
-now-playing info on an HDMI screen, and increments the Play Count in your
-Discogs collection when a full side plays through.
+now-playing info on an HDMI screen, increments the Play Count, and records the
+Last Played date in your Discogs collection when a full side plays through.
 
 ---
 
@@ -35,7 +35,7 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                     ▼                   ▼                    TrackMetadata
              DisplayRenderer    DiscogsClient                         │
              (pygame, HDMI)     increment_play_count          ┌───────┴────────┐
-                                                              ▼                ▼
+                                update_last_played            ▼                ▼
                                                         PlayerState      ListenTracker
                                                         .current_track   .log_track()
 ```
@@ -215,6 +215,21 @@ Returns `True` on HTTP 204, `False` otherwise. The `field_id` is lazily fetched
 and cached from `/users/{username}/collection/fields`. Falls back to 0 if the
 GET fails or the field is blank.
 
+**`update_last_played(release_id, instance_id)`:**
+
+Writes today's date (ISO 8601, `YYYY-MM-DD`) to the Last Played custom field:
+
+```
+POST /users/{username}/collection/folders/0/releases/{release_id}
+     /instances/{instance_id}/fields/{field_id}
+{"value": "YYYY-MM-DD"}
+```
+
+Returns `True` on HTTP 204 or if `last_played_field_name` is not configured
+(graceful no-op). Returns `False` on any failure. The field name is read from
+`discogs.last_played_field_name` in `config.yaml`; if that key is absent, no
+API calls are made.
+
 ---
 
 ### `src/metadata/coverart.py` — CoverArtFallback
@@ -334,7 +349,8 @@ Scales proportionally at any resolution. Tested at 1024×600, 800×480,
 
 ### `src/tracking/listen_tracker.py` — ListenTracker
 
-Manages `PlaySession` lifecycle and triggers the Discogs Play Count update.
+Manages `PlaySession` lifecycle and triggers Discogs field updates on album
+completion.
 
 **Session lifecycle:**
 1. `MUSIC_STARTED` → `_start_session()` (creates a fresh `PlaySession`)
@@ -347,6 +363,7 @@ Manages `PlaySession` lifecycle and triggers the Discogs Play Count update.
 potential_last_track == True
 AND album_release_id is not None
     → discogs.increment_play_count(release_id, instance_id)
+    → discogs.update_last_played(release_id, instance_id)  [if configured]
 
 potential_last_track == True
 AND album_release_id is None
@@ -356,8 +373,11 @@ potential_last_track == False
     → skip (only Side A played, or recognition never reached the last track)
 ```
 
-Conservative by design: the Play Count is only incremented when we're confident
-the full side was played through to completion.
+The two Discogs updates are independent — a failure from `update_last_played`
+is logged as a warning but does not affect the Play Count result or vice versa.
+
+Conservative by design: neither field is updated unless the full side was
+confirmed played through to completion.
 
 ---
 
@@ -390,7 +410,9 @@ the full side was played through to completion.
 4. SilenceDetector           after 45s → SESSION_ENDED
 5. ListenTracker._end_session()  potential_last_track + release_id present
                                  → DiscogsClient.increment_play_count()
-6. DiscogsClient             GET current value, increment, POST new value
+                                 → DiscogsClient.update_last_played()  [if configured]
+6. DiscogsClient             Play Count: GET current value, increment, POST new value
+                             Last Played: POST today's ISO date
                              → HTTP 204 → return True
 7. main.py handler           PlayerState.clear() → status IDLE
 8. DisplayRenderer           idle screen
@@ -411,6 +433,7 @@ the full side was played through to completion.
 | `discogs.user_token` | — | From discogs.com → Settings → Developers |
 | `discogs.username` | — | Your Discogs username |
 | `discogs.play_count_field_name` | `"Play Count"` | Must match custom field name exactly (case-sensitive) |
+| `discogs.last_played_field_name` | _(optional)_ | If set, writes today's date (YYYY-MM-DD) to this custom field on completion |
 | `display.width` / `height` | `1024` / `600` | Waveshare 7" HDMI LCD (H) native resolution |
 | `display.fullscreen` | `true` | |
 | `display.background_color` | `[10, 10, 10]` | RGB |
@@ -434,12 +457,12 @@ the full side was played through to completion.
 | `src/audio/recognizer.py` | ShazamIO recognition loop, confirmation logic |
 | `src/metadata/models.py` | TrackMetadata, PlaySession, MetadataSource dataclasses |
 | `src/metadata/resolver.py` | 3-step metadata lookup chain |
-| `src/metadata/discogs_client.py` | Discogs collection/DB search, Play Count update |
+| `src/metadata/discogs_client.py` | Discogs collection/DB search, Play Count increment, Last Played update |
 | `src/metadata/coverart.py` | MusicBrainz Cover Art Archive fallback |
 | `src/state/player_state.py` | Central state, status transitions, change listeners |
 | `src/display/layouts.py` | Pixel geometry and font sizes (restyle here) |
 | `src/display/renderer.py` | pygame window, cover art cache, screen rendering |
-| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs Play Count update trigger |
+| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs field update trigger |
 
 ---
 
@@ -454,5 +477,5 @@ All source modules are complete. The only remaining work requires hardware:
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (138 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (148 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
