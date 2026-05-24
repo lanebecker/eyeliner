@@ -14,11 +14,36 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.0.1] — 2026-05-24
+
+### Changed
+
+- **Play Count replaces "Listened?" boolean** — `DiscogsClient.mark_as_listened()`
+  (which set a dropdown field to "Yes") is replaced by `increment_play_count()`,
+  which reads the current integer value of a "Play Count" custom field and
+  increments it by 1. An empty Play Count field implies unlistened, making the
+  separate boolean redundant.
+- `discogs.listened_field_name` and `discogs.listened_field_value` config keys
+  replaced by a single `discogs.play_count_field_name` key.
+- `ListenTracker` updated to call `increment_play_count()` instead of
+  `mark_as_listened()`; log messages updated accordingly.
+
+### Added
+
+- `DiscogsClient._get_field_value()` — reads the current raw value of a custom
+  field from the collection API response, used by `increment_play_count()` to
+  determine the value before incrementing (read-before-write pattern; falls back
+  to 0 on GET failure or blank field).
+- `tests/test_discogs_client.py` — new unit test file covering 14 scenarios for
+  `increment_play_count` and `_get_field_value` (blank field, existing counts,
+  garbage values, field-not-found, GET/POST failures, exceptions).
+
+---
+
 ## [1.0.0] — 2026-05-24
 
 Initial release. Full core loop operational: turntable audio → Shazam
-recognition → Discogs metadata → pygame display → Discogs "Listened to?"
-field update.
+recognition → Discogs metadata → pygame display → Discogs field update.
 
 ### Added
 
@@ -59,9 +84,9 @@ field update.
 **State & tracking**
 - `PlayerState` — central in-memory state with observer pattern;
   status enum: `IDLE → LISTENING → PLAYING → IDLE`
-- `ListenTracker` — manages `PlaySession` lifecycle; marks Discogs
-  "Listened to?" field only when last track is confirmed AND release is in
-  collection (conservative by design — partial plays do not trigger an update)
+- `ListenTracker` — manages `PlaySession` lifecycle; updates Discogs field
+  only when last track is confirmed AND release is in collection (conservative
+  by design — partial plays do not trigger an update)
 - `PlaySession` — deduplicates consecutive track logs; latches release/instance
   IDs from the first Discogs-sourced track
 
@@ -72,7 +97,7 @@ field update.
   detection, listen tracker, metadata resolver, recognition loop, display layout)
 - `test_discogs_live.py` — live Discogs integration test with read-only and
   `--test-write` modes; tests collection search, database search, tracklist
-  fetch, custom field detection, and `mark_as_listened`
+  fetch, custom field detection, and field update
 
 **Documentation**
 - `docs/architecture.md` — full system design, component reference, data flows,
