@@ -57,7 +57,7 @@ cp config.example.yaml config.yaml
 | `tests/test_models.py` | Data models (TrackMetadata, PlaySession, etc.) | No | No |
 | `tests/test_silence.py` | Silence detector state machine | No | No |
 | `tests/test_listen_tracker.py` | Last-track detection & Discogs update logic | No | No |
-| `tests/test_discogs_client.py` | DiscogsClient Play Count increment logic | No | No |
+| `tests/test_discogs_client.py` | DiscogsClient Play Count & Last Played logic | No | No |
 | `tests/test_resolver.py` | 3-step metadata fallback chain | No | No |
 | `tests/test_recognizer.py` | Recognition loop confirmation logic | No | No |
 | `tests/test_layouts.py` | Display layout geometry | No | No |
@@ -79,15 +79,15 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 138 items
+collected 148 items
 
-tests/test_discogs_client.py ..............                              [ 10%]
-tests/test_layouts.py ........................                           [ 27%]
-tests/test_listen_tracker.py .................                           [ 39%]
-tests/test_models.py .........................                           [ 57%]
-tests/test_recognizer.py .................                               [ 70%]
-tests/test_resolver.py ...................                               [ 84%]
-tests/test_silence.py ......................                             [100%]
+tests/test_discogs_client.py .....................                          [ 14%]
+tests/test_layouts.py ........................                              [ 30%]
+tests/test_listen_tracker.py ....................                           [ 43%]
+tests/test_models.py .........................                              [ 60%]
+tests/test_recognizer.py .................                                  [ 72%]
+tests/test_resolver.py ...................                                  [ 85%]
+tests/test_silence.py ......................                                [100%]
 
 =============================== warnings summary ===============================
 venv/lib/python3.9/site-packages/urllib3/__init__.py:35
@@ -95,7 +95,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 138 passed in 0.49s ==============================
+============================== 148 passed in 0.49s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -168,7 +168,7 @@ Key cases:
 Mocks `DiscogsClient` and drives `ListenTracker` directly. Tests every edge case
 from the architecture doc.
 
-Key cases:
+Key cases — Play Count:
 - **Happy path:** last track identified + session ends → `increment_play_count` called with correct `release_id` and `instance_id`
 - **Only Side A:** session ends before last track → NOT called
 - **Missed recognition:** all tracks except the last identified → NOT called
@@ -177,12 +177,18 @@ Key cases:
 - **Spurious SESSION_ENDED:** no active session when event fires → no crash
 - **Discogs API failure:** `increment_play_count` returns `False` → no crash, logged
 
-### `test_discogs_client.py` — Play Count increment logic
+Key cases — Last Played:
+- **Configured:** `last_played_field_name` set → `update_last_played` called alongside `increment_play_count`
+- **Not configured:** `last_played_field_name` is `None` → `update_last_played` never called
+- **Failure:** `update_last_played` returns `False` → logs warning, no crash
 
-Mocks all HTTP calls and tests `DiscogsClient.increment_play_count()` and its
-`_get_field_value()` helper in isolation. No real Discogs account required.
+### `test_discogs_client.py` — Play Count & Last Played logic
 
-Key cases:
+Mocks all HTTP calls and tests `DiscogsClient.increment_play_count()`,
+`update_last_played()`, and the `_get_field_value()` helper in isolation.
+No real Discogs account required.
+
+Key cases — increment_play_count:
 - **Blank field:** Play Count field is empty → posts `"1"`
 - **Existing count:** count `"5"` → posts `"6"`; count `"1"` → posts `"2"`
 - **Garbage value:** non-integer string → logs a warning, treats as 0, posts `"1"`
@@ -192,10 +198,20 @@ Key cases:
 - **POST non-204:** returns `False`
 - **POST 401:** returns `False`
 - **Exception during POST:** caught, returns `False`, no crash
-- **`_get_field_value` — correct instance:** returns the value string
-- **`_get_field_value` — wrong instance_id:** returns `None`
-- **`_get_field_value` — non-200 GET:** returns `None`
-- **`_get_field_value` — field not in notes:** returns `None`
+
+Key cases — update_last_played:
+- **Not configured:** `last_played_field_name` is `None` → returns `True`, no API calls
+- **Happy path:** posts today's ISO date (YYYY-MM-DD), returns `True`
+- **Date format:** posted value is always a valid parseable ISO 8601 date
+- **Field not found:** `"Last Played"` absent from collection fields → returns `False`, no POST
+- **POST non-204 / 401:** returns `False`
+- **Exception during POST:** caught, returns `False`, no crash
+
+Key cases — _get_field_value:
+- **Correct instance:** returns the value string
+- **Wrong instance_id:** returns `None`
+- **Non-200 GET:** returns `None`
+- **Field not in notes:** returns `None`
 
 ### `test_resolver.py` — Metadata fallback chain
 
