@@ -1,7 +1,8 @@
 """Discogs API wrapper.
 
 Handles collection search, database search, tracklist retrieval,
-and incrementing the 'Play Count' custom field on each completed listen.
+incrementing the 'Play Count' custom field, and recording the 'Last Played'
+date on each completed listen.
 
 Design notes:
   - python3-discogs-client is used for high-level search operations.
@@ -15,6 +16,7 @@ Design notes:
 """
 
 import logging
+from datetime import date
 from typing import Optional
 
 import discogs_client
@@ -34,6 +36,7 @@ class DiscogsClient:
         cfg = config["discogs"]
         self.username: str = cfg["username"]
         self.play_count_field_name: str = cfg["play_count_field_name"]
+        self.last_played_field_name: Optional[str] = cfg.get("last_played_field_name")
         self._token: str = cfg["user_token"]
 
         # High-level client — used for search() and release() lookups
@@ -194,6 +197,56 @@ class DiscogsClient:
 
         except Exception as e:
             log.error(f"Failed to increment Play Count for release {release_id}: {e}")
+            return False
+
+    def update_last_played(self, release_id: int, instance_id: int) -> bool:
+        """Write today's date (ISO 8601, YYYY-MM-DD) to the 'Last Played' custom field.
+
+        If last_played_field_name is not configured in config.yaml, this is a
+        graceful no-op that returns True without making any API calls.
+
+        Uses the Discogs collection field update endpoint:
+          POST /users/{username}/collection/folders/0/releases/{release_id}
+               /instances/{instance_id}/fields/{field_id}
+
+        Returns True on success (HTTP 204) or if not configured, False on any failure.
+        """
+        if not self.last_played_field_name:
+            return True  # Not configured — graceful no-op
+
+        try:
+            fields = self._get_collection_fields()
+            field_id = fields.get(self.last_played_field_name)
+            if field_id is None:
+                log.error(
+                    f"Custom field '{self.last_played_field_name}' not found in Discogs. "
+                    f"Available fields: {list(fields.keys())}"
+                )
+                return False
+
+            today = date.today().isoformat()  # e.g. "2026-05-24"
+
+            url = (
+                f"{_API_BASE}/users/{self.username}/collection"
+                f"/folders/0/releases/{release_id}"
+                f"/instances/{instance_id}/fields/{field_id}"
+            )
+            resp = self._session.post(url, json={"value": today})
+
+            if resp.status_code == 204:
+                log.info(
+                    f"Last Played updated for release {release_id} / instance {instance_id}: "
+                    f"{today}."
+                )
+                return True
+
+            log.error(
+                f"Discogs Last Played update returned {resp.status_code}: {resp.text[:200]}"
+            )
+            return False
+
+        except Exception as e:
+            log.error(f"Failed to update Last Played for release {release_id}: {e}")
             return False
 
     # -------------------------------------------------------------------------
