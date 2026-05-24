@@ -4,7 +4,7 @@ numpy>=1.24.0
 soundfile>=0.12.1
 
 # Music recognition
-shazamio>=0.7.0
+shazamio>=0.6.0
 
 # Discogs
 python3-discogs-client>=2.6.0
