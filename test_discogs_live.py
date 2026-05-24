@@ -13,6 +13,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -51,7 +52,7 @@ def load_config() -> dict:
 # Individual tests
 # ---------------------------------------------------------------------------
 
-def test_search_collection(client) -> dict | None:
+def test_search_collection(client) -> Optional[dict]:
     sep(f"1 · search_collection  —  {TEST_ARTIST} / {TEST_ALBUM}")
     try:
         result = client.search_collection(TEST_ARTIST, TEST_ALBUM)
@@ -144,7 +145,7 @@ def test_collection_fields(client):
         )
 
 
-def test_mark_as_listened(client, collection_result: dict | None):
+def test_mark_as_listened(client, collection_result: Optional[dict]):
     sep("5 · mark_as_listened  —  WRITE TEST")
     if collection_result is None:
         fail("Skipping — requires a successful search_collection result first.")
