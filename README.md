@@ -39,9 +39,13 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 - `audio.device_name` — run `python -c "import sounddevice; print(sounddevice.query_devices())"` to find your USB interface name
 - `discogs.listened_field_name` — the exact name of your custom field (default: `"Listened to?"`)
 
-## Architecture
+## Documentation
 
-See [docs/architecture.md](docs/architecture.md) for full system design.
+- [Architecture](docs/architecture.md) — full system design, component reference, data flows
+- [Roadmap](docs/roadmap.md) — planned features and versioning
+- [Testing guide](docs/testing-guide.md) — running the unit and integration test suites
+- [Pi setup guide](docs/pi-setup-guide.md) — hardware bring-up from bare Pi to running app
+- [Hardware guide](docs/hardware-guide.md) — wiring diagram and parts list
 
 ## Inspired By
 
