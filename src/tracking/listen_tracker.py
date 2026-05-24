@@ -1,12 +1,12 @@
-"""ListenTracker — session tracking and Discogs 'Listened to?' field updater.
+"""ListenTracker — session tracking and Discogs Play Count updater.
 
 Logic:
   - Maintains a PlaySession from first track identification until SESSION_ENDED.
   - When the last track on the album is identified, sets potential_last_track = True.
   - On SESSION_ENDED (sustained silence), if potential_last_track is set,
-    calls DiscogsClient.mark_as_listened for the release.
+    calls DiscogsClient.increment_play_count for the release.
   - Conservative by design: if the last track was never identified (e.g. only
-    Side A was played), the field is NOT updated.
+    Side A was played), the Play Count is NOT incremented.
 """
 
 import asyncio
@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 
 class ListenTracker:
-    """Manages play sessions and triggers Discogs updates on album completion."""
+    """Manages play sessions and triggers Discogs Play Count updates on album completion."""
 
     def __init__(self, config: dict, resolver: "MetadataResolver"):
         self.discogs = resolver.discogs
@@ -59,27 +59,27 @@ class ListenTracker:
         if session.potential_last_track and session.album_release_id:
             log.info(
                 f"Last track confirmed for release {session.album_release_id} — "
-                f"marking as listened in Discogs."
+                f"incrementing Play Count in Discogs."
             )
             success = await asyncio.get_event_loop().run_in_executor(
                 None,
-                self.discogs.mark_as_listened,
+                self.discogs.increment_play_count,
                 session.album_release_id,
                 session.album_instance_id,
             )
             if success:
-                log.info("✅ Discogs 'Listened to?' updated successfully.")
+                log.info("✅ Discogs Play Count incremented successfully.")
             else:
-                log.warning("⚠ Failed to update Discogs 'Listened to?' field.")
+                log.warning("⚠ Failed to increment Discogs Play Count.")
 
         elif session.potential_last_track and not session.album_release_id:
             log.info(
                 "Last track reached but release not in Discogs collection — "
-                "skipping field update (fallback metadata)."
+                "skipping Play Count update (fallback metadata)."
             )
         else:
             log.info(
-                "Last track not reached — not marking as listened "
+                "Last track not reached — not incrementing Play Count "
                 "(likely only one side played)."
             )
 
