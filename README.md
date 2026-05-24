@@ -45,6 +45,7 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 
 - [Architecture](docs/architecture.md) — full system design, component reference, data flows
 - [Roadmap](docs/roadmap.md) — planned features and versioning
+- [Changelog](CHANGELOG.md) — what changed in each version
 - [Testing guide](docs/testing-guide.md) — running the unit and integration test suites
 - [Pi setup guide](docs/pi-setup-guide.md) — hardware bring-up from bare Pi to running app
 - [Hardware guide](docs/hardware-guide.md) — wiring diagram and parts list
