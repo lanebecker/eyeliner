@@ -6,7 +6,7 @@ All tests are read-only by default.
 
 Usage:
     python test_discogs_live.py                # read-only
-    python test_discogs_live.py --test-write   # also tests mark_as_listened
+    python test_discogs_live.py --test-write   # also tests increment_play_count
                                                # (WRITES to your Discogs collection)
 """
 
@@ -71,7 +71,7 @@ def test_search_collection(client) -> Optional[dict]:
     ok(f"Year:       {result.get('year') or '(unknown)'}")
     ok(f"Cat. no.:   {result.get('catalog_number') or '(none)'}")
     ok(f"Release ID: {result['release_id']}")
-    ok(f"Instance ID:{result['instance_id']}  ← needed for mark_as_listened")
+    ok(f"Instance ID:{result['instance_id']}  ← needed for increment_play_count")
     ok(f"Cover URL:  {(result.get('cover_art_url') or '(none)')[:72]}")
 
     tracks = result.get("tracklist", [])
@@ -133,20 +133,20 @@ def test_collection_fields(client):
 
     ok(f"{len(fields)} custom field(s) in your collection:")
     for name, fid in fields.items():
-        target = name == client.listened_field_name
+        target = name == client.play_count_field_name
         marker = "  ← this is the one we update" if target else ""
         info(f"    [{fid}]  {name}{marker}")
 
-    if client.listened_field_name not in fields:
+    if client.play_count_field_name not in fields:
         fail(
-            f"Field '{client.listened_field_name}' not found!\n"
-            f"     Check that listened_field_name in config.yaml matches exactly "
+            f"Field '{client.play_count_field_name}' not found!\n"
+            f"     Check that play_count_field_name in config.yaml matches exactly "
             f"(case-sensitive)."
         )
 
 
-def test_mark_as_listened(client, collection_result: Optional[dict]):
-    sep("5 · mark_as_listened  —  WRITE TEST")
+def test_increment_play_count(client, collection_result: Optional[dict]):
+    sep("5 · increment_play_count  —  WRITE TEST")
     if collection_result is None:
         fail("Skipping — requires a successful search_collection result first.")
         return
@@ -154,17 +154,17 @@ def test_mark_as_listened(client, collection_result: Optional[dict]):
     release_id  = collection_result["release_id"]
     instance_id = collection_result["instance_id"]
 
-    info(f"About to write '{client.listened_field_value}' → '{client.listened_field_name}'")
+    info(f"About to increment '{client.play_count_field_name}'")
     info(f"Release {release_id}, instance {instance_id}")
 
     try:
-        success = client.mark_as_listened(release_id, instance_id)
+        success = client.increment_play_count(release_id, instance_id)
     except Exception as e:
         fail(f"Exception: {e}")
         return
 
     if success:
-        ok("Field updated! Check your Discogs collection to confirm.")
+        ok("Play Count incremented! Check your Discogs collection to confirm.")
         info("You can reset the value manually in Discogs if needed.")
     else:
         fail("Update failed — check the error logged above.")
@@ -181,7 +181,7 @@ def main():
     parser.add_argument(
         "--test-write",
         action="store_true",
-        help="Also run mark_as_listened — WRITES to your Discogs collection.",
+        help="Also run increment_play_count — WRITES to your Discogs collection.",
     )
     args = parser.parse_args()
 
@@ -199,13 +199,13 @@ def main():
     client = DiscogsClient(config)
 
     print()
-    info(f"User:          {client.username}")
-    info(f"Listened field: '{client.listened_field_name}' → '{client.listened_field_value}'")
-    info(f"Test album:    {TEST_ARTIST} / {TEST_ALBUM}")
+    info(f"User:             {client.username}")
+    info(f"Play Count field: '{client.play_count_field_name}'")
+    info(f"Test album:       {TEST_ARTIST} / {TEST_ALBUM}")
     if args.test_write:
-        info("Mode:          READ + WRITE (--test-write)")
+        info("Mode:             READ + WRITE (--test-write)")
     else:
-        info("Mode:          read-only  (pass --test-write to also test the field update)")
+        info("Mode:             read-only  (pass --test-write to also test the field update)")
 
     # Run tests
     collection_result = test_search_collection(client)
@@ -217,10 +217,10 @@ def main():
     test_collection_fields(client)
 
     if args.test_write:
-        test_mark_as_listened(client, collection_result)
+        test_increment_play_count(client, collection_result)
     else:
-        sep("5 · mark_as_listened  —  skipped (read-only mode)")
-        info("Run with --test-write to also test the field update.")
+        sep("5 · increment_play_count  —  skipped (read-only mode)")
+        info("Run with --test-write to also test the Play Count increment.")
 
     sep()
     print("  Done.\n")
