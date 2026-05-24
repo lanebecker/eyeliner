@@ -7,9 +7,11 @@ Design notes:
   - python3-discogs-client is used for high-level search operations.
   - requests is used directly for endpoints the library doesn't expose cleanly:
     the per-release collection membership check and the field update POST.
-  - search_collection() searches the Discogs database first, then cross-references
-    the top results against the user's collection — this is more reliable than
-    trying to search the collection directly, which has limited API support.
+  - search_collection() uses two strategies in order:
+      1. Search the Discogs database for up to 25 candidates, then cross-reference
+         each against the user's collection via the membership endpoint.
+      2. If that misses (e.g. the user owns a rare pressing not near the top of
+         search results), fall back to a fuzzy walk of the collection itself.
 """
 
 import logging
@@ -58,25 +60,25 @@ class DiscogsClient:
     def search_collection(self, artist: str, album: str) -> Optional[dict]:
         """Search the user's Discogs collection for a release matching artist + album.
 
-        Strategy:
-          1. Search the Discogs database for the top 5 matching releases.
-          2. For each candidate, call the collection membership endpoint to see
-             if the user owns it.
-          3. Return the first hit with full metadata (pressing details, tracklist,
-             cover art, instance_id).
+        Strategy 1 — database cross-reference (fast):
+          Search the Discogs database for up to 25 candidates. For each, call
+          the collection membership endpoint to see if the user owns that pressing.
+          Returns the first hit found.
+
+        Strategy 2 — collection walk (slower, catches rare/obscure pressings):
+          If strategy 1 finds nothing, page through the user's whole collection
+          and fuzzy-match on artist + album title.
 
         Returns None if the release is not found in the collection.
         """
-        candidates = self._database_search(artist, album, limit=5)
-        if not candidates:
-            return None
-
+        # Strategy 1: database candidates → collection membership check
+        candidates = self._database_search(artist, album, limit=25)
         for release in candidates:
             try:
                 instance_id = self._get_collection_instance_id(release.id)
                 if instance_id is not None:
                     log.debug(
-                        f"Found in collection: '{release.title}' "
+                        f"Found in collection (strategy 1): '{release.title}' "
                         f"(release {release.id}, instance {instance_id})"
                     )
                     return self._build_result(release, instance_id=instance_id)
@@ -84,7 +86,12 @@ class DiscogsClient:
                 log.debug(f"Collection check failed for release {release.id}: {e}")
                 continue
 
-        return None
+        # Strategy 2: walk the collection and fuzzy-match
+        log.debug(
+            f"Strategy 1 found nothing for '{artist} / {album}'; "
+            f"falling back to collection walk."
+        )
+        return self._search_collection_walk(artist, album)
 
     def search_database(self, artist: str, album: str) -> Optional[dict]:
         """Search the full Discogs database (not just the user's collection).
@@ -107,7 +114,7 @@ class DiscogsClient:
 
         return None
 
-    def get_tracklist(self, release_id: int) -> list[TracklistEntry]:
+    def get_tracklist(self, release_id: int) -> list:
         """Fetch and return the full tracklist for a release.
 
         Filters out Discogs "heading" pseudo-tracks (e.g. "Side A", "Side B")
@@ -197,7 +204,7 @@ class DiscogsClient:
         log.debug(f"Collection fields loaded: {self._collection_fields}")
         return self._collection_fields
 
-    def _database_search(self, artist: str, album: str, limit: int = 5) -> list:
+    def _database_search(self, artist: str, album: str, limit: int = 25) -> list:
         """Search the Discogs database and return up to `limit` Release objects."""
         try:
             results = self._client.search(album, artist=artist, type="release")
@@ -223,6 +230,61 @@ class DiscogsClient:
             return None
         # If the user owns multiple copies, use the first instance
         return instances[0].get("instance_id")
+
+    def _search_collection_walk(self, artist: str, album: str) -> Optional[dict]:
+        """Walk the user's collection pages and fuzzy-match on artist + album.
+
+        This is the slow path — used only when the database cross-reference
+        strategy fails to find the release (e.g. rare pressings, unusual
+        artist/album string formatting in the database).
+        """
+        artist_lower = artist.lower()
+        album_lower = album.lower()
+        page = 1
+
+        while True:
+            try:
+                resp = self._session.get(
+                    f"{_API_BASE}/users/{self.username}/collection/folders/0/releases",
+                    params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                log.warning(f"Collection walk failed on page {page}: {e}")
+                return None
+
+            releases = data.get("releases", [])
+            if not releases:
+                break
+
+            for item in releases:
+                basic = item.get("basic_information", {})
+                title = basic.get("title", "").lower()
+                artists = [a.get("name", "").lower() for a in basic.get("artists", [])]
+
+                if album_lower in title and any(artist_lower in a for a in artists):
+                    release_id = basic.get("id")
+                    instance_id = item.get("instance_id")
+                    log.debug(
+                        f"Found in collection (strategy 2): '{basic.get('title')}' "
+                        f"(release {release_id}, instance {instance_id})"
+                    )
+                    try:
+                        release_obj = self._client.release(release_id)
+                        return self._build_result(release_obj, instance_id=instance_id)
+                    except Exception as e:
+                        log.debug(f"Failed to build result for collection item {release_id}: {e}")
+                        continue
+
+            # Check if there are more pages
+            pagination = data.get("pagination", {})
+            if page >= pagination.get("pages", 1):
+                break
+            page += 1
+
+        log.debug(f"Collection walk found nothing for '{artist} / {album}'.")
+        return None
 
     def _build_result(self, release, instance_id: Optional[int]) -> dict:
         """Build a standardised result dict from a Discogs Release object.
