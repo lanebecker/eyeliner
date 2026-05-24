@@ -1,66 +1,315 @@
-"""Tests for MetadataResolver fallback chain."""
+"""Unit tests for MetadataResolver — the 3-step fallback chain.
 
+DiscogsClient and CoverArtFallback are injected as mocks so no network
+access, Discogs account, or MusicBrainz lookup is needed.
+
+Verifies:
+  - Collection hit → DISCOGS_COLLECTION source, database not tried
+  - Collection miss, database hit → DISCOGS_DATABASE source
+  - Both miss → FALLBACK source with MusicBrainz cover
+  - Exceptions in step 1 fall through to step 2
+  - Exceptions in step 2 fall through to fallback
+  - NotImplementedError (stub) falls through gracefully
+  - All TrackMetadata fields are populated correctly from each source
+"""
+import asyncio
+from unittest.mock import MagicMock, patch
 import pytest
-from unittest.mock import MagicMock
 
-from src.metadata.models import MetadataSource
 from src.audio.recognizer import RawRecognitionResult
+from src.metadata.models import MetadataSource, TracklistEntry
 
 
-RAW = RawRecognitionResult(
-    title="So What",
-    artist="Miles Davis",
-    album="Kind of Blue",
-)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-DISCOGS_RESULT = {
-    "album": "Kind of Blue",
-    "year": "1959",
-    "label": "Columbia",
-    "catalog_number": "CL 1355",
-    "release_id": 12345,
-    "instance_id": 99999,
-    "cover_art_url": "https://example.com/kob.jpg",
-    "tracklist": [],
-}
+def make_raw(title="So What", artist="Miles Davis", album="Kind of Blue"):
+    return RawRecognitionResult(title=title, artist=artist, album=album)
 
 
-class TestMetadataResolverFallbackChain:
-    def _make_resolver(self):
-        from src.metadata.resolver import MetadataResolver
-        config = {
-            "discogs": {
-                "user_token": "x",
-                "username": "u",
-                "listened_field_name": "Listened to?",
-                "listened_field_value": "Yes",
-            }
-        }
-        return MetadataResolver(config)
+def make_discogs_result(release_id=100, instance_id=200):
+    return {
+        "album": "Kind of Blue",
+        "year": "1959",
+        "label": "Columbia",
+        "catalog_number": "CS 8163",
+        "release_id": release_id,
+        "instance_id": instance_id,
+        "cover_art_url": "https://img.discogs.com/cover.jpg",
+        "tracklist": [
+            TracklistEntry("A1", "So What"),
+            TracklistEntry("A2", "Freddie Freeloader"),
+            TracklistEntry("A3", "Blue in Green"),
+            TracklistEntry("B1", "All Blues"),
+            TracklistEntry("B2", "Flamenco Sketches"),
+        ],
+    }
 
-    @pytest.mark.asyncio
-    async def test_returns_collection_result_when_found(self):
-        resolver = self._make_resolver()
-        resolver.discogs.search_collection = MagicMock(return_value=DISCOGS_RESULT)
-        result = await resolver.resolve(RAW)
-        assert result.source == MetadataSource.DISCOGS_COLLECTION
-        assert result.year == "1959"
-        assert result.discogs_release_id == 12345
 
-    @pytest.mark.asyncio
-    async def test_falls_back_to_database_when_not_in_collection(self):
-        resolver = self._make_resolver()
-        resolver.discogs.search_collection = MagicMock(return_value=None)
-        resolver.discogs.search_database = MagicMock(return_value=DISCOGS_RESULT)
-        result = await resolver.resolve(RAW)
-        assert result.source == MetadataSource.DISCOGS_DATABASE
+@pytest.fixture
+def mock_discogs():
+    m = MagicMock()
+    m.search_collection.return_value = None
+    m.search_database.return_value = None
+    return m
 
-    @pytest.mark.asyncio
-    async def test_falls_back_to_musicbrainz_when_discogs_misses(self):
-        resolver = self._make_resolver()
-        resolver.discogs.search_collection = MagicMock(return_value=None)
-        resolver.discogs.search_database = MagicMock(return_value=None)
-        resolver.coverart.get_cover_art_url = MagicMock(return_value="https://mb.org/art.jpg")
-        result = await resolver.resolve(RAW)
-        assert result.source == MetadataSource.FALLBACK
-        assert result.cover_art_url == "https://mb.org/art.jpg"
+
+@pytest.fixture
+def mock_coverart():
+    m = MagicMock()
+    m.get_cover_art_url.return_value = "https://coverartarchive.org/release/abc/front"
+    return m
+
+
+@pytest.fixture
+def resolver(mock_discogs, mock_coverart):
+    """Build a MetadataResolver with injected mock clients."""
+    # Import here to avoid triggering real client instantiation at module load
+    from src.metadata.resolver import MetadataResolver
+    r = MetadataResolver.__new__(MetadataResolver)
+    r.discogs = mock_discogs
+    r.coverart = mock_coverart
+    return r
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Discogs collection hit
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_collection_hit_returns_discogs_collection_source(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source == MetadataSource.DISCOGS_COLLECTION
+
+
+@pytest.mark.asyncio
+async def test_collection_hit_skips_database(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    await resolver.resolve(make_raw())
+
+    mock_discogs.search_database.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_collection_hit_populates_all_metadata_fields(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = make_discogs_result(
+        release_id=100, instance_id=200
+    )
+
+    result = await resolver.resolve(make_raw(title="So What", artist="Miles Davis"))
+
+    assert result.title == "So What"
+    assert result.artist == "Miles Davis"
+    assert result.album == "Kind of Blue"
+    assert result.year == "1959"
+    assert result.label == "Columbia"
+    assert result.catalog_number == "CS 8163"
+    assert result.discogs_release_id == 100
+    assert result.discogs_instance_id == 200
+    assert result.cover_art_url == "https://img.discogs.com/cover.jpg"
+    assert len(result.tracklist) == 5
+
+
+@pytest.mark.asyncio
+async def test_collection_hit_tracklist_enables_last_track_detection(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    result = await resolver.resolve(make_raw(title="Flamenco Sketches"))
+
+    assert result.is_last_track is True
+
+
+@pytest.mark.asyncio
+async def test_collection_search_called_with_artist_and_album(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    await resolver.resolve(make_raw(artist="Miles Davis", album="Kind of Blue"))
+
+    mock_discogs.search_collection.assert_called_once_with("Miles Davis", "Kind of Blue")
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Discogs database hit (collection miss)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_collection_miss_falls_through_to_database(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = make_discogs_result(instance_id=None)
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source == MetadataSource.DISCOGS_DATABASE
+    mock_discogs.search_database.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_database_result_has_no_instance_id(resolver, mock_discogs):
+    """Database results don't have an instance_id (not owned by the user)."""
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = make_discogs_result(
+        release_id=100, instance_id=None
+    )
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.discogs_instance_id is None
+    assert result.discogs_release_id == 100
+
+
+@pytest.mark.asyncio
+async def test_database_hit_populates_enriched_fields(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = make_discogs_result(instance_id=None)
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.year == "1959"
+    assert result.label == "Columbia"
+    assert result.catalog_number == "CS 8163"
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Fallback (both Discogs steps return None)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_both_discogs_miss_returns_fallback_source(resolver, mock_discogs, mock_coverart):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = None
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source == MetadataSource.FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_fallback_cover_art_fetched_from_musicbrainz(resolver, mock_discogs, mock_coverart):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = None
+    mock_coverart.get_cover_art_url.return_value = "https://musicbrainz.org/img/cover.jpg"
+
+    result = await resolver.resolve(make_raw())
+
+    mock_coverart.get_cover_art_url.assert_called_once_with("Miles Davis", "Kind of Blue")
+    assert result.cover_art_url == "https://musicbrainz.org/img/cover.jpg"
+
+
+@pytest.mark.asyncio
+async def test_fallback_uses_shazam_title_artist_album(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = None
+
+    raw = make_raw(title="My Track", artist="My Artist", album="My Album")
+    result = await resolver.resolve(raw)
+
+    assert result.title == "My Track"
+    assert result.artist == "My Artist"
+    assert result.album == "My Album"
+
+
+@pytest.mark.asyncio
+async def test_fallback_has_no_discogs_ids(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = None
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.discogs_release_id is None
+    assert result.discogs_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_has_empty_tracklist(resolver, mock_discogs):
+    """Fallback metadata has no tracklist — last-track detection won't fire."""
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = None
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.tracklist == []
+    assert result.is_last_track is False
+
+
+# ---------------------------------------------------------------------------
+# Exception handling — graceful fallthrough
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_collection_exception_falls_through_to_database(resolver, mock_discogs):
+    mock_discogs.search_collection.side_effect = Exception("Discogs network timeout")
+    mock_discogs.search_database.return_value = make_discogs_result(instance_id=None)
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source == MetadataSource.DISCOGS_DATABASE
+
+
+@pytest.mark.asyncio
+async def test_database_exception_falls_through_to_fallback(resolver, mock_discogs, mock_coverart):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.side_effect = Exception("Rate limited")
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source == MetadataSource.FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_both_exceptions_fall_through_to_fallback(resolver, mock_discogs, mock_coverart):
+    mock_discogs.search_collection.side_effect = Exception("Error 1")
+    mock_discogs.search_database.side_effect = Exception("Error 2")
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source == MetadataSource.FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_not_implemented_error_falls_through_gracefully(resolver, mock_discogs):
+    """NotImplementedError is treated as 'stub not yet built' — fall through silently."""
+    mock_discogs.search_collection.side_effect = NotImplementedError
+    mock_discogs.search_database.return_value = make_discogs_result(instance_id=None)
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source == MetadataSource.DISCOGS_DATABASE
+
+
+# ---------------------------------------------------------------------------
+# resolve() always returns a TrackMetadata (never raises, never returns None)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_always_returns_track_metadata(resolver, mock_discogs, mock_coverart):
+    """Even with both Discogs steps failing, resolve() returns a valid FALLBACK TrackMetadata."""
+    from src.metadata.models import TrackMetadata
+    mock_discogs.search_collection.side_effect = Exception("boom")
+    mock_discogs.search_database.side_effect = Exception("boom")
+    # Cover art fallback succeeds (returns None when nothing found — normal behaviour)
+    mock_coverart.get_cover_art_url.return_value = None
+
+    result = await resolver.resolve(make_raw())
+
+    assert isinstance(result, TrackMetadata)
+    assert result.source == MetadataSource.FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_title_from_raw_is_preserved_through_all_paths(resolver, mock_discogs):
+    """The raw Shazam title is always present in the final result, whatever path was taken."""
+    # Collection path
+    mock_discogs.search_collection.return_value = make_discogs_result()
+    result = await resolver.resolve(make_raw(title="So What"))
+    assert result.title == "So What"
+
+    # Fallback path
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = None
+    result = await resolver.resolve(make_raw(title="So What"))
+    assert result.title == "So What"
