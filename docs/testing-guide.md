@@ -57,6 +57,7 @@ cp config.example.yaml config.yaml
 | `tests/test_models.py` | Data models (TrackMetadata, PlaySession, etc.) | No | No |
 | `tests/test_silence.py` | Silence detector state machine | No | No |
 | `tests/test_listen_tracker.py` | Last-track detection & Discogs update logic | No | No |
+| `tests/test_discogs_client.py` | DiscogsClient Play Count increment logic | No | No |
 | `tests/test_resolver.py` | 3-step metadata fallback chain | No | No |
 | `tests/test_recognizer.py` | Recognition loop confirmation logic | No | No |
 | `tests/test_layouts.py` | Display layout geometry | No | No |
@@ -66,7 +67,7 @@ cp config.example.yaml config.yaml
 
 ## Running the unit tests
 
-### All six suites at once
+### All suites at once
 
 ```bash
 pytest
@@ -78,16 +79,17 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.11.x, pytest-7.x.x, pluggy-1.x.x
-collected 90 items
+collected 104 items
 
-tests/test_models.py ....................                               [ 22%]
-tests/test_silence.py ............................                      [ 53%]
-tests/test_listen_tracker.py ..................                         [ 73%]
-tests/test_resolver.py ...................                              [ 94%]
+tests/test_models.py ....................                               [ 19%]
+tests/test_silence.py ............................                      [ 46%]
+tests/test_listen_tracker.py ..................                         [ 63%]
+tests/test_discogs_client.py ..............                            [ 77%]
+tests/test_resolver.py ...................                              [ 95%]
 tests/test_recognizer.py ..................                             [ 99%]
 tests/test_layouts.py .........                                        [100%]
 
-============================== 90 passed in 1.23s ==============================
+============================== 104 passed in 1.35s ==============================
 ```
 
 ### One suite at a time
@@ -96,6 +98,7 @@ tests/test_layouts.py .........                                        [100%]
 pytest tests/test_models.py
 pytest tests/test_silence.py
 pytest tests/test_listen_tracker.py
+pytest tests/test_discogs_client.py
 pytest tests/test_resolver.py
 pytest tests/test_recognizer.py
 pytest tests/test_layouts.py
@@ -116,7 +119,7 @@ pytest -x
 ### Run a single test by name
 
 ```bash
-pytest tests/test_listen_tracker.py::test_only_side_a_played_does_not_mark
+pytest tests/test_listen_tracker.py::test_only_side_a_played_does_not_increment
 ```
 
 ---
@@ -158,13 +161,33 @@ Mocks `DiscogsClient` and drives `ListenTracker` directly. Tests every edge case
 from the architecture doc.
 
 Key cases:
-- **Happy path:** last track identified + session ends → `mark_as_listened` called with correct `release_id` and `instance_id`
+- **Happy path:** last track identified + session ends → `increment_play_count` called with correct `release_id` and `instance_id`
 - **Only Side A:** session ends before last track → NOT called
 - **Missed recognition:** all tracks except the last identified → NOT called
 - **Fallback metadata:** last track reached but `discogs_release_id = None` → NOT called
 - **No tracks at all:** recognition never succeeded → NOT called
 - **Spurious SESSION_ENDED:** no active session when event fires → no crash
-- **Discogs API failure:** `mark_as_listened` returns `False` → no crash, logged
+- **Discogs API failure:** `increment_play_count` returns `False` → no crash, logged
+
+### `test_discogs_client.py` — Play Count increment logic
+
+Mocks all HTTP calls and tests `DiscogsClient.increment_play_count()` and its
+`_get_field_value()` helper in isolation. No real Discogs account required.
+
+Key cases:
+- **Blank field:** Play Count field is empty → posts `"1"`
+- **Existing count:** count `"5"` → posts `"6"`; count `"1"` → posts `"2"`
+- **Garbage value:** non-integer string → logs a warning, treats as 0, posts `"1"`
+- **Whitespace-only value:** treated as 0, posts `"1"`
+- **Field not found:** `"Play Count"` absent from collection fields → returns `False`, no POST
+- **GET failure:** current-value GET returns non-200 → falls back to 0, still posts `"1"`
+- **POST non-204:** returns `False`
+- **POST 401:** returns `False`
+- **Exception during POST:** caught, returns `False`, no crash
+- **`_get_field_value` — correct instance:** returns the value string
+- **`_get_field_value` — wrong instance_id:** returns `None`
+- **`_get_field_value` — non-200 GET:** returns `None`
+- **`_get_field_value` — field not in notes:** returns `None`
 
 ### `test_resolver.py` — Metadata fallback chain
 
@@ -224,7 +247,7 @@ This tests:
 1. `search_collection` — looks for *Sister* in your collection
 2. `search_database` — looks for *Sister* in the Discogs database (all releases)
 3. `get_tracklist` — fetches the full tracklist for the found release
-4. Collection custom fields — verifies your "Listened to?" field exists and returns its ID
+4. Collection custom fields — verifies your "Play Count" field exists and returns its ID
 
 ### Sample output
 
@@ -258,7 +281,7 @@ TEST 3: get_tracklist(release_id)
 
 TEST 4: Collection custom fields
 ──────────────────────────────────────────────────
-  ✓ Found "Listened to?" → field ID 3
+  ✓ Found "Play Count" → field ID 6
 
 ══════════════════════════════════════════════════════════
   4/4 tests passed
@@ -268,14 +291,14 @@ TEST 4: Collection custom fields
 ### Output symbols
 
 | Symbol | Meaning |
-|--------|----------|
+|--------|---------|
 | `✓` | Passed — got expected data |
 | `✗` | Failed — API error or unexpected response |
 | `·` | Skipped — e.g. *Sister* not in your collection; collection-specific tests N/A |
 
 If *Sister* isn't in your collection, TEST 1 will show `·` and TEST 3 will use the
 release ID from TEST 2 instead. That's fine — the important thing is that your token
-is valid and the `Listened to?` field is found.
+is valid and the `Play Count` field is found.
 
 ### With the write test (modifies your Discogs collection)
 
@@ -283,9 +306,10 @@ is valid and the `Listened to?` field is found.
 python test_discogs_live.py --test-write
 ```
 
-This additionally tests `mark_as_listened`. It will prompt for confirmation before
-making any changes. The field is idempotent — setting it to "Yes" when it's already
-"Yes" is harmless. If you want to reset it afterward, flip it manually in Discogs.
+This additionally tests `increment_play_count`. It will prompt for confirmation before
+making any changes. The field is a running counter — running this test will increment
+the Play Count by 1 on the test release. If you want to correct it afterward, adjust
+the value manually in your Discogs collection.
 
 ---
 
@@ -307,8 +331,8 @@ This is fixed by `asyncio_mode = auto` in `pytest.ini`. If you see it, check tha
 **`discogs_client.exceptions.HTTPError: 401 Unauthorized`** in live test  
 Your `user_token` in `config.yaml` is wrong or expired. Regenerate it at discogs.com/settings/developers.
 
-**`KeyError: 'Listened to?'`** in live test  
-The `listened_field_name` in `config.yaml` doesn't exactly match your Discogs custom field name. It's case-sensitive — check the spelling in your Discogs collection settings.
+**`KeyError: 'Play Count'`** in live test  
+The `play_count_field_name` in `config.yaml` doesn't exactly match your Discogs custom field name. It's case-sensitive — check the spelling in your Discogs collection settings.
 
 ---
 
