@@ -78,19 +78,27 @@ in the `tests/` directory. Expected output:
 
 ```
 ============================= test session starts ==============================
-platform darwin -- Python 3.11.x, pytest-7.x.x, pluggy-1.x.x
-collected 104 items
+platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
+collected 138 items
 
-tests/test_models.py ....................                               [ 19%]
-tests/test_silence.py ............................                      [ 46%]
-tests/test_listen_tracker.py ..................                         [ 63%]
-tests/test_discogs_client.py ..............                            [ 77%]
-tests/test_resolver.py ...................                              [ 95%]
-tests/test_recognizer.py ..................                             [ 99%]
-tests/test_layouts.py .........                                        [100%]
+tests/test_discogs_client.py ..............                              [ 10%]
+tests/test_layouts.py ........................                           [ 27%]
+tests/test_listen_tracker.py .................                           [ 39%]
+tests/test_models.py .........................                           [ 57%]
+tests/test_recognizer.py .................                               [ 70%]
+tests/test_resolver.py ...................                               [ 84%]
+tests/test_silence.py ......................                             [100%]
 
-============================== 104 passed in 1.35s ==============================
+=============================== warnings summary ===============================
+venv/lib/python3.9/site-packages/urllib3/__init__.py:35
+  NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the
+  'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
+  urllib3/urllib3/issues/3020
+
+============================== 138 passed in 0.49s ==============================
 ```
+
+The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
 
 ### One suite at a time
 
@@ -327,6 +335,9 @@ Install the system dependency: `brew install portaudio` (Mac) or `sudo apt insta
 
 **`RuntimeError: no running event loop`** in async tests  
 This is fixed by `asyncio_mode = auto` in `pytest.ini`. If you see it, check that `pytest-asyncio >= 0.23` is installed: `pip install "pytest-asyncio>=0.23"`.
+
+**`NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+`** on macOS  
+Harmless. macOS ships with LibreSSL instead of OpenSSL, and urllib3 v2 emits this warning when it detects it. The tests all pass and nothing is broken — the Pi runs Linux with proper OpenSSL and will never show this warning. You can safely ignore it.
 
 **`discogs_client.exceptions.HTTPError: 401 Unauthorized`** in live test  
 Your `user_token` in `config.yaml` is wrong or expired. Regenerate it at discogs.com/settings/developers.
