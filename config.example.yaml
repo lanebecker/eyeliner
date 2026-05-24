@@ -16,6 +16,9 @@ discogs:
   username: "your_discogs_username"
   # Must match your custom field name exactly (case-sensitive)
   play_count_field_name: "Play Count"
+  # Optional: record today's date in a custom field each time an album completes.
+  # Create a "Last Played" custom field in your Discogs collection, then uncomment:
+  # last_played_field_name: "Last Played"
 
 display:
   # Default resolution matches Waveshare 7" HDMI LCD (H) — adjust if using a different screen
