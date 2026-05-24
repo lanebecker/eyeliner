@@ -1,7 +1,7 @@
 """Discogs API wrapper.
 
 Handles collection search, database search, tracklist retrieval,
-and updating the 'Listened to?' custom field.
+and incrementing the 'Play Count' custom field on each completed listen.
 
 Design notes:
   - python3-discogs-client is used for high-level search operations.
@@ -33,8 +33,7 @@ class DiscogsClient:
     def __init__(self, config: dict):
         cfg = config["discogs"]
         self.username: str = cfg["username"]
-        self.listened_field_name: str = cfg["listened_field_name"]
-        self.listened_field_value: str = cfg.get("listened_field_value", "Yes")
+        self.play_count_field_name: str = cfg["play_count_field_name"]
         self._token: str = cfg["user_token"]
 
         # High-level client — used for search() and release() lookups
@@ -139,8 +138,11 @@ class DiscogsClient:
             log.warning(f"Failed to fetch tracklist for release {release_id}: {e}")
             return []
 
-    def mark_as_listened(self, release_id: int, instance_id: int) -> bool:
-        """Set the 'Listened to?' custom field to 'Yes' for a collection item.
+    def increment_play_count(self, release_id: int, instance_id: int) -> bool:
+        """Increment the 'Play Count' custom field by 1 for a collection item.
+
+        Reads the current value first (defaulting to 0 if blank, unreadable,
+        or unreachable), then POSTs the incremented value back.
 
         Uses the Discogs collection field update endpoint:
           POST /users/{username}/collection/folders/0/releases/{release_id}
@@ -150,25 +152,38 @@ class DiscogsClient:
         """
         try:
             fields = self._get_collection_fields()
-            field_id = fields.get(self.listened_field_name)
+            field_id = fields.get(self.play_count_field_name)
             if field_id is None:
                 log.error(
-                    f"Custom field '{self.listened_field_name}' not found in Discogs. "
+                    f"Custom field '{self.play_count_field_name}' not found in Discogs. "
                     f"Available fields: {list(fields.keys())}"
                 )
                 return False
+
+            # Read current value; fall back to 0 if blank, missing, or GET fails
+            raw_value = self._get_field_value(release_id, instance_id, field_id)
+            try:
+                current_count = int(raw_value) if raw_value and raw_value.strip() else 0
+            except (ValueError, TypeError):
+                log.warning(
+                    f"Play Count field for release {release_id} / instance {instance_id} "
+                    f"contains non-integer value {raw_value!r}; treating as 0."
+                )
+                current_count = 0
+
+            new_count = current_count + 1
 
             url = (
                 f"{_API_BASE}/users/{self.username}/collection"
                 f"/folders/0/releases/{release_id}"
                 f"/instances/{instance_id}/fields/{field_id}"
             )
-            resp = self._session.post(url, json={"value": self.listened_field_value})
+            resp = self._session.post(url, json={"value": str(new_count)})
 
             if resp.status_code == 204:
                 log.info(
-                    f"Marked release {release_id} / instance {instance_id} "
-                    f"as '{self.listened_field_value}' in Discogs."
+                    f"Play Count updated for release {release_id} / instance {instance_id}: "
+                    f"{current_count} → {new_count}."
                 )
                 return True
 
@@ -178,7 +193,7 @@ class DiscogsClient:
             return False
 
         except Exception as e:
-            log.error(f"Failed to mark release {release_id} as listened: {e}")
+            log.error(f"Failed to increment Play Count for release {release_id}: {e}")
             return False
 
     # -------------------------------------------------------------------------
@@ -203,6 +218,44 @@ class DiscogsClient:
         }
         log.debug(f"Collection fields loaded: {self._collection_fields}")
         return self._collection_fields
+
+    def _get_field_value(
+        self, release_id: int, instance_id: int, field_id: int
+    ) -> Optional[str]:
+        """Read the current value of a custom field for a specific collection instance.
+
+        GETs /users/{username}/collection/releases/{release_id} and finds the
+        matching instance_id, then returns the note value for field_id.
+
+        Returns None if the GET fails, the instance isn't found, or the field
+        has no value set.
+        """
+        try:
+            resp = self._session.get(
+                f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}"
+            )
+            if resp.status_code != 200:
+                log.debug(
+                    f"_get_field_value: GET returned {resp.status_code} "
+                    f"for release {release_id}; defaulting to 0."
+                )
+                return None
+            instances = resp.json().get("releases", [])
+            for inst in instances:
+                if inst.get("instance_id") == instance_id:
+                    for note in inst.get("notes", []):
+                        if note.get("field_id") == field_id:
+                            return note.get("value")
+                    # Instance found but field not set — return None (treat as 0)
+                    return None
+            log.debug(
+                f"_get_field_value: instance {instance_id} not found in "
+                f"release {release_id} response; defaulting to 0."
+            )
+            return None
+        except Exception as e:
+            log.debug(f"_get_field_value failed for release {release_id}: {e}")
+            return None
 
     def _database_search(self, artist: str, album: str, limit: int = 25) -> list:
         """Search the Discogs database and return up to `limit` Release objects."""
