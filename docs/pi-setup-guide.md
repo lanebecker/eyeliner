@@ -165,7 +165,7 @@ Key values to fill in:
 | `audio.device_name` | Must match what `aplay -l` showed — default `"USB Audio Codec"` is usually correct |
 | `discogs.user_token` | From discogs.com → Settings → Developers → Generate token |
 | `discogs.username` | Your Discogs username |
-| `discogs.listened_field_name` | Must match your custom field name **exactly** (case-sensitive) |
+| `discogs.play_count_field_name` | Must match your "Play Count" custom field name **exactly** (case-sensitive) |
 
 Everything else can stay as-is for a first run.
 
@@ -220,7 +220,7 @@ Watch the terminal output for log messages. Key things to look for:
 - `RawRecognitionResult` — Shazam identified a track
 - `Committed track:` — confirmation count reached, track is live on screen
 - `Found in collection` — the Discogs lookup succeeded
-- `Marked release ... as listened` — the field update fired at end of session
+- `Play Count updated for release ...` — the field update fired at end of session
 
 If `MUSIC_STARTED` never appears, the silence threshold may be too high for
 your room's noise floor. Tune `audio.silence_threshold_rms` in config.yaml —
