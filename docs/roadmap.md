@@ -19,7 +19,7 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 - End-to-end Discogs field update on album completion
 - 124-test unit suite covering all non-hardware components
 
-### v1.0.1 ✅ (current)
+### v1.0.1 ✅
 
 - Replaced the boolean "Listened?" field update with a **Play Count increment**:
   reads the current integer value, increments by 1, writes back. Empty Play Count
@@ -29,27 +29,21 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 
 ---
 
-## v1.1.0 — Discogs Listening Statistics
+## v1.1.0 — Discogs Listening Statistics ✅ (current)
 
-**Why first:** builds directly on the infrastructure already in place — no new
-external dependencies, and the Play Count update path already exists (v1.0.1).
-The natural next step is to also record *when* it was last played.
-
-**What it adds:**
-- Writes a "Last Played" date (ISO 8601) to a Discogs custom field each time
-  `_end_session()` fires with `potential_last_track = True`
-- Field is optional and only updated if it exists in your collection
-  (graceful no-op if not configured)
-- New `discogs.last_played_field_name` config key (optional)
-
-**Prerequisite:** add a "Last Played" custom field to your Discogs collection
-settings before enabling.
+- Writes a "Last Played" date (ISO 8601, `YYYY-MM-DD`) to a configurable Discogs
+  custom field each time a full album side plays through.
+- Field is optional: if `discogs.last_played_field_name` is not set in `config.yaml`,
+  the method is a graceful no-op and no API calls are made.
+- New `discogs.last_played_field_name` config key (optional).
+- 148-test unit suite (+10 tests covering `update_last_played` and its
+  `ListenTracker` integration).
 
 ---
 
 ## v1.2.0 — Last.fm Scrobbling
 
-**Why second:** highest value-to-effort ratio of any remaining feature on the
+**Why next:** highest value-to-effort ratio of any remaining feature on the
 list. Last.fm builds a permanent, queryable listening history. For vinyl
 listeners this is especially satisfying — nothing else does it automatically.
 The `ListenTracker` already has the right hooks; this is mostly a new client
