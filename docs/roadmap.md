@@ -30,15 +30,15 @@ field on completion, and incrementing a play count + recording a last-played
 date is trivially additive.
 
 **What it adds:**
-- Increments a "Play count" Discogs custom field each time `_end_session()` fires
+- Increments a "Play Count" Discogs custom field each time `_end_session()` fires
   with `potential_last_track = True`
-- Writes a "Last played" date (ISO 8601) to a Discogs custom field on the same condition
+- Writes a "Last Played" date (ISO 8601) to a Discogs custom field on the same condition
 - Both fields are optional and only updated if they exist in your collection
   (graceful no-op if not configured)
 - New `discogs.play_count_field_name` and `discogs.last_played_field_name`
   config keys (both optional)
 
-**Prerequisite:** add "Play count" and "Last played" custom fields to your
+**Prerequisite:** add "Play Count" and "Last Played" custom fields to your
 Discogs collection settings before enabling.
 
 ---
