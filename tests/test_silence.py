@@ -319,15 +319,17 @@ def test_custom_threshold_respected():
 def test_signal_just_at_threshold_is_music():
     """RMS exactly at threshold should be treated as music (>= comparison).
 
-    Uses a constant-valued array so RMS is exactly equal to the threshold —
-    music_chunk() scales random noise and can land a hair below the target
-    due to floating-point rounding, making it unsuitable for exact-boundary tests.
+    Uses a constant float64 array so RMS is exactly equal to the threshold.
+    float32 cannot represent 0.01 exactly (nearest value is ~0.009999999776),
+    which would land just below the float64 threshold and cause a spurious miss.
+    With float64, every sample stores the same bit pattern as self.threshold,
+    so mean(x**2) == threshold**2 and sqrt → threshold exactly.
     """
     threshold = 0.01
     detector = SilenceDetector(make_config(threshold=threshold))
     events = collect(detector)
-    # np.full gives RMS == threshold exactly (every sample == threshold,
-    # so mean(x**2) == threshold**2, sqrt → threshold).
-    exact_chunk = np.full(4096, threshold, dtype=np.float32)
+    # float64 (numpy default) — 0.01 has the same representation in the array
+    # and in self.threshold, so the >= comparison resolves to exactly True.
+    exact_chunk = np.full(4096, threshold)  # dtype=float64 by default
     detector.process(exact_chunk, SAMPLE_RATE)
     assert AudioEvent.MUSIC_STARTED in events
