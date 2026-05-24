@@ -15,9 +15,7 @@ discogs:
   user_token: "YOUR_DISCOGS_TOKEN_HERE"
   username: "your_discogs_username"
   # Must match your custom field name exactly (case-sensitive)
-  listened_field_name: "Listened to?"
-  # Value to set when an album is fully played
-  listened_field_value: "Yes"
+  play_count_field_name: "Play Count"
 
 display:
   # Default resolution matches Waveshare 7" HDMI LCD (H) — adjust if using a different screen
