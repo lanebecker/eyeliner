@@ -1,8 +1,9 @@
-"""Unit tests for DiscogsClient.increment_play_count and _get_field_value.
+"""Unit tests for DiscogsClient.increment_play_count, _get_field_value,
+and update_last_played.
 
 All HTTP calls are mocked via unittest.mock — no real Discogs account required.
 
-Covered scenarios:
+Covered scenarios — increment_play_count:
   ✓ Blank Play Count field → sets "1"
   ✓ Existing count "5" → sets "6"
   ✓ Existing count "1" → sets "2"
@@ -13,10 +14,23 @@ Covered scenarios:
   ✓ POST returns non-204 → returns False
   ✓ POST returns 401 → returns False
   ✓ Exception raised during POST → returns False, no crash
-  ✓ _get_field_value: correct instance_id → returns value string
-  ✓ _get_field_value: instance_id not in response → returns None
-  ✓ _get_field_value: non-200 GET → returns None
+
+Covered scenarios — _get_field_value:
+  ✓ Correct instance_id → returns value string
+  ✓ instance_id not in response → returns None
+  ✓ Non-200 GET → returns None
+  ✓ Instance found but field_id not in notes → returns None
+
+Covered scenarios — update_last_played:
+  ✓ last_played_field_name not configured → returns True, no API calls
+  ✓ Configured, field found, POST 204 → returns True, posts today's ISO date
+  ✓ Date written matches today's ISO format (YYYY-MM-DD)
+  ✓ Field not found in collection fields → returns False, no POST
+  ✓ POST returns non-204 → returns False
+  ✓ POST returns 401 → returns False
+  ✓ Exception raised during POST → returns False, no crash
 """
+from datetime import date
 from unittest.mock import MagicMock, patch, call
 import pytest
 
@@ -35,10 +49,11 @@ _BASE_CONFIG = {
     }
 }
 
-# Arbitrary integer used to keep mock request/response data internally
-# consistent. All HTTP calls are mocked, so this never touches the real
-# Discogs API — the actual field ID on the account is irrelevant here.
+# Arbitrary integers used to keep mock request/response data internally
+# consistent. All HTTP calls are mocked, so these never touch the real
+# Discogs API — the actual field IDs on the account are irrelevant here.
 _FIELD_ID = 6
+_LAST_PLAYED_FIELD_ID = 7
 
 
 def make_client():
@@ -47,6 +62,26 @@ def make_client():
         client = DiscogsClient(_BASE_CONFIG)
     # Pre-populate the fields cache so tests don't need to stub the fields GET
     client._collection_fields = {"Play Count": _FIELD_ID}
+    return client
+
+
+def make_client_with_last_played():
+    """Build a DiscogsClient configured with last_played_field_name."""
+    config = {
+        "discogs": {
+            "username": "testuser",
+            "user_token": "fake-token",
+            "play_count_field_name": "Play Count",
+            "last_played_field_name": "Last Played",
+        }
+    }
+    with patch("src.metadata.discogs_client.discogs_client.Client"):
+        client = DiscogsClient(config)
+    # Pre-populate both fields in the cache
+    client._collection_fields = {
+        "Play Count": _FIELD_ID,
+        "Last Played": _LAST_PLAYED_FIELD_ID,
+    }
     return client
 
 
@@ -308,3 +343,116 @@ def test_get_field_value_field_not_in_notes_returns_none():
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# update_last_played — not configured (graceful no-op)
+# ---------------------------------------------------------------------------
+
+def test_update_last_played_not_configured_returns_true_no_api_calls():
+    """When last_played_field_name is not set, update_last_played is a no-op."""
+    client = make_client()  # last_played_field_name is None (not in config)
+
+    client._session.post = MagicMock()
+    client._session.get = MagicMock()
+
+    result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is True
+    client._session.post.assert_not_called()
+    client._session.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# update_last_played — happy path
+# ---------------------------------------------------------------------------
+
+def test_update_last_played_posts_todays_iso_date():
+    """update_last_played POSTs today's ISO date string and returns True."""
+    client = make_client_with_last_played()
+
+    post_resp = make_post_response(204)
+    client._session.post = MagicMock(return_value=post_resp)
+
+    fake_today = date(2026, 5, 24)
+    with patch("src.metadata.discogs_client.date") as mock_date:
+        mock_date.today.return_value = fake_today
+        result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is True
+    client._session.post.assert_called_once()
+    _, kwargs = client._session.post.call_args
+    assert kwargs["json"]["value"] == "2026-05-24"
+
+
+def test_update_last_played_date_is_iso_format():
+    """The posted value is always a valid ISO 8601 date string (YYYY-MM-DD)."""
+    client = make_client_with_last_played()
+
+    post_resp = make_post_response(204)
+    client._session.post = MagicMock(return_value=post_resp)
+
+    result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is True
+    _, kwargs = client._session.post.call_args
+    posted_value = kwargs["json"]["value"]
+    # Verify format by parsing — raises ValueError if not valid ISO date
+    parsed = date.fromisoformat(posted_value)
+    assert str(parsed) == posted_value
+
+
+# ---------------------------------------------------------------------------
+# update_last_played — field not found
+# ---------------------------------------------------------------------------
+
+def test_update_last_played_field_not_found_returns_false():
+    """If 'Last Played' field doesn't exist in collection fields, return False."""
+    client = make_client_with_last_played()
+    client._collection_fields = {"Play Count": _FIELD_ID}  # Override: no Last Played field
+
+    client._session.post = MagicMock()
+
+    result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is False
+    client._session.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# update_last_played — POST failures
+# ---------------------------------------------------------------------------
+
+def test_update_last_played_post_non204_returns_false():
+    """A non-204 POST response from update_last_played returns False."""
+    client = make_client_with_last_played()
+
+    post_resp = make_post_response(400, "Bad Request")
+    client._session.post = MagicMock(return_value=post_resp)
+
+    result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is False
+
+
+def test_update_last_played_post_401_returns_false():
+    """A 401 Unauthorized response from update_last_played returns False."""
+    client = make_client_with_last_played()
+
+    post_resp = make_post_response(401, "Unauthorized")
+    client._session.post = MagicMock(return_value=post_resp)
+
+    result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is False
+
+
+def test_update_last_played_exception_returns_false_no_crash():
+    """An exception raised during update_last_played POST is caught, returns False."""
+    client = make_client_with_last_played()
+
+    client._session.post = MagicMock(side_effect=ConnectionError("network gone"))
+
+    result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is False
