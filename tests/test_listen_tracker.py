@@ -9,6 +9,11 @@ Covers every edge case from the architecture doc:
   ✓ SESSION_ENDED with no active session → no crash
   ✓ Already-counted album (idempotent Discogs call) → called once anyway
 
+Covers update_last_played integration:
+  ✓ last_played_field_name configured → update_last_played called on album completion
+  ✓ last_played_field_name not configured → update_last_played NOT called
+  ✓ update_last_played returns False → logs warning, no crash
+
 No audio hardware, display, or Discogs account required. DiscogsClient is mocked.
 """
 import asyncio
@@ -26,10 +31,20 @@ from src.tracking.listen_tracker import ListenTracker
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
 
-def make_resolver(increment_play_count_return=True):
-    """Mock resolver whose .discogs.increment_play_count returns a controlled value."""
+def make_resolver(
+    increment_play_count_return=True,
+    last_played_field_name=None,
+    update_last_played_return=True,
+):
+    """Mock resolver whose .discogs methods return controlled values.
+
+    last_played_field_name defaults to None (not configured). Set it to a
+    non-empty string to simulate a user who has the Last Played field enabled.
+    """
     resolver = MagicMock()
     resolver.discogs.increment_play_count.return_value = increment_play_count_return
+    resolver.discogs.last_played_field_name = last_played_field_name
+    resolver.discogs.update_last_played.return_value = update_last_played_return
     return resolver
 
 
@@ -63,8 +78,16 @@ def make_track(
     )
 
 
-def make_tracker(increment_play_count_return=True):
-    resolver = make_resolver(increment_play_count_return)
+def make_tracker(
+    increment_play_count_return=True,
+    last_played_field_name=None,
+    update_last_played_return=True,
+):
+    resolver = make_resolver(
+        increment_play_count_return=increment_play_count_return,
+        last_played_field_name=last_played_field_name,
+        update_last_played_return=update_last_played_return,
+    )
     tracker = ListenTracker({}, resolver)
     return tracker, resolver
 
@@ -315,3 +338,45 @@ async def test_already_counted_album_still_calls_increment_once():
     await tracker._end_session()
     # We called it; Discogs handles the read-before-write
     resolver.discogs.increment_play_count.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# update_last_played integration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_full_album_calls_update_last_played_when_configured():
+    """When last_played_field_name is configured, update_last_played is called on completion."""
+    tracker, resolver = make_tracker(last_played_field_name="Last Played")
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    await tracker._end_session()
+
+    resolver.discogs.increment_play_count.assert_called_once_with(12345, 67890)
+    resolver.discogs.update_last_played.assert_called_once_with(12345, 67890)
+
+
+@pytest.mark.asyncio
+async def test_full_album_does_not_call_update_last_played_when_not_configured():
+    """When last_played_field_name is None, update_last_played is never called."""
+    tracker, resolver = make_tracker(last_played_field_name=None)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    await tracker._end_session()
+
+    resolver.discogs.increment_play_count.assert_called_once()
+    resolver.discogs.update_last_played.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_last_played_returning_false_does_not_raise():
+    """update_last_played failure should log a warning but not crash the session."""
+    tracker, resolver = make_tracker(
+        last_played_field_name="Last Played",
+        update_last_played_return=False,
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    # Should complete without raising
+    await tracker._end_session()
+    resolver.discogs.update_last_played.assert_called_once()
