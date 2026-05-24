@@ -1,0 +1,44 @@
+name: Sync version badge
+
+# Runs whenever VERSION is pushed to main.
+# Reads the new version and updates the shields.io badge URL in README.md,
+# then commits the change back so the badge always matches the VERSION file.
+#
+# To cut a release: edit VERSION, commit, push. That's it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+
+jobs:
+  sync-badge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_OUTPUT
+
+      - name: Update badge URL in README
+        run: |
+          sed -i \
+            's|https://img.shields.io/badge/version-[^-]*-blueviolet|https://img.shields.io/badge/version-${{ steps.ver.outputs.version }}-blueviolet|g' \
+            README.md
+
+      - name: Commit if README changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --quiet README.md || (
+            git add README.md &&
+            git commit -m "chore: sync version badge to ${{ steps.ver.outputs.version }}" &&
+            git push
+          )
