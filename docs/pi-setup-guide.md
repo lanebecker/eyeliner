@@ -166,6 +166,7 @@ Key values to fill in:
 | `discogs.user_token` | From discogs.com → Settings → Developers → Generate token |
 | `discogs.username` | Your Discogs username |
 | `discogs.play_count_field_name` | Must match your "Play Count" custom field name **exactly** (case-sensitive) |
+| `discogs.last_played_field_name` | **Optional.** If you have a "Last Played" custom field in your Discogs collection, set this to match its name exactly. Leave it commented out (the default) if you don't want this feature. |
 
 Everything else can stay as-is for a first run.
 
@@ -220,7 +221,8 @@ Watch the terminal output for log messages. Key things to look for:
 - `RawRecognitionResult` — Shazam identified a track
 - `Committed track:` — confirmation count reached, track is live on screen
 - `Found in collection` — the Discogs lookup succeeded
-- `Play Count updated for release ...` — the field update fired at end of session
+- `Play Count updated for release ...` — the Play Count field was incremented at end of session
+- `Last Played updated for release ...` — the Last Played date was written (only if `last_played_field_name` is configured)
 
 If `MUSIC_STARTED` never appears, the silence threshold may be too high for
 your room's noise floor. Tune `audio.silence_threshold_rms` in config.yaml —
