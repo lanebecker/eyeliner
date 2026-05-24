@@ -26,6 +26,14 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
+def read_version() -> str:
+    """Read the version string from the VERSION file at the repo root."""
+    try:
+        return (Path(__file__).resolve().parent / "VERSION").read_text().strip()
+    except Exception:
+        return "unknown"
+
+
 def load_config(path: str = "config.yaml") -> dict:
     config_path = Path(path)
     if not config_path.exists():
@@ -67,7 +75,7 @@ async def main():
             sig, lambda: asyncio.create_task(shutdown(capture, display))
         )
 
-    log.info("vinyl-now-playing starting up 🎵")
+    log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
     display.start()
 
     await asyncio.gather(
