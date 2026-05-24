@@ -35,7 +35,10 @@ _BASE_CONFIG = {
     }
 }
 
-_FIELD_ID = 6  # Matches what a real Discogs account would return
+# Arbitrary integer used to keep mock request/response data internally
+# consistent. All HTTP calls are mocked, so this never touches the real
+# Discogs API — the actual field ID on the account is irrelevant here.
+_FIELD_ID = 6
 
 
 def make_client():
