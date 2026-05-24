@@ -6,40 +6,44 @@ The current version is in the `VERSION` file at the repo root.
 
 ---
 
-## v1.0.0 — Foundation ✅ (current)
+## v1.0.0 — Foundation ✅
 
 The complete core loop: turntable audio → Shazam recognition → Discogs metadata
-→ pygame display → Discogs "Listened to?" field update.
+→ pygame display → Discogs field update on album completion.
 
 - Full async audio pipeline (AudioCapture → SilenceDetector → RecognitionLoop)
 - ShazamIO recognition with N-of-consecutive-matches confirmation gate
 - Three-tier metadata resolution: Discogs collection → Discogs database → MusicBrainz fallback
 - Proportional pygame display layout at any resolution (primary: Waveshare 7" HDMI, 1024×600)
 - Discogs collection search with 25-candidate + collection-walk fallback strategy
-- End-to-end Discogs "Listened to?" field update on album completion
+- End-to-end Discogs field update on album completion
 - 124-test unit suite covering all non-hardware components
+
+### v1.0.1 ✅ (current)
+
+- Replaced the boolean "Listened?" field update with a **Play Count increment**:
+  reads the current integer value, increments by 1, writes back. Empty Play Count
+  implies unlistened — no separate boolean field needed.
+- New `discogs.play_count_field_name` config key replaces `listened_field_name`
+  and `listened_field_value`.
 
 ---
 
 ## v1.1.0 — Discogs Listening Statistics
 
 **Why first:** builds directly on the infrastructure already in place — no new
-external dependencies, and the custom field update path (`mark_as_listened`)
-already exists. This is the most natural next step: the app already writes one
-field on completion, and incrementing a play count + recording a last-played
-date is trivially additive.
+external dependencies, and the Play Count update path already exists (v1.0.1).
+The natural next step is to also record *when* it was last played.
 
 **What it adds:**
-- Increments a "Play Count" Discogs custom field each time `_end_session()` fires
-  with `potential_last_track = True`
-- Writes a "Last Played" date (ISO 8601) to a Discogs custom field on the same condition
-- Both fields are optional and only updated if they exist in your collection
+- Writes a "Last Played" date (ISO 8601) to a Discogs custom field each time
+  `_end_session()` fires with `potential_last_track = True`
+- Field is optional and only updated if it exists in your collection
   (graceful no-op if not configured)
-- New `discogs.play_count_field_name` and `discogs.last_played_field_name`
-  config keys (both optional)
+- New `discogs.last_played_field_name` config key (optional)
 
-**Prerequisite:** add "Play Count" and "Last Played" custom fields to your
-Discogs collection settings before enabling.
+**Prerequisite:** add a "Last Played" custom field to your Discogs collection
+settings before enabling.
 
 ---
 
@@ -92,14 +96,14 @@ experience — the Pi is on all the time, and "nothing" is what you see most.
 
 **Why fourth:** makes the listening completion logic meaningfully more accurate.
 Right now the tracker treats every needle-drop-to-lift session the same way,
-so playing only Side A of a two-sided album can still trigger a "Listened to?"
-update if Side A happens to end on the last listed track. Side awareness closes
+so playing only Side A of a two-sided album can still trigger a Play Count
+increment if Side A happens to end on the last listed track. Side awareness closes
 that gap and enables the flip reminder.
 
 **What it adds:**
 - `PlaySession` gains a `side` field inferred from the track positions identified
   (`"A"` if all tracks are Ax, `"B"` if all are Bx, `None` if mixed or unknown)
-- "Listened to?" update now requires both Side A and Side B sessions to have
+- Play Count increment now requires both Side A and Side B sessions to have
   completed — stored in a small local state file between sessions
   (e.g. `~/.vinyl-now-playing/session-state.json`)
 - Idle screen "Flip to Side B →" reminder after a Side A session ends
