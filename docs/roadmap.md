@@ -21,12 +21,35 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 
 ---
 
-## v1.1.0 — Last.fm Scrobbling
+## v1.1.0 — Discogs Listening Statistics
 
-**Why first:** highest value-to-effort ratio of any feature on the list. Last.fm
-builds a permanent, queryable listening history. For vinyl listeners this is
-especially satisfying — nothing else does it automatically. The
-`ListenTracker` already has the right hooks; this is mostly a new client module.
+**Why first:** builds directly on the infrastructure already in place — no new
+external dependencies, and the custom field update path (`mark_as_listened`)
+already exists. This is the most natural next step: the app already writes one
+field on completion, and incrementing a play count + recording a last-played
+date is trivially additive.
+
+**What it adds:**
+- Increments a "Play count" Discogs custom field each time `_end_session()` fires
+  with `potential_last_track = True`
+- Writes a "Last played" date (ISO 8601) to a Discogs custom field on the same condition
+- Both fields are optional and only updated if they exist in your collection
+  (graceful no-op if not configured)
+- New `discogs.play_count_field_name` and `discogs.last_played_field_name`
+  config keys (both optional)
+
+**Prerequisite:** add "Play count" and "Last played" custom fields to your
+Discogs collection settings before enabling.
+
+---
+
+## v1.2.0 — Last.fm Scrobbling
+
+**Why second:** highest value-to-effort ratio of any remaining feature on the
+list. Last.fm builds a permanent, queryable listening history. For vinyl
+listeners this is especially satisfying — nothing else does it automatically.
+The `ListenTracker` already has the right hooks; this is mostly a new client
+module.
 
 **What it adds:**
 - New `src/tracking/lastfm_client.py` — wraps the Last.fm Scrobbling API 2.0
@@ -48,9 +71,9 @@ lastfm:
 
 ---
 
-## v1.2.0 — Idle Screen & Recent Plays
+## v1.3.0 — Idle Screen & Recent Plays
 
-**Why second:** the idle screen is currently a blank dark background (a TODO in
+**Why third:** the idle screen is currently a blank dark background (a TODO in
 `DisplayRenderer._render_idle()`). This is the most visible gap in the daily
 experience — the Pi is on all the time, and "nothing" is what you see most.
 
@@ -62,26 +85,6 @@ experience — the Pi is on all the time, and "nothing" is what you see most.
   displayed during extended idle periods (calls `DiscogsClient` to pull a
   random collection item)
 - New `display.idle_mode` config option: `"recent"` | `"random"` | `"clock"` | `"blank"`
-
----
-
-## v1.3.0 — Discogs Listening Statistics
-
-**Why third:** builds on working infrastructure with no new external dependencies.
-The custom field update path (`mark_as_listened`) already exists — this just
-calls it more often with more data.
-
-**What it adds:**
-- Increments a "Play count" Discogs custom field each time `_end_session()` fires
-  with `potential_last_track = True`
-- Writes a "Last played" date (ISO 8601) to a Discogs custom field on the same condition
-- Both fields are optional and only updated if they exist in your collection
-  (graceful no-op if not configured)
-- New `discogs.play_count_field_name` and `discogs.last_played_field_name`
-  config keys (both optional)
-
-**Prerequisite:** add "Play count" and "Last played" custom fields to your
-Discogs collection settings before enabling.
 
 ---
 
