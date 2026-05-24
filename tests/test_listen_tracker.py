@@ -1,13 +1,13 @@
 """Unit tests for ListenTracker — the most business-logic-heavy component.
 
 Covers every edge case from the architecture doc:
-  ✓ Full album played → mark_as_listened called
-  ✓ Only Side A played → NOT marked
-  ✓ Last track recognition missed → NOT marked
-  ✓ Album not in collection (fallback metadata, no release_id) → NOT marked
-  ✓ mark_as_listened returns False → no crash
+  ✓ Full album played → increment_play_count called
+  ✓ Only Side A played → NOT incremented
+  ✓ Last track recognition missed → NOT incremented
+  ✓ Album not in collection (fallback metadata, no release_id) → NOT incremented
+  ✓ increment_play_count returns False → no crash
   ✓ SESSION_ENDED with no active session → no crash
-  ✓ Already-marked album (idempotent Discogs call) → called once anyway
+  ✓ Already-counted album (idempotent Discogs call) → called once anyway
 
 No audio hardware, display, or Discogs account required. DiscogsClient is mocked.
 """
@@ -26,10 +26,10 @@ from src.tracking.listen_tracker import ListenTracker
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
 
-def make_resolver(mark_as_listened_return=True):
-    """Mock resolver whose .discogs.mark_as_listened returns a controlled value."""
+def make_resolver(increment_play_count_return=True):
+    """Mock resolver whose .discogs.increment_play_count returns a controlled value."""
     resolver = MagicMock()
-    resolver.discogs.mark_as_listened.return_value = mark_as_listened_return
+    resolver.discogs.increment_play_count.return_value = increment_play_count_return
     return resolver
 
 
@@ -63,8 +63,8 @@ def make_track(
     )
 
 
-def make_tracker(mark_as_listened_return=True):
-    resolver = make_resolver(mark_as_listened_return)
+def make_tracker(increment_play_count_return=True):
+    resolver = make_resolver(increment_play_count_return)
     tracker = ListenTracker({}, resolver)
     return tracker, resolver
 
@@ -94,12 +94,12 @@ def test_second_music_started_does_not_replace_existing_session():
 
 
 # ---------------------------------------------------------------------------
-# Happy path: full album → mark as listened
+# Happy path: full album → increment Play Count
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_full_album_calls_mark_as_listened():
-    """Playing through the last track + SESSION_ENDED → Discogs updated."""
+async def test_full_album_calls_increment_play_count():
+    """Playing through the last track + SESSION_ENDED → Discogs Play Count incremented."""
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
 
@@ -111,7 +111,7 @@ async def test_full_album_calls_mark_as_listened():
 
     await tracker._end_session()  # Direct await for reliable test execution
 
-    resolver.discogs.mark_as_listened.assert_called_once_with(12345, 67890)
+    resolver.discogs.increment_play_count.assert_called_once_with(12345, 67890)
 
 
 @pytest.mark.asyncio
@@ -124,12 +124,12 @@ async def test_session_cleared_after_end():
 
 
 @pytest.mark.asyncio
-async def test_mark_as_listened_uses_correct_release_and_instance_ids():
+async def test_increment_play_count_uses_correct_release_and_instance_ids():
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik", release_id=99, instance_id=77))
     await tracker._end_session()
-    resolver.discogs.mark_as_listened.assert_called_once_with(99, 77)
+    resolver.discogs.increment_play_count.assert_called_once_with(99, 77)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +137,7 @@ async def test_mark_as_listened_uses_correct_release_and_instance_ids():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_only_side_a_played_does_not_mark():
+async def test_only_side_a_played_does_not_increment():
     """Session ends before last track identified → no Discogs update."""
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
@@ -149,7 +149,7 @@ async def test_only_side_a_played_does_not_mark():
 
     assert tracker._session.potential_last_track is False
     await tracker._end_session()
-    resolver.discogs.mark_as_listened.assert_not_called()
+    resolver.discogs.increment_play_count.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ async def test_only_side_a_played_does_not_mark():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_all_but_last_track_identified_does_not_mark():
+async def test_all_but_last_track_identified_does_not_increment():
     """Recognizer missed the last track (e.g. needle skip) → no update."""
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
@@ -169,7 +169,7 @@ async def test_all_but_last_track_identified_does_not_mark():
 
     assert tracker._session.potential_last_track is False
     await tracker._end_session()
-    resolver.discogs.mark_as_listened.assert_not_called()
+    resolver.discogs.increment_play_count.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +177,7 @@ async def test_all_but_last_track_identified_does_not_mark():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_last_track_reached_but_fallback_source_does_not_mark():
+async def test_last_track_reached_but_fallback_source_does_not_increment():
     """Last track identified but metadata is FALLBACK (no release_id) → skip."""
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
@@ -199,11 +199,11 @@ async def test_last_track_reached_but_fallback_source_does_not_mark():
     assert tracker._session.album_release_id is None
 
     await tracker._end_session()
-    resolver.discogs.mark_as_listened.assert_not_called()
+    resolver.discogs.increment_play_count.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_database_source_without_instance_id_does_not_mark():
+async def test_database_source_without_instance_id_does_not_increment():
     """DISCOGS_DATABASE result has no instance_id → can't update collection field."""
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
@@ -222,11 +222,11 @@ async def test_database_source_without_instance_id_does_not_mark():
     assert tracker._session.album_instance_id is None
 
     await tracker._end_session()
-    # mark_as_listened will be called with instance_id=None — the tracker passes
+    # increment_play_count will be called with instance_id=None — the tracker passes
     # whatever is on the session. The client handles None gracefully.
     # (This documents the current behavior — if future code guards against None,
     #  update this test accordingly.)
-    resolver.discogs.mark_as_listened.assert_called_once_with(12345, None)
+    resolver.discogs.increment_play_count.assert_called_once_with(12345, None)
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +234,12 @@ async def test_database_source_without_instance_id_does_not_mark():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_session_with_no_identified_tracks_does_not_mark():
+async def test_session_with_no_identified_tracks_does_not_increment():
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     # Music was heard but recognition never succeeded
     await tracker._end_session()
-    resolver.discogs.mark_as_listened.assert_not_called()
+    resolver.discogs.increment_play_count.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -253,22 +253,22 @@ async def test_end_session_with_no_session_does_not_crash():
     assert tracker._session is None
     # Should not raise
     await tracker._end_session()
-    resolver.discogs.mark_as_listened.assert_not_called()
+    resolver.discogs.increment_play_count.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# mark_as_listened failure handling
+# increment_play_count failure handling
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_mark_as_listened_returning_false_does_not_raise():
+async def test_increment_play_count_returning_false_does_not_raise():
     """Discogs API returning failure should log a warning but not crash."""
-    tracker, resolver = make_tracker(mark_as_listened_return=False)
+    tracker, resolver = make_tracker(increment_play_count_return=False)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik"))
     # Should complete without raising
     await tracker._end_session()
-    resolver.discogs.mark_as_listened.assert_called_once()
+    resolver.discogs.increment_play_count.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -303,15 +303,15 @@ async def test_on_track_identified_sets_potential_last_track():
 
 
 # ---------------------------------------------------------------------------
-# Already-listened (idempotent)
+# Already-counted (idempotent)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_already_listened_album_still_calls_mark_once():
-    """mark_as_listened is idempotent on the Discogs side — we just call it."""
-    tracker, resolver = make_tracker(mark_as_listened_return=True)
+async def test_already_counted_album_still_calls_increment_once():
+    """increment_play_count handles existing counts — we just call it once per session."""
+    tracker, resolver = make_tracker(increment_play_count_return=True)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik"))
     await tracker._end_session()
-    # We called it; Discogs handles the idempotency
-    resolver.discogs.mark_as_listened.assert_called_once()
+    # We called it; Discogs handles the read-before-write
+    resolver.discogs.increment_play_count.assert_called_once()
