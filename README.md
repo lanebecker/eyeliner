@@ -4,14 +4,14 @@
 
 A Raspberry Pi app that listens to a vinyl record playing through a USB audio interface, identifies the current track via audio fingerprinting, enriches it with metadata from your Discogs collection, and displays the artist, album, track name, and cover art on an HDMI-connected LCD screen.
 
-When the last track of an album finishes, it automatically marks that record as "Listened to?" in your Discogs collection.
+When the last track of an album finishes, it automatically increments the Play Count for that record in your Discogs collection.
 
 ## Features
 
 - 🎵 Real-time audio fingerprinting via ShazamIO (no manual input needed)
 - 💿 Discogs collection-first metadata — pulls your specific pressing's details
 - 🖼️ Full cover art display on any HDMI screen
-- ✅ Automatically marks records as listened in Discogs when the last track plays
+- ✅ Automatically increments Play Count in Discogs when the last track plays
 - 🔄 Graceful fallback: Discogs collection → Discogs database → MusicBrainz
 - 🔧 Swappable recognition backend (ShazamIO, ACRCloud, AudD)
 
@@ -39,7 +39,7 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 - `discogs.user_token` — from https://www.discogs.com/settings/developers
 - `discogs.username` — your Discogs username
 - `audio.device_name` — run `python -c "import sounddevice; print(sounddevice.query_devices())"` to find your USB interface name
-- `discogs.listened_field_name` — the exact name of your custom field (default: `"Listened to?"`)
+- `discogs.play_count_field_name` — the exact name of your Play Count custom field (default: `"Play Count"`)
 
 ## Documentation
 
