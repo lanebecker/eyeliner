@@ -14,6 +14,35 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.1.0] — 2026-05-24
+
+### Added
+
+- **Last Played date tracking** — on album completion, `DiscogsClient.update_last_played()`
+  writes today's date (ISO 8601, `YYYY-MM-DD`) to a configurable "Last Played" custom
+  field in the user's Discogs collection. The field is optional: if
+  `discogs.last_played_field_name` is not set in `config.yaml`, the method is a
+  graceful no-op and no API calls are made.
+- `config.example.yaml` — added optional `last_played_field_name` key (commented out
+  by default) with instructions for enabling it.
+- 7 new unit tests in `tests/test_discogs_client.py` covering `update_last_played`
+  (not configured no-op, happy path, ISO date format verification, field not found,
+  non-204 POST, 401, exception handling).
+- 3 new unit tests in `tests/test_listen_tracker.py` covering Last Played integration
+  (called when configured, not called when unconfigured, failure is non-fatal).
+
+### Changed
+
+- `ListenTracker._end_session()` now calls `update_last_played()` after
+  `increment_play_count()` when `last_played_field_name` is configured. A failure
+  from `update_last_played` is logged as a warning but does not affect the Play Count
+  result — the two updates are independent.
+- Log message updated: "incrementing Play Count in Discogs" →
+  "incrementing Play Count and updating Last Played in Discogs".
+- Total unit test count: 138 → 148.
+
+---
+
 ## [1.0.1] — 2026-05-24
 
 ### Changed
