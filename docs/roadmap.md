@@ -41,9 +41,64 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 
 ---
 
-## v1.2.0 — Last.fm Scrobbling
+## v1.2.0 — Display Redesign & Dynamic Theming
 
-**Why next:** highest value-to-effort ratio of any remaining feature on the
+**Why next:** the current display layout — while functional — doesn't take full
+advantage of the data already being fetched or the visual real estate of the
+Waveshare screen. This release is a comprehensive visual overhaul based on a new
+design, and absorbs the color theming work originally planned for v1.5.0 (same
+files, same mechanism — no reason to ship them separately). It also lays the
+tracklist-parsing groundwork that makes v1.5.0's Side A/B behavioral logic
+significantly lighter to implement.
+
+**What it adds:**
+
+*Layout redesign:*
+- Track name promoted to the dominant visual element — displayed at maximum size
+  at the top of the text panel, where the artist name currently lives
+- Short horizontal accent divider line between track name and artist
+- Artist name rendered large and bold beneath the divider
+- Album name rendered in italic serif in the accent color (below artist)
+- Genre and style tags from Discogs displayed as small bordered pill badges
+- Slim full-width header bar: `● NOW PLAYING` indicator (left) and
+  `SIDE A · 04 OF 06` track position (right), both in small monospace
+- Two-column footer showing `← PREV` / previous track name and
+  `NEXT →` / next track name
+
+*Dynamic color theming (absorbed from planned v1.5.0):*
+- Dominant color extracted from the cached album art JPEG using Pillow's color
+  quantization
+- Background color subtly tinted per album, giving each record a distinct visual
+  atmosphere
+- Accent color (divider line, album name, genre badge borders) derived from the
+  same extraction, luminance-clamped for readability against the dark background
+- Smooth color transition when the track changes (lerp over ~1 second)
+- New `display.dynamic_theming` config boolean (default `true`)
+
+*Tracklist parsing (foundation for v1.5.0 side awareness):*
+- Full tracklist fetched from the existing Discogs release response — no new API
+  calls; the data is already returned, just not previously extracted
+- Track positions parsed to determine current side (`A`, `B`, etc.), position
+  within that side, and total tracks on the side
+- Previous and next track names resolved from position in tracklist
+- Genre and style arrays extracted from the same release response
+
+**Files affected:** `layouts.py` (full geometry redesign), `renderer.py` (pill
+badges, divider line, header bar, prev/next footer, color extraction and
+transition logic), `models.py` (extended `NowPlayingState` with tracklist,
+position, genres, prev/next), `discogs_client.py` (surface tracklist, genres,
+styles from existing response), `listen_tracker.py` (track current position
+within tracklist)
+
+**No new API calls.** All new data surfaces come from fields already present in
+the Discogs release response. Color extraction runs locally on the cached album
+art image.
+
+---
+
+## v1.3.0 — Last.fm Scrobbling
+
+**Why third:** highest value-to-effort ratio of any remaining feature on the
 list. Last.fm builds a permanent, queryable listening history. For vinyl
 listeners this is especially satisfying — nothing else does it automatically.
 The `ListenTracker` already has the right hooks; this is mostly a new client
@@ -69,9 +124,9 @@ lastfm:
 
 ---
 
-## v1.3.0 — Idle Screen & Recent Plays
+## v1.4.0 — Idle Screen & Recent Plays
 
-**Why third:** the idle screen is currently a blank dark background (a TODO in
+**Why fourth:** the idle screen is currently a blank dark background (a TODO in
 `DisplayRenderer._render_idle()`). This is the most visible gap in the daily
 experience — the Pi is on all the time, and "nothing" is what you see most.
 
@@ -86,13 +141,15 @@ experience — the Pi is on all the time, and "nothing" is what you see most.
 
 ---
 
-## v1.4.0 — Side A / Side B Awareness
+## v1.5.0 — Side A / Side B Awareness
 
-**Why fourth:** makes the listening completion logic meaningfully more accurate.
+**Why fifth:** makes the listening completion logic meaningfully more accurate.
 Right now the tracker treats every needle-drop-to-lift session the same way,
 so playing only Side A of a two-sided album can still trigger a Play Count
 increment if Side A happens to end on the last listed track. Side awareness closes
-that gap and enables the flip reminder.
+that gap and enables the flip reminder. The tracklist parsing introduced in
+v1.2.0 means this version can focus purely on behavioral logic — no parsing
+groundwork required.
 
 **What it adds:**
 - `PlaySession` gains a `side` field inferred from the track positions identified
@@ -102,22 +159,6 @@ that gap and enables the flip reminder.
   (e.g. `~/.vinyl-now-playing/session-state.json`)
 - Idle screen "Flip to Side B →" reminder after a Side A session ends
 - `ListenTracker` gains a `_completed_sides` dict keyed by `release_id`
-
----
-
-## v1.5.0 — Album Art Color Theming
-
-**Why fifth:** mostly cosmetic but genuinely delightful. Every record gets its
-own visual identity on screen. `Pillow` is already in `requirements.txt`.
-
-**What it adds:**
-- Extract the dominant colour from the cached album art JPEG using
-  `Pillow`'s colour quantization
-- Dynamically set `DisplayRenderer.accent_color` (currently used for the track
-  title) to the extracted dominant colour, with a luminance clamp so it's always
-  readable against the dark background
-- Smooth transition between colours when the track changes (lerp over ~1 second)
-- New `display.dynamic_accent_color` config boolean (default `true`)
 
 ---
 
