@@ -16,7 +16,7 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                                          15s chunks, 5s overlap
                                                   │
                               ┌───────────────────┴────────────────────┐
-                              ▼                                         ▼
+                              ↓                                         ↓
                      SilenceDetector                          RecognitionLoop
                      (RMS threshold)                          (ShazamIO backend)
                               │                                         │
@@ -26,16 +26,16 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                    SESSION_ENDED                              confirmation gate
                               │                               (N consecutive matches)
                     ┌─────────┴──────────┐                             │
-                    ▼                    ▼                    MetadataResolver
+                    ↓                    ↓                    MetadataResolver
                PlayerState         ListenTracker              3-step lookup:
                (status +           (PlaySession)           1. Discogs collection
                current_track)           │                  2. Discogs database
                     │            SESSION_ENDED              3. MusicBrainz fallback
                     │                   │                             │
-                    ▼                   ▼                    TrackMetadata
+                    ↓                   ↓                    TrackMetadata
              DisplayRenderer    DiscogsClient                         │
              (pygame, HDMI)     increment_play_count          ┌───────┴────────┐
-                                update_last_played            ▼                ▼
+                                update_last_played            ↓                ↓
                                                         PlayerState      ListenTracker
                                                         .current_track   .log_track()
 ```
@@ -114,7 +114,7 @@ lifecycle events.
 **Events emitted (`AudioEvent` enum):**
 
 | Event | Meaning |
-|-------|--------|
+|-------|---------|
 | `MUSIC_STARTED` | First above-threshold chunk after silence |
 | `MUSIC_STOPPED` | RMS drops below threshold (inter-track gap or lift) |
 | `SESSION_ENDED` | Silence sustained for `session_end_silence_seconds` |
@@ -297,7 +297,7 @@ components that need to know what's currently playing.
 ```
 IDLE ──(MUSIC_STARTED)──→ LISTENING ──(track committed)──→ PLAYING
   ↑                                                            │
-  └──────────────(SESSION_ENDED / clear())────────────────────┘
+  └──────────────(SESSION_ENDED / clear())──────────────────────┘
 ```
 
 `SESSION_ENDED` sets status back to `IDLE` via `state.clear()` (called in
@@ -320,18 +320,23 @@ Manages the pygame window and renders state-appropriate screens at ~30 fps.
 | State | Screen |
 |-------|--------|
 | `IDLE` / `SESSION_ENDED` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
-| `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey |
-| `PLAYING` | Full "Museum Card" now-playing layout |
+| `LISTENING` | Spinning arc + “IDENTIFYING…” label in muted grey |
+| `PLAYING` | Full “Museum Card” now-playing layout |
 
-**Now-playing layout (v1.2.0 "Museum Card"):**
+**Now-playing layout (v1.2.1 “Museum Card” — dynamic push-down):**
 - Full-width header strip: pulsing `●` dot + `NOW PLAYING` label (left),
   `SIDE A · 02 OF 03` position indicator (right), both in monospace
 - Left panel: square album art (~440px), downloaded from URL, MD5-keyed disk
   cache at `display.cover_art_cache_dir`
-- Right panel, top to bottom: hero track title (72px bold, word-wrapped),
-  short accent divider line, artist name (48px), album name (32px italic,
-  accent color), genre/style chip badges (bordered pills, monospace),
-  meta footer (year · label · catalog, monospace muted), prev/next track strip
+- Right panel: hero track title (72px bold, word-wrapped) is the unconstrained
+  primary element — it claims as much vertical space as it naturally needs.
+  The accent divider line, artist name (48px), album name (32px italic, accent
+  color), and genre/style chip badges (bordered pills, monospace) then flow
+  downward from the title's actual bottom edge (v1.2.1 dynamic push-down).
+  Meta footer (year · label · catalog, monospace muted) and prev/next track strip
+  remain bottom-anchored regardless of title height. Font size reduction is a
+  last resort, applied only if the title cannot fit even with the full available
+  space above the secondary block.
 
 **Dynamic color theming:**
 - On each new track, `_queue_palette()` runs PIL color quantization on the
@@ -343,9 +348,11 @@ Manages the pygame window and renders state-appropriate screens at ~30 fps.
   the transition, then returns to dirty-flag mode
 - `display.dynamic_theming: false` disables extraction and uses `FALLBACK_PALETTE`
 
-**Font system:** three dicts pre-built at startup — `_fonts` (regular + bold),
-`_italic_fonts`, `_mono_fonts` — all keyed by pixel size. No SysFont calls
-during rendering.
+**Font system:** four dicts pre-built at startup — `_fonts` (regular, with the
+track-title size overwritten by a bold variant), `_italic_fonts`, `_mono_fonts`,
+and `_bold_fonts` (bold title fonts at 4 px steps from the default size down to
+18 px, used by the v1.2.1 font-scaling fallback) — all keyed by pixel size.
+No SysFont calls during rendering.
 
 **Performance:** `_dirty` flag prevents redraws when state hasn't changed.
 `DisplayRenderer._on_state_change()` is registered as a `PlayerState` listener
@@ -371,7 +378,7 @@ header strip  = 30px tall, full width
 cover art     = 440×440px square (min of sx/sy scale to stay square at any aspect ratio)
                left margin 50px, top at 60px
 text panel    = starts at x=534, width=440
-  track_text  = 170px tall  (room for 2 word-wrapped lines at 72px)
+  track_text  = 170px tall  (defines x/y/w; .h is unused in v1.2.1 — see note)
   divider     = 2px tall, 64px wide accent line
   artist_text = 60px tall
   album_text  = 45px tall (italic)
@@ -384,6 +391,14 @@ All values scale proportionally from the 1024×600 reference using `sx` and `sy`
 scale factors. Cover art is forced square via `min(int(440*sx), int(440*sy))` so
 it never distorts at non-16:9 resolutions. Tested at 1024×600, 800×480,
 1280×720, and 640×480.
+
+> **v1.2.1 note:** The renderer uses `track_text.x`, `track_text.y`, and
+> `track_text.w` from the layout, but derives the title's maximum pixel height
+> dynamically at render time: `meta_y − title_top − secondary_block_height`.
+> `track_text.h` (170px) is no longer used as a fixed title slot — the title
+> now expands freely up to that computed budget, and secondary elements flow
+> below it. The layout rect is preserved so any future tooling reading geometry
+> from the layout dataclass still has a meaningful value.
 
 ---
 
