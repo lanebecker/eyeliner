@@ -87,6 +87,10 @@ sudo apt install -y libportaudio2 portaudio19-dev
 # pygame display dependencies
 sudo apt install -y libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev
 
+# Pillow image processing (required for dynamic color theming)
+# These provide JPEG/PNG decode support when Pillow compiles from source on the Pi
+sudo apt install -y libjpeg-dev libpng-dev
+
 # Git (usually pre-installed, but just in case)
 sudo apt install -y git
 
@@ -167,6 +171,7 @@ Key values to fill in:
 | `discogs.username` | Your Discogs username |
 | `discogs.play_count_field_name` | Must match your "Play Count" custom field name **exactly** (case-sensitive) |
 | `discogs.last_played_field_name` | **Optional.** If you have a "Last Played" custom field in your Discogs collection, set this to match its name exactly. Leave it commented out (the default) if you don't want this feature. |
+| `display.dynamic_theming` | Defaults to `true`. Extracts a 5-color palette from each album's cover art (Pillow) and shifts the background/accent colors per record. Set to `false` if you prefer a fixed dark theme or notice performance issues on older Pi hardware. |
 
 Everything else can stay as-is for a first run.
 

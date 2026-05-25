@@ -79,14 +79,14 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 148 items
+collected 192 items
 
-tests/test_discogs_client.py .....................                          [ 14%]
-tests/test_layouts.py ........................                              [ 30%]
-tests/test_listen_tracker.py ....................                           [ 43%]
-tests/test_models.py .........................                              [ 60%]
-tests/test_recognizer.py .................                                  [ 72%]
-tests/test_resolver.py ...................                                  [ 85%]
+tests/test_discogs_client.py .....................                          [ 11%]
+tests/test_layouts.py ....................................                  [ 29%]
+tests/test_listen_tracker.py ....................                           [ 40%]
+tests/test_models.py ...........................................               [ 62%]
+tests/test_recognizer.py .................                                  [ 71%]
+tests/test_resolver.py ......................                               [ 83%]
 tests/test_silence.py ......................                                [100%]
 
 =============================== warnings summary ===============================
@@ -95,7 +95,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 148 passed in 0.49s ==============================
+============================== 192 passed in 0.34s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -136,7 +136,8 @@ pytest tests/test_listen_tracker.py::test_only_side_a_played_does_not_increment
 
 ### `test_models.py` — Data models
 
-Tests `TracklistEntry`, `TrackMetadata`, `PlaySession`, and `MetadataSource` in isolation.
+Tests `TracklistEntry`, `TrackMetadata`, `PlaySession`, `MetadataSource`,
+`DisplayPalette`, `FALLBACK_PALETTE`, and `_SIDE_RE` in isolation.
 
 Key cases:
 - `is_last_track` returns `True` only for the final entry in the tracklist, case-insensitively and with whitespace tolerance
@@ -145,6 +146,10 @@ Key cases:
 - `log_track()` sets `potential_last_track = True` when the last track is logged
 - `log_track()` latches `album_release_id` from the **first** Discogs-sourced track only (not overwritten by subsequent tracks)
 - Fallback tracks (no `discogs_release_id`) do not latch any IDs
+- `DisplayPalette` fields round-trip correctly; `FALLBACK_PALETTE` is a valid `DisplayPalette` with very dark `bg`
+- `_SIDE_RE` matches standard (`"A1"`) and multi-digit (`"B12"`) positions; does not match numeric-only strings
+- `genres` field defaults to `[]` and stores values correctly
+- Side-awareness properties (`side_letter`, `side_position`, `side_total`, `prev_track_title`, `next_track_title`) using the Sonic Youth *Sister* tracklist (A1–A3, B1–B4): correct side grouping, 1-indexed positions, `None` at boundaries, `None` for unknown tracks or numeric-only position strings
 
 ### `test_silence.py` — Silence detection
 
@@ -224,6 +229,7 @@ Key cases:
 - Exceptions in any step fall through to the next without crashing
 - `NotImplementedError` (not-yet-implemented stub) falls through gracefully
 - All `TrackMetadata` fields correctly populated from each source
+- `genres` list passed through from Discogs result dict; defaults to `[]` if key absent; always `[]` on fallback path
 
 ### `test_recognizer.py` — Confirmation logic
 
@@ -241,16 +247,19 @@ Key cases:
 
 ### `test_layouts.py` — Display geometry
 
-Tests `get_now_playing_layout()` at multiple resolutions (1024x600, 800x480, 1280x720, 640x480).
+Tests `get_now_playing_layout()` at multiple resolutions (1024×600, 800×480, 1280×720, 640×480).
 No pygame window is opened.
 
 Key cases:
-- All rects have positive dimensions and non-negative coordinates
+- All 9 rects (`header_strip`, `cover_art`, `track_text`, `divider`, `artist_text`, `album_text`, `genre_chips`, `meta_text`, `prev_next`) have positive dimensions and non-negative coordinates
 - Nothing bleeds off-screen at any tested resolution
-- Cover art is square (equal width and height)
+- Cover art is square at all resolutions (including non-16:9 like 800×480)
+- Header strip spans full width and starts at y=0
 - Text panels start to the right of the cover art's right edge
-- Artist > album >= track > meta in font size hierarchy
-- Layout scales proportionally with resolution changes
+- Vertical ordering: track → divider → artist → album → chips → meta → prev/next
+- Font size hierarchy: track ≥ artist ≥ album ≥ meta/chips/header
+- Chip and divider geometry is positive/non-negative
+- Layout scales proportionally: larger resolution → larger cover art, wider text panels, larger fonts
 
 ---
 
@@ -315,7 +324,7 @@ TEST 4: Collection custom fields
 ### Output symbols
 
 | Symbol | Meaning |
-|--------|---------|
+|--------|--------|
 | `✓` | Passed — got expected data |
 | `✗` | Failed — API error or unexpected response |
 | `·` | Skipped — e.g. *Sister* not in your collection; collection-specific tests N/A |

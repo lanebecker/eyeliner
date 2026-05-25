@@ -114,7 +114,7 @@ lifecycle events.
 **Events emitted (`AudioEvent` enum):**
 
 | Event | Meaning |
-|-------|---------|
+|-------|--------|
 | `MUSIC_STARTED` | First above-threshold chunk after silence |
 | `MUSIC_STOPPED` | RMS drops below threshold (inter-track gap or lift) |
 | `SESSION_ENDED` | Silence sustained for `session_end_silence_seconds` |
@@ -247,18 +247,32 @@ front cover thumbnail found. Returns `None` if nothing is available.
 - `DISCOGS_DATABASE` — found in Discogs DB, not user's collection
 - `FALLBACK` — Shazam metadata + MusicBrainz cover art
 
+**`_SIDE_RE`** — compiled regex `r"^([A-Za-z]+)(\d+)$"` — parses Discogs
+position strings like `"A1"` or `"B12"` into `(side_letter, track_number)`.
+
+**`DisplayPalette`** — five-field dataclass carrying the current color theme:
+`bg`, `surface`, `accent`, `text`, `muted` (all `(R, G, B)` tuples).
+Extracted from album art via Pillow color quantization; falls back to
+`FALLBACK_PALETTE` when no cover art is available.
+
 **`TracklistEntry`**: `position` (e.g. `"A1"`), `title`, `duration` (optional, e.g. `"4:37"`)
 
 **`TrackMetadata`**: Fully resolved metadata for display and tracking.
 
 Key fields: `title`, `artist`, `album`, `source`, `year`, `label`,
 `catalog_number`, `discogs_release_id`, `discogs_instance_id`,
-`cover_art_url`, `tracklist`
+`cover_art_url`, `tracklist`, `genres`
 
 Key properties:
 - `is_last_track` — True if `self.title` (lowercased, stripped) matches the
   final entry in `self.tracklist`
 - `track_display` — returns position string (e.g. `"A3"`) or `""` if not found
+- `side_letter` — `"A"`, `"B"`, etc., parsed from the current entry's position
+  via `_SIDE_RE`; `None` for numeric-only tracklists
+- `side_position` — 1-indexed track number within the current side
+- `side_total` — total tracks on the current side
+- `prev_track_title` / `next_track_title` — adjacent track titles within the
+  same side; `None` at side boundaries or when track is not in tracklist
 
 **`PlaySession`**: Tracks one needle-drop-to-lift session.
 
@@ -305,16 +319,33 @@ Manages the pygame window and renders state-appropriate screens at ~30 fps.
 
 | State | Screen |
 |-------|--------|
-| `IDLE` / `SESSION_ENDED` | Dark background (idle screen, TODO: last-played art, clock) |
-| `LISTENING` | Centered "Listening…" text in muted grey |
-| `PLAYING` | Full now-playing layout (cover art + text panels) |
+| `IDLE` / `SESSION_ENDED` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
+| `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey |
+| `PLAYING` | Full "Museum Card" now-playing layout |
 
-**Now-playing layout:**
-- Left panel: square album art (85% of screen height), downloaded from URL,
-  MD5-keyed disk cache at `display.cover_art_cache_dir`
-- Right panel text fields: artist (36px bold), album (26px), track title
-  (24px, accent colour), meta line (year · label · catalog no., 16px muted),
-  track position ("A1", 16px), source badge (fallback warning, bottom-right)
+**Now-playing layout (v1.2.0 "Museum Card"):**
+- Full-width header strip: pulsing `●` dot + `NOW PLAYING` label (left),
+  `SIDE A · 02 OF 03` position indicator (right), both in monospace
+- Left panel: square album art (~440px), downloaded from URL, MD5-keyed disk
+  cache at `display.cover_art_cache_dir`
+- Right panel, top to bottom: hero track title (72px bold, word-wrapped),
+  short accent divider line, artist name (48px), album name (32px italic,
+  accent color), genre/style chip badges (bordered pills, monospace),
+  meta footer (year · label · catalog, monospace muted), prev/next track strip
+
+**Dynamic color theming:**
+- On each new track, `_queue_palette()` runs PIL color quantization on the
+  cached cover art JPEG — 8 colors → dominant tint → `bg`/`surface`, most
+  vibrant → `accent`, near-white → `text`/`muted`
+- Palettes cached per `cover_art_url`; extraction only runs once per album
+- `_animated_palette()` lerps `_current_palette` → `_target_palette` over
+  `_TRANSITION_SECS = 1.0` seconds; the run loop re-renders every frame during
+  the transition, then returns to dirty-flag mode
+- `display.dynamic_theming: false` disables extraction and uses `FALLBACK_PALETTE`
+
+**Font system:** three dicts pre-built at startup — `_fonts` (regular + bold),
+`_italic_fonts`, `_mono_fonts` — all keyed by pixel size. No SysFont calls
+during rendering.
 
 **Performance:** `_dirty` flag prevents redraws when state hasn't changed.
 `DisplayRenderer._on_state_change()` is registered as a `PlayerState` listener
@@ -333,16 +364,25 @@ Escape key exits the app cleanly.
 All pixel geometry and font sizes for the now-playing screen. Change this
 file to restyle the display without touching renderer logic.
 
-**Layout formula (1024×600 example):**
+**Layout formula (1024×600 reference geometry):**
 
 ```
-cover_size = height * 0.85  = 510px  (square, left-aligned)
-margin     = height * 0.075 =  45px
-text_x     = cover_size + margin * 2 = 600px
-text_w     = width - text_x - margin = 379px
+header strip  = 30px tall, full width
+cover art     = 440×440px square (min of sx/sy scale to stay square at any aspect ratio)
+               left margin 50px, top at 60px
+text panel    = starts at x=534, width=440
+  track_text  = 170px tall  (room for 2 word-wrapped lines at 72px)
+  divider     = 2px tall, 64px wide accent line
+  artist_text = 60px tall
+  album_text  = 45px tall (italic)
+  genre_chips = 40px tall (pill badges)
+  meta_text   = 20px tall  ┐ anchored from
+  prev_next   = 44px tall  ┘ bottom of content area
 ```
 
-Scales proportionally at any resolution. Tested at 1024×600, 800×480,
+All values scale proportionally from the 1024×600 reference using `sx` and `sy`
+scale factors. Cover art is forced square via `min(int(440*sx), int(440*sy))` so
+it never distorts at non-16:9 resolutions. Tested at 1024×600, 800×480,
 1280×720, and 640×480.
 
 ---
@@ -436,10 +476,7 @@ confirmed played through to completion.
 | `discogs.last_played_field_name` | _(optional)_ | If set, writes today's date (YYYY-MM-DD) to this custom field on completion |
 | `display.width` / `height` | `1024` / `600` | Waveshare 7" HDMI LCD (H) native resolution |
 | `display.fullscreen` | `true` | |
-| `display.background_color` | `[10, 10, 10]` | RGB |
-| `display.font_color` | `[240, 240, 240]` | RGB |
-| `display.accent_color` | `[180, 140, 80]` | Track title colour |
-| `display.show_source_indicator` | `true` | Subtle badge when metadata is from fallback |
+| `display.dynamic_theming` | `true` | Extract 5-color palette from album art via Pillow; set `false` for fixed neutral dark theme |
 | `display.cover_art_cache_dir` | `"src/display/assets/cache"` | MD5-keyed JPEG cache |
 | `recognition.backend` | `"shazamio"` | `"shazamio"` \| `"acrcloud"` \| `"audd"` |
 | `recognition.confirmation_required` | `2` | Consecutive matching results before committing |
@@ -455,9 +492,9 @@ confirmed played through to completion.
 | `src/audio/capture.py` | USB audio recording, overlapping chunks |
 | `src/audio/silence.py` | RMS silence detection, AudioEvent emission |
 | `src/audio/recognizer.py` | ShazamIO recognition loop, confirmation logic |
-| `src/metadata/models.py` | TrackMetadata, PlaySession, MetadataSource dataclasses |
+| `src/metadata/models.py` | TrackMetadata, PlaySession, TracklistEntry, MetadataSource, DisplayPalette, FALLBACK_PALETTE, _SIDE_RE |
 | `src/metadata/resolver.py` | 3-step metadata lookup chain |
-| `src/metadata/discogs_client.py` | Discogs collection/DB search, Play Count increment, Last Played update |
+| `src/metadata/discogs_client.py` | Discogs collection/DB search, genres/styles extraction, Play Count increment, Last Played update |
 | `src/metadata/coverart.py` | MusicBrainz Cover Art Archive fallback |
 | `src/state/player_state.py` | Central state, status transitions, change listeners |
 | `src/display/layouts.py` | Pixel geometry and font sizes (restyle here) |
@@ -477,5 +514,5 @@ All source modules are complete. The only remaining work requires hardware:
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (148 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (192 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.

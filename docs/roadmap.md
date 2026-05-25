@@ -29,7 +29,7 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 
 ---
 
-## v1.1.0 — Discogs Listening Statistics ✅ (current)
+## v1.1.0 — Discogs Listening Statistics ✅
 
 - Writes a "Last Played" date (ISO 8601, `YYYY-MM-DD`) to a configurable Discogs
   custom field each time a full album side plays through.
@@ -41,17 +41,17 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 
 ---
 
-## v1.2.0 — Display Redesign & Dynamic Theming
+## v1.2.0 — Display Redesign & Dynamic Theming ✅ (current)
 
-**Why next:** the current display layout — while functional — doesn't take full
-advantage of the data already being fetched or the visual real estate of the
-Waveshare screen. This release is a comprehensive visual overhaul based on a new
-design, and absorbs the color theming work originally planned for v1.5.0 (same
-files, same mechanism — no reason to ship them separately). It also lays the
-tracklist-parsing groundwork that makes v1.5.0's Side A/B behavioral logic
-significantly lighter to implement.
+A comprehensive visual overhaul based on the "Museum Card" layout from Claude
+Design mockups. Absorbed the color theming work originally planned for v1.5.0
+and laid the tracklist-parsing groundwork that makes v1.5.0's Side A/B behavioral
+logic significantly lighter to implement.
 
-**What it adds:**
+**192-test unit suite** (+44 tests covering side-awareness properties, new layout
+geometry, and genres passthrough).
+
+**What shipped:**
 
 *Layout redesign:*
 - Track name promoted to the dominant visual element — displayed at maximum size
@@ -85,10 +85,10 @@ significantly lighter to implement.
 
 **Files affected:** `layouts.py` (full geometry redesign), `renderer.py` (pill
 badges, divider line, header bar, prev/next footer, color extraction and
-transition logic), `models.py` (extended `NowPlayingState` with tracklist,
-position, genres, prev/next), `discogs_client.py` (surface tracklist, genres,
-styles from existing response), `listen_tracker.py` (track current position
-within tracklist)
+transition logic), `models.py` (extended `TrackMetadata` with genres and
+side-awareness properties; added `DisplayPalette`, `FALLBACK_PALETTE`,
+`_SIDE_RE`), `discogs_client.py` (surface genres and styles from existing
+response), `resolver.py` (genres passthrough)
 
 **No new API calls.** All new data surfaces come from fields already present in
 the Discogs release response. Color extraction runs locally on the cached album
