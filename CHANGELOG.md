@@ -14,11 +14,36 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.2.1] — 2026-05-25
+
+### Changed
+
+- **Dynamic title push-down layout** — the track title is now the unconstrained
+  hero element. Instead of occupying a fixed 170px slot and scaling down when text
+  overflows, the title takes as much vertical space as it naturally requires. The
+  accent divider, artist name, album title, and genre chip badges then flow
+  downward from the title's actual bottom edge. The meta footer and prev/next strip
+  remain bottom-anchored and are never displaced.  Font size reduction is a last
+  resort, applied only when the title genuinely cannot fit even after the secondary
+  block has been pushed as far down as possible (i.e. the full budget is consumed).
+- `_draw_wrapped_text()` now returns the actual rendered height in pixels so callers
+  can position subsequent elements relative to the measured bottom edge.
+- New `_measure_wrapped_text()` helper computes wrapped-text height without drawing,
+  using the same word-wrap algorithm as `_draw_wrapped_text()` to ensure consistent
+  measurement vs. render output.
+- `_draw_genre_chips()` accepts an optional `chips_rect` parameter; when supplied it
+  overrides `layout.genre_chips` for positioning, enabling dynamic y-coordinate injection.
+- `_build_font_cache()` pre-builds stepped-down bold font variants (4 px steps from
+  the default title size down to 18 px) into a new `_bold_fonts` dict, used by
+  the title-scaling fallback in `_render_now_playing()`.
+
+---
+
 ## [1.2.0] — 2026-05-25
 
 ### Added
 
-- **“Museum Card” display redesign** — completely new layout derived from Claude Design
+- **"Museum Card" display redesign** — completely new layout derived from Claude Design
   mockups (DirectionA variant): cover art on the left (~440×440px), text panel on the
   right with a hero-scale track title (72px bold), a short accent divider line, artist
   name (48px), album name (32px italic serif), genre/style chip badges, a compact meta

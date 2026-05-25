@@ -3,7 +3,7 @@
 Listens for PlayerState changes and re-renders the appropriate layout.
 Runs as an async task in the main event loop.
 
-v1.2.0 visual design
+v1.2.1 visual design
 ---------------------
 Implements the "Museum Card" layout from the Claude Design Direction A mockups:
   - 5-color palette extracted from album art via Pillow (bg, surface, accent, text, muted)
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.state.player_state import PlayerState, PlayerStatus
-from src.display.layouts import get_now_playing_layout, NowPlayingLayout
+from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
 
 log = logging.getLogger(__name__)
@@ -163,6 +163,7 @@ class DisplayRenderer:
         self._fonts: dict = {}          # size → pygame.font.Font
         self._italic_fonts: dict = {}   # size → italic pygame.font.Font
         self._mono_fonts: dict = {}     # size → monospace pygame.font.Font
+        self._bold_fonts: dict = {}     # size → bold pygame.font.Font (title scaling)
         self._running = True
         self._dirty = True              # Force initial render
 
@@ -212,6 +213,11 @@ class DisplayRenderer:
         self._fonts[layout.font_size_track] = pygame.font.SysFont(
             "dejavu sans", layout.font_size_track, bold=True
         )
+        # Pre-build stepped-down bold variants for v1.2.1 title font-size fallback.
+        # Range covers the default size down to 18px in 4px steps.
+        track_sz = layout.font_size_track
+        for sz in range(track_sz, max(18, track_sz - 40), -4):
+            self._bold_fonts[sz] = pygame.font.SysFont("dejavu sans", sz, bold=True)
 
     def _on_state_change(self, state: PlayerState):
         """Called by PlayerState whenever anything changes."""
@@ -265,7 +271,16 @@ class DisplayRenderer:
     # -----------------------------------------------------------------------
 
     def _render_now_playing(self):
-        """Render the full now-playing layout with the new v1.2.0 design."""
+        """Render the full now-playing layout — v1.2.1 dynamic push-down design.
+
+        The track title is the hero element and claims as much vertical space as
+        it naturally needs.  Divider, artist, album, and genre chips then flow
+        downward from the title's actual bottom edge rather than from fixed
+        positions.  Meta footer and prev/next remain bottom-anchored.
+
+        Font size reduction is a last resort: it only kicks in when the title
+        genuinely cannot fit even after yielding all available space.
+        """
         import pygame
 
         track = self.state.current_track
@@ -289,37 +304,96 @@ class DisplayRenderer:
         # --- Header strip ---
         self._draw_header(layout, p, track)
 
-        # --- Track title (hero, word-wrapped) ---
-        self._draw_wrapped_text(
-            track.title, layout.font_size_track,
-            layout.track_text, p.text,
-            bold=True,
+        # -----------------------------------------------------------------
+        # v1.2.1 dynamic push-down geometry
+        # -----------------------------------------------------------------
+        # Scale inter-element gaps proportionally from the 1024x600 reference.
+        sy = self.height / 600
+        GAP_BEFORE_DIV    = max(2, int(4  * sy))   # title bottom -> divider top
+        GAP_AFTER_DIV     = max(8, int(20 * sy))   # divider bottom -> artist top
+        GAP_AFTER_ARTIST  = max(2, int(4  * sy))   # artist bottom -> album top
+        GAP_AFTER_ALBUM   = max(3, int(8  * sy))   # album bottom -> chips top
+        GAP_CHIPS_TO_META = max(8, int(16 * sy))   # chips bottom -> meta top (min)
+
+        # Fixed heights of secondary elements (already scaled by layouts.py)
+        div_h    = max(2, layout.divider.h)
+        artist_h = layout.artist_text.h
+        album_h  = layout.album_text.h
+        chips_h  = layout.genre_chips.h
+
+        # Total vertical space the secondary block consumes below the title
+        secondary_h = (
+            GAP_BEFORE_DIV + div_h + GAP_AFTER_DIV
+            + artist_h + GAP_AFTER_ARTIST
+            + album_h + GAP_AFTER_ALBUM
+            + chips_h + GAP_CHIPS_TO_META
         )
 
-        # --- Accent divider line ---
+        # Maximum pixels the title can occupy before it would crowd the secondary block
+        title_top   = layout.track_text.y
+        meta_y      = layout.meta_text.y
+        max_title_h = max(layout.font_size_track + 8, meta_y - title_top - secondary_h)
+
+        # Choose font size: try the layout default, step down 4 px at a time if needed
+        font_size = layout.font_size_track
+        title_h   = self._measure_wrapped_text(
+            track.title, font_size, layout.track_text.w, bold=True
+        )
+        if title_h > max_title_h:
+            for smaller in sorted(
+                [s for s in self._bold_fonts if s < font_size and s >= 18],
+                reverse=True,
+            ):
+                candidate_h = self._measure_wrapped_text(
+                    track.title, smaller, layout.track_text.w, bold=True
+                )
+                if candidate_h <= max_title_h:
+                    font_size = smaller
+                    title_h   = candidate_h
+                    break
+            else:
+                title_h = max_title_h   # absolute last resort: clip bottom lines
+
+        # Draw the title; rect height capped at max_title_h so overflow clips
+        title_rect = Rect(layout.track_text.x, title_top, layout.track_text.w, max_title_h)
+        actual_title_h = self._draw_wrapped_text(
+            track.title, font_size, title_rect, p.text, bold=True
+        )
+        title_bottom = title_top + actual_title_h
+
+        # -----------------------------------------------------------------
+        # Secondary elements — positions derived from title_bottom
+        # -----------------------------------------------------------------
+
+        # Accent divider line
+        div_y = title_bottom + GAP_BEFORE_DIV
         pygame.draw.rect(
             self._screen, p.accent,
-            (layout.divider.x, layout.divider.y, layout.divider_width, max(2, layout.divider.h)),
+            (layout.divider.x, div_y, layout.divider_width, div_h),
         )
 
-        # --- Artist ---
+        # Artist name
+        artist_y    = div_y + div_h + GAP_AFTER_DIV
+        artist_rect = Rect(layout.artist_text.x, artist_y, layout.artist_text.w, artist_h)
+        self._draw_text_clipped(track.artist, layout.font_size_artist, artist_rect, p.text)
+
+        # Album name (italic)
+        album_y    = artist_y + artist_h + GAP_AFTER_ARTIST
+        album_rect = Rect(layout.album_text.x, album_y, layout.album_text.w, album_h)
         self._draw_text_clipped(
-            track.artist, layout.font_size_artist,
-            layout.artist_text, p.text,
+            track.album, layout.font_size_album, album_rect, p.accent, italic=True
         )
 
-        # --- Album (italic) ---
-        self._draw_text_clipped(
-            track.album, layout.font_size_album,
-            layout.album_text, p.accent,
-            italic=True,
-        )
-
-        # --- Genre chips ---
+        # Genre chips
+        chips_y    = album_y + album_h + GAP_AFTER_ALBUM
+        chips_rect = Rect(layout.genre_chips.x, chips_y, layout.genre_chips.w, chips_h)
         if track.genres:
-            self._draw_genre_chips(track.genres, layout, p)
+            self._draw_genre_chips(track.genres, layout, p, chips_rect=chips_rect)
 
-        # --- Meta footer ---
+        # -----------------------------------------------------------------
+        # Bottom-anchored elements — positions unchanged from layout
+        # -----------------------------------------------------------------
+
         meta_parts = [x for x in [track.year, track.label, track.catalog_number] if x]
         if meta_parts:
             self._draw_mono_text(
@@ -327,7 +401,6 @@ class DisplayRenderer:
                 layout.meta_text, p.muted,
             )
 
-        # --- Prev / next ---
         self._draw_prev_next(layout, p, track)
 
     def _draw_header(self, layout: NowPlayingLayout, p: DisplayPalette, track):
@@ -368,18 +441,29 @@ class DisplayRenderer:
             return track.track_display
         return ""
 
-    def _draw_genre_chips(self, genres: list, layout: NowPlayingLayout, p: DisplayPalette):
-        """Render genre/style pill badges, wrapping onto a second row if needed."""
+    def _draw_genre_chips(
+        self,
+        genres: list,
+        layout: NowPlayingLayout,
+        p: DisplayPalette,
+        chips_rect=None,
+    ):
+        """Render genre/style pill badges, wrapping onto a second row if needed.
+
+        If *chips_rect* is supplied it overrides ``layout.genre_chips`` for the
+        bounding box, allowing the caller to position chips dynamically.
+        """
         import pygame
         font = self._mono_fonts.get(layout.font_size_chips) or self._mono_fonts.get(12)
         if not font:
             return
 
+        rect = chips_rect if chips_rect is not None else layout.genre_chips
         px = layout.chip_padding_x
         py = layout.chip_padding_y
         gap = layout.chip_gap
-        x0 = layout.genre_chips.x
-        y0 = layout.genre_chips.y
+        x0 = rect.x
+        y0 = rect.y
         x = x0
         y = y0
         chip_h = font.get_height() + py * 2
@@ -388,11 +472,11 @@ class DisplayRenderer:
             text_surf = font.render(genre, True, p.muted)
             chip_w = text_surf.get_width() + px * 2
 
-            # Wrap to next row if we'd overflow
-            if x + chip_w > x0 + layout.genre_chips.w and x > x0:
+            # Wrap to next row if we'd overflow the bounding box width
+            if x + chip_w > x0 + rect.w and x > x0:
                 x = x0
                 y += chip_h + gap
-                if y + chip_h > layout.genre_chips.y + layout.genre_chips.h + chip_h:
+                if y + chip_h > rect.y + rect.h + chip_h:
                     break  # Out of room
 
             # Draw border rect (sharp corners per design)
@@ -400,7 +484,7 @@ class DisplayRenderer:
             pygame.draw.rect(self._screen, p.surface, border_rect)
             pygame.draw.rect(self._screen, p.muted, border_rect, 1)
 
-            # Draw label centered in chip
+            # Draw label inside chip
             self._screen.blit(text_surf, (x + px, y + py))
             x += chip_w + gap
 
@@ -421,6 +505,7 @@ class DisplayRenderer:
             label = label_font.render("← PREV", True, p.muted)
             self._screen.blit(label, (strip.x, strip.y))
             name = name_font.render(prev, True, p.text)
+            # Clip to half-width
             clip = pygame.Rect(strip.x, strip.y + label.get_height() + 4, half_w - 8, name.get_height())
             self._screen.blit(name, clip.topleft, area=(0, 0, clip.w, clip.h))
 
@@ -430,7 +515,7 @@ class DisplayRenderer:
             label = label_font.render("NEXT →", True, p.muted)
             lx = strip.x + half_w + 8
             self._screen.blit(label, (lx, strip.y))
-            name = name_font.render(nxt, True, p.text)
+            name = name_font.render(nxt, True, (*p.text[:3],))
             clip_w = half_w - 8
             self._screen.blit(name, (lx, strip.y + label.get_height() + 4), area=(0, 0, clip_w, name.get_height()))
 
@@ -450,6 +535,7 @@ class DisplayRenderer:
         angle = (time.monotonic() * 200) % 360
 
         pygame.draw.circle(self._screen, p.surface, (cx, cy), r + 4, 1)
+        # Draw a short arc via thick line (poor man's spinner)
         import math
         for deg in range(0, 50, 3):
             a = math.radians(angle + deg)
@@ -474,11 +560,17 @@ class DisplayRenderer:
     # -----------------------------------------------------------------------
 
     def _draw_gradient_bg(self, p: DisplayPalette):
-        """Fill the screen with a radial gradient from surface (centre) to bg (edges)."""
+        """Fill the screen with a radial gradient from surface (centre) to bg (edges).
+
+        Pygame has no built-in radial gradient, so we approximate with concentric
+        circles drawn from the outer edge inward. The gradient is anchored at
+        roughly 25% from the left (over the cover art area), matching the JSX.
+        """
         import pygame
 
         self._screen.fill(p.bg)
 
+        # Overlay a soft radial highlight using a small number of concentric circles
         cx = int(self.width * 0.25)
         cy = int(self.height * 0.35)
         max_r = int(max(self.width, self.height) * 0.75)
@@ -486,18 +578,23 @@ class DisplayRenderer:
 
         for i in range(steps, 0, -1):
             t = i / steps
+            # Blend from surface (centre) toward bg (edge)
             color = _lerp_color(p.bg, p.surface, t * 0.55)
             r = int(max_r * t)
             pygame.draw.circle(self._screen, color, (cx, cy), r)
 
     def _draw_wrapped_text(
         self, text: str, size: int, rect, color: tuple, bold: bool = False
-    ):
-        """Render text with word-wrapping to fit within rect.w, clipped to rect.h."""
+    ) -> int:
+        """Render text with word-wrapping to fit within rect.w, clipped to rect.h.
+
+        Returns the actual rendered height in pixels (distance from rect.y to the
+        bottom of the last drawn line).  Returns 0 if nothing was drawn.
+        """
         import pygame
-        font = self._fonts.get(size)
+        font = (self._bold_fonts if bold else self._fonts).get(size)
         if not font or not text:
-            return
+            return 0
 
         words = text.split()
         lines = []
@@ -515,13 +612,50 @@ class DisplayRenderer:
             lines.append(current)
 
         y = rect.y
-        line_h = int(font.get_height() * 0.98)
+        line_h = int(font.get_height() * 0.98)  # 0.98 lineHeight from JSX
+        last_bottom = rect.y
         for line in lines:
             if y + line_h > rect.y + rect.h:
                 break
             surf = font.render(line, True, color)
             self._screen.blit(surf, (rect.x, y))
+            last_bottom = y + line_h
             y += line_h + 2
+
+        return max(0, last_bottom - rect.y)
+
+    def _measure_wrapped_text(
+        self, text: str, size: int, available_width: int, bold: bool = False
+    ) -> int:
+        """Measure wrapped-text height without drawing anything.
+
+        Uses the same word-wrap algorithm as _draw_wrapped_text so that
+        measurements exactly match render output.  Returns total pixel height;
+        0 if font unavailable or text empty.
+        """
+        font = (self._bold_fonts if bold else self._fonts).get(size)
+        if not font or not text:
+            return 0
+
+        words = text.split()
+        lines = []
+        current = ""
+        for word in words:
+            test = (current + " " + word).strip()
+            if font.size(test)[0] <= available_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+
+        if not lines:
+            return 0
+        line_h = int(font.get_height() * 0.98)
+        # n lines: n x (line_h + 2) minus the trailing gap after the last line
+        return len(lines) * (line_h + 2) - 2
 
     def _draw_text_clipped(
         self, text: str, size: int, rect, color: tuple, italic: bool = False
@@ -557,6 +691,8 @@ class DisplayRenderer:
         elif cover_url in self._palette_cache:
             target = self._palette_cache[cover_url]
         else:
+            # Extraction happens synchronously here; cover art is already cached
+            # on disk from _load_cover(), so no network I/O.
             cache_key = self._url_to_cache_key(cover_url)
             cache_path = self.cache_dir / cache_key
             if cache_path.exists():
@@ -586,7 +722,11 @@ class DisplayRenderer:
         return hashlib.md5(url.encode()).hexdigest() + ".jpg"
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
-        """Load and scale cover art from URL, with local file cache."""
+        """Load and scale cover art from URL, with local file cache.
+
+        Side effect: if the cover is downloaded fresh, _queue_palette is called
+        so palette extraction can run against the newly saved file.
+        """
         import urllib.request
         import pygame
 
@@ -605,6 +745,7 @@ class DisplayRenderer:
                 log.warning(f"Failed to download cover art: {e}")
                 return None
 
+        # If just downloaded, kick off palette extraction now that the file exists
         if fresh and self.dynamic_theming:
             self._queue_palette(url)
 

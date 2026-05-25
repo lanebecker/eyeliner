@@ -41,7 +41,7 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 
 ---
 
-## v1.2.0 — Display Redesign & Dynamic Theming ✅ (current)
+## v1.2.0 — Display Redesign & Dynamic Theming ✅
 
 A comprehensive visual overhaul based on the "Museum Card" layout from Claude
 Design mockups. Absorbed the color theming work originally planned for v1.5.0
@@ -93,6 +93,20 @@ response), `resolver.py` (genres passthrough)
 **No new API calls.** All new data surfaces come from fields already present in
 the Discogs release response. Color extraction runs locally on the cached album
 art image.
+
+### v1.2.1 ✅ (current)
+
+**Dynamic title push-down layout** — the track title is no longer confined to a
+fixed-height slot. It claims as much vertical space as it naturally requires, and
+the accent divider, artist name, album title, and genre chip badges flow downward
+from the title's actual bottom edge. The meta footer and prev/next strip stay
+bottom-anchored. Font size reduction is a genuine last resort, applied only when
+the title cannot fit even with the full available budget.
+
+- `_draw_wrapped_text()` now returns actual rendered height in pixels
+- New `_measure_wrapped_text()` helper for layout-safe height pre-computation
+- `_draw_genre_chips()` accepts an optional `chips_rect` override for dynamic positioning
+- New `_bold_fonts` dict pre-built at startup with stepped-down bold title sizes
 
 ---
 
