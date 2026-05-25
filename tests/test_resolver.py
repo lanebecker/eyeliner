@@ -65,7 +65,6 @@ def mock_coverart():
 @pytest.fixture
 def resolver(mock_discogs, mock_coverart):
     """Build a MetadataResolver with injected mock clients."""
-    # Import here to avoid triggering real client instantiation at module load
     from src.metadata.resolver import MetadataResolver
     r = MetadataResolver.__new__(MetadataResolver)
     r.discogs = mock_discogs
@@ -291,7 +290,6 @@ async def test_resolve_always_returns_track_metadata(resolver, mock_discogs, moc
     from src.metadata.models import TrackMetadata
     mock_discogs.search_collection.side_effect = Exception("boom")
     mock_discogs.search_database.side_effect = Exception("boom")
-    # Cover art fallback succeeds (returns None when nothing found — normal behaviour)
     mock_coverart.get_cover_art_url.return_value = None
 
     result = await resolver.resolve(make_raw())
@@ -313,3 +311,37 @@ async def test_title_from_raw_is_preserved_through_all_paths(resolver, mock_disc
     mock_discogs.search_database.return_value = None
     result = await resolver.resolve(make_raw(title="So What"))
     assert result.title == "So What"
+
+
+# ---------------------------------------------------------------------------
+# v1.2.0: genres passthrough
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_genres_passed_through_from_discogs_result(resolver, mock_discogs):
+    """Genres from the Discogs result dict are stored on TrackMetadata."""
+    result_with_genres = make_discogs_result()
+    result_with_genres["genres"] = ["Post-Hardcore", "Punk"]
+    mock_discogs.search_collection.return_value = result_with_genres
+
+    result = await resolver.resolve(make_raw())
+    assert result.genres == ["Post-Hardcore", "Punk"]
+
+
+@pytest.mark.asyncio
+async def test_genres_default_empty_when_missing_from_result(resolver, mock_discogs):
+    """If Discogs result has no genres key, TrackMetadata.genres is []."""
+    mock_discogs.search_collection.return_value = make_discogs_result()  # no genres key
+
+    result = await resolver.resolve(make_raw())
+    assert result.genres == []
+
+
+@pytest.mark.asyncio
+async def test_genres_empty_on_fallback_path(resolver, mock_discogs):
+    """Fallback metadata (no Discogs) always has empty genres."""
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = None
+
+    result = await resolver.resolve(make_raw())
+    assert result.genres == []
