@@ -91,5 +91,6 @@ class MetadataResolver:
             discogs_instance_id=discogs_result.get("instance_id"),
             cover_art_url=discogs_result.get("cover_art_url"),
             tracklist=discogs_result.get("tracklist", []),
+            genres=discogs_result.get("genres", []),
             source=source,
         )

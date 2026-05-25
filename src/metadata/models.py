@@ -1,5 +1,6 @@
 """Data models for track metadata and play sessions."""
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
@@ -10,6 +11,41 @@ class MetadataSource(Enum):
     DISCOGS_COLLECTION = auto()   # Found in user's personal collection
     DISCOGS_DATABASE = auto()     # Found in Discogs DB but not user's collection
     FALLBACK = auto()             # Shazam metadata + MusicBrainz cover art
+
+
+# Matches Discogs position strings like "A1", "B12", "AA3".
+# Group 1 = side letter(s), Group 2 = track number within the side.
+_SIDE_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+@dataclass
+class DisplayPalette:
+    """5-color palette for dynamic theming, extracted from album art.
+
+    All values are (R, G, B) tuples in 0-255 range.
+
+    Matches the palette schema from the Claude Design mockups:
+      bg      — main background tint (very dark, ~15-22% lightness)
+      surface — slightly lighter card/panel tone for radial gradient
+      accent  — vibrant extracted color (divider line, album name, badge borders)
+      text    — primary text color (near-white, slightly tinted)
+      muted   — secondary/meta text color (medium gray, slightly tinted)
+    """
+    bg: tuple
+    surface: tuple
+    accent: tuple
+    text: tuple
+    muted: tuple
+
+
+# Used when no cover art is available or palette extraction fails.
+FALLBACK_PALETTE = DisplayPalette(
+    bg=(10, 10, 10),
+    surface=(22, 22, 22),
+    accent=(200, 200, 200),
+    text=(235, 230, 220),
+    muted=(138, 133, 124),
+)
 
 
 @dataclass
@@ -35,6 +71,11 @@ class TrackMetadata:
     discogs_instance_id: Optional[int] = None  # Needed for collection field updates
     cover_art_url: Optional[str] = None
     tracklist: list["TracklistEntry"] = field(default_factory=list)
+    genres: list[str] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Last-track detection
+    # ------------------------------------------------------------------
 
     @property
     def is_last_track(self) -> bool:
@@ -46,11 +87,83 @@ class TrackMetadata:
 
     @property
     def track_display(self) -> str:
-        """Human-readable track position, e.g. 'A1'"""
+        """Human-readable track position, e.g. 'A1'."""
         for entry in self.tracklist:
             if entry.title.lower().strip() == self.title.lower().strip():
                 return entry.position
         return ""
+
+    # ------------------------------------------------------------------
+    # Side-awareness (v1.2.0 display; foundation for v1.5.0 logic)
+    # ------------------------------------------------------------------
+
+    @property
+    def _current_entry(self) -> Optional["TracklistEntry"]:
+        """The TracklistEntry for this track, matched by title."""
+        title_key = self.title.lower().strip()
+        for entry in self.tracklist:
+            if entry.title.lower().strip() == title_key:
+                return entry
+        return None
+
+    @property
+    def side_letter(self) -> Optional[str]:
+        """The side letter for this track (e.g. 'A', 'B'), or None.
+
+        Returns None when the position string has no alphabetic prefix
+        (e.g. numbered-only tracklists like '1', '2', '3').
+        """
+        entry = self._current_entry
+        if not entry:
+            return None
+        m = _SIDE_RE.match(entry.position)
+        return m.group(1).upper() if m else None
+
+    @property
+    def _side_entries(self) -> list["TracklistEntry"]:
+        """All tracklist entries that share this track's side letter, in order."""
+        letter = self.side_letter
+        if not letter:
+            return []
+        return [
+            e for e in self.tracklist
+            if (m := _SIDE_RE.match(e.position)) and m.group(1).upper() == letter
+        ]
+
+    @property
+    def side_position(self) -> Optional[int]:
+        """1-indexed position of this track within its side."""
+        title_key = self.title.lower().strip()
+        for i, entry in enumerate(self._side_entries):
+            if entry.title.lower().strip() == title_key:
+                return i + 1
+        return None
+
+    @property
+    def side_total(self) -> Optional[int]:
+        """Total number of tracks on this track's side."""
+        entries = self._side_entries
+        return len(entries) if entries else None
+
+    @property
+    def prev_track_title(self) -> Optional[str]:
+        """Title of the previous track on this side, or None if first/unknown."""
+        title_key = self.title.lower().strip()
+        entries = self._side_entries
+        for i, entry in enumerate(entries):
+            if entry.title.lower().strip() == title_key:
+                return entries[i - 1].title if i > 0 else None
+        return None
+
+    @property
+    def next_track_title(self) -> Optional[str]:
+        """Title of the next track on this side, or None if last/unknown."""
+        title_key = self.title.lower().strip()
+        entries = self._side_entries
+        for i, entry in enumerate(entries):
+            if entry.title.lower().strip() == title_key:
+                return entries[i + 1].title if i < len(entries) - 1 else None
+        return None
 
 
 @dataclass
