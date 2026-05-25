@@ -1,10 +1,12 @@
-"""Unit tests for TrackMetadata, PlaySession, TracklistEntry, and MetadataSource.
+"""Unit tests for TrackMetadata, PlaySession, TracklistEntry, MetadataSource,
+DisplayPalette, and the new v1.2.0 side-awareness properties.
 
 No hardware, network, or external dependencies required.
 """
 import pytest
 from src.metadata.models import (
-    MetadataSource, TracklistEntry, TrackMetadata, PlaySession
+    MetadataSource, TracklistEntry, TrackMetadata, PlaySession,
+    DisplayPalette, FALLBACK_PALETTE, _SIDE_RE,
 )
 
 
@@ -231,3 +233,159 @@ def test_metadata_source_names():
     assert MetadataSource.DISCOGS_COLLECTION.name == "DISCOGS_COLLECTION"
     assert MetadataSource.DISCOGS_DATABASE.name == "DISCOGS_DATABASE"
     assert MetadataSource.FALLBACK.name == "FALLBACK"
+
+
+# ---------------------------------------------------------------------------
+# DisplayPalette and FALLBACK_PALETTE
+# ---------------------------------------------------------------------------
+
+def test_display_palette_fields():
+    p = DisplayPalette(bg=(10, 10, 10), surface=(22, 22, 22),
+                       accent=(200, 150, 80), text=(235, 230, 220), muted=(138, 133, 124))
+    assert p.bg == (10, 10, 10)
+    assert p.accent == (200, 150, 80)
+
+
+def test_fallback_palette_is_display_palette():
+    assert isinstance(FALLBACK_PALETTE, DisplayPalette)
+    # Should be very dark
+    assert all(c < 30 for c in FALLBACK_PALETTE.bg)
+
+
+# ---------------------------------------------------------------------------
+# _SIDE_RE regex
+# ---------------------------------------------------------------------------
+
+def test_side_re_matches_standard_positions():
+    m = _SIDE_RE.match("A1")
+    assert m and m.group(1) == "A" and m.group(2) == "1"
+
+def test_side_re_matches_multi_digit():
+    m = _SIDE_RE.match("B12")
+    assert m and m.group(1) == "B" and m.group(2) == "12"
+
+def test_side_re_no_match_for_numeric_only():
+    assert _SIDE_RE.match("1") is None
+    assert _SIDE_RE.match("12") is None
+
+
+# ---------------------------------------------------------------------------
+# TrackMetadata.genres (v1.2.0)
+# ---------------------------------------------------------------------------
+
+def test_genres_default_empty():
+    track = TrackMetadata(
+        title="Catholic Block", artist="Sonic Youth", album="Sister",
+        source=MetadataSource.DISCOGS_COLLECTION,
+    )
+    assert track.genres == []
+
+
+def test_genres_stored():
+    track = TrackMetadata(
+        title="Catholic Block", artist="Sonic Youth", album="Sister",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        genres=["Noise Rock", "Alt Rock", "Post-Punk"],
+    )
+    assert track.genres == ["Noise Rock", "Alt Rock", "Post-Punk"]
+
+
+# ---------------------------------------------------------------------------
+# Side-awareness properties (v1.2.0)
+# ---------------------------------------------------------------------------
+
+def make_sister_full_tracklist():
+    """Full Sonic Youth - Sister tracklist with proper A/B positions."""
+    return [
+        TracklistEntry("A1", "Catholic Block"),
+        TracklistEntry("A2", "Pipeline/Kill Time"),
+        TracklistEntry("A3", "Stereo Sanctity"),
+        TracklistEntry("B1", "Tuff Gnarl"),
+        TracklistEntry("B2", "Cotton Crown"),
+        TracklistEntry("B3", "White Cross"),
+        TracklistEntry("B4", "Master-Dik"),
+    ]
+
+
+def make_side_track(title, tracklist=None):
+    if tracklist is None:
+        tracklist = make_sister_full_tracklist()
+    return TrackMetadata(
+        title=title, artist="Sonic Youth", album="Sister",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        tracklist=tracklist,
+    )
+
+
+# side_letter
+def test_side_letter_a_side():
+    assert make_side_track("Catholic Block").side_letter == "A"
+
+def test_side_letter_b_side():
+    assert make_side_track("Tuff Gnarl").side_letter == "B"
+
+def test_side_letter_none_when_not_in_tracklist():
+    assert make_side_track("Unknown Song").side_letter is None
+
+def test_side_letter_none_for_numeric_positions():
+    tracklist = [TracklistEntry("1", "Track One"), TracklistEntry("2", "Track Two")]
+    assert make_side_track("Track One", tracklist).side_letter is None
+
+
+# side_position
+def test_side_position_first_on_side():
+    assert make_side_track("Catholic Block").side_position == 1
+
+def test_side_position_third_on_a_side():
+    assert make_side_track("Stereo Sanctity").side_position == 3
+
+def test_side_position_first_on_b_side():
+    assert make_side_track("Tuff Gnarl").side_position == 1
+
+def test_side_position_last_on_b_side():
+    assert make_side_track("Master-Dik").side_position == 4
+
+def test_side_position_none_when_not_found():
+    assert make_side_track("Unknown Song").side_position is None
+
+
+# side_total
+def test_side_total_a_side():
+    assert make_side_track("Catholic Block").side_total == 3  # A1, A2, A3
+
+def test_side_total_b_side():
+    assert make_side_track("Tuff Gnarl").side_total == 4  # B1, B2, B3, B4
+
+def test_side_total_none_when_not_found():
+    assert make_side_track("Unknown Song").side_total is None
+
+
+# prev_track_title
+def test_prev_track_first_on_side_is_none():
+    assert make_side_track("Catholic Block").prev_track_title is None
+
+def test_prev_track_middle_of_a_side():
+    assert make_side_track("Stereo Sanctity").prev_track_title == "Pipeline/Kill Time"
+
+def test_prev_track_first_on_b_side_is_none():
+    assert make_side_track("Tuff Gnarl").prev_track_title is None
+
+def test_prev_track_last_on_b_side():
+    assert make_side_track("Master-Dik").prev_track_title == "White Cross"
+
+
+# next_track_title
+def test_next_track_first_on_a_side():
+    assert make_side_track("Catholic Block").next_track_title == "Pipeline/Kill Time"
+
+def test_next_track_last_on_a_side_is_none():
+    assert make_side_track("Stereo Sanctity").next_track_title is None
+
+def test_next_track_middle_of_b_side():
+    assert make_side_track("Cotton Crown").next_track_title == "White Cross"
+
+def test_next_track_last_on_b_side_is_none():
+    assert make_side_track("Master-Dik").next_track_title is None
+
+def test_next_track_none_when_not_found():
+    assert make_side_track("Unknown Song").next_track_title is None

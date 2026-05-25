@@ -3,6 +3,8 @@
 Pure geometry — no pygame window, no display hardware, no Pi required.
 Verifies that get_now_playing_layout() produces sane proportions at
 multiple resolutions, with no overlapping or out-of-bounds rects.
+
+Updated for v1.2.0 "Museum Card" layout (Direction A from Claude Design).
 """
 import pytest
 from src.display.layouts import get_now_playing_layout, Rect, NowPlayingLayout
@@ -13,15 +15,16 @@ from src.display.layouts import get_now_playing_layout, Rect, NowPlayingLayout
 # ---------------------------------------------------------------------------
 
 TEXT_PANEL_NAMES = (
+    "track_text",
+    "divider",
     "artist_text",
     "album_text",
-    "track_text",
+    "genre_chips",
     "meta_text",
-    "position_text",
-    "source_badge",
+    "prev_next",
 )
 
-ALL_RECT_NAMES = ("cover_art",) + TEXT_PANEL_NAMES
+ALL_RECT_NAMES = ("header_strip", "cover_art") + TEXT_PANEL_NAMES
 
 
 def all_rects(layout):
@@ -47,6 +50,11 @@ def test_all_text_panels_are_rects():
         assert isinstance(getattr(layout, name), Rect), f"{name} should be a Rect"
 
 
+def test_header_strip_is_rect():
+    layout = get_now_playing_layout(1024, 600)
+    assert isinstance(layout.header_strip, Rect)
+
+
 # ---------------------------------------------------------------------------
 # Positive non-zero dimensions
 # ---------------------------------------------------------------------------
@@ -66,7 +74,7 @@ def test_all_rects_have_non_negative_coordinates():
 
 
 # ---------------------------------------------------------------------------
-# Nothing bleeds off-screen at 1024x600 (primary target)
+# Nothing bleeds off-screen
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("width,height", [
@@ -87,11 +95,31 @@ def test_all_rects_fit_within_screen(width, height):
 
 
 # ---------------------------------------------------------------------------
+# Header strip geometry
+# ---------------------------------------------------------------------------
+
+def test_header_strip_spans_full_width():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.header_strip.x == 0
+    assert layout.header_strip.w == 1024
+
+
+def test_header_strip_starts_at_top():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.header_strip.y == 0
+
+
+def test_header_strip_is_thin():
+    """Strip should be a slim bar, not a large region."""
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.header_strip.h < 600 * 0.10
+
+
+# ---------------------------------------------------------------------------
 # Cover art geometry
 # ---------------------------------------------------------------------------
 
 def test_cover_art_is_square():
-    """Album art should be square — equal width and height."""
     layout = get_now_playing_layout(1024, 600)
     assert layout.cover_art.w == layout.cover_art.h
 
@@ -99,9 +127,7 @@ def test_cover_art_is_square():
 def test_cover_art_is_square_at_all_resolutions():
     for w, h in [(800, 480), (1024, 600), (1280, 720)]:
         layout = get_now_playing_layout(w, h)
-        assert layout.cover_art.w == layout.cover_art.h, (
-            f"Cover art not square at {w}x{h}"
-        )
+        assert layout.cover_art.w == layout.cover_art.h, f"Cover art not square at {w}x{h}"
 
 
 def test_cover_art_occupies_significant_screen_portion():
@@ -113,7 +139,12 @@ def test_cover_art_occupies_significant_screen_portion():
 def test_cover_art_starts_near_left_edge():
     """Cover art should begin close to the left margin, not centered."""
     layout = get_now_playing_layout(1024, 600)
-    assert layout.cover_art.x < 1024 * 0.10  # Within 10% of left edge
+    assert layout.cover_art.x < 1024 * 0.10
+
+
+def test_cover_art_starts_below_header_strip():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.cover_art.y >= layout.header_strip.h
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +152,6 @@ def test_cover_art_starts_near_left_edge():
 # ---------------------------------------------------------------------------
 
 def test_text_panels_start_after_cover_art():
-    """All text panels must start to the right of the cover art's right edge."""
     layout = get_now_playing_layout(1024, 600)
     cover_right = layout.cover_art.x + layout.cover_art.w
     for name in TEXT_PANEL_NAMES:
@@ -132,7 +162,6 @@ def test_text_panels_start_after_cover_art():
 
 
 def test_text_panels_have_meaningful_width():
-    """Text panels need enough width to actually render text."""
     layout = get_now_playing_layout(1024, 600)
     for name in TEXT_PANEL_NAMES:
         rect = getattr(layout, name)
@@ -140,27 +169,95 @@ def test_text_panels_have_meaningful_width():
 
 
 # ---------------------------------------------------------------------------
-# Font sizes
+# Vertical ordering: track → divider → artist → album → chips → meta → prev/next
 # ---------------------------------------------------------------------------
 
-def test_artist_font_is_largest():
+def test_track_is_above_divider():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.track_text.y < layout.divider.y
+
+
+def test_divider_is_above_artist():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.divider.y < layout.artist_text.y
+
+
+def test_artist_is_above_album():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.artist_text.y < layout.album_text.y
+
+
+def test_album_is_above_genre_chips():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.album_text.y < layout.genre_chips.y
+
+
+def test_meta_is_above_prev_next():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.meta_text.y < layout.prev_next.y
+
+
+def test_prev_next_is_near_bottom():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.prev_next.y > 600 * 0.70
+
+
+# ---------------------------------------------------------------------------
+# Font sizes — new hierarchy: track > artist > album > meta/chips/header
+# ---------------------------------------------------------------------------
+
+def test_track_font_is_largest():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.font_size_track >= layout.font_size_artist
+    assert layout.font_size_track >= layout.font_size_album
+    assert layout.font_size_track >= layout.font_size_meta
+
+
+def test_artist_font_larger_than_album():
     layout = get_now_playing_layout(1024, 600)
     assert layout.font_size_artist >= layout.font_size_album
-    assert layout.font_size_artist >= layout.font_size_track
-    assert layout.font_size_artist >= layout.font_size_meta
 
 
-def test_meta_font_is_smallest():
+def test_header_font_is_smallest_or_near_smallest():
     layout = get_now_playing_layout(1024, 600)
-    assert layout.font_size_meta <= layout.font_size_track
-    assert layout.font_size_meta <= layout.font_size_album
+    assert layout.font_size_header <= layout.font_size_meta
+    assert layout.font_size_header <= layout.font_size_chips
 
 
 def test_font_sizes_are_usable():
-    """Minimum readable sizes on a 7" display."""
     layout = get_now_playing_layout(1024, 600)
-    assert layout.font_size_artist >= 20, "Artist font too small to read"
-    assert layout.font_size_meta >= 10, "Meta font too small to read"
+    assert layout.font_size_track >= 24, "Track font too small"
+    assert layout.font_size_artist >= 18, "Artist font too small"
+    assert layout.font_size_meta >= 10, "Meta font too small"
+
+
+# ---------------------------------------------------------------------------
+# Divider geometry
+# ---------------------------------------------------------------------------
+
+def test_divider_is_thin():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.divider.h <= 4  # Should be a fine accent line
+
+
+def test_divider_width_is_positive():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.divider_width > 0
+
+
+# ---------------------------------------------------------------------------
+# Chip geometry
+# ---------------------------------------------------------------------------
+
+def test_chip_padding_is_positive():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.chip_padding_x > 0
+    assert layout.chip_padding_y > 0
+
+
+def test_chip_gap_is_non_negative():
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.chip_gap >= 0
 
 
 # ---------------------------------------------------------------------------
@@ -175,30 +272,11 @@ def test_cover_art_larger_at_higher_resolution():
 
 def test_text_panels_wider_at_wider_resolution():
     narrow = get_now_playing_layout(800, 480)
-    wide = get_now_playing_layout(1280, 480)  # Same height, different width
-    assert wide.artist_text.w > narrow.artist_text.w
+    wide = get_now_playing_layout(1280, 480)
+    assert wide.track_text.w > narrow.track_text.w
 
 
-# ---------------------------------------------------------------------------
-# Vertical ordering of text panels (artist at top, meta at bottom)
-# ---------------------------------------------------------------------------
-
-def test_artist_text_is_above_album_text():
-    layout = get_now_playing_layout(1024, 600)
-    assert layout.artist_text.y < layout.album_text.y
-
-
-def test_album_text_is_above_track_text():
-    layout = get_now_playing_layout(1024, 600)
-    assert layout.album_text.y < layout.track_text.y
-
-
-def test_track_text_is_above_meta_text():
-    layout = get_now_playing_layout(1024, 600)
-    assert layout.track_text.y < layout.meta_text.y
-
-
-def test_source_badge_is_near_bottom():
-    """Source badge (fallback indicator) should be in the lower portion."""
-    layout = get_now_playing_layout(1024, 600)
-    assert layout.source_badge.y > 600 * 0.70
+def test_font_sizes_larger_at_higher_resolution():
+    small = get_now_playing_layout(640, 480)
+    large = get_now_playing_layout(1280, 720)
+    assert large.font_size_track > small.font_size_track
