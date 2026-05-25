@@ -10,7 +10,8 @@ When the last track of an album finishes, it automatically increments the Play C
 
 - 🎵 Real-time audio fingerprinting via ShazamIO (no manual input needed)
 - 💿 Discogs collection-first metadata — pulls your specific pressing's details
-- 🖼️ Full cover art display on any HDMI screen
+- 🖼️ "Museum Card" display layout: large cover art, hero track title, artist, italic album name, genre/style chip badges, side indicator, prev/next track footer
+- 🎨 Dynamic color theming — palette extracted from each album's cover art; background, accent, and text colors shift per record with a smooth 1-second transition
 - ✅ Automatically increments Play Count in Discogs when the last track plays
 - 📅 Optionally records Last Played date (ISO 8601) in a Discogs custom field
 - 🔄 Graceful fallback: Discogs collection → Discogs database → MusicBrainz

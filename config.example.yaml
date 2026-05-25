@@ -25,11 +25,10 @@ display:
   width: 1024
   height: 600
   fullscreen: true
-  background_color: [10, 10, 10]
-  font_color: [240, 240, 240]
-  accent_color: [180, 140, 80]
-  # Show a subtle indicator when metadata came from fallback (not Discogs)
-  show_source_indicator: true
+  # Dynamic color theming: extracts a 5-color palette from each album's cover art.
+  # Background, accent, and text colors shift per record with a 1-second lerp transition.
+  # Set to false for a fixed neutral dark theme (useful on low-powered hardware).
+  dynamic_theming: true
   cover_art_cache_dir: "src/display/assets/cache"
 
 recognition:
