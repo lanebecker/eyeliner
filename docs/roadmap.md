@@ -94,7 +94,7 @@ response), `resolver.py` (genres passthrough)
 the Discogs release response. Color extraction runs locally on the cached album
 art image.
 
-### v1.2.1 ✅ (current)
+### v1.2.1 ✅
 
 **Dynamic title push-down layout** — the track title is no longer confined to a
 fixed-height slot. It claims as much vertical space as it naturally requires, and
@@ -107,6 +107,18 @@ the title cannot fit even with the full available budget.
 - New `_measure_wrapped_text()` helper for layout-safe height pre-computation
 - `_draw_genre_chips()` accepts an optional `chips_rect` override for dynamic positioning
 - New `_bold_fonts` dict pre-built at startup with stepped-down bold title sizes
+
+### v1.2.2 ✅ (current)
+
+**Cross-side boundary fix for `prev_track_title` / `next_track_title`** — the
+side-awareness properties now correctly stitch across side boundaries. Previously,
+the first track on any side (e.g. B1) returned `None` for `prev_track_title`
+instead of falling back to the last track of the preceding side (A3), and the
+last track on any side (e.g. A3) returned `None` for `next_track_title` instead
+of the first track of the following side (B1). The global tracklist is now
+consulted as a fallback whenever a side boundary is hit.
+
+- 193-test unit suite (+1 test; also expanded cross-side coverage with renamed tests)
 
 ---
 

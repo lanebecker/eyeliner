@@ -79,12 +79,12 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 192 items
+collected 193 items
 
 tests/test_discogs_client.py .....................                          [ 11%]
 tests/test_layouts.py ....................................                  [ 29%]
 tests/test_listen_tracker.py ....................                           [ 40%]
-tests/test_models.py ...........................................               [ 62%]
+tests/test_models.py ............................................             [ 62%]
 tests/test_recognizer.py .................                                  [ 71%]
 tests/test_resolver.py ......................                               [ 83%]
 tests/test_silence.py ......................                                [100%]
@@ -95,7 +95,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 192 passed in 0.34s ==============================
+============================== 193 passed in 0.34s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -150,6 +150,7 @@ Key cases:
 - `_SIDE_RE` matches standard (`"A1"`) and multi-digit (`"B12"`) positions; does not match numeric-only strings
 - `genres` field defaults to `[]` and stores values correctly
 - Side-awareness properties (`side_letter`, `side_position`, `side_total`, `prev_track_title`, `next_track_title`) using the Sonic Youth *Sister* tracklist (A1–A3, B1–B4): correct side grouping, 1-indexed positions, `None` at boundaries, `None` for unknown tracks or numeric-only position strings
+- Cross-side boundary stitching: B1's `prev_track_title` correctly returns the last track of Side A; A3's `next_track_title` correctly returns the first track of Side B
 
 ### `test_silence.py` — Silence detection
 
@@ -324,7 +325,7 @@ TEST 4: Collection custom fields
 ### Output symbols
 
 | Symbol | Meaning |
-|--------|--------|
+|--------|---------|
 | `✓` | Passed — got expected data |
 | `✗` | Failed — API error or unexpected response |
 | `·` | Skipped — e.g. *Sister* not in your collection; collection-specific tests N/A |

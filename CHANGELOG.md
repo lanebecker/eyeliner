@@ -14,6 +14,27 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.2.2] — 2026-05-25
+
+### Fixed
+
+- **Cross-side boundary bug in `prev_track_title` / `next_track_title`** — both
+  properties previously searched only within the current side's entries. This
+  caused the first track on any non-first side (e.g. B1) to return `None` for
+  `prev_track_title` instead of the last track of the preceding side (e.g. A3),
+  and the last track on any non-last side (e.g. A3) to return `None` for
+  `next_track_title` instead of the first track of the following side (e.g. B1).
+  Both properties now fall back to the global tracklist when a side boundary is
+  reached, correctly stitching sides together. A track that is genuinely first
+  globally still returns `None` for `prev_track_title`; a track that is genuinely
+  last globally still returns `None` for `next_track_title`.
+- 1 new unit test (`test_prev_track_cross_side_b1_returns_last_of_a`) and 1 new
+  unit test (`test_next_track_cross_side_last_a_returns_first_of_b`) cover the
+  fixed behaviour; 3 related tests were also added or renamed for clarity.
+  Total unit test count: 192 → 193.
+
+---
+
 ## [1.2.1] — 2026-05-25
 
 ### Changed

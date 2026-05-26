@@ -16,7 +16,7 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                                          15s chunks, 5s overlap
                                                   │
                               ┌───────────────────┴────────────────────┐
-                              ↓                                         ↓
+                              ▼                                         ▼
                      SilenceDetector                          RecognitionLoop
                      (RMS threshold)                          (ShazamIO backend)
                               │                                         │
@@ -26,16 +26,16 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                    SESSION_ENDED                              confirmation gate
                               │                               (N consecutive matches)
                     ┌─────────┴──────────┐                             │
-                    ↓                    ↓                    MetadataResolver
+                    ▼                    ▼                    MetadataResolver
                PlayerState         ListenTracker              3-step lookup:
                (status +           (PlaySession)           1. Discogs collection
                current_track)           │                  2. Discogs database
                     │            SESSION_ENDED              3. MusicBrainz fallback
                     │                   │                             │
-                    ↓                   ↓                    TrackMetadata
+                    ▼                   ▼                    TrackMetadata
              DisplayRenderer    DiscogsClient                         │
              (pygame, HDMI)     increment_play_count          ┌───────┴────────┐
-                                update_last_played            ↓                ↓
+                                update_last_played            ▼                ▼
                                                         PlayerState      ListenTracker
                                                         .current_track   .log_track()
 ```
@@ -114,7 +114,7 @@ lifecycle events.
 **Events emitted (`AudioEvent` enum):**
 
 | Event | Meaning |
-|-------|---------|
+|-------|----------|
 | `MUSIC_STARTED` | First above-threshold chunk after silence |
 | `MUSIC_STOPPED` | RMS drops below threshold (inter-track gap or lift) |
 | `SESSION_ENDED` | Silence sustained for `session_end_silence_seconds` |
@@ -271,8 +271,10 @@ Key properties:
   via `_SIDE_RE`; `None` for numeric-only tracklists
 - `side_position` — 1-indexed track number within the current side
 - `side_total` — total tracks on the current side
-- `prev_track_title` / `next_track_title` — adjacent track titles within the
-  same side; `None` at side boundaries or when track is not in tracklist
+- `prev_track_title` / `next_track_title` — adjacent track titles; searches
+  within the current side first, then falls back to the global tracklist at side
+  boundaries (e.g. B1 correctly returns A3 as its predecessor). `None` only when
+  the track is the very first or very last in the full tracklist, or is not found
 
 **`PlaySession`**: Tracks one needle-drop-to-lift session.
 
@@ -297,7 +299,7 @@ components that need to know what's currently playing.
 ```
 IDLE ──(MUSIC_STARTED)──→ LISTENING ──(track committed)──→ PLAYING
   ↑                                                            │
-  └──────────────(SESSION_ENDED / clear())──────────────────────┘
+  └──────────────(SESSION_ENDED / clear())────────────────────┘
 ```
 
 `SESSION_ENDED` sets status back to `IDLE` via `state.clear()` (called in
@@ -320,10 +322,10 @@ Manages the pygame window and renders state-appropriate screens at ~30 fps.
 | State | Screen |
 |-------|--------|
 | `IDLE` / `SESSION_ENDED` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
-| `LISTENING` | Spinning arc + “IDENTIFYING…” label in muted grey |
-| `PLAYING` | Full “Museum Card” now-playing layout |
+| `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey |
+| `PLAYING` | Full "Museum Card" now-playing layout |
 
-**Now-playing layout (v1.2.1 “Museum Card” — dynamic push-down):**
+**Now-playing layout (v1.2.1 "Museum Card" — dynamic push-down):**
 - Full-width header strip: pulsing `●` dot + `NOW PLAYING` label (left),
   `SIDE A · 02 OF 03` position indicator (right), both in monospace
 - Left panel: square album art (~440px), downloaded from URL, MD5-keyed disk
@@ -529,5 +531,5 @@ All source modules are complete. The only remaining work requires hardware:
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (192 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (193 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
