@@ -171,13 +171,91 @@ Key values to fill in:
 | `discogs.username` | Your Discogs username |
 | `discogs.play_count_field_name` | Must match your "Play Count" custom field name **exactly** (case-sensitive) |
 | `discogs.last_played_field_name` | **Optional.** If you have a "Last Played" custom field in your Discogs collection, set this to match its name exactly. Leave it commented out (the default) if you don't want this feature. |
+| `lastfm.scrobble_enabled` | Set to `true` to enable Last.fm scrobbling. Also fill in `api_key`, `api_secret`, and `session_key` (see step 8 below). |
+| `lastfm.api_key` | Your Last.fm API key — see step 8. |
+| `lastfm.api_secret` | Your Last.fm shared secret — see step 8. |
+| `lastfm.session_key` | Generated once via `python get_lastfm_session_key.py` — see step 8. Does not expire. |
+| `lastfm.love_on_completion` | **Optional.** If `true`, marks the last identified track as Loved on Last.fm when a full album side plays through. Defaults to `false`. |
 | `display.dynamic_theming` | Defaults to `true`. Extracts a 5-color palette from each album's cover art (Pillow) and shifts the background/accent colors per record. Set to `false` if you prefer a fixed dark theme or notice performance issues on older Pi hardware. |
 
 Everything else can stay as-is for a first run.
 
 ---
 
-## 8. Verify Discogs credentials
+## 8. Set up Last.fm scrobbling (optional)
+
+Skip this step if you don't have a Last.fm account or don't want scrobbling.
+
+### 8a. Create a Last.fm API application
+
+1. Log into [last.fm](https://www.last.fm) with your account.
+2. Go to [last.fm/api/account/create](https://www.last.fm/api/account/create).
+3. Fill in:
+   - **Application name:** anything you like (e.g. `Vinyl Now Playing`)
+   - **Application description:** brief description
+   - **Callback URL:** leave blank (the app uses the desktop auth flow, not web OAuth)
+4. Submit. You'll land on a page showing your **API key** and **Shared secret** — copy both into your `config.yaml` under `lastfm.api_key` and `lastfm.api_secret`.
+
+### 8b. Generate a session key
+
+Last.fm requires a one-time authorisation step to generate a session key. The
+session key never expires, so this only needs to be done once.
+
+With the venv active, run the helper script from the repo root:
+
+```bash
+source venv/bin/activate
+python get_lastfm_session_key.py
+```
+
+The script will:
+1. Prompt you to paste your API key and shared secret
+2. Open the Last.fm authorisation page in your browser
+3. Wait for you to approve access on the Last.fm site
+4. Print your session key to the terminal
+
+Copy the session key into `config.yaml` under `lastfm.session_key`.
+
+### 8c. Complete the config.yaml lastfm section
+
+Your `config.yaml` should now contain:
+
+```yaml
+lastfm:
+  scrobble_enabled: true
+  api_key: "your-api-key-here"
+  api_secret: "your-shared-secret-here"
+  session_key: "your-session-key-here"
+  love_on_completion: false   # set to true to mark last track as Loved on album completion
+```
+
+### 8d. Verify the connection
+
+Confirm all three credentials are valid and talking to the Last.fm API:
+
+```bash
+python -c "
+import pylast
+network = pylast.LastFMNetwork(
+    api_key='YOUR_API_KEY',
+    api_secret='YOUR_API_SECRET',
+    session_key='YOUR_SESSION_KEY',
+    username='YOUR_LASTFM_USERNAME'
+)
+user = network.get_authenticated_user()
+print(f'Authenticated as: {user.get_name()}')
+print(f'Play count: {user.get_playcount()}')
+"
+```
+
+Replace the four placeholder values with your actual credentials. You should see
+your Last.fm username and total scrobble count printed. A `WSError` means
+something is wrong with the credentials — double-check that all three values
+were copied correctly from the API account page and the session key helper output.
+
+---
+
+## 9. Verify Discogs credentials
 
 Before dealing with audio and display, confirm the Discogs side works:
 
@@ -191,7 +269,7 @@ adjusting to match a record you actually own.
 
 ---
 
-## 9. Run a Python device check
+## 10. Run a Python device check
 
 Confirm sounddevice sees the UCA222 at the Python level:
 
@@ -205,7 +283,7 @@ appears as an input device — it should show a positive number of input channel
 
 ---
 
-## 10. First manual run
+## 11. First manual run
 
 With the display connected, the UCA222 plugged in, and your turntable's RCA
 output going into the UCA222's inputs:
@@ -228,6 +306,8 @@ Watch the terminal output for log messages. Key things to look for:
 - `Found in collection` — the Discogs lookup succeeded
 - `Play Count updated for release ...` — the Play Count field was incremented at end of session
 - `Last Played updated for release ...` — the Last Played date was written (only if `last_played_field_name` is configured)
+- `✅ Scrobbled to Last.fm:` — the track was successfully posted to your Last.fm listening history
+- `✅ Last.fm loved:` — the track was marked as Loved on Last.fm (only if `love_on_completion: true`)
 
 If `MUSIC_STARTED` never appears, the silence threshold may be too high for
 your room's noise floor. Tune `audio.silence_threshold_rms` in config.yaml —
@@ -237,7 +317,7 @@ To exit: `Ctrl+C`.
 
 ---
 
-## 11. Set up autostart with systemd
+## 12. Set up autostart with systemd
 
 Once the manual run works, set it up to start automatically on boot.
 
@@ -290,7 +370,7 @@ journalctl -u vinyl-now-playing -f
 
 ---
 
-## 12. Optional: hide the desktop and boot straight to the app
+## 13. Optional: hide the desktop and boot straight to the app
 
 If you want the Pi to boot directly to the vinyl display with no desktop
 visible underneath:
