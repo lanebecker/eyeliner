@@ -122,7 +122,7 @@ consulted as a fallback whenever a side boundary is hit.
 
 ---
 
-## v1.3.0 — Last.fm Scrobbling ✅ (current)
+## v1.3.0 — Last.fm Scrobbling ✅
 
 **208-test unit suite** (+15 tests in `tests/test_lastfm_client.py`).
 
@@ -142,6 +142,29 @@ consulted as a fallback whenever a side boundary is hit.
 - New `lastfm` section in `config.example.yaml`:
   `scrobble_enabled`, `api_key`, `api_secret`, `session_key`, `love_on_completion`.
 - `pylast>=5.1.0` added to `requirements.txt`.
+
+### v1.3.1 ✅ (current)
+
+**Bug-fix release — no new features.** Post-QA sweep of the entire codebase
+identified eight bugs across five files; all fixed with zero test regressions
+(208 tests still pass).
+
+- Seven `asyncio.get_event_loop()` → `asyncio.get_running_loop()` replacements
+  across `capture.py`, `recognizer.py`, `listen_tracker.py`, and `main.py`
+  (deprecated in Python 3.10+; raises `RuntimeError` in some async contexts)
+- ShazamIO album extraction: inner `break` only exited the metadata loop, not
+  the outer sections loop — albums from non-first sections were silently missed
+- Cover-art download (`urlretrieve`) was blocking the async event loop
+  synchronously on every new track; refactored to an async prefetch via
+  `run_in_executor` + `create_task`
+- Pulsing NOW PLAYING dot froze after ~1 second (`_dirty` never re-set)
+- Genre chip overflow check allowed a full extra row beyond the panel boundary
+- NEXT track label used `(*p.text[:3],)` instead of `p.text` (inconsistent
+  with the PREV label)
+- Wrong Last.fm auth URL in help text of `get_lastfm_session_key.py`
+  (`/api/accounts` → `/api/account/create`)
+- Negative sleep duration possible in `AudioCapture.run()` when
+  `overlap_seconds >= chunk_seconds`; clamped with `max(0, ...)`
 
 ---
 
