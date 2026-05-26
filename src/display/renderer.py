@@ -25,10 +25,12 @@ is never blocked by network I/O.
 import asyncio
 import logging
 import os
+import tempfile
 import time
-import urllib.request
 from pathlib import Path
 from typing import Optional
+
+import requests
 
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
@@ -42,6 +44,11 @@ os.environ.setdefault("DISPLAY", ":0")  # Needed when running headless / via SSH
 
 # How long (seconds) to lerp between palettes on track change
 _TRANSITION_SECS = 1.0
+
+# Cap on the per-URL palette cache.  Extraction is fast (~ms per album), so
+# re-running on a cache miss is fine; the cap just prevents unbounded growth
+# on machines with very long uptimes or very large collections.
+_PALETTE_CACHE_MAX = 200
 
 
 def _lerp_color(a: tuple, b: tuple, t: float) -> tuple:
@@ -251,11 +258,16 @@ class DisplayRenderer:
             # Keep re-rendering during a palette transition even if not dirty
             transitioning = (time.monotonic() - self._transition_start) < _TRANSITION_SECS
             if self._dirty or transitioning:
-                self._render()
+                # Reset BEFORE rendering so _render_now_playing /
+                # _render_listening can set self._dirty = True to request
+                # another frame for animations (pulsing dot, spinner).
                 self._dirty = False
+                self._render()
                 pygame.display.flip()
 
-            await asyncio.sleep(1 / 30)
+            # Sleep cadence: 30 fps while transitioning (smooth lerp), otherwise
+            # ~10 fps — fast enough for the 0.8s pulsing dot, but easy on the Pi.
+            await asyncio.sleep(1 / 30 if transitioning else 1 / 10)
 
     # -----------------------------------------------------------------------
     # Render dispatch
@@ -693,13 +705,22 @@ class DisplayRenderer:
     # -----------------------------------------------------------------------
 
     def _queue_palette(self, cover_url: Optional[str]):
-        """Set the target palette for a new track, triggering a transition."""
+        """Set the target palette for a new track, triggering a transition.
+
+        If a previous transition is still in flight, snap _current_palette to
+        the currently-interpolated value before reassigning the target — that
+        way the new lerp starts from what the user is *currently seeing*
+        instead of jumping back to a stale starting point.
+        """
         if not self.dynamic_theming:
             return
         if cover_url is None:
             target = FALLBACK_PALETTE
         elif cover_url in self._palette_cache:
             target = self._palette_cache[cover_url]
+            # LRU-ish refresh: pop and re-insert so this entry isn't first to evict.
+            self._palette_cache.pop(cover_url)
+            self._palette_cache[cover_url] = target
         else:
             # Extraction happens synchronously here; cover art is already cached
             # on disk from _prefetch_cover(), so no network I/O.
@@ -708,9 +729,16 @@ class DisplayRenderer:
             if cache_path.exists():
                 target = _extract_palette(cache_path)
                 self._palette_cache[cover_url] = target
+                # Evict oldest entries if the cache has overflowed.
+                while len(self._palette_cache) > _PALETTE_CACHE_MAX:
+                    # dict preserves insertion order — iter(...) yields oldest first
+                    self._palette_cache.pop(next(iter(self._palette_cache)))
             else:
                 target = FALLBACK_PALETTE
 
+        # Snap current to the live interpolated value before retargeting, so a
+        # mid-transition track change doesn't lerp from a stale base palette.
+        self._current_palette = self._animated_palette()
         self._target_palette = target
         self._transition_start = time.monotonic()
 
@@ -738,6 +766,13 @@ class DisplayRenderer:
         download runs in a thread-pool executor and never stalls the event loop.
         Once the file is written, palette extraction is (re-)queued and the
         display is marked dirty so the next frame picks up the fresh image.
+
+        Implementation details:
+          - Uses requests.get with an explicit timeout so a hung CDN connection
+            can't tie up an executor thread indefinitely.
+          - Writes to a tempfile in the cache directory first, then atomically
+            renames into place — partial downloads (network drop, process kill)
+            never leave a half-written file that _load_cover would fail on.
         """
         cache_key = self._url_to_cache_key(url)
         cache_path = self.cache_dir / cache_key
@@ -746,12 +781,7 @@ class DisplayRenderer:
 
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                urllib.request.urlretrieve,
-                url,
-                str(cache_path),
-            )
+            await loop.run_in_executor(None, self._download_cover_blocking, url, cache_path)
             log.debug(f"Cover art cached: {cache_path.name}")
             # File is now on disk — extract palette and trigger a redraw
             if self.dynamic_theming:
@@ -759,6 +789,36 @@ class DisplayRenderer:
             self._dirty = True
         except Exception as e:
             log.warning(f"Failed to download cover art from {url}: {e}")
+
+    def _download_cover_blocking(self, url: str, cache_path: Path):
+        """Synchronous cover-art download — must run in an executor.
+
+        Streams the response into a tempfile in the cache directory, then
+        atomically renames into the final cache path on success.  The 15s
+        timeout covers both connection setup and per-chunk reads.
+        """
+        with requests.get(url, timeout=15, stream=True) as resp:
+            resp.raise_for_status()
+            # delete=False so we can rename after closing; we clean up manually on error
+            tmp = tempfile.NamedTemporaryFile(
+                dir=str(self.cache_dir),
+                prefix=".cover-",
+                suffix=".part",
+                delete=False,
+            )
+            try:
+                with tmp as f:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                os.replace(tmp.name, str(cache_path))  # atomic on POSIX
+            except Exception:
+                # Clean up partial file before re-raising
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+                raise
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
         """Load and scale cover art from the local file cache.

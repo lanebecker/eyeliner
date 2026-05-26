@@ -80,16 +80,17 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 208 items
+collected 210 items
 
-tests/test_discogs_client.py .....................                          [ 10%]
-tests/test_lastfm_client.py ...............                                [ 17%]
-tests/test_layouts.py ....................................                  [ 31%]
-tests/test_listen_tracker.py ....................                           [ 40%]
-tests/test_models.py ............................................             [ 62%]
-tests/test_recognizer.py .................                                  [ 70%]
-tests/test_resolver.py ......................                               [ 81%]
-tests/test_silence.py ......................                                [100%]
+tests/test_discogs_client.py .....................                       [ 10%]
+tests/test_lastfm_client.py ...............                              [ 17%]
+tests/test_layouts.py .....................................              [ 34%]
+tests/test_listen_tracker.py ....................                        [ 44%]
+tests/test_models.py ................................................... [ 68%]
+.....                                                                    [ 70%]
+tests/test_recognizer.py .................                               [ 79%]
+tests/test_resolver.py ......................                            [ 89%]
+tests/test_silence.py ......................                             [100%]
 
 =============================== warnings summary ===============================
 venv/lib/python3.9/site-packages/urllib3/__init__.py:35
@@ -97,7 +98,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 208 passed in 0.34s ==============================
+============================== 210 passed in 0.34s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -307,9 +308,9 @@ This tests:
 ### Sample output
 
 ```
-══════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════
   vinyl-now-playing — Discogs Live Test
-══════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════
 
 TEST 1: search_collection("Sonic Youth", "Sister")
 ──────────────────────────────────────────────────
@@ -338,9 +339,9 @@ TEST 4: Collection custom fields
 ──────────────────────────────────────────────────
   ✓ Found "Play Count" → field ID 6
 
-══════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════
   4/4 tests passed
-══════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════
 ```
 
 ### Output symbols

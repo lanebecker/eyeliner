@@ -33,15 +33,18 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                current_track)           │                  2. Discogs database
                     │            SESSION_ENDED              3. MusicBrainz fallback
                     │                   │                             │
-                    ▼                   ▼                    TrackMetadata
-             DisplayRenderer    DiscogsClient                         │
-             (pygame, HDMI)     increment_play_count          ┌───────┴────────┐
-                                update_last_played            ▼                ▼
-                                LastFmClient.love()     PlayerState      ListenTracker
-                                (on completion)         .current_track   .log_track()
-                                                                              │
-                                                                    LastFmClient.scrobble()
-                                                                    (per committed track)
+                    │                   ├─► DiscogsClient             ▼
+                    │                   │   .increment_play_count   TrackMetadata
+                    │                   │   .update_last_played        │
+                    │                   │                       ┌──────┴──────────┐
+                    │                   └─► LastFmClient        ▼                 ▼
+                    ▼                       .love(last_track)  PlayerState   ListenTracker
+             DisplayRenderer                (on completion)    .current_track .log_track()
+             (pygame, HDMI)                                                       │
+                                                                                  ▼
+                                                                          LastFmClient
+                                                                          .scrobble()
+                                                                       (per committed track)
 ```
 
 ---
@@ -290,8 +293,12 @@ Key fields: `started_at`, `identified_tracks`, `potential_last_track`,
 `log_track(track)` behaviour:
 - Deduplicates consecutive identical tracks
 - Sets `potential_last_track = True` when `track.is_last_track`
-- Latches `album_release_id` / `album_instance_id` from the **first**
-  Discogs-sourced track (not overwritten by subsequent tracks or fallback tracks)
+- Latches `album_release_id` / `album_instance_id` from the **first track that
+  has BOTH IDs** — i.e. the first DISCOGS_COLLECTION-sourced track.
+  DISCOGS_DATABASE results (which have a `release_id` but no `instance_id`,
+  because the user doesn't own that pressing) intentionally don't latch, so
+  the Discogs field-update endpoint is never called with an invalid
+  `instances/None/...` URL.  FALLBACK tracks similarly don't latch.
 
 ---
 
@@ -333,7 +340,10 @@ all listeners on any state change. `DisplayRenderer` uses this to set its dirty 
 
 ### `src/display/renderer.py` — DisplayRenderer
 
-Manages the pygame window and renders state-appropriate screens at ~30 fps.
+Manages the pygame window and renders state-appropriate screens.  The run
+loop sleeps at 30 fps while a palette transition is animating (for smooth
+lerping) and ~10 fps otherwise (fast enough for the 0.8s pulsing-dot
+animation, easier on the Pi's CPU).
 
 **Screens:**
 
@@ -362,10 +372,14 @@ Manages the pygame window and renders state-appropriate screens at ~30 fps.
 - On each new track, `_queue_palette()` runs PIL color quantization on the
   cached cover art JPEG — 8 colors → dominant tint → `bg`/`surface`, most
   vibrant → `accent`, near-white → `text`/`muted`
-- Palettes cached per `cover_art_url`; extraction only runs once per album
+- Palettes cached per `cover_art_url` with an LRU-style cap
+  (`_PALETTE_CACHE_MAX = 200`); extraction only runs once per album
 - `_animated_palette()` lerps `_current_palette` → `_target_palette` over
   `_TRANSITION_SECS = 1.0` seconds; the run loop re-renders every frame during
-  the transition, then returns to dirty-flag mode
+  the transition, then drops back to ~10 fps for the pulsing-dot animation
+- If a new track arrives mid-transition, `_queue_palette()` snaps
+  `_current_palette` to the currently-rendered interpolated value first, so
+  the new lerp starts from what the user is actually seeing
 - `display.dynamic_theming: false` disables extraction and uses `FALLBACK_PALETTE`
 
 **Font system:** four dicts pre-built at startup — `_fonts` (regular, with the
@@ -611,5 +625,5 @@ All source modules are complete. The only remaining work requires hardware:
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (208 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (210 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
