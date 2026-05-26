@@ -70,7 +70,7 @@ class ListenTracker:
                 f"Last track confirmed for release {session.album_release_id} — "
                 f"incrementing Play Count and updating Last Played in Discogs."
             )
-            success = await asyncio.get_event_loop().run_in_executor(
+            success = await asyncio.get_running_loop().run_in_executor(
                 None,
                 self.discogs.increment_play_count,
                 session.album_release_id,
@@ -82,7 +82,7 @@ class ListenTracker:
                 log.warning("⚠ Failed to increment Discogs Play Count.")
 
             if self.discogs.last_played_field_name:
-                last_played_success = await asyncio.get_event_loop().run_in_executor(
+                last_played_success = await asyncio.get_running_loop().run_in_executor(
                     None,
                     self.discogs.update_last_played,
                     session.album_release_id,
@@ -109,7 +109,7 @@ class ListenTracker:
         if session.potential_last_track and self.lastfm and self.lastfm.love_on_completion:
             last_track = session.identified_tracks[-1] if session.identified_tracks else None
             if last_track:
-                love_success = await asyncio.get_event_loop().run_in_executor(
+                love_success = await asyncio.get_running_loop().run_in_executor(
                     None, self.lastfm.love, last_track
                 )
                 if love_success:
