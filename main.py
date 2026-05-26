@@ -95,7 +95,7 @@ async def shutdown(capture: "AudioCapture", display: "DisplayRenderer"):
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    asyncio.get_event_loop().stop()
+    asyncio.get_running_loop().stop()
 
 
 if __name__ == "__main__":
