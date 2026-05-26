@@ -66,13 +66,18 @@ class ShazamIOBackend(RecognizerBackend):
             if not track:
                 return None
 
-            # Pull album from the metadata section if present
+            # Pull album from the metadata section if present.
+            # Break both loops as soon as the album is found — without the
+            # outer break the inner break only exits the metadata loop and
+            # subsequent sections could overwrite the value.
             album = ""
             for section in track.get("sections", []):
                 for meta in section.get("metadata", []):
                     if meta.get("title", "").lower() == "album":
                         album = meta.get("text", "")
                         break
+                if album:
+                    break
 
             return RawRecognitionResult(
                 title=track.get("title", ""),
@@ -184,7 +189,7 @@ class RecognitionLoop:
         )
         if self.lastfm:
             try:
-                await asyncio.get_event_loop().run_in_executor(
+                await asyncio.get_running_loop().run_in_executor(
                     None, self.lastfm.scrobble, metadata, timestamp
                 )
             except Exception as e:
