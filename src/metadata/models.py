@@ -132,7 +132,11 @@ class TrackMetadata:
 
     @property
     def side_position(self) -> Optional[int]:
-        """1-indexed position of this track within its side."""
+        """1-indexed position of this track within its side.
+
+        E.g. the 3rd track on Side A returns 3, regardless of whether
+        its Discogs position string is 'A3' or something else.
+        """
         title_key = self.title.lower().strip()
         for i, entry in enumerate(self._side_entries):
             if entry.title.lower().strip() == title_key:
@@ -147,22 +151,44 @@ class TrackMetadata:
 
     @property
     def prev_track_title(self) -> Optional[str]:
-        """Title of the previous track on this side, or None if first/unknown."""
+        """Title of the previous track, or None if this is the very first track.
+
+        Searches within the current side first.  When this track is the first
+        on its side (i == 0), falls back to the global tracklist to find the
+        preceding track — e.g. B1 correctly returns A7 (the last track of
+        Side A) rather than None.
+        """
         title_key = self.title.lower().strip()
         entries = self._side_entries
         for i, entry in enumerate(entries):
             if entry.title.lower().strip() == title_key:
-                return entries[i - 1].title if i > 0 else None
+                if i > 0:
+                    return entries[i - 1].title
+                # First track on this side — fall back to global tracklist
+                for j, global_entry in enumerate(self.tracklist):
+                    if global_entry.title.lower().strip() == title_key:
+                        return self.tracklist[j - 1].title if j > 0 else None
         return None
 
     @property
     def next_track_title(self) -> Optional[str]:
-        """Title of the next track on this side, or None if last/unknown."""
+        """Title of the next track, or None if this is the very last track.
+
+        Searches within the current side first.  When this track is the last
+        on its side, falls back to the global tracklist to find the following
+        track — e.g. A7 correctly returns B1 (the first track of Side B)
+        rather than None.
+        """
         title_key = self.title.lower().strip()
         entries = self._side_entries
         for i, entry in enumerate(entries):
             if entry.title.lower().strip() == title_key:
-                return entries[i + 1].title if i < len(entries) - 1 else None
+                if i < len(entries) - 1:
+                    return entries[i + 1].title
+                # Last track on this side — fall back to global tracklist
+                for j, global_entry in enumerate(self.tracklist):
+                    if global_entry.title.lower().strip() == title_key:
+                        return self.tracklist[j + 1].title if j < len(self.tracklist) - 1 else None
         return None
 
 

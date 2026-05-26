@@ -361,31 +361,40 @@ def test_side_total_none_when_not_found():
 
 
 # prev_track_title
-def test_prev_track_first_on_side_is_none():
+def test_prev_track_very_first_track_is_none():
+    # A1 is the first track globally — no previous track exists
     assert make_side_track("Catholic Block").prev_track_title is None
 
 def test_prev_track_middle_of_a_side():
     assert make_side_track("Stereo Sanctity").prev_track_title == "Pipeline/Kill Time"
 
-def test_prev_track_first_on_b_side_is_none():
-    assert make_side_track("Tuff Gnarl").prev_track_title is None
-
 def test_prev_track_last_on_b_side():
     assert make_side_track("Master-Dik").prev_track_title == "White Cross"
+
+def test_prev_track_cross_side_b1_returns_last_of_a():
+    # B1 (Tuff Gnarl) is first on Side B — should fall back to global tracklist
+    # and return A3 (Stereo Sanctity), the last track of Side A.
+    assert make_side_track("Tuff Gnarl").prev_track_title == "Stereo Sanctity"
+
+def test_prev_track_none_when_not_found():
+    assert make_side_track("Unknown Song").prev_track_title is None
 
 
 # next_track_title
 def test_next_track_first_on_a_side():
     assert make_side_track("Catholic Block").next_track_title == "Pipeline/Kill Time"
 
-def test_next_track_last_on_a_side_is_none():
-    assert make_side_track("Stereo Sanctity").next_track_title is None
-
 def test_next_track_middle_of_b_side():
     assert make_side_track("Cotton Crown").next_track_title == "White Cross"
 
-def test_next_track_last_on_b_side_is_none():
+def test_next_track_very_last_track_is_none():
+    # B4 (Master-Dik) is the final track globally — no next track exists
     assert make_side_track("Master-Dik").next_track_title is None
+
+def test_next_track_cross_side_last_a_returns_first_of_b():
+    # A3 (Stereo Sanctity) is last on Side A — should fall back to global tracklist
+    # and return B1 (Tuff Gnarl), the first track of Side B.
+    assert make_side_track("Stereo Sanctity").next_track_title == "Tuff Gnarl"
 
 def test_next_track_none_when_not_found():
     assert make_side_track("Unknown Song").next_track_title is None
