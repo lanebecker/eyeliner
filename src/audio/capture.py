@@ -62,7 +62,7 @@ class AudioCapture:
         while self._running:
             try:
                 # Record one chunk in a thread pool to avoid blocking the event loop
-                audio = await asyncio.get_event_loop().run_in_executor(
+                audio = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: sd.rec(
                         chunk_frames,
@@ -81,8 +81,10 @@ class AudioCapture:
                 # Enqueue for recognition (async, slow — handled by RecognitionLoop)
                 await self.recognizer.enqueue(audio_flat, self.sample_rate)
 
-                # Overlap: wait for (chunk - overlap) before recording next chunk
-                await asyncio.sleep(self.chunk_seconds - self.overlap_seconds)
+                # Overlap: wait for (chunk - overlap) before recording next chunk.
+                # Clamped to 0 so a misconfigured overlap_seconds >= chunk_seconds
+                # doesn't produce a negative delay and spin the event loop.
+                await asyncio.sleep(max(0, self.chunk_seconds - self.overlap_seconds))
 
             except Exception as e:
                 log.error(f"Audio capture error: {e}")
