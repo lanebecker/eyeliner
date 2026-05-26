@@ -226,8 +226,12 @@ async def test_last_track_reached_but_fallback_source_does_not_increment():
 
 
 @pytest.mark.asyncio
-async def test_database_source_without_instance_id_does_not_increment():
-    """DISCOGS_DATABASE result has no instance_id → can't update collection field."""
+async def test_database_source_without_instance_id_does_not_call_increment():
+    """DISCOGS_DATABASE result has no instance_id → log_track refuses to latch
+    the release_id (since we can't build a valid field-update URL without an
+    instance_id), so _end_session sees album_release_id is None and skips the
+    Discogs update entirely.
+    """
     tracker, resolver = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
 
@@ -241,15 +245,16 @@ async def test_database_source_without_instance_id_does_not_increment():
         tracklist=make_tracklist(),
     )
     await tracker.on_track_identified(db_last)
+    # potential_last_track IS True (we DID identify the last track)
     assert tracker._session.potential_last_track is True
+    # But the release_id was NOT latched, because there's no instance_id to go with it
+    assert tracker._session.album_release_id is None
     assert tracker._session.album_instance_id is None
 
     await tracker._end_session()
-    # increment_play_count will be called with instance_id=None — the tracker passes
-    # whatever is on the session. The client handles None gracefully.
-    # (This documents the current behavior — if future code guards against None,
-    #  update this test accordingly.)
-    resolver.discogs.increment_play_count.assert_called_once_with(12345, None)
+    # No POST attempted with instance_id=None
+    resolver.discogs.increment_play_count.assert_not_called()
+    resolver.discogs.update_last_played.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

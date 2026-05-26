@@ -143,7 +143,7 @@ consulted as a fallback whenever a side boundary is hit.
   `scrobble_enabled`, `api_key`, `api_secret`, `session_key`, `love_on_completion`.
 - `pylast>=5.1.0` added to `requirements.txt`.
 
-### v1.3.1 ✅ (current)
+### v1.3.1 ✅
 
 **Bug-fix release — no new features.** Post-QA sweep of the entire codebase
 identified eight bugs across five files; all fixed with zero test regressions
@@ -165,6 +165,43 @@ identified eight bugs across five files; all fixed with zero test regressions
   (`/api/accounts` → `/api/account/create`)
 - Negative sleep duration possible in `AudioCapture.run()` when
   `overlap_seconds >= chunk_seconds`; clamped with `max(0, ...)`
+
+### v1.3.2 ✅ (current)
+
+**Bug-fix release — no new features.** A follow-up QA sweep of the v1.3.1
+codebase found one site the previous sweep had missed plus several other
+real bugs and hardening opportunities.
+
+- Completed the `get_event_loop()` → `get_running_loop()` migration for the
+  eighth and final site (`resolver.py`), which v1.3.1 missed
+- Fixed the dirty-flag clobber that froze the pulsing NOW PLAYING dot and
+  the IDENTIFYING spinner after the initial palette transition (the v1.3.1
+  fix did not actually take effect)
+- Tightened `PlaySession.log_track` to refuse `DISCOGS_DATABASE` results
+  (release_id but no instance_id), preventing a guaranteed-to-fail Discogs
+  POST to `…/instances/None/fields/…` when only DB metadata was available
+- Renamed and flipped the misleading
+  `test_database_source_without_instance_id_does_not_increment` test that
+  documented the bug rather than catching it
+- Added HTTP timeouts on every Discogs API call and a timeout + atomic
+  rename on the cover-art download
+- Improved diagnostics: multi-match logging for `AudioCapture._find_device_index`,
+  DEBUG-level log when a recognition chunk is dropped
+- Normalized case + whitespace when comparing recognition results, so
+  Shazam formatting jitter doesn't trigger spurious re-commits
+- Bounded `_palette_cache` to 200 entries (LRU-ish eviction)
+- Snap `_current_palette` to the live interpolated value on mid-transition
+  track changes, so the new lerp doesn't jump back to a stale start
+- Adaptive render cadence (30 fps during palette transition, 10 fps
+  otherwise) for the pulsing dot animation, easing CPU load on the Pi
+- Fixed several documentation inaccuracies (CLAUDE.md `discogs.token`,
+  outdated PlaySession description, architecture-diagram LastFmClient
+  placement, current-state test count)
+- README now mentions the `venv` setup step
+- `sync-version-badge.yml` regex now handles hyphenated pre-release
+  versions like `1.4.0-rc1`
+- 210-test unit suite (+2 model-level regression tests covering the new
+  latching behavior)
 
 ---
 

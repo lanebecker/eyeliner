@@ -14,6 +14,132 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.3.2] — 2026-05-26
+
+**Bug-fix release — no new features.** Follow-up QA sweep of the v1.3.1
+codebase identified four real bugs (including one site the v1.3.1
+async-loop migration missed), four documentation inaccuracies, and nine
+smaller hardening opportunities. Everything was fixed in a single pass.
+Test count: 208 → 210 (two new model-level regression tests).
+
+### Fixed
+
+- **`resolver.py` was missed by the v1.3.1 `get_event_loop()` sweep**
+  (`src/metadata/resolver.py`). The v1.3.1 CHANGELOG enumerated four files
+  it swept; `resolver.py` was an eighth site that should have been included
+  and wasn't.  `MetadataResolver.resolve()` (line 35) still called
+  `asyncio.get_event_loop()` from inside a coroutine. Replaced with
+  `asyncio.get_running_loop()` to match the rest of the codebase.
+
+- **Dirty-flag clobber froze the pulsing dot and identifying spinner**
+  (`src/display/renderer.py`).  The v1.3.1 fix that set
+  `self._dirty = True` at the end of `_render_now_playing()` /
+  `_render_listening()` was immediately overwritten by `self._dirty = False`
+  one line later in the run loop, so the animation only ran during the 1s
+  palette transition and then froze.  Reset `_dirty` BEFORE calling
+  `_render()`, so the inner code can re-dirty for the next frame.
+
+- **`PlaySession.log_track` latched a release_id without an instance_id**
+  (`src/metadata/models.py`).  `DISCOGS_DATABASE` results legitimately have
+  `discogs_release_id` set but `discogs_instance_id = None` (the user
+  doesn't own that pressing).  The old guard `if release_id is None and
+  track.discogs_release_id:` accepted these, which meant `_end_session()`
+  later called `increment_play_count(release_id, None)` — building a
+  URL ending in `…/instances/None/fields/…` that Discogs guaranteed to
+  reject.  Tightened the guard to require BOTH IDs before latching.
+
+- **Misleading test name + assertion in `test_listen_tracker.py`** —
+  `test_database_source_without_instance_id_does_not_increment` was named
+  as if it asserted the call was suppressed, but the body asserted
+  `assert_called_once_with(12345, None)`, documenting the bug instead of
+  catching it.  Renamed to
+  `test_database_source_without_instance_id_does_not_call_increment` and
+  flipped the assertion to `assert_not_called()` for both
+  `increment_play_count` and `update_last_played`.
+
+- **Inaccurate `CLAUDE.md` config snippet** — listed `discogs.token` but
+  the actual key (used by `README.md`, `config.example.yaml`,
+  `docs/architecture.md`, `docs/pi-setup-guide.md`, and the code) is
+  `discogs.user_token`.  Corrected and expanded the snippet to include
+  the other commonly-needed keys (`play_count_field_name`,
+  `scrobble_enabled`, etc.) for accuracy.
+
+- **`CLAUDE.md` `PlaySession` description was out of date** — described
+  latching as "first Discogs-sourced track only," which under the new
+  tightened rule is misleading.  Updated to spell out that BOTH IDs are
+  required to latch, so DB-only results don't pre-empt the slot.
+
+- **Architecture diagram in `docs/architecture.md`** showed
+  `LastFmClient.love()` dangling under DisplayRenderer.  Re-grouped it
+  under ListenTracker, where it actually runs.
+
+### Added
+
+- **HTTP timeouts on every Discogs API call** (`src/metadata/discogs_client.py`).
+  Every `self._session.get` and `self._session.post` now passes
+  `timeout=15`.  The high-level `discogs_client.Client` (used for
+  `search()` and `release()` calls) gets matching limits via
+  `set_timeout(connect=5, read=15)`.  Previously, a flaky CDN connection or
+  a hung TCP socket could occupy an executor thread for minutes before the
+  OS-level timeout kicked in.
+
+- **Atomic, timeout-aware cover-art download**
+  (`src/display/renderer.py`).  Replaced `urllib.request.urlretrieve` with
+  a `requests.get(..., timeout=15, stream=True)` flow that writes to a
+  `tempfile.NamedTemporaryFile` in the cache directory and then
+  `os.replace`s into the final path.  No more half-written cache files
+  surviving a network drop or process kill; no more unbounded executor
+  thread occupancy.
+
+- **Improved audio-device matching diagnostics**
+  (`src/audio/capture.py`).  `_find_device_index` now logs all matching
+  candidates when more than one input device matches the configured
+  `device_name`, so users with multiple USB audio devices (e.g. UCA222 +
+  USB mic) can see which one was picked from the logs.
+
+- **Case- and whitespace-insensitive track comparison**
+  (`src/audio/recognizer.py`).  Added a `_same_track` helper that
+  `.strip().lower()`s title and artist before comparing.  Shazam
+  occasionally returns subtly different formatting for the same track
+  between chunks; without normalization those count as a new track and
+  trigger an unnecessary re-resolve / re-scrobble.
+
+- **Debug log when a recognition chunk is dropped**
+  (`src/audio/recognizer.py`).  `enqueue` used to silently drop chunks
+  when the queue was full; now it logs at DEBUG level so a "stopped
+  identifying tracks" complaint has a breadcrumb in the journal.
+
+- **Bounded `_palette_cache`** (`src/display/renderer.py`).  Added a
+  200-entry LRU-ish cap so the per-cover palette cache can't grow
+  unbounded over very long uptimes.  Re-running extraction on a cache
+  miss is cheap (~ms per album), so eviction is harmless.
+
+- **Mid-transition palette snap** (`src/display/renderer.py`).  If a new
+  track arrives before the previous 1s palette lerp completes,
+  `_queue_palette` now snaps `_current_palette` to the currently-rendered
+  interpolated value before reassigning the target — so the new lerp
+  starts from what the user is *currently seeing* instead of from a
+  stale base palette.
+
+- **Adaptive render cadence** (`src/display/renderer.py`).  The run loop
+  now sleeps `1/30s` only during a palette transition (smooth lerp); the
+  rest of the time it sleeps `1/10s`, plenty for the 0.8s pulsing dot
+  but easier on the Pi's CPU.
+
+- **README `venv` step** — added the standard `python3 -m venv venv` +
+  activate instructions to the Setup block, matching what
+  `docs/pi-setup-guide.md` already recommended.
+
+- **Hardened `sync-version-badge.yml` regex** — replaced `[^-]*` with a
+  pattern that survives hyphenated pre-release versions like `1.4.0-rc1`.
+
+- **Two new regression tests in `tests/test_models.py`** covering the
+  PlaySession latching tightening:
+  - `test_log_track_does_not_latch_database_source_without_instance_id`
+  - `test_log_track_database_then_collection_latches_collection_only`
+
+---
+
 ## [1.3.1] — 2026-05-25
 
 ### Fixed
