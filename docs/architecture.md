@@ -2,8 +2,9 @@
 
 A Raspberry Pi 4 listens to a turntable via a USB audio interface, identifies
 tracks using Shazam, looks up pressing details in Discogs, displays the
-now-playing info on an HDMI screen, increments the Play Count, and records the
-Last Played date in your Discogs collection when a full side plays through.
+now-playing info on an HDMI screen, scrobbles each track to Last.fm, increments
+the Play Count, and records the Last Played date in your Discogs collection when
+a full side plays through.
 
 ---
 
@@ -36,8 +37,11 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
              DisplayRenderer    DiscogsClient                         │
              (pygame, HDMI)     increment_play_count          ┌───────┴────────┐
                                 update_last_played            ▼                ▼
-                                                        PlayerState      ListenTracker
-                                                        .current_track   .log_track()
+                                LastFmClient.love()     PlayerState      ListenTracker
+                                (on completion)         .current_track   .log_track()
+                                                                              │
+                                                                    LastFmClient.scrobble()
+                                                                    (per committed track)
 ```
 
 ---
@@ -149,9 +153,11 @@ flickering on noisy or one-off wrong results.
 
 `_commit_track()` calls:
 - `state.set_raw(raw)` — stores the raw result
+- Records a Unix timestamp (`int(time.time())`) before the blocking resolve
 - `await resolver.resolve(raw)` — full metadata lookup
 - `state.set_track(metadata)` — updates display state
 - `await tracker.on_track_identified(metadata)` — logs to play session
+- `lastfm.scrobble(metadata, timestamp)` — fires in an executor (non-blocking); failure is caught and logged, never interrupts the main loop
 
 **Config keys:** `recognition.backend` (default `"shazamio"`),
 `recognition.confirmation_required` (default 2),
@@ -332,8 +338,7 @@ Manages the pygame window and renders state-appropriate screens at ~30 fps.
 **Screens:**
 
 | State | Screen |
-|-------|
---------|
+|-------|--------|
 | `IDLE` / `SESSION_ENDED` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
 | `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey |
 | `PLAYING` | Full "Museum Card" now-playing layout |
@@ -434,20 +439,71 @@ potential_last_track == True
 AND album_release_id is not None
     → discogs.increment_play_count(release_id, instance_id)
     → discogs.update_last_played(release_id, instance_id)  [if configured]
+    → lastfm.love(last_identified_track)                   [if love_on_completion=true]
 
 potential_last_track == True
 AND album_release_id is None
-    → skip (fallback metadata, not in collection)
+    → skip Discogs (fallback metadata, not in collection)
+    → lastfm.love(last_identified_track)                   [if love_on_completion=true]
 
 potential_last_track == False
     → skip (only Side A played, or recognition never reached the last track)
 ```
 
-The two Discogs updates are independent — a failure from `update_last_played`
-is logged as a warning but does not affect the Play Count result or vice versa.
+All three updates are independent — a failure from any one is logged as a
+warning and does not affect the others. The Last.fm love call runs regardless
+of whether the Discogs updates succeeded or failed.
 
-Conservative by design: neither field is updated unless the full side was
-confirmed played through to completion.
+Conservative by design: no field is updated unless the full side was confirmed
+played through to completion.
+
+---
+
+### `src/tracking/lastfm_client.py` — LastFmClient
+
+Wraps `pylast` to scrobble tracks and mark tracks as Loved on Last.fm.
+Synchronous (pylast is synchronous); async callers use `run_in_executor`,
+matching the `DiscogsClient` pattern.
+
+**Design principles:**
+- Graceful no-op when not configured, when credentials are incomplete, or when
+  `pylast` is not installed — no exception ever propagates out of this module
+- `pylast` is imported lazily inside the constructor (not at module level) so the
+  rest of the app can import cleanly even without pylast installed
+- All failures are caught internally and returned as `False`
+
+**`enabled` property:** `True` only when `self._network` was successfully
+initialised (i.e. all credentials present and `pylast.LastFMNetwork(...)` did
+not raise).
+
+**`scrobble(track, timestamp)`:**
+Called from `RecognitionLoop._commit_track()` for every confirmed track.
+
+```python
+self._network.scrobble(
+    artist=track.artist,
+    title=track.title,
+    timestamp=timestamp,          # Unix timestamp recorded before resolve()
+    album=track.album or None,    # empty string → None (pylast requirement)
+)
+```
+
+Returns `True` on success, `False` on any exception. Returns `True` immediately
+(no-op) if `enabled` is `False`.
+
+**`love(track)`:**
+Called from `ListenTracker._end_session()` when `potential_last_track` is `True`
+and `love_on_completion` is enabled in config.
+
+```python
+self._network.get_track(track.artist, track.title).love()
+```
+
+Returns `True` on success, `False` on any exception. Returns `True` immediately
+(no-op) if `enabled` is `False` or `love_on_completion` is `False`.
+
+**Config keys:** `lastfm.scrobble_enabled`, `lastfm.api_key`, `lastfm.api_secret`,
+`lastfm.session_key`, `lastfm.love_on_completion`
 
 ---
 
@@ -470,10 +526,11 @@ confirmed played through to completion.
 8. DisplayRenderer._render() cover art downloaded/cached, layout rendered
 ```
 
-### Side plays through → Discogs updated
+### Side plays through → Discogs + Last.fm updated
 
 ```
 1. RecognitionLoop           last track identified, committed
+                             → LastFmClient.scrobble(track, timestamp) [in executor]
 2. ListenTracker             session.log_track() → potential_last_track=True
                              album_release_id latched from first Discogs track
 3. Needle lifts              silence begins
@@ -481,11 +538,14 @@ confirmed played through to completion.
 5. ListenTracker._end_session()  potential_last_track + release_id present
                                  → DiscogsClient.increment_play_count()
                                  → DiscogsClient.update_last_played()  [if configured]
+                                 → LastFmClient.love(last_track)        [if love_on_completion=true]
 6. DiscogsClient             Play Count: GET current value, increment, POST new value
                              Last Played: POST today's ISO date
                              → HTTP 204 → return True
-7. main.py handler           PlayerState.clear() → status IDLE
-8. DisplayRenderer           idle screen
+7. LastFmClient              get_track(artist, title).love()
+                             → Last.fm API → return True
+8. main.py handler           PlayerState.clear() → status IDLE
+9. DisplayRenderer           idle screen
 ```
 
 ---
@@ -504,6 +564,11 @@ confirmed played through to completion.
 | `discogs.username` | — | Your Discogs username |
 | `discogs.play_count_field_name` | `"Play Count"` | Must match custom field name exactly (case-sensitive) |
 | `discogs.last_played_field_name` | _(optional)_ | If set, writes today's date (YYYY-MM-DD) to this custom field on completion |
+| `lastfm.scrobble_enabled` | `false` | Set to `true` to enable Last.fm scrobbling |
+| `lastfm.api_key` | — | From last.fm/api/account/create |
+| `lastfm.api_secret` | — | From last.fm/api/account/create |
+| `lastfm.session_key` | — | Generated once via `python get_lastfm_session_key.py`; does not expire |
+| `lastfm.love_on_completion` | `false` | If `true`, marks the last identified track as Loved on album completion |
 | `display.width` / `height` | `1024` / `600` | Waveshare 7" HDMI LCD (H) native resolution |
 | `display.fullscreen` | `true` | |
 | `display.dynamic_theming` | `true` | Extract 5-color palette from album art via Pillow; set `false` for fixed neutral dark theme |
@@ -529,7 +594,9 @@ confirmed played through to completion.
 | `src/state/player_state.py` | Central state, status transitions, change listeners |
 | `src/display/layouts.py` | Pixel geometry and font sizes (restyle here) |
 | `src/display/renderer.py` | pygame window, cover art cache, screen rendering |
-| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs field update trigger |
+| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs field update trigger, Last.fm love call |
+| `src/tracking/lastfm_client.py` | Last.fm scrobble and love — wraps pylast; graceful no-op when unconfigured |
+| `get_lastfm_session_key.py` | One-time desktop auth helper — generates a Last.fm session key to paste into config.yaml |
 
 ---
 
@@ -544,5 +611,5 @@ All source modules are complete. The only remaining work requires hardware:
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (193 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (208 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
