@@ -18,12 +18,15 @@ Implements the "Museum Card" layout from the Claude Design Direction A mockups:
 
 Color transitions lerp over ~1 second when a new track starts.
 Palettes are cached per cover art URL so extraction only runs once per album.
+Cover art is downloaded asynchronously (_prefetch_cover) so the render loop
+is never blocked by network I/O.
 """
 
 import asyncio
 import logging
 import os
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -222,9 +225,12 @@ class DisplayRenderer:
     def _on_state_change(self, state: PlayerState):
         """Called by PlayerState whenever anything changes."""
         self._dirty = True
-        # When a new track arrives, queue a palette transition
+        # When a new track arrives, queue a palette transition and prefetch cover art
         if state.status == PlayerStatus.PLAYING and state.current_track:
-            self._queue_palette(state.current_track.cover_art_url)
+            url = state.current_track.cover_art_url
+            self._queue_palette(url)
+            if url:
+                asyncio.create_task(self._prefetch_cover(url))
 
     # -----------------------------------------------------------------------
     # Async render loop
@@ -403,6 +409,9 @@ class DisplayRenderer:
 
         self._draw_prev_next(layout, p, track)
 
+        # Keep re-rendering so the pulsing NOW PLAYING dot stays animated.
+        self._dirty = True
+
     def _draw_header(self, layout: NowPlayingLayout, p: DisplayPalette, track):
         """Draw the full-width header strip: NOW PLAYING dot + SIDE info."""
         import pygame
@@ -476,7 +485,8 @@ class DisplayRenderer:
             if x + chip_w > x0 + rect.w and x > x0:
                 x = x0
                 y += chip_h + gap
-                if y + chip_h > rect.y + rect.h + chip_h:
+                # Stop if the new row's bottom would exceed the bounding box.
+                if y + chip_h > rect.y + rect.h:
                     break  # Out of room
 
             # Draw border rect (sharp corners per design)
@@ -515,7 +525,7 @@ class DisplayRenderer:
             label = label_font.render("NEXT →", True, p.muted)
             lx = strip.x + half_w + 8
             self._screen.blit(label, (lx, strip.y))
-            name = name_font.render(nxt, True, (*p.text[:3],))
+            name = name_font.render(nxt, True, p.text)
             clip_w = half_w - 8
             self._screen.blit(name, (lx, strip.y + label.get_height() + 4), area=(0, 0, clip_w, name.get_height()))
 
@@ -692,7 +702,7 @@ class DisplayRenderer:
             target = self._palette_cache[cover_url]
         else:
             # Extraction happens synchronously here; cover art is already cached
-            # on disk from _load_cover(), so no network I/O.
+            # on disk from _prefetch_cover(), so no network I/O.
             cache_key = self._url_to_cache_key(cover_url)
             cache_path = self.cache_dir / cache_key
             if cache_path.exists():
@@ -714,20 +724,49 @@ class DisplayRenderer:
         return _lerp_palette(self._current_palette, self._target_palette, t)
 
     # -----------------------------------------------------------------------
-    # Cover art loading
+    # Cover art — async fetch + sync load from cache
     # -----------------------------------------------------------------------
 
     def _url_to_cache_key(self, url: str) -> str:
         import hashlib
         return hashlib.md5(url.encode()).hexdigest() + ".jpg"
 
-    def _load_cover(self, url: Optional[str], w: int, h: int):
-        """Load and scale cover art from URL, with local file cache.
+    async def _prefetch_cover(self, url: str):
+        """Download cover art to the local cache without blocking the render loop.
 
-        Side effect: if the cover is downloaded fresh, _queue_palette is called
-        so palette extraction can run against the newly saved file.
+        Scheduled via asyncio.create_task() from _on_state_change() so the
+        download runs in a thread-pool executor and never stalls the event loop.
+        Once the file is written, palette extraction is (re-)queued and the
+        display is marked dirty so the next frame picks up the fresh image.
         """
-        import urllib.request
+        cache_key = self._url_to_cache_key(url)
+        cache_path = self.cache_dir / cache_key
+        if cache_path.exists():
+            return  # Already cached — nothing to do
+
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                urllib.request.urlretrieve,
+                url,
+                str(cache_path),
+            )
+            log.debug(f"Cover art cached: {cache_path.name}")
+            # File is now on disk — extract palette and trigger a redraw
+            if self.dynamic_theming:
+                self._queue_palette(url)
+            self._dirty = True
+        except Exception as e:
+            log.warning(f"Failed to download cover art from {url}: {e}")
+
+    def _load_cover(self, url: Optional[str], w: int, h: int):
+        """Load and scale cover art from the local file cache.
+
+        Returns None if the URL is absent or the file hasn't been downloaded
+        yet — _prefetch_cover() handles the async download and will set
+        self._dirty = True once the file arrives.
+        """
         import pygame
 
         if not url:
@@ -735,19 +774,8 @@ class DisplayRenderer:
 
         cache_key = self._url_to_cache_key(url)
         cache_path = self.cache_dir / cache_key
-        fresh = False
-
         if not cache_path.exists():
-            try:
-                urllib.request.urlretrieve(url, cache_path)
-                fresh = True
-            except Exception as e:
-                log.warning(f"Failed to download cover art: {e}")
-                return None
-
-        # If just downloaded, kick off palette extraction now that the file exists
-        if fresh and self.dynamic_theming:
-            self._queue_palette(url)
+            return None
 
         try:
             img = pygame.image.load(str(cache_path)).convert()
