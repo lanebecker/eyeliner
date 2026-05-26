@@ -14,6 +14,78 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.3.1] — 2026-05-25
+
+### Fixed
+
+- **`asyncio.get_event_loop()` deprecated calls** — seven calls to the
+  deprecated `asyncio.get_event_loop()` inside coroutines were replaced with
+  `asyncio.get_running_loop()` across four files. `get_event_loop()` emits a
+  `DeprecationWarning` in Python 3.10+ and raises `RuntimeError` in some
+  contexts; `get_running_loop()` is the correct API inside a running event loop
+  and raises `RuntimeError` immediately if called outside one, making bugs
+  easier to catch.
+  - `src/audio/capture.py` — `run()` coroutine (×1)
+  - `src/audio/recognizer.py` — `_commit_track()` coroutine (×2, executor call
+    for Last.fm scrobble)
+  - `src/tracking/listen_tracker.py` — `_end_session()` coroutine (×3, all
+    three `run_in_executor` calls for Discogs and Last.fm)
+  - `main.py` — `shutdown()` coroutine (×1, `loop.stop()`)
+
+- **ShazamIO album extraction nested-loop break** (`src/audio/recognizer.py`) —
+  the `break` inside the inner `metadata` loop only exited the metadata
+  iteration, not the outer `sections` loop. On multi-section Shazam responses,
+  the code continued iterating through additional sections and could overwrite a
+  valid album name with an empty string. Added a guard after the inner loop so
+  the outer loop also exits once a non-empty album value is found.
+
+- **Blocking cover-art download in async event loop**
+  (`src/display/renderer.py`) — `urllib.request.urlretrieve()` was called
+  synchronously inside `_load_cover()`, which runs on the main thread of the
+  async event loop. This blocked audio capture, recognition, and all other
+  async tasks for the duration of the HTTP download on each new track. Fixed by
+  splitting responsibilities: `_load_cover()` now reads only from the disk
+  cache and returns `None` immediately on a cache miss; a new
+  `_prefetch_cover(url)` async method downloads the file in a thread-pool
+  executor (`run_in_executor`) and is scheduled via `asyncio.create_task()`
+  from `_on_state_change()`. Cover art loads asynchronously; a brief
+  placeholder is shown if the cache miss occurs.
+
+- **Pulsing NOW PLAYING dot froze after ~1 second**
+  (`src/display/renderer.py`) — the animated `●` dot in the header strip is
+  driven by `time.monotonic()` inside `_render_now_playing()`, but `_dirty`
+  was never set to `True` after the initial render, so the render loop went
+  idle and the animation froze. Added `self._dirty = True` at the end of
+  `_render_now_playing()` to keep the loop re-rendering while the now-playing
+  screen is active.
+
+- **Genre chip overflow allowed an extra row** (`src/display/renderer.py`) —
+  the bounding-box overflow check in the chip grid renderer used
+  `y + chip_h > rect.y + rect.h + chip_h`, which permitted chips to overflow
+  by a full `chip_h` before breaking. Changed to `y + chip_h > rect.y + rect.h`
+  to clip correctly at the panel boundary.
+
+- **Inconsistent color tuple for NEXT track label**
+  (`src/display/renderer.py`) — the NEXT track name was rendered with
+  `(*p.text[:3],)` (an unpacked 3-element slice wrapped in a tuple) while the
+  PREV track name used `p.text` directly. Both are semantically identical when
+  `p.text` is already a 3-tuple, but the NEXT label form was inconsistent and
+  fragile if `DisplayPalette.text` were ever changed to a longer tuple. Changed
+  to `p.text` to match the PREV label.
+
+- **Wrong Last.fm auth URL in `get_lastfm_session_key.py`** — the help text
+  printed at startup referenced `https://www.last.fm/api/accounts`, which
+  returns a 404. Corrected to `https://www.last.fm/api/account/create`.
+
+- **Negative sleep duration in `AudioCapture.run()`**
+  (`src/audio/capture.py`) — if `overlap_seconds >= chunk_seconds` (a
+  pathological but reachable config combination), `chunk_seconds -
+  overlap_seconds` is negative and `asyncio.sleep()` raises a `ValueError`.
+  The duration is now clamped: `await asyncio.sleep(max(0, chunk_seconds -
+  overlap_seconds))`.
+
+---
+
 ## [1.3.0] — 2026-05-25
 
 ### Added
