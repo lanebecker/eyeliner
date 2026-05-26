@@ -12,7 +12,7 @@ Geometry derived from DirectionA.jsx at 1024×600:
   ├─────────────────────────────────────────────────────────────────┤
   │        │                                                         │
   │        │  Catholic Block                                         │ ← track (hero, 72px bold)
-  │ cover  │  ──────────────────                                       │ ← accent divider (2px)
+  │ cover  │  ────────────────                                       │ ← accent divider (2px)
   │  art   │  Sonic Youth                                            │ ← artist (48px)
   │ 440×440│  Sister                                                 │ ← album (32px italic serif)
   │        │  [Noise Rock] [Alt Rock] [Post-Punk]                   │ ← genre chips (12px mono)
@@ -104,6 +104,8 @@ def get_now_playing_layout(width: int, height: int) -> NowPlayingLayout:
     content_h = 600 - MARGIN_TOP - MARGIN_BOT      # 500
 
     # Vertical rhythm within the text panel (reference pixels):
+    # The track title gets the biggest slice — up to ~2 wrapped lines at 72px.
+    # Everything below it flows downward; meta + prev/next anchor from the bottom.
     track_y  = content_y + 6
     track_h  = int(content_h * 0.34)    # ~170px (room for 2 wrapped lines)
 

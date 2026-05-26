@@ -65,6 +65,7 @@ def mock_coverart():
 @pytest.fixture
 def resolver(mock_discogs, mock_coverart):
     """Build a MetadataResolver with injected mock clients."""
+    # Import here to avoid triggering real client instantiation at module load
     from src.metadata.resolver import MetadataResolver
     r = MetadataResolver.__new__(MetadataResolver)
     r.discogs = mock_discogs
@@ -290,6 +291,7 @@ async def test_resolve_always_returns_track_metadata(resolver, mock_discogs, moc
     from src.metadata.models import TrackMetadata
     mock_discogs.search_collection.side_effect = Exception("boom")
     mock_discogs.search_database.side_effect = Exception("boom")
+    # Cover art fallback succeeds (returns None when nothing found — normal behaviour)
     mock_coverart.get_cover_art_url.return_value = None
 
     result = await resolver.resolve(make_raw())
