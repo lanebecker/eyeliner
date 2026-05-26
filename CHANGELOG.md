@@ -28,10 +28,13 @@ new version heading when VERSION is bumped._
   reached, correctly stitching sides together. A track that is genuinely first
   globally still returns `None` for `prev_track_title`; a track that is genuinely
   last globally still returns `None` for `next_track_title`.
-- 1 new unit test (`test_prev_track_cross_side_b1_returns_last_of_a`) and 1 new
-  unit test (`test_next_track_cross_side_last_a_returns_first_of_b`) cover the
-  fixed behaviour; 3 related tests were also added or renamed for clarity.
-  Total unit test count: 192 → 193.
+- New unit tests cover the fixed behaviour:
+  `test_prev_track_cross_side_b1_returns_last_of_a` (B1 prev → A3),
+  `test_next_track_cross_side_last_a_returns_first_of_b` (A3 next → B1),
+  `test_prev_track_very_first_track_is_none` (A1 has no predecessor),
+  and `test_next_track_very_last_track_is_none` (B4 has no successor).
+  Several pre-existing boundary tests were renamed for specificity; net
+  test count: 192 → 193.
 
 ---
 

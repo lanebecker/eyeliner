@@ -114,7 +114,7 @@ lifecycle events.
 **Events emitted (`AudioEvent` enum):**
 
 | Event | Meaning |
-|-------|----------|
+|-------|---------|
 | `MUSIC_STARTED` | First above-threshold chunk after silence |
 | `MUSIC_STOPPED` | RMS drops below threshold (inter-track gap or lift) |
 | `SESSION_ENDED` | Silence sustained for `session_end_silence_seconds` |
@@ -294,16 +294,28 @@ Key fields: `started_at`, `identified_tracks`, `potential_last_track`,
 Central in-memory state. Single source of truth for the display and all
 components that need to know what's currently playing.
 
-**`PlayerStatus`** (enum) and transitions:
+**`PlayerStatus`** (enum) — four values:
+
+| Value | Meaning |
+|-------|---------|
+| `IDLE` | Startup state, or after a session completes |
+| `LISTENING` | Music detected, awaiting first recognition |
+| `PLAYING` | Track identified and displayed |
+| `SESSION_ENDED` | Defined in the enum for renderer compatibility; not explicitly set by `main.py` in the current flow (see below) |
+
+Transitions:
 
 ```
 IDLE ──(MUSIC_STARTED)──→ LISTENING ──(track committed)──→ PLAYING
   ↑                                                            │
-  └──────────────(SESSION_ENDED / clear())────────────────────┘
+  └──────────────(SESSION_ENDED AudioEvent / clear())─────────┘
 ```
 
-`SESSION_ENDED` sets status back to `IDLE` via `state.clear()` (called in
-`main.py`'s silence event handler).
+When `SESSION_ENDED` fires as an `AudioEvent`, `main.py` calls `state.clear()`
+which transitions directly to `IDLE`. The `PlayerStatus.SESSION_ENDED` enum
+value is not currently set on this path, but the renderer handles it explicitly
+(alongside `IDLE`) so that any future code that does set it will render the
+idle screen rather than a blank frame.
 
 **Fields:** `status`, `current_track: Optional[TrackMetadata]`,
 `current_raw: Optional[RawRecognitionResult]`
@@ -320,7 +332,8 @@ Manages the pygame window and renders state-appropriate screens at ~30 fps.
 **Screens:**
 
 | State | Screen |
-|-------|--------|
+|-------|
+--------|
 | `IDLE` / `SESSION_ENDED` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
 | `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey |
 | `PLAYING` | Full "Museum Card" now-playing layout |

@@ -149,8 +149,7 @@ Key cases:
 - `DisplayPalette` fields round-trip correctly; `FALLBACK_PALETTE` is a valid `DisplayPalette` with very dark `bg`
 - `_SIDE_RE` matches standard (`"A1"`) and multi-digit (`"B12"`) positions; does not match numeric-only strings
 - `genres` field defaults to `[]` and stores values correctly
-- Side-awareness properties (`side_letter`, `side_position`, `side_total`, `prev_track_title`, `next_track_title`) using the Sonic Youth *Sister* tracklist (A1–A3, B1–B4): correct side grouping, 1-indexed positions, `None` at boundaries, `None` for unknown tracks or numeric-only position strings
-- Cross-side boundary stitching: B1's `prev_track_title` correctly returns the last track of Side A; A3's `next_track_title` correctly returns the first track of Side B
+- Side-awareness properties (`side_letter`, `side_position`, `side_total`, `prev_track_title`, `next_track_title`) using the Sonic Youth *Sister* tracklist (A1–A3, B1–B4): correct side grouping, 1-indexed positions, cross-side stitching at side boundaries (e.g. B1's `prev_track_title` returns A3; A3's `next_track_title` returns B1), `None` only for the globally first or last track, `None` for unknown tracks or numeric-only position strings
 
 ### `test_silence.py` — Silence detection
 
