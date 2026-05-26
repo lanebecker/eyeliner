@@ -14,6 +14,59 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.3.0] — 2026-05-25
+
+### Added
+
+- **Last.fm scrobbling** — every track confirmed by the recognition loop is
+  automatically scrobbled to Last.fm. Scrobbles include artist, title, album,
+  and the Unix timestamp of when the track was committed. Enabled via the new
+  `lastfm.scrobble_enabled` config key (default `false`).
+- **"Loved" mark on album completion** — when `love_on_completion: true` is
+  set in config and a full album side plays through (i.e. `potential_last_track`
+  fires), the last identified track is marked as Loved on Last.fm. Off by
+  default. Failure is non-fatal and logged as a warning.
+- **`src/tracking/lastfm_client.py`** — new `LastFmClient` class wrapping
+  `pylast`. Synchronous (pylast is synchronous); async callers use
+  `run_in_executor`, matching the `DiscogsClient` pattern. Graceful no-op when
+  not configured or when pylast is not installed. No exception ever propagates
+  out of this module — every failure is caught and returned as `False`.
+- **`get_lastfm_session_key.py`** — one-time helper script at the repo root.
+  Walks through the Last.fm desktop auth flow (token → browser approval →
+  session key), then prints the session key to paste into `config.yaml`. The
+  session key does not expire; the script only needs to be run once.
+- New `lastfm` section in `config.example.yaml`:
+  `scrobble_enabled`, `api_key`, `api_secret`, `session_key`, `love_on_completion`.
+- **`pylast>=5.1.0`** added to `requirements.txt`.
+- **15 new unit tests** in `tests/test_lastfm_client.py` covering: disabled
+  config, missing config section, incomplete credentials, pylast ImportError,
+  scrobble happy path, empty album → `None`, scrobble when disabled, scrobble
+  exception handling, love happy path, love disabled by config, love when
+  client disabled, love exception handling, `enabled` property, `love_on_completion`
+  property, and full-credentials → enabled.
+  Total unit test count: 193 → 208.
+
+### Changed
+
+- `RecognitionLoop.__init__` — accepts an optional `lastfm: LastFmClient`
+  parameter (default `None`; backward-compatible).
+- `RecognitionLoop._commit_track()` — records a Unix timestamp before
+  resolving metadata, then fires `lastfm.scrobble()` in an executor after
+  updating state and tracker. Scrobble failure is caught and logged; it never
+  interrupts the main loop.
+- `ListenTracker.__init__` — accepts an optional `lastfm: LastFmClient`
+  parameter (default `None`; backward-compatible).
+- `ListenTracker._end_session()` — after the Discogs Play Count and Last
+  Played updates, calls `lastfm.love()` on the last identified track when
+  `love_on_completion` is enabled. Independent of Discogs: a Discogs failure
+  does not prevent the love call.
+- `main.py` — constructs `LastFmClient(config)` at startup and injects it
+  into both `ListenTracker` and `RecognitionLoop`.
+- Module docstring for `listen_tracker.py` updated to document the Last.fm
+  love step in the session-end logic.
+
+---
+
 ## [1.2.2] — 2026-05-25
 
 ### Fixed

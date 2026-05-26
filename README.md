@@ -1,10 +1,10 @@
 # vinyl-now-playing
 
-[![version](https://img.shields.io/badge/version-1.2.2-blueviolet)](VERSION)
+[![version](https://img.shields.io/badge/version-1.3.0-blueviolet)](VERSION)
 
 A Raspberry Pi app that listens to a vinyl record playing through a USB audio interface, identifies the current track via audio fingerprinting, enriches it with metadata from your Discogs collection, and displays the artist, album, track name, and cover art on an HDMI-connected LCD screen.
 
-When the last track of an album finishes, it automatically increments the Play Count and records the Last Played date for that record in your Discogs collection.
+When the last track of an album finishes, it automatically increments the Play Count and records the Last Played date for that record in your Discogs collection, and scrobbles the session to Last.fm.
 
 ## Features
 
@@ -14,6 +14,8 @@ When the last track of an album finishes, it automatically increments the Play C
 - 🎨 Dynamic color theming — palette extracted from each album's cover art; background, accent, and text colors shift per record with a smooth 1-second transition
 - ✅ Automatically increments Play Count in Discogs when the last track plays
 - 📅 Optionally records Last Played date (ISO 8601) in a Discogs custom field
+- 🎧 Last.fm scrobbling — every identified track posted to your listening history automatically
+- ❤️ Optional Last.fm "Loved" mark when a full album side completes (configurable, off by default)
 - 🔄 Graceful fallback: Discogs collection → Discogs database → MusicBrainz
 - 🔧 Swappable recognition backend (ShazamIO, ACRCloud, AudD)
 
@@ -43,6 +45,7 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 - `audio.device_name` — run `python -c "import sounddevice; print(sounddevice.query_devices())"` to find your USB interface name
 - `discogs.play_count_field_name` — the exact name of your Play Count custom field (default: `"Play Count"`)
 - `discogs.last_played_field_name` — optional; the exact name of a Last Played custom field in your Discogs collection. If set, today's date is written in `YYYY-MM-DD` format on each album completion.
+- `lastfm.scrobble_enabled` — set to `true` to enable Last.fm scrobbling; also fill in `api_key`, `api_secret`, and `session_key`. Run `python get_lastfm_session_key.py` to generate your session key.
 
 ## Documentation
 

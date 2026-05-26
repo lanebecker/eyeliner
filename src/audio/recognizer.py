@@ -6,6 +6,7 @@ ACRCloud, or AudD can be swapped via config without touching this file.
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
@@ -15,6 +16,7 @@ import numpy as np
 if TYPE_CHECKING:
     from src.metadata.resolver import MetadataResolver
     from src.state.player_state import PlayerState
+    from src.tracking.lastfm_client import LastFmClient
     from src.tracking.listen_tracker import ListenTracker
 
 log = logging.getLogger(__name__)
@@ -96,11 +98,13 @@ class RecognitionLoop:
         state: "PlayerState",
         resolver: "MetadataResolver",
         tracker: "ListenTracker",
+        lastfm: Optional["LastFmClient"] = None,
     ):
         self.config = config["recognition"]
         self.state = state
         self.resolver = resolver
         self.tracker = tracker
+        self.lastfm = lastfm
         self.poll_interval: int = self.config["poll_interval_seconds"]
         self.confirmation_required: int = self.config.get("confirmation_required", 2)
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
@@ -168,8 +172,9 @@ class RecognitionLoop:
             self._pending_count = 0
 
     async def _commit_track(self, raw: RawRecognitionResult):
-        """Resolve full metadata and update state + tracker."""
+        """Resolve full metadata and update state + tracker + Last.fm scrobble."""
         self.state.set_raw(raw)
+        timestamp = int(time.time())
         metadata = await self.resolver.resolve(raw)
         self.state.set_track(metadata)
         await self.tracker.on_track_identified(metadata)
@@ -177,3 +182,10 @@ class RecognitionLoop:
             f"Now playing: {metadata.artist} / {metadata.album} / "
             f"{metadata.title} [{metadata.source.name}]"
         )
+        if self.lastfm:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self.lastfm.scrobble, metadata, timestamp
+                )
+            except Exception as e:
+                log.warning(f"Last.fm scrobble error: {e}")

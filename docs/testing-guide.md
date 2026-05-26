@@ -58,6 +58,7 @@ cp config.example.yaml config.yaml
 | `tests/test_silence.py` | Silence detector state machine | No | No |
 | `tests/test_listen_tracker.py` | Last-track detection & Discogs update logic | No | No |
 | `tests/test_discogs_client.py` | DiscogsClient Play Count & Last Played logic | No | No |
+| `tests/test_lastfm_client.py` | LastFmClient scrobble & love logic | No | No |
 | `tests/test_resolver.py` | 3-step metadata fallback chain | No | No |
 | `tests/test_recognizer.py` | Recognition loop confirmation logic | No | No |
 | `tests/test_layouts.py` | Display layout geometry | No | No |
@@ -79,14 +80,15 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 193 items
+collected 208 items
 
-tests/test_discogs_client.py .....................                          [ 11%]
-tests/test_layouts.py ....................................                  [ 29%]
+tests/test_discogs_client.py .....................                          [ 10%]
+tests/test_lastfm_client.py ...............                                [ 17%]
+tests/test_layouts.py ....................................                  [ 31%]
 tests/test_listen_tracker.py ....................                           [ 40%]
 tests/test_models.py ............................................             [ 62%]
-tests/test_recognizer.py .................                                  [ 71%]
-tests/test_resolver.py ......................                               [ 83%]
+tests/test_recognizer.py .................                                  [ 70%]
+tests/test_resolver.py ......................                               [ 81%]
 tests/test_silence.py ......................                                [100%]
 
 =============================== warnings summary ===============================
@@ -95,7 +97,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 193 passed in 0.34s ==============================
+============================== 208 passed in 0.34s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -107,6 +109,7 @@ pytest tests/test_models.py
 pytest tests/test_silence.py
 pytest tests/test_listen_tracker.py
 pytest tests/test_discogs_client.py
+pytest tests/test_lastfm_client.py
 pytest tests/test_resolver.py
 pytest tests/test_recognizer.py
 pytest tests/test_layouts.py
@@ -218,6 +221,25 @@ Key cases — _get_field_value:
 - **Non-200 GET:** returns `None`
 - **Field not in notes:** returns `None`
 
+### `test_lastfm_client.py` — Last.fm scrobble & love logic
+
+Mocks `pylast` at the `sys.modules` level so no real network calls are made.
+No Last.fm account required.
+
+Key cases:
+- **Disabled config:** `scrobble_enabled: false` → `enabled` is `False`; `scrobble()` and `love()` return `True` (no-op)
+- **Missing config section:** no `lastfm` key in config → no crash, not enabled
+- **Incomplete credentials:** any of `api_key`, `api_secret`, or `session_key` absent → warns, not enabled
+- **pylast not installed:** `ImportError` during import → warns, not enabled, no crash
+- **scrobble happy path:** calls `network.scrobble(artist, title, timestamp, album)` with correct args, returns `True`
+- **Empty album → `None`:** `track.album == ""` → `album=None` passed to pylast (not empty string)
+- **scrobble exception:** pylast raises → returns `False`, does not propagate
+- **love happy path:** calls `network.get_track(artist, title).love()`, returns `True`
+- **love_on_completion=False:** `love()` is a no-op returning `True`; `get_track` never called
+- **love exception:** pylast raises → returns `False`, does not propagate
+- **enabled property:** `True` only when all credentials present and network initialised
+- **love_on_completion property:** reflects `love_on_completion` from config
+
 ### `test_resolver.py` — Metadata fallback chain
 
 Injects mock `DiscogsClient` and `CoverArtFallback` into `MetadataResolver`.
@@ -324,7 +346,7 @@ TEST 4: Collection custom fields
 ### Output symbols
 
 | Symbol | Meaning |
-|--------|---------|
+|--------|----------|
 | `✓` | Passed — got expected data |
 | `✗` | Failed — API error or unexpected response |
 | `·` | Skipped — e.g. *Sister* not in your collection; collection-specific tests N/A |

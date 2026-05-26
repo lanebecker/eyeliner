@@ -108,7 +108,7 @@ the title cannot fit even with the full available budget.
 - `_draw_genre_chips()` accepts an optional `chips_rect` override for dynamic positioning
 - New `_bold_fonts` dict pre-built at startup with stepped-down bold title sizes
 
-### v1.2.2 ✅ (current)
+### v1.2.2 ✅
 
 **Cross-side boundary fix for `prev_track_title` / `next_track_title`** — the
 side-awareness properties now correctly stitch across side boundaries. Previously,
@@ -122,31 +122,26 @@ consulted as a fallback whenever a side boundary is hit.
 
 ---
 
-## v1.3.0 — Last.fm Scrobbling
+## v1.3.0 — Last.fm Scrobbling ✅ (current)
 
-**Why third:** highest value-to-effort ratio of any remaining feature on the
-list. Last.fm builds a permanent, queryable listening history. For vinyl
-listeners this is especially satisfying — nothing else does it automatically.
-The `ListenTracker` already has the right hooks; this is mostly a new client
-module.
+**208-test unit suite** (+15 tests in `tests/test_lastfm_client.py`).
 
-**What it adds:**
-- New `src/tracking/lastfm_client.py` — wraps the Last.fm Scrobbling API 2.0
+**What shipped:**
+- New `src/tracking/lastfm_client.py` — wraps `pylast` (Last.fm Scrobbling
+  API 2.0). Synchronous; async callers use `run_in_executor`. Graceful no-op
+  when not configured or when `pylast` is not installed. All failures caught
+  internally — no exception ever propagates out.
 - Per-track scrobble fired from `RecognitionLoop._commit_track()` when a track
-  is confirmed (includes timestamp, artist, title, album)
-- Optional "loved" mark when `ListenTracker._end_session()` fires and
-  `potential_last_track` is True (configurable, off by default)
-- New `lastfm` section in `config.yaml`: `api_key`, `api_secret`, `session_key`
-
-**Config addition:**
-```yaml
-lastfm:
-  api_key: "YOUR_API_KEY"
-  api_secret: "YOUR_API_SECRET"
-  session_key: "YOUR_SESSION_KEY"   # generated once via auth flow
-  scrobble_enabled: true
-  love_on_completion: false
-```
+  is confirmed. Scrobble includes timestamp, artist, title, and album.
+- Optional "Loved" mark when `ListenTracker._end_session()` fires with
+  `potential_last_track = True` — configurable via `love_on_completion`,
+  off by default.
+- `get_lastfm_session_key.py` — one-time helper at the repo root that walks
+  through the desktop auth flow and prints the session key to paste into
+  `config.yaml`. Session keys do not expire.
+- New `lastfm` section in `config.example.yaml`:
+  `scrobble_enabled`, `api_key`, `api_secret`, `session_key`, `love_on_completion`.
+- `pylast>=5.1.0` added to `requirements.txt`.
 
 ---
 

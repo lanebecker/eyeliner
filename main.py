@@ -17,6 +17,7 @@ from src.audio.recognizer import RecognitionLoop
 from src.metadata.resolver import MetadataResolver
 from src.display.renderer import DisplayRenderer
 from src.state.player_state import PlayerState, PlayerStatus
+from src.tracking.lastfm_client import LastFmClient
 from src.tracking.listen_tracker import ListenTracker
 
 logging.basicConfig(
@@ -51,10 +52,11 @@ async def main():
 
     state = PlayerState()
     resolver = MetadataResolver(config)
-    tracker = ListenTracker(config, resolver)
+    lastfm = LastFmClient(config)
+    tracker = ListenTracker(config, resolver, lastfm)
     display = DisplayRenderer(config, state)
     silence = SilenceDetector(config)
-    recognizer = RecognitionLoop(config, state, resolver, tracker)
+    recognizer = RecognitionLoop(config, state, resolver, tracker, lastfm)
     capture = AudioCapture(config, silence, recognizer)
 
     # Wire silence events into state and tracker
