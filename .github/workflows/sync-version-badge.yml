@@ -40,9 +40,14 @@ jobs:
           fi
 
       - name: Update badge URL in README
+        # The badge URL is .../badge/version-<VERSION>-blueviolet.  We anchor the
+        # match between the literal "version-" prefix and the literal "-blueviolet"
+        # suffix using sed's negated-class trick: `[^"<)]*` swallows anything that
+        # isn't a URL terminator (quote, angle, paren).  This survives hyphenated
+        # versions like "1.4.0-rc1" that the older `[^-]*` pattern truncated.
         run: |
-          sed -i \
-            's|https://img.shields.io/badge/version-[^-]*-blueviolet|https://img.shields.io/badge/version-${{ steps.ver.outputs.version }}-blueviolet|g' \
+          sed -i -E \
+            's|(https://img\.shields\.io/badge/version-)[^"<)]*(-blueviolet)|\1${{ steps.ver.outputs.version }}\2|g' \
             README.md
 
       - name: Commit if README changed

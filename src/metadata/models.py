@@ -209,7 +209,15 @@ class PlaySession:
         self.identified_tracks.append(track)
         if track.is_last_track:
             self.potential_last_track = True
-        # Latch the release/instance IDs from the first Discogs-sourced track
-        if self.album_release_id is None and track.discogs_release_id:
+        # Latch the release/instance IDs from the first collection-sourced track.
+        # We require BOTH release_id and instance_id to be set — a release_id alone
+        # (which is what DISCOGS_DATABASE returns) is not enough to call the
+        # collection field update endpoint, since the endpoint URL needs the
+        # instance_id of the user's specific copy.
+        if (
+            self.album_release_id is None
+            and track.discogs_release_id
+            and track.discogs_instance_id
+        ):
             self.album_release_id = track.discogs_release_id
             self.album_instance_id = track.discogs_instance_id

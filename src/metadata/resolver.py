@@ -32,7 +32,7 @@ class MetadataResolver:
 
     async def resolve(self, raw: "RawRecognitionResult") -> TrackMetadata:
         """Run the full lookup chain. Always returns a TrackMetadata."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Step 1: User's Discogs collection
         try:

@@ -33,15 +33,32 @@ class AudioCapture:
         self.device_name: str = self.config["device_name"]
 
     def _find_device_index(self) -> int:
-        """Look up the sounddevice index for the configured device name."""
+        """Look up the sounddevice index for the configured device name.
+
+        Matching is case-insensitive substring against the device name.  If
+        more than one input device matches, the first is used but ALL matches
+        are logged — multi-USB-audio setups (e.g. UCA222 + a USB mic) can be
+        diagnosed from the logs without having to guess which one got picked.
+        """
         devices = sd.query_devices()
-        for i, device in enumerate(devices):
+        matches = [
+            (i, device) for i, device in enumerate(devices)
             if (
                 self.device_name.lower() in device["name"].lower()
                 and device["max_input_channels"] > 0
-            ):
-                log.info(f"Using audio device [{i}]: {device['name']}")
-                return i
+            )
+        ]
+        if matches:
+            if len(matches) > 1:
+                others = ", ".join(f"[{i}] {d['name']}" for i, d in matches[1:])
+                log.warning(
+                    f"Multiple input devices match '{self.device_name}'. "
+                    f"Using the first; others were: {others}. "
+                    f"Tighten audio.device_name in config.yaml if this is wrong."
+                )
+            i, device = matches[0]
+            log.info(f"Using audio device [{i}]: {device['name']}")
+            return i
         available = [d["name"] for d in devices if d["max_input_channels"] > 0]
         raise ValueError(
             f"Audio device '{self.device_name}' not found. "

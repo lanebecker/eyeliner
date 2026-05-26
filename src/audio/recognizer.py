@@ -125,9 +125,21 @@ class RecognitionLoop:
         raise ValueError(f"Unknown recognition backend: '{backend_name}'")
 
     async def enqueue(self, audio: np.ndarray, sample_rate: int):
-        """Called by AudioCapture to hand off a chunk for recognition."""
+        """Called by AudioCapture to hand off a chunk for recognition.
+
+        If the recognition queue is full (Shazam is taking longer than capture
+        is producing), drop the chunk rather than blocking the capture loop.
+        Dropped chunks are logged at debug level so a "stopped identifying"
+        complaint has a breadcrumb in the journal.
+        """
         if not self._audio_queue.full():
             await self._audio_queue.put((audio, sample_rate))
+        else:
+            log.debug(
+                "Recognition queue full (maxsize=%d); dropping a chunk. "
+                "If this happens consistently, recognition is slower than capture.",
+                self._audio_queue.maxsize,
+            )
 
     async def run(self):
         """Main recognition loop."""
@@ -145,6 +157,22 @@ class RecognitionLoop:
                 log.error(f"Recognition loop error: {e}")
                 await asyncio.sleep(2)
 
+    @staticmethod
+    def _same_track(a: Optional[RawRecognitionResult], b: Optional[RawRecognitionResult]) -> bool:
+        """Compare two recognition results case- and whitespace-insensitively.
+
+        Shazam occasionally returns subtly different formatting for the same
+        track between chunks (trailing whitespace, capitalization tweaks).
+        Without normalization those count as a new track and trigger an
+        unnecessary re-resolve / re-scrobble.
+        """
+        if a is None or b is None:
+            return False
+        return (
+            a.title.strip().lower() == b.title.strip().lower()
+            and a.artist.strip().lower() == b.artist.strip().lower()
+        )
+
     async def _handle_result(self, result: Optional[RawRecognitionResult]):
         """Apply confirmation logic, then resolve metadata and update state."""
         if result is None:
@@ -152,19 +180,10 @@ class RecognitionLoop:
             self._pending_count = 0
             return
 
-        current = self.state.current_raw
-        if (
-            current
-            and result.title == current.title
-            and result.artist == current.artist
-        ):
+        if self._same_track(result, self.state.current_raw):
             return  # Same track still playing
 
-        if (
-            self._pending_result
-            and result.title == self._pending_result.title
-            and result.artist == self._pending_result.artist
-        ):
+        if self._same_track(result, self._pending_result):
             self._pending_count += 1
         else:
             self._pending_result = result
