@@ -6,6 +6,10 @@ A Raspberry Pi app that listens to a vinyl record playing through a USB audio in
 
 When the last track of an album finishes, it automatically increments the Play Count and records the Last Played date for that record in your Discogs collection, and scrobbles the session to Last.fm.
 
+## Now Playing Screen
+
+![Now Playing Screen — Wolf Parade, Dear Sons And Daughters Of Hungry Ghosts](docs/screenshot.svg)
+
 ## Features
 
 - 🎵 Real-time audio fingerprinting via ShazamIO (no manual input needed)
