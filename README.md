@@ -1,6 +1,6 @@
 # vinyl-now-playing
 
-[![version](https://img.shields.io/badge/version-1.3.1-blueviolet)](VERSION)
+[![version](https://img.shields.io/badge/version-1.3.2-blueviolet)](VERSION)
 
 A Raspberry Pi app that listens to a vinyl record playing through a USB audio interface, identifies the current track via audio fingerprinting, enriches it with metadata from your Discogs collection, and displays the artist, album, track name, and cover art on an HDMI-connected LCD screen.
 
@@ -34,6 +34,11 @@ When the last track of an album finishes, it automatically increments the Play C
 ```bash
 git clone https://github.com/lanebecker/vinyl-now-playing.git
 cd vinyl-now-playing
+
+# Recommended: use a virtual environment so requirements stay isolated
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
 pip install -r requirements.txt
 cp config.example.yaml config.yaml
 # Edit config.yaml with your Discogs token, username, and audio device
