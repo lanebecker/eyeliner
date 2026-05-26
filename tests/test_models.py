@@ -216,6 +216,46 @@ def test_log_track_latches_on_second_track_if_first_was_fallback():
     assert session.album_instance_id == 99
 
 
+def test_log_track_does_not_latch_database_source_without_instance_id():
+    """DISCOGS_DATABASE result has release_id but no instance_id (the user
+    doesn't own this pressing). Latching just the release_id would produce a
+    doomed POST to /instances/None/fields/... — so log_track refuses to latch
+    until both IDs are present.
+    """
+    session = PlaySession()
+    db_track = TrackMetadata(
+        title="Catholic Block",
+        artist="Sonic Youth",
+        album="Sister",
+        source=MetadataSource.DISCOGS_DATABASE,
+        discogs_release_id=12345,
+        discogs_instance_id=None,
+    )
+    session.log_track(db_track)
+    assert session.album_release_id is None
+    assert session.album_instance_id is None
+
+
+def test_log_track_database_then_collection_latches_collection_only():
+    """If a DB-sourced track is logged first (no instance_id), and then a
+    collection-sourced track for the same release is logged second, the
+    collection IDs should latch — DB-source must NOT have pre-empted the slot.
+    """
+    session = PlaySession()
+    db_track = TrackMetadata(
+        title="Catholic Block", artist="Sonic Youth", album="Sister",
+        source=MetadataSource.DISCOGS_DATABASE,
+        discogs_release_id=12345, discogs_instance_id=None,
+    )
+    collection_track = make_track(
+        "Pipeline/Kill Time", release_id=12345, instance_id=67890,
+    )
+    session.log_track(db_track)
+    session.log_track(collection_track)
+    assert session.album_release_id == 12345
+    assert session.album_instance_id == 67890
+
+
 # ---------------------------------------------------------------------------
 # MetadataSource enum
 # ---------------------------------------------------------------------------

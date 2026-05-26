@@ -28,6 +28,12 @@ log = logging.getLogger(__name__)
 
 _API_BASE = "https://api.discogs.com"
 
+# Network timeout for every Discogs HTTP call.  Discogs is normally well under a
+# second, but a flaky network or a CDN hiccup can hang a TCP connection for
+# minutes without one.  All session.get/post calls in this module pass this
+# explicitly so an executor thread can't sit indefinitely on a stalled socket.
+_HTTP_TIMEOUT = 15
+
 
 class DiscogsClient:
     """Wraps python3-discogs-client and the Discogs REST API for collection lookups."""
@@ -39,11 +45,16 @@ class DiscogsClient:
         self.last_played_field_name: Optional[str] = cfg.get("last_played_field_name")
         self._token: str = cfg["user_token"]
 
-        # High-level client — used for search() and release() lookups
+        # High-level client — used for search() and release() lookups.
+        # set_timeout() applies the same timeout discipline to the library's
+        # internal fetcher that we apply to our direct session.get/post calls
+        # below; without this, a hung TCP connection in the library can sit
+        # on an executor thread indefinitely.
         self._client = discogs_client.Client(
             "vinyl-now-playing/1.0",
             user_token=self._token,
         )
+        self._client.set_timeout(connect=5, read=_HTTP_TIMEOUT)
 
         # Raw requests session — used for collection membership checks and POSTs
         self._session = requests.Session()
@@ -181,7 +192,9 @@ class DiscogsClient:
                 f"/folders/0/releases/{release_id}"
                 f"/instances/{instance_id}/fields/{field_id}"
             )
-            resp = self._session.post(url, json={"value": str(new_count)})
+            resp = self._session.post(
+                url, json={"value": str(new_count)}, timeout=_HTTP_TIMEOUT,
+            )
 
             if resp.status_code == 204:
                 log.info(
@@ -231,7 +244,7 @@ class DiscogsClient:
                 f"/folders/0/releases/{release_id}"
                 f"/instances/{instance_id}/fields/{field_id}"
             )
-            resp = self._session.post(url, json={"value": today})
+            resp = self._session.post(url, json={"value": today}, timeout=_HTTP_TIMEOUT)
 
             if resp.status_code == 204:
                 log.info(
@@ -262,7 +275,8 @@ class DiscogsClient:
             return self._collection_fields
 
         resp = self._session.get(
-            f"{_API_BASE}/users/{self.username}/collection/fields"
+            f"{_API_BASE}/users/{self.username}/collection/fields",
+            timeout=_HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -285,7 +299,8 @@ class DiscogsClient:
         """
         try:
             resp = self._session.get(
-                f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}"
+                f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}",
+                timeout=_HTTP_TIMEOUT,
             )
             if resp.status_code != 200:
                 log.debug(
@@ -326,7 +341,8 @@ class DiscogsClient:
         The instance_id is needed to update per-item custom fields.
         """
         resp = self._session.get(
-            f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}"
+            f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}",
+            timeout=_HTTP_TIMEOUT,
         )
         if resp.status_code == 404:
             return None
@@ -353,6 +369,7 @@ class DiscogsClient:
                 resp = self._session.get(
                     f"{_API_BASE}/users/{self.username}/collection/folders/0/releases",
                     params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
+                    timeout=_HTTP_TIMEOUT,
                 )
                 resp.raise_for_status()
                 data = resp.json()
