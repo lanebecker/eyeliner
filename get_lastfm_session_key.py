@@ -27,7 +27,7 @@ def main():
     print("=" * 60)
     print()
     print("You'll need the API key and shared secret from your Last.fm")
-    print("API account: https://www.last.fm/api/accounts")
+    print("API account: https://www.last.fm/api/account/create")
     print()
 
     api_key    = input("API key:       ").strip()
