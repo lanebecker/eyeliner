@@ -434,6 +434,20 @@ class DiscogsClient:
         # Tracklist — fetch separately; log but don't fail on error
         tracklist = self.get_tracklist(release.id)
 
+        # Genres and styles — styles are more specific so they come first.
+        # Both are already present in the release object; no extra API call needed.
+        genres: list = []
+        try:
+            if release.styles:
+                genres.extend(release.styles)
+        except Exception:
+            pass
+        try:
+            if release.genres:
+                genres.extend(release.genres)
+        except Exception:
+            pass
+
         return {
             "album": release.title,
             "year": year,
@@ -443,4 +457,5 @@ class DiscogsClient:
             "instance_id": instance_id,
             "cover_art_url": cover_url,
             "tracklist": tracklist,
+            "genres": genres,
         }

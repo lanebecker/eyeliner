@@ -307,13 +307,13 @@ class DisplayRenderer:
         # -----------------------------------------------------------------
         # v1.2.1 dynamic push-down geometry
         # -----------------------------------------------------------------
-        # Scale inter-element gaps proportionally from the 1024x600 reference.
+        # Scale inter-element gaps proportionally from the 1024×600 reference.
         sy = self.height / 600
-        GAP_BEFORE_DIV    = max(2, int(4  * sy))   # title bottom -> divider top
-        GAP_AFTER_DIV     = max(8, int(20 * sy))   # divider bottom -> artist top
-        GAP_AFTER_ARTIST  = max(2, int(4  * sy))   # artist bottom -> album top
-        GAP_AFTER_ALBUM   = max(3, int(8  * sy))   # album bottom -> chips top
-        GAP_CHIPS_TO_META = max(8, int(16 * sy))   # chips bottom -> meta top (min)
+        GAP_BEFORE_DIV    = max(2, int(4  * sy))   # title bottom → divider top
+        GAP_AFTER_DIV     = max(8, int(20 * sy))   # divider bottom → artist top
+        GAP_AFTER_ARTIST  = max(2, int(4  * sy))   # artist bottom → album top
+        GAP_AFTER_ALBUM   = max(3, int(8  * sy))   # album bottom → chips top
+        GAP_CHIPS_TO_META = max(8, int(16 * sy))   # chips bottom → meta top (min)
 
         # Fixed heights of secondary elements (already scaled by layouts.py)
         div_h    = max(2, layout.divider.h)
@@ -654,7 +654,7 @@ class DisplayRenderer:
         if not lines:
             return 0
         line_h = int(font.get_height() * 0.98)
-        # n lines: n x (line_h + 2) minus the trailing gap after the last line
+        # n lines: n × (line_h + 2) minus the trailing gap after the last line
         return len(lines) * (line_h + 2) - 2
 
     def _draw_text_clipped(
