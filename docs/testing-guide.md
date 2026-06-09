@@ -83,18 +83,18 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 261 items
+collected 271 items
 
 tests/test_chunking.py .............                                     [  4%]
-tests/test_discogs_client.py .............................               [ 16%]
+tests/test_discogs_client.py .............................               [ 15%]
 tests/test_lastfm_client.py ...............                              [ 21%]
-tests/test_layouts.py .....................................              [ 36%]
-tests/test_listen_tracker.py .....................                       [ 44%]
+tests/test_layouts.py .....................................              [ 34%]
+tests/test_listen_tracker.py ...........................                 [ 44%]
 tests/test_models.py ................................................... [ 63%]
-.....                                                                    [ 65%]
-tests/test_player_state.py .........                                     [ 68%]
-tests/test_recognizer.py .................                               [ 75%]
-tests/test_renderer_caches.py .............                              [ 80%]
+.........                                                                [ 66%]
+tests/test_player_state.py .........                                     [ 70%]
+tests/test_recognizer.py .................                               [ 76%]
+tests/test_renderer_caches.py .............                              [ 81%]
 tests/test_resolver.py .............................                     [ 91%]
 tests/test_silence.py ......................                             [100%]
 
@@ -104,7 +104,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 261 passed in 0.36s ==============================
+============================== 271 passed in 0.35s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -153,7 +153,7 @@ Tests `TracklistEntry`, `TrackMetadata`, `PlaySession`, `MetadataSource`,
 `DisplayPalette`, `FALLBACK_PALETTE`, and `_SIDE_RE` in isolation.
 
 Key cases:
-- `is_last_track` returns `True` only for the final entry in the tracklist, case-insensitively and with whitespace tolerance
+- `is_last_track` returns `True` only for the album's final track (position-matched since v1.3.4; the entry is located by title case-insensitively and with whitespace tolerance)
 - `track_display` returns the correct position string ("A3") or `""` when not found
 - `log_track()` deduplicates consecutive identical tracks
 - `log_track()` sets `potential_last_track = True` when the last track is logged
@@ -163,6 +163,13 @@ Key cases:
 - `_SIDE_RE` matches standard (`"A1"`) and multi-digit (`"B12"`) positions; does not match numeric-only strings
 - `genres` field defaults to `[]` and stores values correctly
 - Side-awareness properties (`side_letter`, `side_position`, `side_total`, `prev_track_title`, `next_track_title`) using the Sonic Youth *Sister* tracklist (A1–A3, B1–B4): correct side grouping, 1-indexed positions, cross-side stitching at side boundaries (e.g. B1's `prev_track_title` returns A3; A3's `next_track_title` returns B1), `None` only for the globally first or last track, `None` for unknown tracks or numeric-only position strings
+
+Key cases — position-based `is_last_track` (new in v1.3.4):
+- **Regression:** a side-A track sharing the closer's title does NOT set
+  last-track (pre-v1.3.4 it did, enabling phantom play counts)
+- Genuine closers with unique titles still return `True`
+- The current entry is still located with case/whitespace normalization
+- Unknown titles return `False`
 
 ### `test_silence.py` — Silence detection
 
@@ -232,6 +239,14 @@ Key cases — Last Played:
 - **Configured:** `last_played_field_name` set → `update_last_played` called alongside `increment_play_count`
 - **Not configured:** `last_played_field_name` is `None` → `update_last_played` never called
 - **Failure:** `update_last_played` returns `False` → logs warning, no crash
+
+Key cases — album-change auto-split (new in v1.3.4):
+- A confirmed track with a different `release_id` ends the old session and
+  starts a fresh one (new latch, fresh track list)
+- A finished record 1 (closer played) is still credited when the split fires
+- An unfinished record 1 is NOT credited by the split
+- No split on: same release, FALLBACK metadata (no release_id), or before
+  any release has been latched
 
 ### `test_discogs_client.py` — Play Count & Last Played logic
 

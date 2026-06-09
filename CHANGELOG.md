@@ -14,6 +14,69 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.3.4] — 2026-06-10
+
+**Behavior-refinement release — follow-up to the v1.3.3 deep review.** The
+design observations deferred from v1.3.3 were decided and implemented: the
+play-count gate now matches by tracklist position, sessions auto-split when
+records are swapped quickly, side flips no longer banish the now-playing
+card, and two pieces of dead code were removed. Test count: 261 → 271.
+
+### Changed
+
+- **`is_last_track` matches by tracklist position, not title**
+  (`src/metadata/models.py`).  This property is the sole gate on Discogs
+  play-count updates, and title-only matching let any earlier track sharing
+  the closer's title (title-track reprises, live sets) set
+  `potential_last_track` from side A — a phantom play count if the session
+  ended there.  The current entry's position string is now compared to the
+  final entry's.  Deliberately conservative residual behavior: an album
+  whose GENUINE closer duplicates an earlier title resolves to the first
+  occurrence and returns False (a missed count, never a phantom one).
+
+- **Sessions auto-split on mid-session album changes**
+  (`src/tracking/listen_tracker.py`).  Swapping records faster than
+  `session_end_silence_seconds` (45s) used to merge two albums into one
+  `PlaySession` — the release ID stayed latched from record 1, so record
+  2's closer could credit record 1 with a play.  `on_track_identified` now
+  ends the current session when a confirmed track's `discogs_release_id`
+  differs from the latched one (correctly crediting record 1 if its closer
+  played) and starts a fresh session.  Reliable because the v1.3.3 album
+  cache guarantees consistent release IDs per album within a session;
+  FALLBACK tracks (no release ID) never trigger a split.
+
+- **The now-playing card stays up during side flips** (`main.py`).
+  `MUSIC_STARTED` now transitions to LISTENING only from IDLE.  Previously
+  a side flip dropped the display to the IDENTIFYING spinner for ~25s while
+  the first track of side B confirmed; the card now stays on screen showing
+  side A's last track and updates in place on the next commit.  Fresh
+  sessions (from IDLE) still show the spinner.
+
+### Removed
+
+- **`PlayerStatus.SESSION_ENDED`** (`src/state/player_state.py`,
+  `src/display/renderer.py`).  Defined since v1.0.0 but never set by any
+  code path — `AudioEvent.SESSION_ENDED` (a different concept) leads to
+  `clear()`, which transitions directly to IDLE.  Removed from the enum and
+  from the renderer's dispatch; a docstring note explains the history.
+
+- **`ListenTracker.__init__`'s unused `config` parameter**
+  (`src/tracking/listen_tracker.py`).  The tracker reads everything it
+  needs from the resolver's DiscogsClient.  Call sites in `main.py` and the
+  test helpers updated.
+
+### Added
+
+- **`tests/test_listen_tracker.py`** (+6 tests) — album-change auto-split:
+  splits on differing release IDs, credits a finished record 1, does NOT
+  credit an unfinished record 1, no split on same release / FALLBACK
+  metadata / before anything is latched.
+- **`tests/test_models.py`** (+4 tests) — position-based `is_last_track`:
+  the side-A duplicate-title regression, genuine closers, title
+  normalization when locating the entry, unknown titles.
+
+---
+
 ## [1.3.3] — 2026-06-10
 
 **Bug-fix and performance release — no new features.** A full-codebase deep

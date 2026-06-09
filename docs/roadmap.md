@@ -203,7 +203,7 @@ real bugs and hardening opportunities.
 - 210-test unit suite (+2 model-level regression tests covering the new
   latching behavior)
 
-### v1.3.3 ✅ (current)
+### v1.3.3 ✅
 
 **Bug-fix and performance release — no new features.** A full-codebase deep
 review (the first conducted with Claude Fable 5) found and fixed one real
@@ -229,6 +229,26 @@ performance and asyncio-hygiene issues. See `CHANGELOG.md` for full detail.
 - 261-test unit suite (+51: first-ever `PlayerState` tests, ChunkAssembler
   windowing tests, renderer cache/color tests, resolver cache tests,
   Discogs rate-limit tests)
+
+### v1.3.4 ✅ (current)
+
+**Behavior-refinement release.** Implements the design decisions deferred
+from the v1.3.3 deep review; see `CHANGELOG.md` for full detail.
+
+- `is_last_track` matches by tracklist position instead of title — closes
+  the duplicate-title phantom-play-count hole (conservative residual:
+  a genuine closer with a duplicated title is missed, never phantom-counted)
+- Sessions auto-split when a confirmed track resolves to a different
+  Discogs release than the latched one (record swapped in under 45s);
+  record 1 is still credited if its closer played
+- Side flips keep the now-playing card on screen (LISTENING is entered
+  only from IDLE); the card updates in place when the next track commits
+- Removed dead code: the never-set `PlayerStatus.SESSION_ENDED` enum value
+  and `ListenTracker`'s unused `config` constructor parameter
+- Scrobble timing reviewed and deliberately left as-is (timestamps run
+  ~25s behind track start — a documented rounding error, not a bug)
+- 271-test unit suite (+10: album-change splits, position-based
+  last-track matching)
 
 ---
 
