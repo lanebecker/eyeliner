@@ -20,6 +20,23 @@ Color transitions lerp over ~1 second when a new track starts.
 Palettes are cached per cover art URL so extraction only runs once per album.
 Cover art is downloaded asynchronously (_prefetch_cover) so the render loop
 is never blocked by network I/O.
+
+Render-loop caching (v1.3.3)
+----------------------------
+The now-playing screen re-renders continuously (~10 fps) to animate the
+pulsing dot, so anything done per-frame is effectively done forever.  Two
+hot-path costs are therefore cached:
+
+  - Scaled cover art: pygame.image.load + smoothscale of a 440×440 JPEG every
+    frame was the single biggest CPU cost on the Pi.  _load_cover now caches
+    the scaled Surface keyed by (url, w, h) in a bounded cache.
+  - Gradient background: 24 full-screen filled circles per frame.  The
+    gradient is now rendered once per (palette, size) onto an offscreen
+    Surface and re-blitted; it only regenerates while a palette transition
+    is actively lerping.
+
+Both use _BoundedCache, the same insertion-order/LRU-refresh strategy the
+palette cache has used since v1.3.2 (which now also uses it).
 """
 
 import asyncio
@@ -49,6 +66,46 @@ _TRANSITION_SECS = 1.0
 # re-running on a cache miss is fine; the cap just prevents unbounded growth
 # on machines with very long uptimes or very large collections.
 _PALETTE_CACHE_MAX = 200
+
+# Cap on the scaled-cover-Surface cache.  Each 440×440 RGB surface is ~775 KB,
+# so 16 entries ≈ 12 MB — generous for a device that shows one cover at a time,
+# and tiny next to re-decoding a JPEG ten times a second.
+_COVER_CACHE_MAX = 16
+
+
+class _BoundedCache:
+    """A small insertion-ordered cache with LRU-refresh-on-get and a size cap.
+
+    Python dicts preserve insertion order, so the eviction candidate is always
+    the first key.  get() re-inserts hits at the end ("LRU-ish"), matching the
+    strategy the palette cache has used since v1.3.2.  Pure Python, no pygame
+    dependency — unit-tested in tests/test_renderer_caches.py.
+    """
+
+    def __init__(self, max_entries: int):
+        self.max_entries = max_entries
+        self._data: dict = {}
+
+    def get(self, key):
+        """Return the cached value (refreshing its eviction position), or None."""
+        if key not in self._data:
+            return None
+        value = self._data.pop(key)
+        self._data[key] = value
+        return value
+
+    def put(self, key, value):
+        """Insert/replace a value, evicting oldest entries beyond the cap."""
+        self._data.pop(key, None)
+        self._data[key] = value
+        while len(self._data) > self.max_entries:
+            self._data.pop(next(iter(self._data)))
+
+    def __contains__(self, key) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
 
 
 def _lerp_color(a: tuple, b: tuple, t: float) -> tuple:
@@ -181,9 +238,26 @@ class DisplayRenderer:
         self._current_palette: DisplayPalette = FALLBACK_PALETTE
         self._target_palette: DisplayPalette = FALLBACK_PALETTE
         self._transition_start: float = 0.0
-        self._palette_cache: dict = {}  # cover_art_url → DisplayPalette
+        self._palette_cache = _BoundedCache(_PALETTE_CACHE_MAX)  # cover_art_url → DisplayPalette
+
+        # Render hot-path caches (v1.3.3)
+        self._cover_cache = _BoundedCache(_COVER_CACHE_MAX)  # (url, w, h) → scaled Surface
+        self._gradient_key: Optional[tuple] = None           # (bg, surface, w, h)
+        self._gradient_surface = None                        # pygame.Surface
+
+        # Strong references to fire-and-forget tasks (cover prefetches).
+        # asyncio only keeps weak references to tasks, so without this a
+        # running download could in principle be garbage-collected mid-flight.
+        self._bg_tasks: set = set()
 
         self.state.on_change(self._on_state_change)
+
+    def _spawn(self, coro):
+        """create_task() with a strong reference held until the task completes."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -237,7 +311,7 @@ class DisplayRenderer:
             url = state.current_track.cover_art_url
             self._queue_palette(url)
             if url:
-                asyncio.create_task(self._prefetch_cover(url))
+                self._spawn(self._prefetch_cover(url))
 
     # -----------------------------------------------------------------------
     # Async render loop
@@ -587,23 +661,36 @@ class DisplayRenderer:
         Pygame has no built-in radial gradient, so we approximate with concentric
         circles drawn from the outer edge inward. The gradient is anchored at
         roughly 25% from the left (over the cover art area), matching the JSX.
+
+        The rendered gradient is cached per (bg, surface, size) and re-blitted
+        on subsequent frames (v1.3.3).  Steady-state frames — the overwhelming
+        majority, since the palette only changes during the 1s track-change
+        lerp — therefore cost one blit instead of 24 full-screen circle fills.
         """
         import pygame
 
-        self._screen.fill(p.bg)
+        key = (p.bg, p.surface, self.width, self.height)
+        if self._gradient_key != key or self._gradient_surface is None:
+            surface = pygame.Surface((self.width, self.height))
+            surface.fill(p.bg)
 
-        # Overlay a soft radial highlight using a small number of concentric circles
-        cx = int(self.width * 0.25)
-        cy = int(self.height * 0.35)
-        max_r = int(max(self.width, self.height) * 0.75)
-        steps = 24
+            # Overlay a soft radial highlight using a small number of concentric circles
+            cx = int(self.width * 0.25)
+            cy = int(self.height * 0.35)
+            max_r = int(max(self.width, self.height) * 0.75)
+            steps = 24
 
-        for i in range(steps, 0, -1):
-            t = i / steps
-            # Blend from surface (centre) toward bg (edge)
-            color = _lerp_color(p.bg, p.surface, t * 0.55)
-            r = int(max_r * t)
-            pygame.draw.circle(self._screen, color, (cx, cy), r)
+            for i in range(steps, 0, -1):
+                t = i / steps
+                # Blend from surface (centre) toward bg (edge)
+                color = _lerp_color(p.bg, p.surface, t * 0.55)
+                r = int(max_r * t)
+                pygame.draw.circle(surface, color, (cx, cy), r)
+
+            self._gradient_key = key
+            self._gradient_surface = surface
+
+        self._screen.blit(self._gradient_surface, (0, 0))
 
     def _draw_wrapped_text(
         self, text: str, size: int, rect, color: tuple, bold: bool = False
@@ -716,11 +803,8 @@ class DisplayRenderer:
             return
         if cover_url is None:
             target = FALLBACK_PALETTE
-        elif cover_url in self._palette_cache:
-            target = self._palette_cache[cover_url]
-            # LRU-ish refresh: pop and re-insert so this entry isn't first to evict.
-            self._palette_cache.pop(cover_url)
-            self._palette_cache[cover_url] = target
+        elif (cached := self._palette_cache.get(cover_url)) is not None:
+            target = cached  # get() already refreshed its eviction position
         else:
             # Extraction happens synchronously here; cover art is already cached
             # on disk from _prefetch_cover(), so no network I/O.
@@ -728,11 +812,7 @@ class DisplayRenderer:
             cache_path = self.cache_dir / cache_key
             if cache_path.exists():
                 target = _extract_palette(cache_path)
-                self._palette_cache[cover_url] = target
-                # Evict oldest entries if the cache has overflowed.
-                while len(self._palette_cache) > _PALETTE_CACHE_MAX:
-                    # dict preserves insertion order — iter(...) yields oldest first
-                    self._palette_cache.pop(next(iter(self._palette_cache)))
+                self._palette_cache.put(cover_url, target)  # put() handles eviction
             else:
                 target = FALLBACK_PALETTE
 
@@ -826,11 +906,20 @@ class DisplayRenderer:
         Returns None if the URL is absent or the file hasn't been downloaded
         yet — _prefetch_cover() handles the async download and will set
         self._dirty = True once the file arrives.
+
+        The scaled Surface is cached keyed by (url, w, h) (v1.3.3): the render
+        loop calls this every frame, and re-decoding + smoothscaling a JPEG at
+        10 fps was the largest constant CPU cost on the Pi.  Disk load and
+        scaling now happen exactly once per cover per resolution.
         """
         import pygame
 
         if not url:
             return None
+
+        cached = self._cover_cache.get((url, w, h))
+        if cached is not None:
+            return cached
 
         cache_key = self._url_to_cache_key(url)
         cache_path = self.cache_dir / cache_key
@@ -839,7 +928,9 @@ class DisplayRenderer:
 
         try:
             img = pygame.image.load(str(cache_path)).convert()
-            return pygame.transform.smoothscale(img, (w, h))
+            scaled = pygame.transform.smoothscale(img, (w, h))
+            self._cover_cache.put((url, w, h), scaled)
+            return scaled
         except Exception as e:
             log.warning(f"Failed to load cached cover art: {e}")
             cache_path.unlink(missing_ok=True)
