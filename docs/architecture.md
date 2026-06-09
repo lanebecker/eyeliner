@@ -321,8 +321,12 @@ Key fields: `title`, `artist`, `album`, `source`, `year`, `label`,
 `cover_art_url`, `tracklist`, `genres`
 
 Key properties:
-- `is_last_track` — True if `self.title` (lowercased, stripped) matches the
-  final entry in `self.tracklist`
+- `is_last_track` — True if the current entry's POSITION matches the final
+  tracklist entry's position (v1.3.4; the entry itself is located by
+  normalized title).  Position matching prevents duplicate-title albums
+  (reprises, title tracks) from phantom-latching `potential_last_track`
+  from side A; the residual failure mode is conservative — a genuine closer
+  that duplicates an earlier title is missed, never phantom-counted
 - `track_display` — returns position string (e.g. `"A3"`) or `""` if not found
 - `side_letter` — `"A"`, `"B"`, etc., parsed from the current entry's position
   via `_SIDE_RE`; `None` for numeric-only tracklists
@@ -355,14 +359,13 @@ Key fields: `started_at`, `identified_tracks`, `potential_last_track`,
 Central in-memory state. Single source of truth for the display and all
 components that need to know what's currently playing.
 
-**`PlayerStatus`** (enum) — four values:
+**`PlayerStatus`** (enum) — three values:
 
 | Value | Meaning |
 |-------|---------|
 | `IDLE` | Startup state, or after a session completes |
-| `LISTENING` | Music detected, awaiting first recognition |
+| `LISTENING` | Awaiting the first recognition of a fresh session |
 | `PLAYING` | Track identified and displayed |
-| `SESSION_ENDED` | Defined in the enum for renderer compatibility; not explicitly set by `main.py` in the current flow (see below) |
 
 Transitions:
 
@@ -373,10 +376,12 @@ IDLE ──(MUSIC_STARTED)──→ LISTENING ──(track committed)──→ P
 ```
 
 When `SESSION_ENDED` fires as an `AudioEvent`, `main.py` calls `state.clear()`
-which transitions directly to `IDLE`. The `PlayerStatus.SESSION_ENDED` enum
-value is not currently set on this path, but the renderer handles it explicitly
-(alongside `IDLE`) so that any future code that does set it will render the
-idle screen rather than a blank frame.
+which transitions directly to `IDLE`.  (A `PlayerStatus.SESSION_ENDED` enum
+value existed through v1.3.3 but was never set by any code path; it was
+removed in v1.3.4.)  Since v1.3.4, `MUSIC_STARTED` transitions to LISTENING
+**only from IDLE** — during an active session (a side flip), the status stays
+PLAYING so the now-playing card remains on screen and updates in place when
+the next track commits.
 
 **Fields:** `status`, `current_track: Optional[TrackMetadata]`,
 `current_raw: Optional[RawRecognitionResult]`
@@ -406,8 +411,8 @@ animation, easier on the Pi's CPU).
 
 | State | Screen |
 |-------|--------|
-| `IDLE` / `SESSION_ENDED` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
-| `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey |
+| `IDLE` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
+| `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey — fresh sessions only; side flips keep the card up (v1.3.4) |
 | `PLAYING` | Full "Museum Card" now-playing layout |
 
 **Now-playing layout (v1.2.1 "Museum Card" — dynamic push-down):**
@@ -515,7 +520,14 @@ completion.
 
 **Session lifecycle:**
 1. `MUSIC_STARTED` → `_start_session()` (creates a fresh `PlaySession`)
-2. Each `on_track_identified(track)` → `session.log_track(track)`
+2. Each `on_track_identified(track)` → `session.log_track(track)`.
+   **Album-change auto-split (v1.3.4):** if the confirmed track's
+   `discogs_release_id` differs from the session's latched ID, the user
+   swapped records faster than the 45s silence threshold — the current
+   session is ended immediately (correctly crediting the previous record if
+   its closer played) and a fresh one begins.  Reliable because the v1.3.3
+   album cache guarantees consistent release IDs per album; FALLBACK tracks
+   (no release ID) never trigger a split
 3. `SESSION_ENDED` → `_end_session()` scheduled via `asyncio.create_task`,
    with a strong reference held in `_bg_tasks` until the task completes
    (v1.3.3 — asyncio only weak-references tasks, and this one performs the
@@ -604,7 +616,7 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 1. AudioCapture.run()        InputStream streams continuously;
                              ChunkAssembler emits a 15s window every 10s
 2. SilenceDetector.process() RMS >= threshold → emit MUSIC_STARTED
-3. main.py handler           PlayerState.set_status(LISTENING)
+3. main.py handler           PlayerState.set_status(LISTENING) [from IDLE only]
                              ListenTracker._start_session()
 4. RecognitionLoop.run()     dequeues chunk → ShazamIOBackend.recognize()
                              → RawRecognitionResult (or None)
@@ -710,5 +722,5 @@ All source modules are complete. The only remaining work requires hardware:
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (261 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (271 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
