@@ -385,3 +385,27 @@ async def test_update_last_played_returning_false_does_not_raise():
     # Should complete without raising
     await tracker._end_session()
     resolver.discogs.update_last_played.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Background task management (v1.3.3)
+#
+# SESSION_ENDED schedules _end_session() as an asyncio task. asyncio holds
+# only weak references to tasks, so ListenTracker must keep a strong
+# reference until the task — which performs the Discogs play-count write —
+# completes.
+# ---------------------------------------------------------------------------
+
+async def test_session_ended_task_is_referenced_until_done():
+    tracker = ListenTracker({}, make_resolver())
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    tracker.on_silence_event(AudioEvent.SESSION_ENDED)
+    assert len(tracker._bg_tasks) == 1  # Strong reference held while running
+
+    # Let the scheduled _end_session task run to completion
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert tracker._session is None      # Session was ended
+    assert len(tracker._bg_tasks) == 0   # Reference released on completion

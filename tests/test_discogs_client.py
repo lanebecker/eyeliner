@@ -456,3 +456,125 @@ def test_update_last_played_exception_returns_false_no_crash():
     result = client.update_last_played(release_id=111, instance_id=42)
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit handling — _request (v1.3.3)
+#
+# Discogs answers excess traffic with HTTP 429 + Retry-After (seconds).
+# _request retries exactly once, honoring the header clamped to
+# [1, _RATE_LIMIT_MAX_WAIT], with _RATE_LIMIT_DEFAULT_WAIT as fallback.
+# time.sleep is patched throughout — these tests never actually wait.
+# ---------------------------------------------------------------------------
+
+def make_429_response(retry_after=None):
+    resp = MagicMock()
+    resp.status_code = 429
+    resp.headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return resp
+
+
+def test_request_retries_once_on_429_honoring_retry_after():
+    client = make_client()
+    ok = make_get_response(200, {})
+    client._session.get = MagicMock(side_effect=[make_429_response("3"), ok])
+
+    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
+        resp = client._request("GET", "https://api.discogs.com/anything")
+
+    assert resp is ok
+    assert client._session.get.call_count == 2
+    mock_sleep.assert_called_once_with(3)
+
+
+def test_request_429_uses_default_wait_when_header_missing():
+    from src.metadata.discogs_client import _RATE_LIMIT_DEFAULT_WAIT
+    client = make_client()
+    client._session.get = MagicMock(
+        side_effect=[make_429_response(), make_get_response(200, {})]
+    )
+
+    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
+        client._request("GET", "https://api.discogs.com/anything")
+
+    mock_sleep.assert_called_once_with(_RATE_LIMIT_DEFAULT_WAIT)
+
+
+def test_request_429_uses_default_wait_when_header_unparseable():
+    from src.metadata.discogs_client import _RATE_LIMIT_DEFAULT_WAIT
+    client = make_client()
+    client._session.get = MagicMock(
+        side_effect=[make_429_response("soon-ish"), make_get_response(200, {})]
+    )
+
+    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
+        client._request("GET", "https://api.discogs.com/anything")
+
+    mock_sleep.assert_called_once_with(_RATE_LIMIT_DEFAULT_WAIT)
+
+
+def test_request_429_wait_is_capped():
+    from src.metadata.discogs_client import _RATE_LIMIT_MAX_WAIT
+    client = make_client()
+    client._session.get = MagicMock(
+        side_effect=[make_429_response("9999"), make_get_response(200, {})]
+    )
+
+    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
+        client._request("GET", "https://api.discogs.com/anything")
+
+    mock_sleep.assert_called_once_with(_RATE_LIMIT_MAX_WAIT)
+
+
+def test_request_does_not_retry_on_success():
+    client = make_client()
+    client._session.get = MagicMock(return_value=make_get_response(200, {}))
+
+    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
+        client._request("GET", "https://api.discogs.com/anything")
+
+    assert client._session.get.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+def test_request_gives_up_after_second_429():
+    """No infinite retry loops: a second consecutive 429 is returned as-is."""
+    client = make_client()
+    client._session.get = MagicMock(
+        side_effect=[make_429_response("1"), make_429_response("1")]
+    )
+
+    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
+        resp = client._request("GET", "https://api.discogs.com/anything")
+
+    assert resp.status_code == 429
+    assert client._session.get.call_count == 2
+    mock_sleep.assert_called_once()  # Slept for the first retry only
+
+
+def test_request_routes_post_through_session_post():
+    client = make_client()
+    client._session.post = MagicMock(return_value=make_post_response(204))
+
+    resp = client._request("POST", "https://api.discogs.com/anything", json={"value": "1"})
+
+    assert resp.status_code == 204
+    client._session.post.assert_called_once()
+    _, kwargs = client._session.post.call_args
+    assert kwargs["json"] == {"value": "1"}
+    assert "timeout" in kwargs  # _HTTP_TIMEOUT applied by default
+
+
+def test_increment_play_count_survives_one_rate_limit_on_post():
+    """End-to-end: a 429 on the field-update POST still results in success."""
+    client = make_client()
+    get_resp = make_get_response(200, {"releases": []})  # No prior value → 0
+    client._session.get = MagicMock(return_value=get_resp)
+    client._session.post = MagicMock(
+        side_effect=[make_429_response("1"), make_post_response(204)]
+    )
+
+    with patch("src.metadata.discogs_client.time.sleep"):
+        assert client.increment_play_count(111, 222) is True
+
+    assert client._session.post.call_count == 2
