@@ -422,9 +422,12 @@ also run the arecord sanity check from step 5 to confirm audio is reaching the P
 
 **Recognition never commits a track**
 Check that you have internet connectivity (`ping 8.8.8.8`). ShazamIO makes
-outbound HTTPS requests. Also confirm the chunk length — at `chunk_seconds: 15`
-with `confirmation_required: 2`, the first commit takes ~30 seconds after the
-needle drops.
+outbound HTTPS requests. Also confirm the chunk timing — capture is
+continuous (v1.3.3), with a `chunk_seconds: 15` window sent for recognition
+every `chunk_seconds - overlap_seconds` (10s by default). With
+`confirmation_required: 2`, the first commit takes ~25 seconds after the
+needle drops (first window completes at 15s, second at 25s), plus Shazam
+round-trip time.
 
 **`Discogs 401 Unauthorized`**
 Your `user_token` is invalid or expired. Generate a new one at

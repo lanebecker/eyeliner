@@ -56,12 +56,15 @@ cp config.example.yaml config.yaml
 |------|--------------|-----------------|----------------|
 | `tests/test_models.py` | Data models (TrackMetadata, PlaySession, etc.) | No | No |
 | `tests/test_silence.py` | Silence detector state machine | No | No |
+| `tests/test_chunking.py` | ChunkAssembler overlapping-window logic | No | No |
+| `tests/test_player_state.py` | PlayerState transitions & change notifications | No | No |
 | `tests/test_listen_tracker.py` | Last-track detection & Discogs update logic | No | No |
-| `tests/test_discogs_client.py` | DiscogsClient Play Count & Last Played logic | No | No |
+| `tests/test_discogs_client.py` | DiscogsClient Play Count, Last Played & rate-limit logic | No | No |
 | `tests/test_lastfm_client.py` | LastFmClient scrobble & love logic | No | No |
-| `tests/test_resolver.py` | 3-step metadata fallback chain | No | No |
+| `tests/test_resolver.py` | 3-step metadata fallback chain + album cache | No | No |
 | `tests/test_recognizer.py` | Recognition loop confirmation logic | No | No |
 | `tests/test_layouts.py` | Display layout geometry | No | No |
+| `tests/test_renderer_caches.py` | Renderer bounded caches & palette color math | No | No |
 | `test_discogs_live.py` | Live Discogs API integration | No | **Yes** |
 
 ---
@@ -80,16 +83,19 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 210 items
+collected 261 items
 
-tests/test_discogs_client.py .....................                       [ 10%]
-tests/test_lastfm_client.py ...............                              [ 17%]
-tests/test_layouts.py .....................................              [ 34%]
-tests/test_listen_tracker.py ....................                        [ 44%]
-tests/test_models.py ................................................... [ 68%]
-.....                                                                    [ 70%]
-tests/test_recognizer.py .................                               [ 79%]
-tests/test_resolver.py ......................                            [ 89%]
+tests/test_chunking.py .............                                     [  4%]
+tests/test_discogs_client.py .............................               [ 16%]
+tests/test_lastfm_client.py ...............                              [ 21%]
+tests/test_layouts.py .....................................              [ 36%]
+tests/test_listen_tracker.py .....................                       [ 44%]
+tests/test_models.py ................................................... [ 63%]
+.....                                                                    [ 65%]
+tests/test_player_state.py .........                                     [ 68%]
+tests/test_recognizer.py .................                               [ 75%]
+tests/test_renderer_caches.py .............                              [ 80%]
+tests/test_resolver.py .............................                     [ 91%]
 tests/test_silence.py ......................                             [100%]
 
 =============================== warnings summary ===============================
@@ -98,7 +104,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 210 passed in 0.34s ==============================
+============================== 261 passed in 0.36s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -108,12 +114,15 @@ The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failu
 ```bash
 pytest tests/test_models.py
 pytest tests/test_silence.py
+pytest tests/test_chunking.py
+pytest tests/test_player_state.py
 pytest tests/test_listen_tracker.py
 pytest tests/test_discogs_client.py
 pytest tests/test_lastfm_client.py
 pytest tests/test_resolver.py
 pytest tests/test_recognizer.py
 pytest tests/test_layouts.py
+pytest tests/test_renderer_caches.py
 ```
 
 ### With verbose output (see each test name)
@@ -172,6 +181,39 @@ Key cases:
   can fire for the next session
 - All registered listeners receive every event
 
+### `test_chunking.py` — Overlapping-window capture logic (new in v1.3.3)
+
+Drives `ChunkAssembler` (the windowing engine behind `AudioCapture`) with
+synthesized numpy ramps so every frame position is checkable. No sounddevice,
+no hardware.
+
+Key cases:
+- Constructor validation: `chunk_frames > 0`, `1 <= hop_frames <= chunk_frames`
+- No chunk emitted until a full window has accumulated
+- Consecutive chunks start exactly `hop_frames` apart and genuinely share
+  `(chunk - hop)` frames of identical audio
+- One oversized block can emit multiple chunks in order
+- Feeding 1-frame blocks produces byte-identical windows to one big feed —
+  no audio is ever lost at block boundaries
+- Emitted chunks are independent copies (mutating one can't corrupt later audio)
+- `buffered_frames` / `reset()` housekeeping; 2-D blocks are flattened
+
+### `test_player_state.py` — State transitions & notifications (new in v1.3.3)
+
+First-ever coverage for `PlayerState` — added alongside the v1.3.3 fix for
+the swallowed track-change notification, which this suite would have caught.
+
+Key cases:
+- Initial state is IDLE with no track/raw
+- `set_status` notifies on change only; quiet when status is unchanged
+- `set_track` transitions to PLAYING and notifies
+- **Regression:** `set_track` notifies on every track change, including when
+  the status is already PLAYING (the v1.3.3 bug)
+- `set_track` notifies exactly once per call (no double-notify on the first track)
+- `set_raw` stores without notifying
+- `clear()` resets track + raw and notifies via the IDLE transition
+- A listener that raises doesn't break other listeners
+
 ### `test_listen_tracker.py` — Last-track detection (most important)
 
 Mocks `DiscogsClient` and drives `ListenTracker` directly. Tests every edge case
@@ -222,6 +264,16 @@ Key cases — _get_field_value:
 - **Non-200 GET:** returns `None`
 - **Field not in notes:** returns `None`
 
+Key cases — _request rate-limit handling (new in v1.3.3; `time.sleep` is
+patched, so none of these actually wait):
+- **429 then success:** retried once, sleeping for the `Retry-After` value
+- **Missing/unparseable `Retry-After`:** falls back to the 2s default
+- **Oversized `Retry-After`:** clamped to the 30s cap
+- **Success:** no retry, no sleep
+- **Two consecutive 429s:** second response returned as-is (no infinite retry)
+- **POST routing:** dispatches via `session.post` with default timeout applied
+- **End-to-end:** `increment_play_count` succeeds through one 429 on the POST
+
 ### `test_lastfm_client.py` — Last.fm scrobble & love logic
 
 Mocks `pylast` at the `sys.modules` level so no real network calls are made.
@@ -254,6 +306,15 @@ Key cases:
 - All `TrackMetadata` fields correctly populated from each source
 - `genres` list passed through from Discogs result dict; defaults to `[]` if key absent; always `[]` on fallback path
 
+Key cases — album-level cache (new in v1.3.3):
+- Second track from the same album served from cache — Discogs called once,
+  per-track fields (title) still correct, album-level fields shared
+- Cache key normalizes case and whitespace
+- Database-tier results cached too
+- Fallback cached only when both Discogs tiers completed cleanly; a raised
+  exception (network blip) leaves the album retryable
+- Different albums resolve independently; cache is bounded at `_ALBUM_CACHE_MAX`
+
 ### `test_recognizer.py` — Confirmation logic
 
 Drives `RecognitionLoop._handle_result()` with canned `RawRecognitionResult` objects.
@@ -267,6 +328,25 @@ Key cases:
 - Same track as `current_raw` is silently skipped (no re-commit for the same song)
 - `confirmation_required = 3` requires three, `= 1` commits immediately
 - After a commit, pending state is cleared
+
+### `test_renderer_caches.py` — Renderer caches & color math (new in v1.3.3)
+
+Tests the pure-Python pieces of `DisplayRenderer` headlessly — importing
+`src.display.renderer` does not import pygame (pygame imports live inside
+methods), so no display or pygame installation is exercised.
+
+Key cases — `_BoundedCache` (backs the palette, scaled-cover, and gradient caches):
+- `get()` returns `None` on miss, the stored value on hit
+- Eviction drops the OLDEST entry beyond `max_entries`
+- `get()` refreshes an entry's eviction position (LRU-ish)
+- `put()` on an existing key replaces the value and refreshes position
+- `__contains__` / `__len__`; a one-entry cache holds only the latest value
+
+Key cases — color helpers:
+- `_lerp_color` endpoints, midpoint, and clamping of `t` outside [0, 1]
+- `_lerp_palette` interpolates all five palette channels
+- `_clamp_luminance` brightens too-dark colors, leaves bright colors and
+  pure black unchanged
 
 ### `test_layouts.py` — Display geometry
 
@@ -399,9 +479,13 @@ The `play_count_field_name` in `config.yaml` doesn't exactly match your Discogs 
 
 These components need the actual Pi + USB audio interface + display to test:
 
-- `src/audio/capture.py` — `sounddevice` recording from the UCA222
+- `src/audio/capture.py` — the `sounddevice`/`InputStream` integration with
+  the UCA222 (the overlapping-window logic it drives is fully covered
+  hardware-free by `tests/test_chunking.py`)
 - `src/audio/recognizer.py` → `ShazamIOBackend.recognize()` — real Shazam API calls with real audio
-- `src/display/renderer.py` — pygame rendering on the HDMI display
+- `src/display/renderer.py` — pygame rendering on the HDMI display (the
+  bounded caches and palette color math are covered hardware-free by
+  `tests/test_renderer_caches.py`)
 - `main.py` end-to-end — the full event loop with all components wired together
 
 Once the hardware arrives, a `test_integration.py` covering the full needle-drop →
