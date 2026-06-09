@@ -44,7 +44,18 @@ class RecognizerBackend(ABC):
 
 
 class ShazamIOBackend(RecognizerBackend):
-    """Recognition via ShazamIO (unofficial Shazam API — free, personal use)."""
+    """Recognition via ShazamIO (unofficial Shazam API — free, personal use).
+
+    The Shazam client is created once on first use and reused for every
+    subsequent recognition (v1.3.3) — constructing a fresh client per chunk
+    threw away its internal HTTP session several times a minute for no
+    benefit.  The shazamio/soundfile imports stay inside recognize() on
+    purpose: they keep this module importable (and the rest of the suite
+    testable) on machines without the audio stack installed.
+    """
+
+    def __init__(self):
+        self._shazam = None  # Created lazily on first recognize()
 
     async def recognize(
         self, audio: np.ndarray, sample_rate: int
@@ -59,8 +70,9 @@ class ShazamIOBackend(RecognizerBackend):
             sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")
             buf.seek(0)
 
-            shazam = Shazam()
-            result = await shazam.recognize(buf.read())
+            if self._shazam is None:
+                self._shazam = Shazam()
+            result = await self._shazam.recognize(buf.read())
 
             track = result.get("track")
             if not track:
