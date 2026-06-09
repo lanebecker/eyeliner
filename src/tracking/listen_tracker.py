@@ -37,13 +37,20 @@ class ListenTracker:
         self.discogs = resolver.discogs
         self.lastfm = lastfm
         self._session: Optional[PlaySession] = None
+        # Strong references to in-flight _end_session tasks.  asyncio only
+        # keeps weak references to tasks, so a fire-and-forget create_task()
+        # could in principle be garbage-collected mid-flight — and this is the
+        # task that performs the Discogs play-count write, so it must survive.
+        self._bg_tasks: set = set()
 
     def on_silence_event(self, event: AudioEvent):
         """Receive silence events from SilenceDetector (wired up in main.py)."""
         if event == AudioEvent.MUSIC_STARTED:
             self._start_session()
         elif event == AudioEvent.SESSION_ENDED:
-            asyncio.create_task(self._end_session())
+            task = asyncio.create_task(self._end_session())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
 
     def _start_session(self):
         if self._session is None:

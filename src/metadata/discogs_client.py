@@ -16,6 +16,7 @@ Design notes:
 """
 
 import logging
+import time
 from datetime import date
 from typing import Optional
 
@@ -33,6 +34,13 @@ _API_BASE = "https://api.discogs.com"
 # minutes without one.  All session.get/post calls in this module pass this
 # explicitly so an executor thread can't sit indefinitely on a stalled socket.
 _HTTP_TIMEOUT = 15
+
+# Discogs allows 60 requests/minute for authenticated callers and answers
+# excess traffic with HTTP 429 + a Retry-After header (seconds).  When that
+# happens we honour the header once per request, capped so a pathological
+# header value can't park an executor thread for minutes.
+_RATE_LIMIT_MAX_WAIT = 30
+_RATE_LIMIT_DEFAULT_WAIT = 2
 
 
 class DiscogsClient:
@@ -65,6 +73,47 @@ class DiscogsClient:
         })
 
         self._collection_fields: Optional[dict] = None  # Lazily fetched, then cached
+
+    # -------------------------------------------------------------------------
+    # HTTP plumbing
+    # -------------------------------------------------------------------------
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Issue a session request with rate-limit awareness (v1.3.3).
+
+        All direct REST calls in this module go through here so that an HTTP
+        429 from Discogs is retried exactly once, after sleeping for the
+        server-suggested Retry-After (clamped to _RATE_LIMIT_MAX_WAIT, with
+        _RATE_LIMIT_DEFAULT_WAIT as the fallback when the header is missing
+        or unparseable).
+
+        This runs on an executor thread (every caller is dispatched via
+        run_in_executor), so the time.sleep() here never blocks the event
+        loop.  Calls made by the python3-discogs-client library itself
+        (search/release) are NOT routed through this helper — the library
+        does its own fetching — so 429s there surface as exceptions and are
+        handled by callers' existing fallback paths.
+
+        Dispatches via self._session.get / self._session.post (rather than
+        session.request) so tests can keep mocking those two methods as the
+        single HTTP seam.
+        """
+        kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+        send = self._session.get if method == "GET" else self._session.post
+        resp = send(url, **kwargs)
+        if resp.status_code == 429:
+            try:
+                wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_DEFAULT_WAIT))
+            except (TypeError, ValueError):
+                wait = _RATE_LIMIT_DEFAULT_WAIT
+            wait = max(1, min(wait, _RATE_LIMIT_MAX_WAIT))
+            log.warning(
+                f"Discogs rate limit hit (429) for {method} {url}; "
+                f"retrying once in {wait}s."
+            )
+            time.sleep(wait)
+            resp = send(url, **kwargs)
+        return resp
 
     # -------------------------------------------------------------------------
     # Public interface
@@ -192,9 +241,7 @@ class DiscogsClient:
                 f"/folders/0/releases/{release_id}"
                 f"/instances/{instance_id}/fields/{field_id}"
             )
-            resp = self._session.post(
-                url, json={"value": str(new_count)}, timeout=_HTTP_TIMEOUT,
-            )
+            resp = self._request("POST", url, json={"value": str(new_count)})
 
             if resp.status_code == 204:
                 log.info(
@@ -244,7 +291,7 @@ class DiscogsClient:
                 f"/folders/0/releases/{release_id}"
                 f"/instances/{instance_id}/fields/{field_id}"
             )
-            resp = self._session.post(url, json={"value": today}, timeout=_HTTP_TIMEOUT)
+            resp = self._request("POST", url, json={"value": today})
 
             if resp.status_code == 204:
                 log.info(
@@ -274,9 +321,8 @@ class DiscogsClient:
         if self._collection_fields is not None:
             return self._collection_fields
 
-        resp = self._session.get(
-            f"{_API_BASE}/users/{self.username}/collection/fields",
-            timeout=_HTTP_TIMEOUT,
+        resp = self._request(
+            "GET", f"{_API_BASE}/users/{self.username}/collection/fields"
         )
         resp.raise_for_status()
         data = resp.json()
@@ -298,9 +344,9 @@ class DiscogsClient:
         has no value set.
         """
         try:
-            resp = self._session.get(
+            resp = self._request(
+                "GET",
                 f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}",
-                timeout=_HTTP_TIMEOUT,
             )
             if resp.status_code != 200:
                 log.debug(
@@ -340,9 +386,9 @@ class DiscogsClient:
         Returns the instance_id if found, or None if not in the collection.
         The instance_id is needed to update per-item custom fields.
         """
-        resp = self._session.get(
+        resp = self._request(
+            "GET",
             f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}",
-            timeout=_HTTP_TIMEOUT,
         )
         if resp.status_code == 404:
             return None
@@ -366,10 +412,10 @@ class DiscogsClient:
 
         while True:
             try:
-                resp = self._session.get(
+                resp = self._request(
+                    "GET",
                     f"{_API_BASE}/users/{self.username}/collection/folders/0/releases",
                     params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
-                    timeout=_HTTP_TIMEOUT,
                 )
                 resp.raise_for_status()
                 data = resp.json()

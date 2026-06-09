@@ -1,6 +1,18 @@
 """vinyl-now-playing — entry point.
 
 Wires all components together and starts the main event loop.
+
+Shutdown design (v1.3.3)
+------------------------
+SIGINT/SIGTERM cancel the gathered pipeline tasks and let main() unwind
+naturally.  The previous approach (cancel ALL tasks — including main()
+itself — then call loop.stop() from inside asyncio.run()) "worked" but
+guaranteed a RuntimeError("Event loop stopped before Future completed")
+traceback on every Ctrl+C.  Cancellation now flows top-down:
+
+    signal → run_task.cancel() → gather propagates CancelledError to
+    capture/recognizer/display coroutines → main()'s finally block calls
+    capture.stop() and display.stop() → asyncio.run() exits cleanly.
 """
 
 import asyncio
@@ -12,7 +24,7 @@ from pathlib import Path
 import yaml
 
 from src.audio.capture import AudioCapture
-from src.audio.silence import SilenceDetector
+from src.audio.silence import SilenceDetector, AudioEvent
 from src.audio.recognizer import RecognitionLoop
 from src.metadata.resolver import MetadataResolver
 from src.display.renderer import DisplayRenderer
@@ -60,7 +72,6 @@ async def main():
     capture = AudioCapture(config, silence, recognizer)
 
     # Wire silence events into state and tracker
-    from src.audio.silence import AudioEvent
     def on_silence_event(event: AudioEvent):
         tracker.on_silence_event(event)
         if event == AudioEvent.MUSIC_STARTED:
@@ -70,32 +81,31 @@ async def main():
 
     silence.on_event(on_silence_event)
 
-    # Graceful shutdown on Ctrl+C or SIGTERM
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(
-            sig, lambda: asyncio.create_task(shutdown(capture, display))
-        )
-
     log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
     display.start()
 
-    await asyncio.gather(
+    # The three long-running pipeline coroutines, gathered into one awaitable.
+    run_task = asyncio.gather(
         capture.run(),
         recognizer.run(),
         display.run(),
     )
 
+    # Graceful shutdown on Ctrl+C or SIGTERM: cancelling the gather propagates
+    # CancelledError into all three coroutines.  run_task.cancel is a plain
+    # synchronous call, so it's safe to invoke directly from a signal handler —
+    # no fire-and-forget task required.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, run_task.cancel)
 
-async def shutdown(capture: "AudioCapture", display: "DisplayRenderer"):
-    log.info("Shutting down...")
-    capture.stop()
-    display.stop()
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    for t in tasks:
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    asyncio.get_running_loop().stop()
+    try:
+        await run_task
+    except asyncio.CancelledError:
+        log.info("Shutdown signal received — stopping cleanly.")
+    finally:
+        capture.stop()
+        display.stop()
 
 
 if __name__ == "__main__":
