@@ -9,6 +9,20 @@ Logic:
       3. Calls LastFmClient.love on the last track if love_on_completion is enabled.
   - Conservative by design: if the last track was never identified (e.g. only
     Side A was played), none of the above updates are triggered.
+
+Album-change auto-split (v1.3.4)
+--------------------------------
+A session normally ends only after session_end_silence_seconds (default 45s)
+of silence.  Swapping records faster than that used to merge two albums into
+one session: the release ID stayed latched from record 1, so record 2's
+closer could credit record 1 with a play.  on_track_identified now detects
+the swap — a confirmed track whose discogs_release_id differs from the
+latched one — and splits: the current session is ended (correctly crediting
+record 1 if its closer played) and a fresh session begins for the new
+record.  This signal is reliable because MetadataResolver's album cache
+(v1.3.3) guarantees every track of an album resolves to identical release
+IDs within a session.  Tracks without a release_id (FALLBACK source) can't
+be distinguished and never trigger a split.
 """
 
 import asyncio
@@ -30,10 +44,11 @@ class ListenTracker:
 
     def __init__(
         self,
-        config: dict,
         resolver: "MetadataResolver",
         lastfm: Optional["LastFmClient"] = None,
     ):
+        # v1.3.4: the unused `config` parameter was removed — ListenTracker
+        # reads everything it needs from the resolver's DiscogsClient.
         self.discogs = resolver.discogs
         self.lastfm = lastfm
         self._session: Optional[PlaySession] = None
@@ -125,9 +140,33 @@ class ListenTracker:
                     log.warning("⚠ Failed to love track on Last.fm.")
 
     async def on_track_identified(self, track: TrackMetadata):
-        """Called by RecognitionLoop when a new track is confirmed."""
+        """Called by RecognitionLoop when a new track is confirmed.
+
+        Detects mid-session album changes (v1.3.4): if this track resolved to
+        a different Discogs release than the one latched for the current
+        session, the user swapped records faster than the silence threshold.
+        The current session is ended immediately — which correctly credits
+        the previous record if its closer played — and a fresh session starts
+        for the new record.  Both IDs must be present for a split: a missing
+        latched ID means nothing to mis-credit, and a missing track ID
+        (FALLBACK metadata) means the album can't be distinguished.
+        """
         if self._session is None:
             self._start_session()
+
+        if (
+            self._session.album_release_id is not None
+            and track.discogs_release_id is not None
+            and track.discogs_release_id != self._session.album_release_id
+        ):
+            log.info(
+                f"Album change detected mid-session "
+                f"(release {self._session.album_release_id} → "
+                f"{track.discogs_release_id}) — splitting session."
+            )
+            await self._end_session()
+            self._start_session()
+
         self._session.log_track(track)
         if track.is_last_track:
             log.info(f"Last track of album identified: '{track.title}' — watching for session end.")

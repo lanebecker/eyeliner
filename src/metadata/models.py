@@ -79,11 +79,28 @@ class TrackMetadata:
 
     @property
     def is_last_track(self) -> bool:
-        """True if this track is the final track on the album."""
+        """True if this track is the final track on the album.
+
+        Matched by tracklist POSITION rather than by title (v1.3.4): the
+        current entry is located by title via _current_entry, then its
+        position string is compared to the final entry's position.
+
+        Why: this property is the sole gate on Discogs play-count updates.
+        Pure title matching let any earlier track that shares the closer's
+        title (title-track reprises, live sets) latch potential_last_track
+        from side A, producing a phantom play count if the session ended
+        there.  Note the deliberately conservative failure mode that remains:
+        when an album's GENUINE closer duplicates an earlier title,
+        _current_entry resolves to the first occurrence and this returns
+        False — a missed play count rather than a phantom one, matching the
+        tracker's listening-completion philosophy.
+        """
         if not self.tracklist:
             return False
-        last = self.tracklist[-1]
-        return self.title.lower().strip() == last.title.lower().strip()
+        entry = self._current_entry
+        if entry is None:
+            return False
+        return entry.position == self.tracklist[-1].position
 
     @property
     def track_display(self) -> str:

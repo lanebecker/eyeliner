@@ -65,7 +65,7 @@ async def main():
     state = PlayerState()
     resolver = MetadataResolver(config)
     lastfm = LastFmClient(config)
-    tracker = ListenTracker(config, resolver, lastfm)
+    tracker = ListenTracker(resolver, lastfm)
     display = DisplayRenderer(config, state)
     silence = SilenceDetector(config)
     recognizer = RecognitionLoop(config, state, resolver, tracker, lastfm)
@@ -75,7 +75,12 @@ async def main():
     def on_silence_event(event: AudioEvent):
         tracker.on_silence_event(event)
         if event == AudioEvent.MUSIC_STARTED:
-            state.set_status(PlayerStatus.LISTENING)
+            # v1.3.4: only enter LISTENING from IDLE.  During an active
+            # session (e.g. a side flip), keep the now-playing card on
+            # screen — it updates in place when the next track commits —
+            # instead of dropping to the IDENTIFYING spinner for ~25s.
+            if state.status == PlayerStatus.IDLE:
+                state.set_status(PlayerStatus.LISTENING)
         elif event == AudioEvent.SESSION_ENDED:
             state.clear()
 

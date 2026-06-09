@@ -15,10 +15,16 @@ log = logging.getLogger(__name__)
 
 
 class PlayerStatus(Enum):
+    """Display-facing player status.
+
+    Note: AudioEvent.SESSION_ENDED (src/audio/silence.py) is a separate
+    concept — when it fires, main.py calls clear(), which transitions
+    directly to IDLE.  A PlayerStatus.SESSION_ENDED value existed through
+    v1.3.3 but was never set by any code path and was removed in v1.3.4.
+    """
     IDLE = auto()           # Startup or after session ended
     LISTENING = auto()      # Music detected, awaiting first recognition
     PLAYING = auto()        # Track identified and displayed
-    SESSION_ENDED = auto()  # Silence threshold crossed, transitioning to idle
 
 
 class PlayerState:
