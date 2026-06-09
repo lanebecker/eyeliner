@@ -349,7 +349,7 @@ class DisplayRenderer:
 
     def _render(self):
         """Dispatch to the appropriate layout based on current player status."""
-        if self.state.status in (PlayerStatus.IDLE, PlayerStatus.SESSION_ENDED):
+        if self.state.status == PlayerStatus.IDLE:
             self._render_idle()
         elif self.state.status == PlayerStatus.LISTENING:
             self._render_listening()
