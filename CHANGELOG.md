@@ -14,6 +14,126 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.3.3] — 2026-06-10
+
+**Bug-fix and performance release — no new features.** A full-codebase deep
+review found one real notification bug, one capture-pipeline design flaw
+masquerading as a feature, a Discogs API usage pattern flirting with the rate
+limit, two render-loop hot paths doing per-frame work that should have been
+cached, and a handful of asyncio hygiene issues. All fixed in one pass.
+Test count: 210 → 261 (three new test files plus additions to three existing
+ones), including the first-ever tests for `PlayerState`.
+
+### Fixed
+
+- **`PlayerState.set_track()` swallowed every track change after the first**
+  (`src/state/player_state.py`).  `set_track()` notified listeners only via
+  `set_status(PLAYING)`, which no-ops when the status is already PLAYING —
+  so for track 2 onward, `DisplayRenderer._on_state_change()` never fired,
+  meaning no cover-art prefetch and no palette transition for any track whose
+  cover URL differed from the previous one (fallback-sourced tracks, or
+  changing records without a 45s silence gap).  `set_track()` now notifies
+  exactly once on every call.  Caught by the new `test_player_state.py` —
+  `PlayerState` previously had zero test coverage.
+
+- **"Overlapping" capture chunks actually had a dead gap between them**
+  (`src/audio/capture.py`, new `src/audio/chunking.py`).  The capture loop
+  recorded a 15s chunk with blocking `sd.rec()`, then slept for
+  `chunk_seconds - overlap_seconds` (10s) during which nothing was recorded —
+  the documented 5s overlap was in reality a 10s blind spot, delaying
+  music/silence transition detection by up to ~25s.  Capture now records
+  continuously via `sd.InputStream`; a new pure-numpy `ChunkAssembler` emits
+  a 15s window every 10s with a genuine 5s shared region between consecutive
+  chunks.  No audio is ever dropped between windows.  Fully unit-tested
+  without hardware (`tests/test_chunking.py`).
+
+- **Ctrl+C produced a RuntimeError traceback on every shutdown** (`main.py`).
+  The old `shutdown()` cancelled ALL tasks (including `main()` itself) and
+  then called `loop.stop()` from inside `asyncio.run()`, which guarantees
+  `RuntimeError: Event loop stopped before Future completed`.  Signal
+  handlers now simply cancel the gathered pipeline tasks; `main()` unwinds
+  through a `finally` block that stops capture and display, and
+  `asyncio.run()` exits cleanly.
+
+- **Fire-and-forget `asyncio.create_task()` results were never referenced**
+  (`src/tracking/listen_tracker.py`, `src/display/renderer.py`).  asyncio
+  holds only weak references to tasks, so a running task can in principle be
+  garbage-collected mid-flight — and one of these tasks performs the Discogs
+  play-count write.  Both classes now hold strong references in a
+  `_bg_tasks` set, discarded via done-callback.
+
+### Changed
+
+- **Album-level metadata cache in `MetadataResolver`**
+  (`src/metadata/resolver.py`).  A single Discogs resolve can cost 30+ HTTP
+  requests (database search, up to 25 collection-membership checks, release
+  + tracklist fetches), and every track on an album repeats the identical
+  (artist, album) lookup.  `resolve()` now caches results per normalized
+  (artist, album) key — Discogs hits and clean fallbacks alike — cutting
+  per-LP API traffic by roughly 90%.  Fallback results are cached only when
+  both Discogs tiers completed without raising, so a transient network error
+  never pins an album to fallback metadata.  Bounded at 64 albums with
+  LRU-style eviction.
+
+- **Discogs 429 rate-limit handling** (`src/metadata/discogs_client.py`).
+  All direct REST calls now route through a `_request()` helper that retries
+  exactly once on HTTP 429, honoring the server's `Retry-After` header
+  (clamped to 30s, defaulting to 2s when absent or unparseable).  Discogs
+  allows 60 requests/minute; previously a 429 simply failed the operation.
+
+- **Scaled cover art is now cached** (`src/display/renderer.py`).  The
+  render loop re-renders ~10×/second to animate the pulsing dot, and every
+  frame re-loaded the cover JPEG from disk and re-`smoothscale`d it — the
+  single largest constant CPU cost on the Pi.  `_load_cover()` now caches
+  the scaled Surface keyed by (url, w, h) in a 16-entry bounded cache.
+
+- **Gradient background is now cached** (`src/display/renderer.py`).  The
+  radial gradient (24 full-screen circle fills) is rendered once per
+  (palette, size) onto an offscreen Surface and re-blitted each frame.  It
+  only regenerates while a palette transition is actively lerping.  Together
+  with the cover cache, steady-state render CPU drops by roughly an order of
+  magnitude.
+
+- **Shazam client is now reused across recognitions**
+  (`src/audio/recognizer.py`).  `ShazamIOBackend` previously constructed a
+  fresh `Shazam()` object (and its internal HTTP machinery) for every chunk,
+  several times a minute.  One client is now created lazily on first use and
+  reused.
+
+- **`_BoundedCache` extracted as a reusable helper**
+  (`src/display/renderer.py`).  The palette, scaled-cover, and gradient
+  caches all share one insertion-ordered, LRU-refresh-on-get, size-capped
+  implementation (previously inline dict juggling for the palette cache
+  only).  Pure Python and unit-tested in `tests/test_renderer_caches.py`.
+
+- **`overlap_seconds >= chunk_seconds` is now rejected at startup**
+  (`src/audio/capture.py`).  Previously this misconfiguration was silently
+  clamped to a zero-second sleep; it now logs a clear warning and disables
+  overlap (the old clamp produced an infinite re-recognition of the same
+  audio under the new windowing).
+
+### Added
+
+- **`tests/test_player_state.py`** (9 tests) — first coverage for
+  `PlayerState`, including the regression test for the set_track
+  notification bug and listener-exception isolation.
+- **`tests/test_chunking.py`** (13 tests) — pins the ChunkAssembler
+  windowing contract: overlap correctness, no lost audio across block
+  boundaries, emitted chunks are independent copies, validation.
+- **`tests/test_renderer_caches.py`** (13 tests) — `_BoundedCache` semantics
+  (eviction order, LRU refresh, replacement) and the palette color math
+  (`_lerp_color`, `_lerp_palette`, `_clamp_luminance`).
+- **`tests/test_resolver.py`** (+7 tests) — album-cache behavior: cache hits
+  skip Discogs, key normalization, fallback-caching rules, transient-error
+  retry, bounded eviction.
+- **`tests/test_discogs_client.py`** (+8 tests) — `_request()` rate-limit
+  behavior: Retry-After honored/defaulted/capped, single retry only, POST
+  routing, end-to-end increment-survives-429.
+- **`tests/test_listen_tracker.py`** (+1 test) — `_end_session` task is
+  strongly referenced until completion.
+
+---
+
 ## [1.3.2] — 2026-05-26
 
 **Bug-fix release — no new features.** Follow-up QA sweep of the v1.3.1
