@@ -52,9 +52,21 @@ class PlayerState:
         self.current_raw = raw
 
     def set_track(self, track: "TrackMetadata"):
-        """Set the fully resolved track metadata and transition to PLAYING."""
+        """Set the fully resolved track metadata and transition to PLAYING.
+
+        Listeners are notified exactly once on EVERY call — including when the
+        status is already PLAYING.  Track changes mid-session don't change the
+        status, but consumers (e.g. DisplayRenderer, which prefetches cover art
+        and queues palette transitions from its state-change callback) still
+        need to hear about them.  Relying on set_status() alone would silently
+        swallow every track change after the first (v1.3.3 bug fix).
+        """
         self.current_track = track
-        self.set_status(PlayerStatus.PLAYING)
+        if self.status != PlayerStatus.PLAYING:
+            self.set_status(PlayerStatus.PLAYING)  # status change → notifies
+        else:
+            log.debug(f"Track changed while PLAYING: {track.artist} — {track.title}")
+            self._notify()  # status unchanged, but the track did change
 
     def clear(self):
         """Reset to idle state (call on SESSION_ENDED)."""
