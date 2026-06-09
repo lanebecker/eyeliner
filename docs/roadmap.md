@@ -166,7 +166,7 @@ identified eight bugs across five files; all fixed with zero test regressions
 - Negative sleep duration possible in `AudioCapture.run()` when
   `overlap_seconds >= chunk_seconds`; clamped with `max(0, ...)`
 
-### v1.3.2 ✅ (current)
+### v1.3.2 ✅
 
 **Bug-fix release — no new features.** A follow-up QA sweep of the v1.3.1
 codebase found one site the previous sweep had missed plus several other
@@ -202,6 +202,33 @@ real bugs and hardening opportunities.
   versions like `1.4.0-rc1`
 - 210-test unit suite (+2 model-level regression tests covering the new
   latching behavior)
+
+### v1.3.3 ✅ (current)
+
+**Bug-fix and performance release — no new features.** A full-codebase deep
+review (the first conducted with Claude Fable 5) found and fixed one real
+notification bug, one capture-pipeline design flaw, and a series of
+performance and asyncio-hygiene issues. See `CHANGELOG.md` for full detail.
+
+- `PlayerState.set_track()` now notifies listeners on every track change —
+  previously every track after the first was silently swallowed, so the
+  renderer never prefetched new cover art or queued palette transitions
+  mid-session
+- Capture redesigned around continuous `sd.InputStream` + a new pure-numpy
+  `ChunkAssembler` (`src/audio/chunking.py`) — the old record-then-sleep
+  loop's "5s overlap" was actually a 10s dead gap between chunks
+- Album-level metadata cache in `MetadataResolver` (~90% fewer Discogs
+  requests per LP) and 429/`Retry-After` rate-limit handling in
+  `DiscogsClient`
+- Render-loop hot paths cached: scaled cover art (was re-decoding a JPEG
+  ~10×/second) and the radial gradient background (was 24 full-screen
+  circle fills per frame), via a shared `_BoundedCache` helper
+- Clean Ctrl+C shutdown (cancellation-based; no more `RuntimeError`
+  traceback) and strong references for fire-and-forget asyncio tasks
+- Shazam client reused across recognitions instead of rebuilt per chunk
+- 261-test unit suite (+51: first-ever `PlayerState` tests, ChunkAssembler
+  windowing tests, renderer cache/color tests, resolver cache tests,
+  Discogs rate-limit tests)
 
 ---
 
