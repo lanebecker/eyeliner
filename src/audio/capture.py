@@ -1,15 +1,36 @@
 """Audio capture from USB audio interface.
 
-Continuously records overlapping chunks from the configured sounddevice input
-and feeds them into the recognition loop queue.
+Records continuously from the configured sounddevice input and feeds
+genuinely overlapping chunks into the silence detector and recognition loop.
+
+Capture design (v1.3.3)
+-----------------------
+Earlier versions used blocking sd.rec() calls separated by a sleep, which
+left a dead gap between chunks (see src/audio/chunking.py for the full
+story).  Capture now works in three stages:
+
+  1. sd.InputStream records continuously; its PortAudio callback (which runs
+     on a non-asyncio audio thread) hands each ~0.25s block to the event loop
+     via loop.call_soon_threadsafe.
+  2. run() drains those blocks from an asyncio.Queue and feeds them to a
+     ChunkAssembler, which emits a chunk_seconds-long window every
+     (chunk_seconds - overlap_seconds).
+  3. Each emitted chunk goes synchronously to SilenceDetector.process() and
+     asynchronously to RecognitionLoop.enqueue() — same consumers, same
+     chunk shape as before; only the windowing changed.
+
+If the block queue ever fills (the event loop stalls for >16s), the OLDEST
+block is dropped and a warning logged — recent audio wins.
 """
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 import sounddevice as sd
+
+from src.audio.chunking import ChunkAssembler
 
 if TYPE_CHECKING:
     from src.audio.silence import SilenceDetector
@@ -17,20 +38,41 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Size of each InputStream callback block, in seconds.  Small enough to keep
+# silence-detection latency low, large enough that call_soon_threadsafe runs
+# only ~4×/second.
+_BLOCK_SECONDS = 0.25
+
+# Max blocks buffered between the audio callback and run().  64 × 0.25s = 16s
+# of slack before the drop-oldest policy kicks in.
+_BLOCK_QUEUE_MAX = 64
+
 
 class AudioCapture:
-    """Wraps sounddevice to record overlapping audio chunks from the USB interface."""
+    """Wraps sounddevice to stream overlapping audio chunks from the USB interface."""
 
     def __init__(self, config: dict, silence: "SilenceDetector", recognizer: "RecognitionLoop"):
         self.config = config["audio"]
         self.silence = silence
         self.recognizer = recognizer
         self._running = False
+        self._blocks: Optional[asyncio.Queue] = None
 
         self.sample_rate: int = self.config["sample_rate"]
         self.chunk_seconds: int = self.config["chunk_seconds"]
         self.overlap_seconds: int = self.config.get("overlap_seconds", 5)
         self.device_name: str = self.config["device_name"]
+
+        # Guard against a misconfigured overlap: hop must stay >= 1 frame.
+        # overlap >= chunk would mean each chunk advances zero (or negative)
+        # frames — an infinite re-recognition of the same audio.
+        if self.overlap_seconds >= self.chunk_seconds:
+            log.warning(
+                f"audio.overlap_seconds ({self.overlap_seconds}) >= "
+                f"chunk_seconds ({self.chunk_seconds}); disabling overlap. "
+                f"Fix config.yaml — overlap must be smaller than the chunk."
+            )
+            self.overlap_seconds = 0
 
     def _find_device_index(self) -> int:
         """Look up the sounddevice index for the configured device name.
@@ -65,48 +107,87 @@ class AudioCapture:
             f"Available input devices: {available}"
         )
 
+    def _make_callback(self, loop: asyncio.AbstractEventLoop, blocks: asyncio.Queue):
+        """Build the InputStream callback (runs on the PortAudio audio thread).
+
+        The callback must never touch asyncio objects directly — it marshals
+        each block onto the event loop with call_soon_threadsafe, where
+        _enqueue_block applies the drop-oldest overflow policy.
+        """
+        def _enqueue_block(block: np.ndarray):
+            # Runs on the event loop thread.
+            if blocks.full():
+                try:
+                    blocks.get_nowait()  # Drop the OLDEST block — recent audio wins
+                    log.warning(
+                        "Audio block queue full; dropped the oldest block. "
+                        "The event loop appears to be stalling."
+                    )
+                except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
+                    pass
+            blocks.put_nowait(block)
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                log.warning(f"Audio input status: {status}")
+            # Copy: PortAudio reuses the indata buffer after the callback returns.
+            block = indata[:, 0].copy()
+            loop.call_soon_threadsafe(_enqueue_block, block)
+
+        return callback
+
     async def run(self):
-        """Main capture loop. Records chunks and dispatches to silence detector and recognizer."""
+        """Main capture loop. Streams audio and dispatches overlapping chunks."""
         device_index = self._find_device_index()
+        loop = asyncio.get_running_loop()
+
         chunk_frames = self.chunk_seconds * self.sample_rate
+        hop_frames = (self.chunk_seconds - self.overlap_seconds) * self.sample_rate
         self._running = True
 
         log.info(
             f"Starting audio capture: {self.chunk_seconds}s chunks "
-            f"at {self.sample_rate}Hz (overlap: {self.overlap_seconds}s)"
+            f"at {self.sample_rate}Hz, new chunk every "
+            f"{self.chunk_seconds - self.overlap_seconds}s "
+            f"({self.overlap_seconds}s overlap)"
         )
 
         while self._running:
+            assembler = ChunkAssembler(chunk_frames, hop_frames)
+            blocks: asyncio.Queue = asyncio.Queue(maxsize=_BLOCK_QUEUE_MAX)
+            self._blocks = blocks
             try:
-                # Record one chunk in a thread pool to avoid blocking the event loop
-                audio = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: sd.rec(
-                        chunk_frames,
-                        samplerate=self.sample_rate,
-                        channels=1,
-                        dtype="float32",
-                        device=device_index,
-                        blocking=True,
-                    ),
+                stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    device=device_index,
+                    blocksize=int(_BLOCK_SECONDS * self.sample_rate),
+                    callback=self._make_callback(loop, blocks),
                 )
-                audio_flat = audio.flatten()
-
-                # Dispatch to silence detector (sync, fast)
-                self.silence.process(audio_flat, self.sample_rate)
-
-                # Enqueue for recognition (async, slow — handled by RecognitionLoop)
-                await self.recognizer.enqueue(audio_flat, self.sample_rate)
-
-                # Overlap: wait for (chunk - overlap) before recording next chunk.
-                # Clamped to 0 so a misconfigured overlap_seconds >= chunk_seconds
-                # doesn't produce a negative delay and spin the event loop.
-                await asyncio.sleep(max(0, self.chunk_seconds - self.overlap_seconds))
-
+                with stream:
+                    while self._running:
+                        block = await blocks.get()
+                        if block is None:
+                            continue  # stop() sentinel — re-check self._running
+                        for chunk in assembler.feed(block):
+                            # Silence detection is sync and fast (one RMS).
+                            self.silence.process(chunk, self.sample_rate)
+                            # Recognition enqueue never blocks (drops when full).
+                            await self.recognizer.enqueue(chunk, self.sample_rate)
             except Exception as e:
+                # CancelledError is BaseException and intentionally NOT caught
+                # here — shutdown cancellation propagates to main() cleanly.
                 log.error(f"Audio capture error: {e}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(1)  # Then retry with a fresh stream
 
     def stop(self):
         self._running = False
+        # Wake run() if it's parked on blocks.get() so it can observe
+        # self._running == False without needing to be cancelled.
+        if self._blocks is not None:
+            try:
+                self._blocks.put_nowait(None)
+            except asyncio.QueueFull:
+                pass  # run() has plenty to wake up for already
         log.info("Audio capture stopped.")
