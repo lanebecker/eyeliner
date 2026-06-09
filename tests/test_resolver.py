@@ -70,6 +70,7 @@ def resolver(mock_discogs, mock_coverart):
     r = MetadataResolver.__new__(MetadataResolver)
     r.discogs = mock_discogs
     r.coverart = mock_coverart
+    r._album_cache = {}  # Normally created in __init__ (bypassed via __new__)
     return r
 
 
@@ -347,3 +348,99 @@ async def test_genres_empty_on_fallback_path(resolver, mock_discogs):
 
     result = await resolver.resolve(make_raw())
     assert result.genres == []
+
+
+# ---------------------------------------------------------------------------
+# Album-level result cache (v1.3.3)
+#
+# A full Discogs lookup can cost 30+ HTTP requests, and every track on an
+# album shares the same (artist, album) pair — so resolve() caches per
+# normalized key. These tests pin the caching contract.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_second_track_same_album_hits_cache_not_discogs(resolver, mock_discogs):
+    """Track 2 of an album must not repeat the Discogs lookup."""
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    first = await resolver.resolve(make_raw(title="So What"))
+    second = await resolver.resolve(make_raw(title="Freddie Freeloader"))
+
+    mock_discogs.search_collection.assert_called_once()
+    assert second.source == MetadataSource.DISCOGS_COLLECTION
+    assert second.title == "Freddie Freeloader"      # Per-track field preserved
+    assert second.album == first.album                # Album-level fields shared
+    assert second.discogs_release_id == first.discogs_release_id
+
+
+@pytest.mark.asyncio
+async def test_cache_key_normalizes_case_and_whitespace(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    await resolver.resolve(make_raw(artist="Miles Davis", album="Kind of Blue"))
+    await resolver.resolve(make_raw(artist="  MILES DAVIS ", album="kind of blue  "))
+
+    mock_discogs.search_collection.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_database_results_are_cached_too(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = None
+    mock_discogs.search_database.return_value = make_discogs_result(instance_id=None)
+
+    await resolver.resolve(make_raw(title="So What"))
+    second = await resolver.resolve(make_raw(title="All Blues"))
+
+    mock_discogs.search_database.assert_called_once()
+    assert second.source == MetadataSource.DISCOGS_DATABASE
+
+
+@pytest.mark.asyncio
+async def test_fallback_cached_when_discogs_lookups_complete_cleanly(
+    resolver, mock_discogs, mock_coverart
+):
+    """Both tiers returning None (genuinely not found) caches the fallback."""
+    await resolver.resolve(make_raw(title="So What"))
+    await resolver.resolve(make_raw(title="All Blues"))
+
+    mock_discogs.search_collection.assert_called_once()
+    mock_coverart.get_cover_art_url.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fallback_not_cached_after_discogs_exception(
+    resolver, mock_discogs, mock_coverart
+):
+    """A network blip must NOT pin the album to fallback metadata forever."""
+    mock_discogs.search_collection.side_effect = ConnectionError("flaky wifi")
+
+    await resolver.resolve(make_raw(title="So What"))
+    # Discogs recovers; the next track must retry the real lookup
+    mock_discogs.search_collection.side_effect = None
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    second = await resolver.resolve(make_raw(title="All Blues"))
+
+    assert second.source == MetadataSource.DISCOGS_COLLECTION
+    assert mock_discogs.search_collection.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_different_albums_resolve_independently(resolver, mock_discogs):
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    await resolver.resolve(make_raw(album="Kind of Blue"))
+    await resolver.resolve(make_raw(album="Sketches of Spain"))
+
+    assert mock_discogs.search_collection.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_is_bounded(resolver, mock_discogs):
+    from src.metadata.resolver import _ALBUM_CACHE_MAX
+    mock_discogs.search_collection.return_value = make_discogs_result()
+
+    for i in range(_ALBUM_CACHE_MAX + 10):
+        await resolver.resolve(make_raw(album=f"Album {i}"))
+
+    assert len(resolver._album_cache) == _ALBUM_CACHE_MAX
