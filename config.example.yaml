@@ -3,6 +3,10 @@ audio:
   # to find your USB audio interface device name
   device_name: "USB Audio Codec"
   sample_rate: 44100
+  # Audio is recorded continuously; a chunk_seconds-long window is sent for
+  # recognition every (chunk_seconds - overlap_seconds), so consecutive
+  # windows share overlap_seconds of audio. overlap_seconds must be smaller
+  # than chunk_seconds (otherwise it's disabled with a warning at startup).
   chunk_seconds: 15
   overlap_seconds: 5
   # RMS energy below this = silence (tune to your room noise floor)
