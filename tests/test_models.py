@@ -438,3 +438,77 @@ def test_next_track_cross_side_last_a_returns_first_of_b():
 
 def test_next_track_none_when_not_found():
     assert make_side_track("Unknown Song").next_track_title is None
+
+
+# ---------------------------------------------------------------------------
+# is_last_track position matching (v1.3.4)
+#
+# is_last_track now compares the current entry's POSITION to the final
+# entry's position instead of comparing titles. Title-only matching let an
+# earlier track that shares the closer's title (reprises, title tracks)
+# set potential_last_track from side A.
+# ---------------------------------------------------------------------------
+
+def _duplicate_title_tracklist():
+    """Album whose A2 shares its title with the B3 closer (e.g. a reprise
+    pattern, or a title track that bookends the record)."""
+    return [
+        TracklistEntry("A1", "Opener"),
+        TracklistEntry("A2", "Hungry Ghosts"),
+        TracklistEntry("A3", "Middle Eight"),
+        TracklistEntry("B1", "Deep Cut"),
+        TracklistEntry("B2", "Penultimate"),
+        TracklistEntry("B3", "Hungry Ghosts"),
+    ]
+
+
+def test_is_last_track_true_for_genuine_closer_with_unique_title():
+    track = TrackMetadata(
+        title="Penultimate", artist="a", album="b",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        tracklist=_duplicate_title_tracklist(),
+    )
+    assert track.is_last_track is False  # B2 is not the closer
+    closer = TrackMetadata(
+        title="Middle Eight", artist="a", album="b",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        tracklist=[TracklistEntry("A1", "Opener"), TracklistEntry("A2", "Middle Eight")],
+    )
+    assert closer.is_last_track is True
+
+
+def test_duplicate_closer_title_on_side_a_does_not_set_last_track():
+    """Regression: playing A2 'Hungry Ghosts' must NOT count as the closer,
+    even though B3 shares the title. Pre-v1.3.4 this returned True and could
+    phantom-increment the play count after a side-A-only session."""
+    track = TrackMetadata(
+        title="Hungry Ghosts", artist="a", album="b",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        tracklist=_duplicate_title_tracklist(),
+    )
+    # Title matching resolves to the FIRST occurrence (A2), whose position
+    # differs from the closer's (B3) -> False. Documented conservative
+    # trade-off: the genuine B3 play is also missed (no phantom counts).
+    assert track.is_last_track is False
+
+
+def test_is_last_track_position_match_is_title_normalized():
+    """Locating the current entry still tolerates case/whitespace jitter."""
+    track = TrackMetadata(
+        title="  master-dik  ", artist="a", album="b",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        tracklist=[
+            TracklistEntry("A1", "Catholic Block"),
+            TracklistEntry("B4", "Master-Dik"),
+        ],
+    )
+    assert track.is_last_track is True
+
+
+def test_is_last_track_false_when_title_not_in_tracklist():
+    track = TrackMetadata(
+        title="Not On This Album", artist="a", album="b",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        tracklist=_duplicate_title_tracklist(),
+    )
+    assert track.is_last_track is False

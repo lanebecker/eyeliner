@@ -88,7 +88,7 @@ def make_tracker(
         last_played_field_name=last_played_field_name,
         update_last_played_return=update_last_played_return,
     )
-    tracker = ListenTracker({}, resolver)
+    tracker = ListenTracker(resolver)
     return tracker, resolver
 
 
@@ -397,7 +397,7 @@ async def test_update_last_played_returning_false_does_not_raise():
 # ---------------------------------------------------------------------------
 
 async def test_session_ended_task_is_referenced_until_done():
-    tracker = ListenTracker({}, make_resolver())
+    tracker = ListenTracker(make_resolver())
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
 
     tracker.on_silence_event(AudioEvent.SESSION_ENDED)
@@ -409,3 +409,105 @@ async def test_session_ended_task_is_referenced_until_done():
 
     assert tracker._session is None      # Session was ended
     assert len(tracker._bg_tasks) == 0   # Reference released on completion
+
+
+# ---------------------------------------------------------------------------
+# Album-change auto-split (v1.3.4)
+#
+# Swapping records faster than session_end_silence_seconds used to merge two
+# albums into one session, letting record 2's closer credit record 1 with a
+# play. on_track_identified now splits the session when a confirmed track's
+# release_id differs from the latched one.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_album_change_splits_session():
+    """A track from a different release ends the old session and starts fresh."""
+    tracker, resolver = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    await tracker.on_track_identified(make_track("Catholic Block", release_id=111, instance_id=222))
+    first_session = tracker._session
+
+    await tracker.on_track_identified(make_track("So What", release_id=999, instance_id=888))
+
+    assert tracker._session is not first_session
+    assert tracker._session.album_release_id == 999
+    assert len(tracker._session.identified_tracks) == 1
+
+
+@pytest.mark.asyncio
+async def test_album_change_credits_first_record_if_its_closer_played():
+    """Record 1 finished (closer identified), record 2 dropped within 45s:
+    the split must still increment record 1's play count."""
+    tracker, resolver = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    await tracker.on_track_identified(make_track("Master-Dik", release_id=111, instance_id=222))
+    assert tracker._session.potential_last_track is True
+
+    await tracker.on_track_identified(make_track("So What", release_id=999, instance_id=888))
+
+    resolver.discogs.increment_play_count.assert_called_once_with(111, 222)
+
+
+@pytest.mark.asyncio
+async def test_album_change_does_not_credit_unfinished_first_record():
+    """Record 1 abandoned mid-side: the split ends its session WITHOUT updates."""
+    tracker, resolver = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    await tracker.on_track_identified(make_track("Catholic Block", release_id=111, instance_id=222))
+    await tracker.on_track_identified(make_track("So What", release_id=999, instance_id=888))
+
+    resolver.discogs.increment_play_count.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_same_release_does_not_split_session():
+    tracker, _ = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    await tracker.on_track_identified(make_track("Catholic Block"))
+    first_session = tracker._session
+    await tracker.on_track_identified(make_track("Pipeline/Kill Time"))
+
+    assert tracker._session is first_session
+    assert len(tracker._session.identified_tracks) == 2
+
+
+@pytest.mark.asyncio
+async def test_fallback_track_without_release_id_does_not_split():
+    """FALLBACK metadata (no release_id) can't be distinguished — no split."""
+    tracker, _ = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    await tracker.on_track_identified(make_track("Catholic Block", release_id=111, instance_id=222))
+    first_session = tracker._session
+
+    fallback = TrackMetadata(
+        title="Mystery Tune",
+        artist="Unknown",
+        album="Bootleg",
+        source=MetadataSource.FALLBACK,
+        discogs_release_id=None,
+        discogs_instance_id=None,
+        tracklist=[],
+    )
+    await tracker.on_track_identified(fallback)
+
+    assert tracker._session is first_session
+
+
+@pytest.mark.asyncio
+async def test_no_split_when_nothing_latched_yet():
+    """First identified track of a session never triggers a split, whatever
+    its release_id — there's nothing latched to differ from."""
+    tracker, _ = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    first_session = tracker._session
+
+    await tracker.on_track_identified(make_track("Catholic Block", release_id=777, instance_id=555))
+
+    assert tracker._session is first_session
+    assert tracker._session.album_release_id == 777
