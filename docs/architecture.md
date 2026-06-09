@@ -13,8 +13,9 @@ a full side plays through.
 ```
 Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                                                   │
-                                         AudioCapture (sounddevice)
-                                         15s chunks, 5s overlap
+                                         AudioCapture (sounddevice
+                                         InputStream → ChunkAssembler)
+                                         15s chunks every 10s, 5s true overlap
                                                   │
                               ┌───────────────────┴────────────────────┐
                               ▼                                         ▼
@@ -60,27 +61,56 @@ event loop. Key wiring:
 - `RecognitionLoop._commit_track` → `MetadataResolver.resolve` → `PlayerState.set_track` + `ListenTracker.on_track_identified`
 - `PlayerState.on_change` → `DisplayRenderer._on_state_change` (sets dirty flag)
 
-Registers `SIGINT`/`SIGTERM` handlers for graceful shutdown (stops capture and
-display, cancels all tasks).
+**Graceful shutdown (v1.3.3):** `SIGINT`/`SIGTERM` handlers call
+`run_task.cancel()` on the gathered pipeline coroutines (capture, recognizer,
+display).  `CancelledError` propagates into each coroutine; `main()` catches
+it and a `finally` block calls `capture.stop()` and `display.stop()`, after
+which `asyncio.run()` exits cleanly.  (The previous design cancelled all
+tasks — including `main()` itself — and called `loop.stop()` from inside
+`asyncio.run()`, which guaranteed a `RuntimeError` traceback on every Ctrl+C.)
 
 ---
 
 ### `src/audio/capture.py` — AudioCapture
 
-Records overlapping audio chunks from the USB interface using `sounddevice`.
+Records **continuously** from the USB interface using `sounddevice` and emits
+genuinely overlapping chunks (redesigned in v1.3.3 — the previous
+record-then-sleep approach left a 10s dead gap between "overlapping" chunks).
+
+**Three-stage pipeline:**
+1. `sd.InputStream` records without interruption; its PortAudio callback
+   (running on a non-asyncio audio thread) hands each ~0.25s block to the
+   event loop via `loop.call_soon_threadsafe`
+2. `run()` drains blocks from an `asyncio.Queue` (drop-oldest policy at 64
+   blocks ≈ 16s of slack) and feeds them to a `ChunkAssembler`
+   (`src/audio/chunking.py`), which emits a `chunk_seconds`-long window every
+   `chunk_seconds - overlap_seconds`
+3. Each emitted chunk is dispatched synchronously to
+   `SilenceDetector.process()` and asynchronously enqueued for `RecognitionLoop`
 
 **Key behaviour:**
 - Finds the device by name substring match against `audio.device_name` in config
-- Records `chunk_seconds` (default 15s) of mono float32 audio at 44100 Hz
-- `sd.rec()` runs in a thread pool executor so it doesn't block the event loop
-- After each recording, sleeps for `chunk_seconds - overlap_seconds` (default 10s)
-  before starting the next, creating 5s of overlap so tracks playing across a
-  chunk boundary are still captured
-- Each chunk is dispatched synchronously to `SilenceDetector.process()` and
-  asynchronously enqueued for `RecognitionLoop`
+- Default timing: a 15s mono float32 window at 44100 Hz every 10s, with a true
+  5s shared region between consecutive windows — no audio is ever unheard
+- `overlap_seconds >= chunk_seconds` is rejected at startup (warning logged,
+  overlap disabled) rather than silently misbehaving
+- On stream errors, retries with a fresh `InputStream` after 1s; cancellation
+  propagates cleanly for shutdown
 
 **Config keys:** `audio.device_name`, `audio.sample_rate`, `audio.chunk_seconds`,
 `audio.overlap_seconds`
+
+---
+
+### `src/audio/chunking.py` — ChunkAssembler
+
+Pure-numpy rolling-window chunker (new in v1.3.3): feed arbitrary-size audio
+blocks, receive `chunk_frames`-long windows every `hop_frames`
+(hop = chunk − overlap).  Chunk N starts at frame N×hop, so consecutive
+chunks share exactly (chunk − hop) frames.  Emitted chunks are independent
+copies; the internal buffer stays bounded below `chunk_frames` between feeds.
+No sounddevice dependency — fully unit-testable without audio hardware
+(`tests/test_chunking.py`).
 
 ---
 
@@ -145,7 +175,8 @@ flickering on noisy or one-off wrong results.
 
 `ShazamIOBackend` — default backend:
 - Serialises the numpy audio array to an in-memory WAV via `soundfile`
-- Passes bytes to `shazamio.Shazam().recognize()`
+- Passes bytes to `shazamio.Shazam.recognize()` — the `Shazam` client is
+  created once on first use and reused for every recognition (v1.3.3)
 - Extracts album from the `sections[].metadata[]` block where `title == "album"`
 
 **Confirmation logic (`_handle_result`):**
@@ -184,6 +215,15 @@ Orchestrates the three-step metadata lookup chain. Always returns a
 Each step runs via `asyncio.run_in_executor` (blocking API calls). Exceptions
 at any step are caught and logged; execution falls through to the next step.
 
+**Album-level result cache (v1.3.3):** a full Discogs resolve can cost 30+
+HTTP requests, and every track on an album shares the same (artist, album)
+pair, so `resolve()` caches per normalized `(artist.lower(), album.lower())`
+key.  Discogs hits cache the result dict + source tier; fallback results
+cache the cover-art URL — but only when both Discogs tiers completed without
+raising, so a transient network error never pins an album to fallback
+metadata for the session.  Bounded at 64 albums (`_ALBUM_CACHE_MAX`) with
+LRU-style eviction.  Cuts per-LP Discogs traffic by roughly 90%.
+
 ---
 
 ### `src/metadata/discogs_client.py` — DiscogsClient
@@ -194,6 +234,14 @@ Wraps the Discogs API for collection search and field updates.
 - `python3-discogs-client` — high-level search and release fetching
 - `requests.Session` — collection membership checks and custom field updates
   (endpoints the library doesn't expose cleanly)
+
+**Rate-limit handling (v1.3.3):** all direct REST calls route through
+`_request()`, which retries exactly once on HTTP 429, sleeping for the
+server-suggested `Retry-After` (clamped to 30s; 2s default when the header is
+missing or unparseable).  The sleep runs on an executor thread, never the
+event loop.  Calls made internally by `python3-discogs-client` are not
+covered — 429s there surface as exceptions and fall through the resolver's
+existing fallback chain.
 
 **`search_collection(artist, album)` — two-strategy approach:**
 
@@ -334,7 +382,16 @@ idle screen rather than a blank frame.
 `current_raw: Optional[RawRecognitionResult]`
 
 Observer pattern: `on_change(callback)` registers listeners; `_notify()` calls
-all listeners on any state change. `DisplayRenderer` uses this to set its dirty flag.
+all listeners on any state change.  A listener that raises is logged and does
+not break the other listeners.  `DisplayRenderer` uses this to set its dirty
+flag, queue palette transitions, and prefetch cover art.
+
+**Notification guarantee (v1.3.3):** `set_track()` notifies on EVERY call —
+including track changes while the status is already PLAYING.  (Previously it
+notified only via the status transition, so every track after the first was
+silently swallowed and the renderer never prefetched new cover art
+mid-session.)  `set_raw()` deliberately does not notify; it stores the
+pre-resolution result only.
 
 ---
 
@@ -388,9 +445,24 @@ and `_bold_fonts` (bold title fonts at 4 px steps from the default size down to
 18 px, used by the v1.2.1 font-scaling fallback) — all keyed by pixel size.
 No SysFont calls during rendering.
 
-**Performance:** `_dirty` flag prevents redraws when state hasn't changed.
-`DisplayRenderer._on_state_change()` is registered as a `PlayerState` listener
-and sets `_dirty = True` on any change.
+**Performance (v1.3.3 render-loop caching):** the now-playing screen
+re-renders continuously (~10 fps) to animate the pulsing dot, so per-frame
+work is effectively permanent work.  Three caches keep the hot path cheap,
+all built on a shared `_BoundedCache` helper (insertion-ordered,
+LRU-refresh-on-get, size-capped; unit-tested in
+`tests/test_renderer_caches.py`):
+
+| Cache | Key | Cap | Saves |
+|-------|-----|-----|-------|
+| `_palette_cache` | cover URL | 200 | PIL quantization per album |
+| `_cover_cache` | (url, w, h) | 16 | JPEG decode + smoothscale **per frame** |
+| gradient surface | (bg, surface, w, h) | 1 | 24 full-screen circle fills per frame |
+
+The gradient regenerates only while a palette transition is actively lerping;
+at steady state every frame is one blit.  The `_dirty` flag prevents redraws
+when nothing changed; `DisplayRenderer._on_state_change()` is registered as a
+`PlayerState` listener and sets `_dirty = True` on any change.  Cover-art
+prefetch tasks are held in a `_bg_tasks` set (strong references) until done.
 
 **Env vars set at import time:**
 - `SDL_AUDIODRIVER=dummy` — suppresses pygame audio (display-only device)
@@ -444,7 +516,10 @@ completion.
 **Session lifecycle:**
 1. `MUSIC_STARTED` → `_start_session()` (creates a fresh `PlaySession`)
 2. Each `on_track_identified(track)` → `session.log_track(track)`
-3. `SESSION_ENDED` → `asyncio.create_task(_end_session())`
+3. `SESSION_ENDED` → `_end_session()` scheduled via `asyncio.create_task`,
+   with a strong reference held in `_bg_tasks` until the task completes
+   (v1.3.3 — asyncio only weak-references tasks, and this one performs the
+   Discogs play-count write)
 
 **`_end_session()` update logic:**
 
@@ -526,7 +601,8 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 ### Needle drop → track on screen
 
 ```
-1. AudioCapture.run()        records 15s chunk
+1. AudioCapture.run()        InputStream streams continuously;
+                             ChunkAssembler emits a 15s window every 10s
 2. SilenceDetector.process() RMS >= threshold → emit MUSIC_STARTED
 3. main.py handler           PlayerState.set_status(LISTENING)
                              ListenTracker._start_session()
@@ -534,10 +610,15 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
                              → RawRecognitionResult (or None)
 5. _handle_result()          confirmation_required=2: need 2 matches
                              second match → _commit_track()
-6. MetadataResolver.resolve()  step 1: Discogs collection hit
-                               → TrackMetadata (DISCOGS_COLLECTION)
-7. PlayerState.set_track()   status → PLAYING, _notify() → _dirty=True
-8. DisplayRenderer._render() cover art downloaded/cached, layout rendered
+6. MetadataResolver.resolve()  album cache miss → step 1: Discogs collection
+                               hit → TrackMetadata (DISCOGS_COLLECTION);
+                               result cached for the album's remaining tracks
+7. PlayerState.set_track()   status → PLAYING, _notify() (fires on every
+                             track change, not just status changes) →
+                             _dirty=True + palette queued + cover prefetched
+8. DisplayRenderer._render() cover art downloaded/cached, layout rendered;
+                             scaled cover + gradient served from cache on
+                             subsequent frames
 ```
 
 ### Side plays through → Discogs + Last.fm updated
@@ -571,7 +652,7 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `audio.device_name` | `"USB Audio Codec"` | Substring matched against sounddevice names |
 | `audio.sample_rate` | `44100` | Hz |
 | `audio.chunk_seconds` | `15` | Recording window length |
-| `audio.overlap_seconds` | `5` | Overlap between consecutive chunks |
+| `audio.overlap_seconds` | `5` | True shared audio between consecutive chunks (must be < `chunk_seconds`; a new chunk is emitted every `chunk_seconds - overlap_seconds`) |
 | `audio.silence_threshold_rms` | `0.01` | Lower = more sensitive; tune to room noise floor |
 | `audio.session_end_silence_seconds` | `45` | Seconds of silence before SESSION_ENDED |
 | `discogs.user_token` | — | From discogs.com → Settings → Developers |
@@ -598,7 +679,8 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | File | Responsibility |
 |------|---------------|
 | `main.py` | Entry point — wires components, runs async event loop |
-| `src/audio/capture.py` | USB audio recording, overlapping chunks |
+| `src/audio/capture.py` | Continuous USB audio streaming (InputStream), chunk dispatch |
+| `src/audio/chunking.py` | Pure-numpy overlapping-window ChunkAssembler |
 | `src/audio/silence.py` | RMS silence detection, AudioEvent emission |
 | `src/audio/recognizer.py` | ShazamIO recognition loop, confirmation logic |
 | `src/metadata/models.py` | TrackMetadata, PlaySession, TracklistEntry, MetadataSource, DisplayPalette, FALLBACK_PALETTE, _SIDE_RE |
@@ -618,12 +700,15 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 
 All source modules are complete. The only remaining work requires hardware:
 
-- **Audio capture testing** — needs the Pi + Behringer UCA222
+- **Audio capture testing** — needs the Pi + Behringer UCA222 (the
+  overlapping-window logic itself is unit-tested hardware-free via
+  `tests/test_chunking.py`; only the sounddevice/InputStream integration
+  remains hardware-bound)
 - **Shazam recognition testing** — needs real audio input
 - **Display rendering testing** — needs the Waveshare HDMI display
 - **End-to-end integration** — full needle-drop → Discogs-updated flow on hardware
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (210 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (261 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
