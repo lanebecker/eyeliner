@@ -511,3 +511,70 @@ async def test_no_split_when_nothing_latched_yet():
 
     assert tracker._session is first_session
     assert tracker._session.album_release_id == 777
+
+
+# ---------------------------------------------------------------------------
+# Auto-split via last_release_id (v1.3.5)
+#
+# The v1.3.4 split compared against the LATCHED album_release_id, which only
+# collection-owned tracks set. A DB-resolved record 1 (never latches) +
+# closer played + quick swap to a collection-owned record 2 evaded detection,
+# and record 2 inherited — and was phantom-credited for — record 1's
+# completed play. Detection now compares against last_release_id, which
+# updates from any source carrying a release ID.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_db_record_then_collection_record_splits():
+    """Regression: a DB-resolved record 1 must not let record 2 inherit its
+    session. Pre-v1.3.5 this merged sessions and phantom-credited record 2."""
+    tracker, resolver = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    # Record 1: DB-resolved (release_id but NO instance_id → never latches),
+    # and its closer plays.
+    db_closer = TrackMetadata(
+        title="Master-Dik", artist="Sonic Youth", album="Sister",
+        source=MetadataSource.DISCOGS_DATABASE,
+        discogs_release_id=111, discogs_instance_id=None,
+        tracklist=make_tracklist(),
+    )
+    await tracker.on_track_identified(db_closer)
+    assert tracker._session.potential_last_track is True
+    assert tracker._session.album_release_id is None     # No latch (DB-only)
+    assert tracker._session.last_release_id == 111       # But it WAS seen
+
+    # Record 2 (collection-owned) dropped within 45s → must split.
+    await tracker.on_track_identified(
+        make_track("Catholic Block", release_id=999, instance_id=888)
+    )
+
+    # The split ended record 1's session; with no latch there was nothing to
+    # credit (correct — we can't update a pressing the user doesn't own)...
+    resolver.discogs.increment_play_count.assert_not_called()
+    # ...and record 2 starts CLEAN: no inherited potential_last_track that
+    # could phantom-credit it at session end.
+    assert tracker._session.potential_last_track is False
+    assert tracker._session.album_release_id == 999
+    assert tracker._session.last_release_id == 999
+
+
+@pytest.mark.asyncio
+async def test_collection_then_db_record_still_splits():
+    """The original v1.3.4 direction (collection → DB) keeps working under
+    last_release_id comparison."""
+    tracker, resolver = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    await tracker.on_track_identified(make_track("Master-Dik", release_id=111, instance_id=222))
+    db_track = TrackMetadata(
+        title="So What", artist="Miles Davis", album="Kind of Blue",
+        source=MetadataSource.DISCOGS_DATABASE,
+        discogs_release_id=555, discogs_instance_id=None,
+        tracklist=[],
+    )
+    await tracker.on_track_identified(db_track)
+
+    # Record 1 was collection-owned and finished → credited by the split.
+    resolver.discogs.increment_play_count.assert_called_once_with(111, 222)
+    assert tracker._session.last_release_id == 555

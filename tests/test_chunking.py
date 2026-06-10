@@ -153,3 +153,31 @@ def test_two_dimensional_blocks_are_flattened():
     assert len(chunks) == 1
     assert chunks[0].ndim == 1
     np.testing.assert_array_equal(chunks[0], ramp(0, 4))
+
+
+# ---------------------------------------------------------------------------
+# Integral-frame validation (v1.3.5)
+#
+# Float frame counts used to pass the range checks and crash later as numpy
+# slice indices (e.g. chunk_seconds: 7.5 in config.yaml). The constructor
+# now rejects fractional counts with a clear message and coerces
+# whole-valued floats (the natural product of seconds * sample_rate math).
+# ---------------------------------------------------------------------------
+
+def test_fractional_chunk_frames_rejected():
+    with pytest.raises(ValueError, match="whole number of frames"):
+        ChunkAssembler(chunk_frames=7.5, hop_frames=2)
+
+
+def test_fractional_hop_frames_rejected():
+    with pytest.raises(ValueError, match="whole number of frames"):
+        ChunkAssembler(chunk_frames=10, hop_frames=2.5)
+
+
+def test_whole_valued_floats_coerced_and_work():
+    """330750.0-style values (seconds * sample_rate arithmetic) are fine."""
+    a = ChunkAssembler(chunk_frames=8.0, hop_frames=4.0)
+    assert a.chunk_frames == 8 and isinstance(a.chunk_frames, int)
+    chunks = a.feed(ramp(0, 8))
+    assert len(chunks) == 1
+    np.testing.assert_array_equal(chunks[0], ramp(0, 8))
