@@ -36,7 +36,7 @@ no locking.
 
 import asyncio
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.metadata.discogs_client import DiscogsClient

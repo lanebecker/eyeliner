@@ -14,7 +14,7 @@ a warning and the method returns False.
 """
 
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.metadata.models import TrackMetadata
@@ -124,7 +124,6 @@ class LastFmClient:
             return True  # Graceful no-op
 
         try:
-            import pylast
             pylast_track = self._network.get_track(track.artist, track.title)
             pylast_track.love()
             log.info(f"Last.fm loved: {track.artist} — {track.title}")
