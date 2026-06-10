@@ -7,7 +7,6 @@ time.monotonic is patched to control the SESSION_ENDED timer precisely.
 """
 from unittest.mock import patch
 import numpy as np
-import pytest
 
 from src.audio.silence import SilenceDetector, AudioEvent
 

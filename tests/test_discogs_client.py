@@ -31,8 +31,7 @@ Covered scenarios — update_last_played:
   ✓ Exception raised during POST → returns False, no crash
 """
 from datetime import date
-from unittest.mock import MagicMock, patch, call
-import pytest
+from unittest.mock import MagicMock, patch
 
 from src.metadata.discogs_client import DiscogsClient
 

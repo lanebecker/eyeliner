@@ -23,7 +23,6 @@ Covered scenarios:
 
 import sys
 from unittest.mock import MagicMock, patch
-import pytest
 
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.tracking.lastfm_client import LastFmClient
