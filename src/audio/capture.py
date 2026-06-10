@@ -141,8 +141,12 @@ class AudioCapture:
         device_index = self._find_device_index()
         loop = asyncio.get_running_loop()
 
-        chunk_frames = self.chunk_seconds * self.sample_rate
-        hop_frames = (self.chunk_seconds - self.overlap_seconds) * self.sample_rate
+        # int() guards against fractional seconds in config.yaml (v1.3.5):
+        # float frame counts previously sailed through to numpy slicing and
+        # crashed mid-capture with a cryptic TypeError.  ChunkAssembler also
+        # validates integrality as a second line of defence.
+        chunk_frames = int(self.chunk_seconds * self.sample_rate)
+        hop_frames = int((self.chunk_seconds - self.overlap_seconds) * self.sample_rate)
         self._running = True
 
         log.info(

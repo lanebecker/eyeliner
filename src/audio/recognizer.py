@@ -140,18 +140,25 @@ class RecognitionLoop:
         """Called by AudioCapture to hand off a chunk for recognition.
 
         If the recognition queue is full (Shazam is taking longer than capture
-        is producing), drop the chunk rather than blocking the capture loop.
-        Dropped chunks are logged at debug level so a "stopped identifying"
-        complaint has a breadcrumb in the journal.
+        is producing), drop the OLDEST queued chunk and admit this one
+        (v1.3.5) — the freshest audio is the most relevant for detecting a
+        track change, and this matches AudioCapture's block-queue policy.
+        (Previously the incoming chunk was discarded, so a lagging backend
+        kept grinding through stale audio and delayed track-change
+        detection.)  Drops are logged at debug level so a "stopped
+        identifying" complaint has a breadcrumb in the journal.
         """
-        if not self._audio_queue.full():
-            await self._audio_queue.put((audio, sample_rate))
-        else:
-            log.debug(
-                "Recognition queue full (maxsize=%d); dropping a chunk. "
-                "If this happens consistently, recognition is slower than capture.",
-                self._audio_queue.maxsize,
-            )
+        if self._audio_queue.full():
+            try:
+                self._audio_queue.get_nowait()  # Drop the OLDEST — recent audio wins
+                log.debug(
+                    "Recognition queue full (maxsize=%d); dropped the oldest chunk. "
+                    "If this happens consistently, recognition is slower than capture.",
+                    self._audio_queue.maxsize,
+                )
+            except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
+                pass
+        await self._audio_queue.put((audio, sample_rate))
 
     async def run(self):
         """Main recognition loop."""

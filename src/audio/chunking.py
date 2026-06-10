@@ -50,6 +50,17 @@ class ChunkAssembler:
     """
 
     def __init__(self, chunk_frames: int, hop_frames: int):
+        # Frame counts must be whole numbers (v1.3.5): floats pass the range
+        # checks below but blow up later as numpy slice indices — fail fast
+        # with a clear message instead.  Whole-valued floats (e.g. 330750.0
+        # from seconds-based arithmetic) are accepted and coerced.
+        for name, value in (("chunk_frames", chunk_frames), ("hop_frames", hop_frames)):
+            if not float(value).is_integer():
+                raise ValueError(
+                    f"{name} must be a whole number of frames, got {value}"
+                )
+        chunk_frames = int(chunk_frames)
+        hop_frames = int(hop_frames)
         if chunk_frames <= 0:
             raise ValueError(f"chunk_frames must be > 0, got {chunk_frames}")
         if not (1 <= hop_frames <= chunk_frames):
