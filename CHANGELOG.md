@@ -14,6 +14,100 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.3.5] — 2026-06-10
+
+**Bug-fix and hardening release — the final-pass audit.** A third
+full-codebase review (this time auditing the two previous sweeps' own work)
+found one bug dating to v1.0.0, one blind spot in the day-old auto-split,
+two robustness gaps, a queue-policy inconsistency, lint, and a cluster of
+inaccurate log-string guidance in the Pi setup guide. Test count: 271 → 297,
+including the first-ever tests for `capture.py`.
+
+### Fixed
+
+- **The ESC key (or closing the window) left the app running headless**
+  (`main.py`).  `DisplayRenderer.run()` exits on ESC/QUIT, but
+  `asyncio.gather` waited for ALL three pipeline legs — so capture and
+  recognition kept running invisibly, still scrobbling and writing play
+  counts with no screen attached, until the process was killed.  The legs
+  are now named tasks awaited with
+  `asyncio.wait(return_when=FIRST_COMPLETED)`: when ANY leg exits, the rest
+  are cancelled and the app shuts down cleanly.  Bonus: an unexpected death
+  of any single coroutine now also stops the whole app instead of leaving it
+  limping.  Present since v1.0.0; survived two prior review sweeps.
+
+- **The v1.3.4 album-change auto-split missed DB-resolved first records**
+  (`src/metadata/models.py`, `src/tracking/listen_tracker.py`).  The split
+  compared against the LATCHED `album_release_id`, which only
+  collection-owned tracks set.  Sequence: record 1 resolves via the Discogs
+  database tier (no latch), its closer plays, record 2 (collection-owned) is
+  dropped within 45s → no difference detected → sessions merge → record 2
+  latches and is phantom-credited with record 1's completed play at session
+  end.  `PlaySession` now tracks `last_release_id` — updated from ANY source
+  carrying a release ID — and the split compares against that.  Regression
+  tests cover both swap directions.
+
+### Changed
+
+- **Recognition queue now drops the oldest chunk, not the newest**
+  (`src/audio/recognizer.py`).  When Shazam lags and the 5-chunk queue
+  fills, the incoming chunk used to be discarded while stale audio kept
+  being processed first — delaying track-change detection.  The OLDEST
+  queued chunk is now evicted instead, matching AudioCapture's block-queue
+  policy: recent audio wins.
+
+- **Palette transitions skip when the target is unchanged**
+  (`src/display/renderer.py`).  Every track commit notifies the renderer,
+  and tracks from the same album share a cover — so each commit restarted
+  the 1s palette transition (30 fps cadence + per-frame gradient
+  regeneration) lerping a palette to itself.  `_queue_palette()` now returns
+  early when the computed target equals the current one.
+
+- **Fractional seconds in config no longer crash capture**
+  (`src/audio/capture.py`, `src/audio/chunking.py`).  `chunk_seconds: 7.5`
+  previously passed validation and died mid-capture with
+  `TypeError: slice indices must be integers` deep in numpy.  Capture now
+  coerces frame math to int, and `ChunkAssembler` rejects fractional frame
+  counts with a clear message (whole-valued floats are accepted and
+  coerced).
+
+- **Lint sweep** — removed every pyflakes-flagged unused import: `Optional`
+  in `resolver.py` and `lastfm_client.py`, a vestigial `import pylast`
+  inside `love()`, `MetadataSource` in `listen_tracker.py`, three
+  method-level `import pygame` statements in renderer methods that no longer
+  touch pygame, and stray `pytest`/`call`/`asyncio`/`patch` imports across
+  five test files.  The tree is now pyflakes-clean.
+
+### Documentation
+
+- **`docs/pi-setup-guide.md` first-run guidance corrected** — the
+  watch-the-logs list told users to look for strings that don't exist
+  (`Committed track:`, `RawRecognitionResult`), are DEBUG-only and invisible
+  at the default INFO level (`MUSIC_STARTED`, `Found in collection`), or are
+  worded wrong (`✅ Scrobbled to Last.fm:` vs the actual
+  `Last.fm scrobbled:`).  Rewritten to the real INFO-level lines in the
+  order they appear, with a note on enabling DEBUG.  The step-11 timing
+  ("within 30–60 seconds") also still reflected the pre-v1.3.3 capture
+  gap; corrected to ~25–40s.
+
+### Added
+
+- **`tests/test_capture.py`** (10 tests) — first-ever coverage for
+  `capture.py`, made possible by stubbing `sounddevice` into `sys.modules`
+  before import (the real module needs PortAudio at import time): device
+  matching (substring, case-insensitivity, input-channel filtering,
+  multi-match warning, not-found error with available-device list), the
+  overlap-misconfiguration guard, and config plumbing.
+- **`tests/test_renderer_palette.py`** (6 tests) — headless `_queue_palette`
+  coverage: disabled theming, fallback paths, cache hits, the v1.3.5
+  same-target skip, and genuine retargets.
+- **`tests/test_listen_tracker.py`** (+2), **`tests/test_models.py`** (+3),
+  **`tests/test_chunking.py`** (+3), **`tests/test_recognizer.py`** (+2) —
+  regression tests for the split blind spot, `last_release_id` semantics,
+  integral-frame validation, and the drop-oldest queue policy.
+
+---
+
 ## [1.3.4] — 2026-06-10
 
 **Behavior-refinement release — follow-up to the v1.3.3 deep review.** The
@@ -681,5 +775,4 @@ recognition → Discogs metadata → pygame display → Discogs field update.
   per-suite descriptions, common failure modes
 - `docs/pi-setup-guide.md` — OS flash, display config, UCA222 setup, venv,
   first run, systemd autostart, troubleshooting
-- `docs/hardware-guide.md` — parts list and wiring diagram
 - `docs/roadmap.md` — versioned feature plan through v1.6.0
