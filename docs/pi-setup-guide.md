@@ -295,21 +295,28 @@ DISPLAY=:0 python3 main.py
 ```
 
 The display should open showing an idle/waiting state. Drop the needle on a
-record — within 30–60 seconds (two consecutive recognition cycles) the track
-name and album art should appear.
+record — within roughly 25–40 seconds the track name and album art should
+appear (capture is continuous: the first 15s recognition window completes at
+15s and the second at 25s, satisfying the two-consecutive-matches gate; the
+rest is Shazam round-trip time).
 
-Watch the terminal output for log messages. Key things to look for:
+Watch the terminal output for log messages. These are the INFO-level lines
+the app actually emits, in the order you should see them:
 
-- `MUSIC_STARTED` — the silence detector is hearing audio above the threshold
-- `RawRecognitionResult` — Shazam identified a track
-- `Committed track:` — confirmation count reached, track is live on screen
-- `Found in collection` — the Discogs lookup succeeded
-- `Play Count updated for release ...` — the Play Count field was incremented at end of session
+- `Play session started.` — the silence detector heard audio above the threshold
+- `Track confirmed: <artist> — <title>` — the confirmation gate passed (two consecutive matching results)
+- `Now playing: <artist> / <album> / <title> [DISCOGS_COLLECTION]` — metadata resolved; the bracketed source shows which lookup tier succeeded (`DISCOGS_COLLECTION` means your own pressing was found; `DISCOGS_DATABASE` or `FALLBACK` mean it wasn't)
+- `Last.fm scrobbled: <artist> — <title>` — the track was posted to your Last.fm listening history (if scrobbling is enabled)
+- `Last track of album identified: ...` — the album closer was recognized; completion updates will fire at session end
+- `Play Count updated for release ...` and `✅ Discogs Play Count incremented successfully.` — the Play Count field was incremented at end of session
 - `Last Played updated for release ...` — the Last Played date was written (only if `last_played_field_name` is configured)
-- `✅ Scrobbled to Last.fm:` — the track was successfully posted to your Last.fm listening history
-- `✅ Last.fm loved:` — the track was marked as Loved on Last.fm (only if `love_on_completion: true`)
+- `✅ Last.fm loved: ...` — the last track was marked as Loved on Last.fm (only if `love_on_completion: true`)
 
-If `MUSIC_STARTED` never appears, the silence threshold may be too high for
+(Chunk-level events such as `SilenceDetector → MUSIC_STARTED` and per-tier
+Discogs lookup details are logged at DEBUG level — change `level=logging.INFO`
+to `logging.DEBUG` in `main.py` if you need them while troubleshooting.)
+
+If `Play session started.` never appears, the silence threshold may be too high for
 your room's noise floor. Tune `audio.silence_threshold_rms` in config.yaml —
 lower values are more sensitive (0.005 is a reasonable starting point).
 
@@ -415,7 +422,7 @@ Run `sudo apt install -y libportaudio2` and try again.
 Run `python3 -c "import sounddevice; print(sounddevice.query_devices())"` and
 check the exact device name. Update `audio.device_name` in config.yaml to match.
 
-**`MUSIC_STARTED` never fires**
+**`Play session started.` never appears**
 The input level is too quiet. Either the turntable volume is low, or
 `silence_threshold_rms` is set too high. Try lowering it to `0.005`. You can
 also run the arecord sanity check from step 5 to confirm audio is reaching the Pi.
