@@ -61,13 +61,16 @@ event loop. Key wiring:
 - `RecognitionLoop._commit_track` → `MetadataResolver.resolve` → `PlayerState.set_track` + `ListenTracker.on_track_identified`
 - `PlayerState.on_change` → `DisplayRenderer._on_state_change` (sets dirty flag)
 
-**Graceful shutdown (v1.3.3):** `SIGINT`/`SIGTERM` handlers call
-`run_task.cancel()` on the gathered pipeline coroutines (capture, recognizer,
-display).  `CancelledError` propagates into each coroutine; `main()` catches
-it and a `finally` block calls `capture.stop()` and `display.stop()`, after
-which `asyncio.run()` exits cleanly.  (The previous design cancelled all
-tasks — including `main()` itself — and called `loop.stop()` from inside
-`asyncio.run()`, which guaranteed a `RuntimeError` traceback on every Ctrl+C.)
+**Graceful shutdown (v1.3.5):** the three pipeline coroutines run as named
+tasks awaited with `asyncio.wait(return_when=FIRST_COMPLETED)` — the moment
+ANY leg exits (the display closing on ESC/window-close, an unexpected
+coroutine death, or `SIGINT`/`SIGTERM` cancelling everything), the remaining
+legs are cancelled and `main()` unwinds through a `finally` block that calls
+`capture.stop()` and `display.stop()`, after which `asyncio.run()` exits
+cleanly.  History: pre-v1.3.3 called `loop.stop()` inside `asyncio.run()`
+(guaranteed `RuntimeError` traceback on Ctrl+C); v1.3.3's cancellable gather
+fixed that but waited for ALL legs, so quitting the display via ESC left
+capture and recognition running headless forever (fixed in v1.3.5).
 
 ---
 
@@ -94,6 +97,9 @@ record-then-sleep approach left a 10s dead gap between "overlapping" chunks).
   5s shared region between consecutive windows — no audio is ever unheard
 - `overlap_seconds >= chunk_seconds` is rejected at startup (warning logged,
   overlap disabled) rather than silently misbehaving
+- Frame counts are coerced to whole integers (v1.3.5) — fractional seconds in
+  config.yaml previously crashed mid-capture as float numpy slice indices;
+  ChunkAssembler also validates integrality as a second line of defence
 - On stream errors, retries with a fresh `InputStream` after 1s; cancellation
   propagates cleanly for shutdown
 
@@ -172,6 +178,12 @@ flickering on noisy or one-off wrong results.
 `title`, `artist`, `album`, `isrc` (optional), `confidence` (optional)
 
 `RecognizerBackend` — ABC with one method: `async recognize(audio, sample_rate) → Optional[RawRecognitionResult]`
+
+**Queue policy (v1.3.5):** chunks arrive from AudioCapture via a bounded
+`asyncio.Queue` (maxsize 5).  When the backend lags and the queue fills, the
+OLDEST chunk is evicted and the incoming one admitted — the freshest audio is
+the most relevant for detecting a track change, matching AudioCapture's
+block-queue policy.
 
 `ShazamIOBackend` — default backend:
 - Serialises the numpy audio array to an in-memory WAV via `soundfile`
@@ -340,11 +352,15 @@ Key properties:
 **`PlaySession`**: Tracks one needle-drop-to-lift session.
 
 Key fields: `started_at`, `identified_tracks`, `potential_last_track`,
-`album_release_id`, `album_instance_id`
+`album_release_id`, `album_instance_id`, `last_release_id` (v1.3.5 — most
+recent release ID seen from any source; drives the auto-split, unlike the
+latched pair which only collection-owned tracks set)
 
 `log_track(track)` behaviour:
 - Deduplicates consecutive identical tracks
 - Sets `potential_last_track = True` when `track.is_last_track`
+- Updates `last_release_id` from any track carrying a `discogs_release_id`
+  (v1.3.5 — including DB-sourced tracks that never latch)
 - Latches `album_release_id` / `album_instance_id` from the **first track that
   has BOTH IDs** — i.e. the first DISCOGS_COLLECTION-sourced track.
   DISCOGS_DATABASE results (which have a `release_id` but no `instance_id`,
@@ -442,6 +458,10 @@ animation, easier on the Pi's CPU).
 - If a new track arrives mid-transition, `_queue_palette()` snaps
   `_current_palette` to the currently-rendered interpolated value first, so
   the new lerp starts from what the user is actually seeing
+- If the computed target equals the current target — every track of the same
+  album shares a cover — `_queue_palette()` returns without restarting the
+  transition (v1.3.5), avoiding 1s of 30 fps rendering per track commit
+  lerping a palette to itself
 - `display.dynamic_theming: false` disables extraction and uses `FALLBACK_PALETTE`
 
 **Font system:** four dicts pre-built at startup — `_fonts` (regular, with the
@@ -522,12 +542,16 @@ completion.
 1. `MUSIC_STARTED` → `_start_session()` (creates a fresh `PlaySession`)
 2. Each `on_track_identified(track)` → `session.log_track(track)`.
    **Album-change auto-split (v1.3.4):** if the confirmed track's
-   `discogs_release_id` differs from the session's latched ID, the user
-   swapped records faster than the 45s silence threshold — the current
+   `discogs_release_id` differs from the session's `last_release_id`, the
+   user swapped records faster than the 45s silence threshold — the current
    session is ended immediately (correctly crediting the previous record if
-   its closer played) and a fresh one begins.  Reliable because the v1.3.3
-   album cache guarantees consistent release IDs per album; FALLBACK tracks
-   (no release ID) never trigger a split
+   its closer played) and a fresh one begins.  Detection compares against
+   `last_release_id` (v1.3.5), which updates from ANY source carrying a
+   release ID — comparing against the latch alone missed swaps where the
+   first record was DB-resolved (never latches), letting record 2 inherit
+   and be phantom-credited for record 1's completed play.  Reliable because
+   the v1.3.3 album cache guarantees consistent release IDs per album;
+   FALLBACK tracks (no release ID) never trigger a split
 3. `SESSION_ENDED` → `_end_session()` scheduled via `asyncio.create_task`,
    with a strong reference held in `_bg_tasks` until the task completes
    (v1.3.3 — asyncio only weak-references tasks, and this one performs the
@@ -712,15 +736,16 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 
 All source modules are complete. The only remaining work requires hardware:
 
-- **Audio capture testing** — needs the Pi + Behringer UCA222 (the
-  overlapping-window logic itself is unit-tested hardware-free via
-  `tests/test_chunking.py`; only the sounddevice/InputStream integration
-  remains hardware-bound)
+- **Audio capture testing** — needs the Pi + Behringer UCA222 for the live
+  `sd.InputStream` integration only: the overlapping-window logic is
+  unit-tested hardware-free via `tests/test_chunking.py`, and device
+  matching, config guards, and constructor plumbing via `tests/test_capture.py`
+  (v1.3.5, using a stubbed sounddevice module)
 - **Shazam recognition testing** — needs real audio input
 - **Display rendering testing** — needs the Waveshare HDMI display
 - **End-to-end integration** — full needle-drop → Discogs-updated flow on hardware
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (271 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (297 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
