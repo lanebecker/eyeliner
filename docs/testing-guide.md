@@ -57,6 +57,7 @@ cp config.example.yaml config.yaml
 | `tests/test_models.py` | Data models (TrackMetadata, PlaySession, etc.) | No | No |
 | `tests/test_silence.py` | Silence detector state machine | No | No |
 | `tests/test_chunking.py` | ChunkAssembler overlapping-window logic | No | No |
+| `tests/test_capture.py` | AudioCapture device matching & config guards (stubbed sounddevice) | No | No |
 | `tests/test_player_state.py` | PlayerState transitions & change notifications | No | No |
 | `tests/test_listen_tracker.py` | Last-track detection & Discogs update logic | No | No |
 | `tests/test_discogs_client.py` | DiscogsClient Play Count, Last Played & rate-limit logic | No | No |
@@ -65,6 +66,7 @@ cp config.example.yaml config.yaml
 | `tests/test_recognizer.py` | Recognition loop confirmation logic | No | No |
 | `tests/test_layouts.py` | Display layout geometry | No | No |
 | `tests/test_renderer_caches.py` | Renderer bounded caches & palette color math | No | No |
+| `tests/test_renderer_palette.py` | _queue_palette transition decisions (headless) | No | No |
 | `test_discogs_live.py` | Live Discogs API integration | No | **Yes** |
 
 ---
@@ -83,19 +85,21 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 271 items
+collected 297 items
 
-tests/test_chunking.py .............                                     [  4%]
-tests/test_discogs_client.py .............................               [ 15%]
-tests/test_lastfm_client.py ...............                              [ 21%]
-tests/test_layouts.py .....................................              [ 34%]
-tests/test_listen_tracker.py ...........................                 [ 44%]
-tests/test_models.py ................................................... [ 63%]
-.........                                                                [ 66%]
+tests/test_capture.py ..........                                         [  3%]
+tests/test_chunking.py ................                                  [  8%]
+tests/test_discogs_client.py .............................               [ 18%]
+tests/test_lastfm_client.py ...............                              [ 23%]
+tests/test_layouts.py .....................................              [ 36%]
+tests/test_listen_tracker.py .............................               [ 45%]
+tests/test_models.py ................................................... [ 62%]
+............                                                             [ 67%]
 tests/test_player_state.py .........                                     [ 70%]
-tests/test_recognizer.py .................                               [ 76%]
-tests/test_renderer_caches.py .............                              [ 81%]
-tests/test_resolver.py .............................                     [ 91%]
+tests/test_recognizer.py ...................                             [ 76%]
+tests/test_renderer_caches.py .............                              [ 80%]
+tests/test_renderer_palette.py ......                                    [ 82%]
+tests/test_resolver.py .............................                     [ 92%]
 tests/test_silence.py ......................                             [100%]
 
 =============================== warnings summary ===============================
@@ -104,7 +108,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 271 passed in 0.35s ==============================
+============================== 297 passed in 0.38s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -115,6 +119,7 @@ The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failu
 pytest tests/test_models.py
 pytest tests/test_silence.py
 pytest tests/test_chunking.py
+pytest tests/test_capture.py
 pytest tests/test_player_state.py
 pytest tests/test_listen_tracker.py
 pytest tests/test_discogs_client.py
@@ -123,6 +128,7 @@ pytest tests/test_resolver.py
 pytest tests/test_recognizer.py
 pytest tests/test_layouts.py
 pytest tests/test_renderer_caches.py
+pytest tests/test_renderer_palette.py
 ```
 
 ### With verbose output (see each test name)
@@ -171,6 +177,11 @@ Key cases — position-based `is_last_track` (new in v1.3.4):
 - The current entry is still located with case/whitespace normalization
 - Unknown titles return `False`
 
+Key cases — `PlaySession.last_release_id` (new in v1.3.5):
+- Set by DB-sourced tracks that never latch the `album_*` pair
+- Follows the MOST RECENT release seen (the latch keeps the first)
+- Unchanged by FALLBACK tracks (no release ID)
+
 ### `test_silence.py` — Silence detection
 
 Synthesizes audio as numpy arrays (music = scaled white noise, silence = zeros) and
@@ -204,6 +215,28 @@ Key cases:
   no audio is ever lost at block boundaries
 - Emitted chunks are independent copies (mutating one can't corrupt later audio)
 - `buffered_frames` / `reset()` housekeeping; 2-D blocks are flattened
+- Integral-frame validation (v1.3.5): fractional frame counts raise a clear
+  ValueError; whole-valued floats (seconds × sample_rate arithmetic) are
+  coerced to int
+
+### `test_capture.py` — AudioCapture device matching & guards (new in v1.3.5)
+
+First-ever coverage for `capture.py`. The module imports `sounddevice` at the
+top level (which needs PortAudio at import time), so the suite plants a stub
+into `sys.modules["sounddevice"]` before importing — and every test patches
+`src.audio.capture.sd` explicitly, so the real module is never exercised even
+on machines where it is installed.
+
+Key cases:
+- Constructor reads the audio config; `overlap_seconds` defaults to 5
+- `overlap >= chunk` is disabled at startup (the v1.3.3 guard)
+- `_find_device_index`: case-insensitive substring matching, output-only
+  devices skipped despite name matches, multi-match uses the first and warns
+  with all candidates, not-found raises a ValueError naming the missing
+  device and listing available inputs
+
+Deliberately NOT covered (genuinely hardware-bound): the live `sd.InputStream`
+integration — callback timing and PortAudio behavior still need the Pi.
 
 ### `test_player_state.py` — State transitions & notifications (new in v1.3.3)
 
@@ -240,13 +273,19 @@ Key cases — Last Played:
 - **Not configured:** `last_played_field_name` is `None` → `update_last_played` never called
 - **Failure:** `update_last_played` returns `False` → logs warning, no crash
 
-Key cases — album-change auto-split (new in v1.3.4):
+Key cases — album-change auto-split (v1.3.4, detection via `last_release_id`
+since v1.3.5):
 - A confirmed track with a different `release_id` ends the old session and
   starts a fresh one (new latch, fresh track list)
 - A finished record 1 (closer played) is still credited when the split fires
 - An unfinished record 1 is NOT credited by the split
 - No split on: same release, FALLBACK metadata (no release_id), or before
-  any release has been latched
+  any release has been seen
+- **Regression (v1.3.5):** a DB-resolved record 1 (release_id but no latch)
+  followed by a collection-owned record 2 splits correctly — record 2 starts
+  clean instead of inheriting (and being phantom-credited for) record 1's
+  `potential_last_track`; the reverse direction (collection → DB) still
+  credits a finished record 1
 
 ### `test_discogs_client.py` — Play Count & Last Played logic
 
@@ -344,6 +383,11 @@ Key cases:
 - `confirmation_required = 3` requires three, `= 1` commits immediately
 - After a commit, pending state is cleared
 
+Key cases — enqueue drop-oldest policy (new in v1.3.5):
+- When the queue is full, the OLDEST chunk is evicted and the incoming one
+  admitted (freshest audio wins; matches AudioCapture's block-queue policy)
+- Below capacity, nothing is dropped
+
 ### `test_renderer_caches.py` — Renderer caches & color math (new in v1.3.3)
 
 Tests the pure-Python pieces of `DisplayRenderer` headlessly — importing
@@ -362,6 +406,21 @@ Key cases — color helpers:
 - `_lerp_palette` interpolates all five palette channels
 - `_clamp_luminance` brightens too-dark colors, leaves bright colors and
   pure black unchanged
+
+### `test_renderer_palette.py` — _queue_palette decisions (new in v1.3.5)
+
+Drives `DisplayRenderer._queue_palette` headlessly — the method never imports
+pygame, and the renderer skeleton is built via `__new__` with only the
+attributes the method reads (the `test_resolver.py` pattern).
+
+Key cases:
+- `dynamic_theming: false` → never retargets
+- Unknown URL with no cached cover file (and `None` URL) → `FALLBACK_PALETTE`
+- Palette-cache hit → cached palette becomes the target, transition starts
+- **Same-target skip (v1.3.5):** re-queuing an unchanged palette does NOT
+  restart the 1s transition (previously every track commit re-triggered
+  30 fps rendering lerping a palette to itself)
+- A genuinely different palette retargets and restarts the timer
 
 ### `test_layouts.py` — Display geometry
 
@@ -494,9 +553,10 @@ The `play_count_field_name` in `config.yaml` doesn't exactly match your Discogs 
 
 These components need the actual Pi + USB audio interface + display to test:
 
-- `src/audio/capture.py` — the `sounddevice`/`InputStream` integration with
-  the UCA222 (the overlapping-window logic it drives is fully covered
-  hardware-free by `tests/test_chunking.py`)
+- `src/audio/capture.py` — only the live `sd.InputStream` integration with
+  the UCA222 now: the overlapping-window logic is covered by
+  `tests/test_chunking.py`, and device matching / config guards by
+  `tests/test_capture.py` (stubbed sounddevice)
 - `src/audio/recognizer.py` → `ShazamIOBackend.recognize()` — real Shazam API calls with real audio
 - `src/display/renderer.py` — pygame rendering on the HDMI display (the
   bounded caches and palette color math are covered hardware-free by
