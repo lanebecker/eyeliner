@@ -775,4 +775,5 @@ recognition → Discogs metadata → pygame display → Discogs field update.
   per-suite descriptions, common failure modes
 - `docs/pi-setup-guide.md` — OS flash, display config, UCA222 setup, venv,
   first run, systemd autostart, troubleshooting
+- `docs/hardware-guide.md` — parts list and wiring diagram
 - `docs/roadmap.md` — versioned feature plan through v1.6.0
