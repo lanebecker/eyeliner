@@ -3,7 +3,6 @@ DisplayPalette, and the new v1.2.0 side-awareness properties.
 
 No hardware, network, or external dependencies required.
 """
-import pytest
 from src.metadata.models import (
     MetadataSource, TracklistEntry, TrackMetadata, PlaySession,
     DisplayPalette, FALLBACK_PALETTE, _SIDE_RE,
@@ -512,3 +511,42 @@ def test_is_last_track_false_when_title_not_in_tracklist():
         tracklist=_duplicate_title_tracklist(),
     )
     assert track.is_last_track is False
+
+
+# ---------------------------------------------------------------------------
+# PlaySession.last_release_id (v1.3.5)
+# ---------------------------------------------------------------------------
+
+def test_last_release_id_updates_from_db_source_without_latching():
+    """DB-resolved tracks set last_release_id (split detection) but never
+    latch album_release_id (Discogs writes need an instance_id)."""
+    session = PlaySession()
+    db_track = TrackMetadata(
+        title="Catholic Block", artist="Sonic Youth", album="Sister",
+        source=MetadataSource.DISCOGS_DATABASE,
+        discogs_release_id=12345, discogs_instance_id=None,
+    )
+    session.log_track(db_track)
+    assert session.last_release_id == 12345
+    assert session.album_release_id is None
+
+
+def test_last_release_id_follows_most_recent_track():
+    session = PlaySession()
+    session.log_track(make_track("Catholic Block", release_id=100, instance_id=200))
+    session.log_track(make_track("Pipeline/Kill Time", release_id=999, instance_id=888))
+    # The latch keeps the FIRST pair; last_release_id follows the LATEST.
+    assert session.album_release_id == 100
+    assert session.last_release_id == 999
+
+
+def test_last_release_id_unchanged_by_fallback_tracks():
+    session = PlaySession()
+    session.log_track(make_track("Catholic Block", release_id=100, instance_id=200))
+    fallback = TrackMetadata(
+        title="Mystery Tune", artist="Unknown", album="Bootleg",
+        source=MetadataSource.FALLBACK,
+        discogs_release_id=None, discogs_instance_id=None,
+    )
+    session.log_track(fallback)
+    assert session.last_release_id == 100

@@ -12,8 +12,7 @@ Verifies:
   - NotImplementedError (stub) falls through gracefully
   - All TrackMetadata fields are populated correctly from each source
 """
-import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import pytest
 
 from src.audio.recognizer import RawRecognitionResult
