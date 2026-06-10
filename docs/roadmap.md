@@ -230,7 +230,7 @@ performance and asyncio-hygiene issues. See `CHANGELOG.md` for full detail.
   windowing tests, renderer cache/color tests, resolver cache tests,
   Discogs rate-limit tests)
 
-### v1.3.4 ✅ (current)
+### v1.3.4 ✅
 
 **Behavior-refinement release.** Implements the design decisions deferred
 from the v1.3.3 deep review; see `CHANGELOG.md` for full detail.
@@ -249,6 +249,29 @@ from the v1.3.3 deep review; see `CHANGELOG.md` for full detail.
   ~25s behind track start — a documented rounding error, not a bug)
 - 271-test unit suite (+10: album-change splits, position-based
   last-track matching)
+
+### v1.3.5 ✅ (current)
+
+**Bug-fix and hardening release — the final-pass audit.** A third review
+auditing the previous two sweeps' own work; see `CHANGELOG.md` for detail.
+
+- ESC/window-close now shuts the whole app down (FIRST_COMPLETED await) —
+  previously the display died and capture/recognition ran headless forever
+  (a v1.0.0 bug that survived two review sweeps)
+- Auto-split now compares against `last_release_id` (any source) instead of
+  the collection-only latch — closes the DB-resolved-first-record blind spot
+  that could phantom-credit record 2 with record 1's play
+- Recognition queue drops the oldest chunk when full (freshest audio wins,
+  matching the capture block queue)
+- Palette transitions skip when the target palette is unchanged (no more
+  1s of 30 fps lerping a palette to itself on every track commit)
+- Fractional seconds in config.yaml are rejected/coerced instead of crashing
+  capture mid-run
+- Pyflakes-clean: all unused imports removed
+- `docs/pi-setup-guide.md` first-run log guidance corrected to the actual
+  INFO-level messages
+- 297-test unit suite (+26: first-ever capture.py coverage via a stubbed
+  sounddevice, headless _queue_palette tests, and regressions for every fix)
 
 ---
 
