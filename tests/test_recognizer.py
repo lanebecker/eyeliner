@@ -7,6 +7,8 @@ No audio hardware, network, or actual Shazam API calls needed.
 The backend is replaced with a MagicMock; we drive _handle_result() directly.
 """
 from unittest.mock import MagicMock, AsyncMock, patch
+
+import numpy as np
 import pytest
 
 from src.audio.recognizer import RawRecognitionResult, RecognitionLoop
@@ -291,3 +293,40 @@ async def test_no_double_commit_after_success():
     await loop._handle_result(raw)
 
     assert resolver.resolve.call_count == 1  # Still only called once
+
+
+# ---------------------------------------------------------------------------
+# enqueue drop-oldest policy (v1.3.5)
+#
+# When the recognition backend lags and the queue fills, the OLDEST chunk is
+# evicted and the incoming one admitted — the freshest audio matters most
+# for detecting a track change. (Previously the incoming chunk was discarded
+# and stale audio kept being processed first.)
+# ---------------------------------------------------------------------------
+
+async def test_enqueue_drops_oldest_when_full():
+    loop_obj, _, _, _ = make_loop()
+    maxsize = loop_obj._audio_queue.maxsize
+
+    for i in range(maxsize):
+        await loop_obj.enqueue(np.full(4, float(i), dtype=np.float32), 44100)
+    assert loop_obj._audio_queue.full()
+
+    # One more: the oldest (marker 0.0) must yield to the newest.
+    await loop_obj.enqueue(np.full(4, 99.0, dtype=np.float32), 44100)
+
+    assert loop_obj._audio_queue.qsize() == maxsize
+    first_audio, _ = loop_obj._audio_queue.get_nowait()
+    assert first_audio[0] == 1.0   # marker 0.0 was evicted
+    remaining = []
+    while not loop_obj._audio_queue.empty():
+        audio, _ = loop_obj._audio_queue.get_nowait()
+        remaining.append(audio[0])
+    assert remaining[-1] == 99.0   # the newest chunk was admitted
+
+
+async def test_enqueue_below_capacity_keeps_everything():
+    loop_obj, _, _, _ = make_loop()
+    await loop_obj.enqueue(np.full(4, 1.0, dtype=np.float32), 44100)
+    await loop_obj.enqueue(np.full(4, 2.0, dtype=np.float32), 44100)
+    assert loop_obj._audio_queue.qsize() == 2
