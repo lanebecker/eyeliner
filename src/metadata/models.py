@@ -217,6 +217,13 @@ class PlaySession:
     potential_last_track: bool = False
     album_release_id: Optional[int] = None
     album_instance_id: Optional[int] = None
+    # Most recent release ID seen from ANY source that carries one — including
+    # DISCOGS_DATABASE results, which never latch the album_* pair above.
+    # Used by ListenTracker's album-change auto-split (v1.3.5): comparing
+    # against the latch alone missed swaps where the first record was
+    # DB-resolved (nothing latched → no difference detected → record 2 could
+    # be phantom-credited with record 1's completed play).
+    last_release_id: Optional[int] = None
 
     def log_track(self, track: TrackMetadata):
         """Record a newly identified track in this session."""
@@ -226,6 +233,8 @@ class PlaySession:
         self.identified_tracks.append(track)
         if track.is_last_track:
             self.potential_last_track = True
+        if track.discogs_release_id:
+            self.last_release_id = track.discogs_release_id
         # Latch the release/instance IDs from the first collection-sourced track.
         # We require BOTH release_id and instance_id to be set — a release_id alone
         # (which is what DISCOGS_DATABASE returns) is not enough to call the

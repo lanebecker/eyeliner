@@ -17,19 +17,24 @@ of silence.  Swapping records faster than that used to merge two albums into
 one session: the release ID stayed latched from record 1, so record 2's
 closer could credit record 1 with a play.  on_track_identified now detects
 the swap — a confirmed track whose discogs_release_id differs from the
-latched one — and splits: the current session is ended (correctly crediting
-record 1 if its closer played) and a fresh session begins for the new
-record.  This signal is reliable because MetadataResolver's album cache
-(v1.3.3) guarantees every track of an album resolves to identical release
-IDs within a session.  Tracks without a release_id (FALLBACK source) can't
-be distinguished and never trigger a split.
+last-seen one — and splits: the current session is ended (correctly
+crediting record 1 if its closer played) and a fresh session begins for the
+new record.  Detection compares against the session's last_release_id
+(v1.3.5) rather than the latched album_release_id: the latch only sets from
+collection-owned tracks, so a DB-resolved first record would otherwise leave
+nothing to compare against and let record 2 inherit (and be phantom-credited
+for) record 1's completed play.  The signal is reliable because
+MetadataResolver's album cache (v1.3.3) guarantees every track of an album
+resolves to identical release IDs within a session.  Tracks without a
+release_id (FALLBACK source) can't be distinguished and never trigger a
+split.
 """
 
 import asyncio
 import logging
 from typing import Optional, TYPE_CHECKING
 
-from src.metadata.models import PlaySession, TrackMetadata, MetadataSource
+from src.metadata.models import PlaySession, TrackMetadata
 from src.audio.silence import AudioEvent
 
 if TYPE_CHECKING:
@@ -143,25 +148,29 @@ class ListenTracker:
         """Called by RecognitionLoop when a new track is confirmed.
 
         Detects mid-session album changes (v1.3.4): if this track resolved to
-        a different Discogs release than the one latched for the current
-        session, the user swapped records faster than the silence threshold.
-        The current session is ended immediately — which correctly credits
-        the previous record if its closer played — and a fresh session starts
-        for the new record.  Both IDs must be present for a split: a missing
-        latched ID means nothing to mis-credit, and a missing track ID
-        (FALLBACK metadata) means the album can't be distinguished.
+        a different Discogs release than the previous one in this session,
+        the user swapped records faster than the silence threshold.  The
+        current session is ended immediately — which correctly credits the
+        previous record if its closer played — and a fresh session starts
+        for the new record.  Comparison is against the session's
+        last_release_id (v1.3.5), which updates from ANY source carrying a
+        release ID — unlike the latch, which only collection-owned tracks
+        set, and which previously let a DB-resolved first record evade
+        detection.  Both IDs must be present for a split: nothing seen yet
+        means nothing to compare, and a missing track ID (FALLBACK metadata)
+        means the album can't be distinguished.
         """
         if self._session is None:
             self._start_session()
 
         if (
-            self._session.album_release_id is not None
+            self._session.last_release_id is not None
             and track.discogs_release_id is not None
-            and track.discogs_release_id != self._session.album_release_id
+            and track.discogs_release_id != self._session.last_release_id
         ):
             log.info(
                 f"Album change detected mid-session "
-                f"(release {self._session.album_release_id} → "
+                f"(release {self._session.last_release_id} → "
                 f"{track.discogs_release_id}) — splitting session."
             )
             await self._end_session()

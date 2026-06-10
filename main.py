@@ -2,17 +2,19 @@
 
 Wires all components together and starts the main event loop.
 
-Shutdown design (v1.3.3)
+Shutdown design (v1.3.5)
 ------------------------
-SIGINT/SIGTERM cancel the gathered pipeline tasks and let main() unwind
-naturally.  The previous approach (cancel ALL tasks — including main()
-itself — then call loop.stop() from inside asyncio.run()) "worked" but
-guaranteed a RuntimeError("Event loop stopped before Future completed")
-traceback on every Ctrl+C.  Cancellation now flows top-down:
+The three pipeline coroutines run as named tasks awaited with
+asyncio.wait(return_when=FIRST_COMPLETED): the moment ANY leg exits — the
+display closing on ESC/window-close, an unexpected coroutine death, or
+SIGINT/SIGTERM cancelling everything — the remaining legs are cancelled and
+main() unwinds through a finally block that stops capture and display.
 
-    signal → run_task.cancel() → gather propagates CancelledError to
-    capture/recognizer/display coroutines → main()'s finally block calls
-    capture.stop() and display.stop() → asyncio.run() exits cleanly.
+History: v1.3.2 and earlier cancelled ALL tasks (including main() itself)
+and called loop.stop() inside asyncio.run(), guaranteeing a RuntimeError
+traceback on every Ctrl+C; v1.3.3 fixed that with a cancellable gather, but
+gather waits for ALL legs — so closing the display via ESC left capture and
+recognition running headless forever (the "ESC zombie", fixed in v1.3.5).
 """
 
 import asyncio
@@ -89,25 +91,40 @@ async def main():
     log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
     display.start()
 
-    # The three long-running pipeline coroutines, gathered into one awaitable.
-    run_task = asyncio.gather(
-        capture.run(),
-        recognizer.run(),
-        display.run(),
-    )
+    # The three long-running pipeline coroutines as named tasks.
+    tasks = [
+        asyncio.create_task(capture.run(), name="capture"),
+        asyncio.create_task(recognizer.run(), name="recognizer"),
+        asyncio.create_task(display.run(), name="display"),
+    ]
 
-    # Graceful shutdown on Ctrl+C or SIGTERM: cancelling the gather propagates
-    # CancelledError into all three coroutines.  run_task.cancel is a plain
-    # synchronous call, so it's safe to invoke directly from a signal handler —
-    # no fire-and-forget task required.
+    # Graceful shutdown on Ctrl+C or SIGTERM: cancel every leg.  Task.cancel
+    # is a plain synchronous call, so it's safe to invoke directly from a
+    # signal handler — no fire-and-forget task required.
+    def _cancel_all():
+        log.info("Shutdown signal received — stopping cleanly.")
+        for t in tasks:
+            t.cancel()
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, run_task.cancel)
+        loop.add_signal_handler(sig, _cancel_all)
 
     try:
-        await run_task
-    except asyncio.CancelledError:
-        log.info("Shutdown signal received — stopping cleanly.")
+        # FIRST_COMPLETED (v1.3.5): if ANY leg exits, shut everything down.
+        # Before this, asyncio.gather waited for ALL legs — so quitting the
+        # display with ESC left capture and recognition running invisibly,
+        # still scrobbling and writing play counts with no screen attached.
+        done, pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for t in done:
+            if not t.cancelled():
+                t.result()  # Re-raises if the leg died with an exception
+        log.info("Pipeline stopped.")
     finally:
         capture.stop()
         display.stop()
