@@ -700,7 +700,6 @@ class DisplayRenderer:
         Returns the actual rendered height in pixels (distance from rect.y to the
         bottom of the last drawn line).  Returns 0 if nothing was drawn.
         """
-        import pygame
         font = (self._bold_fonts if bold else self._fonts).get(size)
         if not font or not text:
             return 0
@@ -770,7 +769,6 @@ class DisplayRenderer:
         self, text: str, size: int, rect, color: tuple, italic: bool = False
     ):
         """Render a single line of text, clipped to rect bounds."""
-        import pygame
         font_dict = self._italic_fonts if italic else self._fonts
         font = font_dict.get(size)
         if not font or not text:
@@ -780,7 +778,6 @@ class DisplayRenderer:
 
     def _draw_mono_text(self, text: str, size: int, rect, color: tuple):
         """Render a single line in the monospace font, clipped to rect."""
-        import pygame
         font = self._mono_fonts.get(size)
         if not font or not text:
             return
@@ -815,6 +812,14 @@ class DisplayRenderer:
                 self._palette_cache.put(cover_url, target)  # put() handles eviction
             else:
                 target = FALLBACK_PALETTE
+
+        # Skip the retarget entirely when nothing changed (v1.3.5): every
+        # track commit notifies the renderer, and tracks from the same album
+        # share a cover URL — without this guard each commit restarted the 1s
+        # transition (30 fps cadence + per-frame gradient regeneration)
+        # lerping a palette to itself.
+        if target == self._target_palette:
+            return
 
         # Snap current to the live interpolated value before retargeting, so a
         # mid-transition track change doesn't lerp from a stale base palette.
