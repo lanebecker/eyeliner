@@ -217,7 +217,7 @@ An optional context row that appears below the catalog footer line. Shows the tr
 
 **Prototype behavior:** `DirectionA.jsx` always renders the full meta column regardless of state. Sample data is always present in the prototype, so the fields are never undefined — suppression is not needed for design-review purposes. The cover is replaced with `DirAEmptyCover`, and the track name text changes, but artist/album/chips/catalog remain visible. This is intentional for the prototype: it lets you evaluate the full layout for each state with real album data in the meta column. The production Python renderer should implement the suppression described above.
 
-**Idle screen is a v1.4.0 design gap.** The diagonal stripe placeholder is intentionally minimal and temporary. The planned redesign will show a grid of recently played album covers, optional clock/date, and a random Discogs collection suggestion during extended idle. Any idle screen design must: use the fallback palette, preserve sharp-corner vocabulary, and feel like a continuation of the room monitor — not a different product.
+**Idle screen is a v1.5.0 design gap.** The diagonal stripe placeholder is intentionally minimal and temporary. The planned redesign will show a grid of recently played album covers, optional clock/date, and a random Discogs collection suggestion during extended idle. Any idle screen design must: use the fallback palette, preserve sharp-corner vocabulary, and feel like a continuation of the room monitor — not a different product.
 
 ## 6. Do's and Don'ts
 

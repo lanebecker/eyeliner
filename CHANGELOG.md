@@ -14,6 +14,98 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.4.0] — 2026-06-11
+
+**Design fidelity release — Phase 1 of the DESIGN.md production
+translation.** Brings the production renderer up to the full design system
+spec (typography, elevation, components) defined in `DESIGN.md` and
+`design/DirectionA.jsx`, plus a major render-loop optimization. Phase 2
+(empty-state redesign + error state) follows separately. Test count:
+297 → 314.
+
+> **Versioning note:** the roadmap previously reserved v1.4.0 for the idle
+> screen redesign; planned features shift up one minor version (idle screen
+> → v1.5.0, side awareness → v1.6.0, web dashboard → v1.7.0).
+
+### Added
+
+- **Bundled display fonts** (`src/display/assets/fonts/`, all OFL-licensed
+  with license texts included): Inter Tight SemiBold (hero track), Inter
+  Tight Medium (artist, adjacent track names), Newsreader Italic (album
+  title), JetBrains Mono Regular (all labels/metadata). Static instances
+  cut from the Google Fonts variable sources. DejaVu SysFont fallback if
+  files are missing.
+- **Letter-spacing for mono labels** (`_render_tracked`): SDL_ttf has no
+  tracking support, so labels render per-character with CSS-equivalent em
+  tracking (0.16em status strip, 0.10em chips, 0.08em catalog footer,
+  0.12em PREV/NEXT). Surfaces cached in a `_BoundedCache` (cap 128).
+- **Cover Lift shadow + hairline ring** (DESIGN.md §4): the design's
+  defining `0 30px 60px rgba(0,0,0,0.55)` shadow, rendered via Pillow
+  gaussian blur (cached per size), plus the 1px ~4%-white inset ring that
+  keeps the cover edge visible against near-black backgrounds.
+- **Shrink-instead-of-ellipsis everywhere** (product decision): artist
+  (single line) and album (≤2 wrapped lines, per the design's 2-line clamp)
+  now step their font size down via the new `_fit_wrapped()` helper instead
+  of hard-clipping. The hero keeps its v1.2.1 step-down behavior. Ellipsis
+  survives in exactly one sanctioned place: PREV/NEXT adjacent track names
+  (`_ellipsize`).
+- **Muted-role contrast clamp** (DESIGN.md Full-Opacity Rule): extracted
+  `muted` colors are lightened at extraction time until they pass WCAG
+  4.5:1 against their album's `bg` (`_ensure_contrast`; cool-dark covers
+  like Cavetown's `#0e1a2a` were the hazard case).
+- **`display.reduced_motion` config flag**: freezes the status dot pulse
+  and the listening spinner — the renderer's translation of the design's
+  `prefers-reduced-motion` requirement (pygame has no OS media query).
+  Bonus: at steady state with the flag on, the render loop goes fully quiet.
+
+### Changed
+
+- **Status strip** now sits on a solid `surface` background (DESIGN.md §5)
+  instead of floating on the gradient; labels are letter-spaced mono.
+- **Status dot** follows the spec pulse — opacity 1→0.55 / scale 1→0.9,
+  1.6s eased loop with an accent glow halo — replacing the old binary
+  on/off color flip every 0.8s.
+- **Genre chips** restyled per DESIGN.md §5: transparent background, 1px
+  border in accent at ~33% alpha (the JSX `{accent}55`), tracked muted
+  text — and capped at 3 chips with a `+N` overflow indicator
+  (`_chip_texts`), replacing unlimited rows.
+- **Album title** renders in Newsreader Italic at line-height 1.12 and may
+  wrap to two lines (previously one hard-clipped DejaVu italic line).
+- **PREV/NEXT panel** matches the design: 1px top divider, NEXT column
+  right-aligned to the metadata column's right edge, names in Inter Tight
+  Medium. The divider deviates from the spec's pure `surface` by blending
+  40% toward `muted` — pure surface was invisible on the physical display
+  at room distance (product decision).
+- **Catalog footer** uses tracked JetBrains Mono.
+
+### Performance
+
+- **Static-frame cache:** the full now-playing frame (gradient, shadow,
+  cover, ring, strip, all text) is composed once per (track content,
+  palette) onto an offscreen Surface; steady-state frames are one blit plus
+  the animated dot, instead of re-rendering every element at 10 fps.
+- **Layout computed once** at startup (`self._layout`) instead of once per
+  frame (`get_now_playing_layout` was called inside the render hot path).
+- **Shared wrap algorithm:** `_wrap_lines()` is now the single source of
+  truth for word-wrapping — `_draw_wrapped_text` and `_measure_wrapped_text`
+  previously carried duplicate copies that could drift.
+
+### Removed
+
+- `_build_font_cache()` and the four startup font dicts (`_fonts`,
+  `_italic_fonts`, `_mono_fonts`, `_bold_fonts`), replaced by the lazy
+  role-based `_font()` cache. `_draw_text_clipped()` and `_draw_mono_text()`
+  superseded by shrink-to-fit drawing and tracked labels.
+
+### Tests
+
+- 314-test unit suite (+17 in `tests/test_renderer_typography.py`):
+  wrap/fit/ellipsize behavior, chip capping, WCAG contrast math and clamp,
+  and a full headless `_compose_now_playing` smoke test under SDL's dummy
+  video driver.
+
+---
+
 ## [1.3.5] — 2026-06-10
 
 **Bug-fix and hardening release — the final-pass audit.** A third

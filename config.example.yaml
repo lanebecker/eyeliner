@@ -33,6 +33,10 @@ display:
   # Background, accent, and text colors shift per record with a 1-second lerp transition.
   # Set to false for a fixed neutral dark theme (useful on low-powered hardware).
   dynamic_theming: true
+  # Reduced motion: freezes the pulsing status dot and spinner (the display's
+  # only animations). Translation of the design's prefers-reduced-motion
+  # requirement — pygame has no OS-level media query.
+  reduced_motion: false
   cover_art_cache_dir: "src/display/assets/cache"
 
 lastfm:

@@ -35,9 +35,9 @@ Warm, obsessive, physical. Like the handwritten notes on an inner sleeve, or a w
 
 ## Planned Features
 
-- **v1.4.0 — Idle Screen:** When no record is playing, the display currently shows a minimal stripe placeholder. The planned redesign shows a grid of recently played album covers, optional clock/date, and a random collection suggestion during extended idle. Design spec TBD.
-- **v1.5.0 — Side A/B Awareness:** Flip reminder on idle screen after Side A ends; Play Count will require both sides to complete before incrementing.
-- **v1.6.0 — Web Dashboard:** Minimal HTTP server at port 8080 for checking now-playing from any device on the local network.
+- **v1.5.0 — Idle Screen:** When no record is playing, the display currently shows a minimal stripe placeholder. The planned redesign shows a grid of recently played album covers, optional clock/date, and a random collection suggestion during extended idle. Design spec TBD. (Was v1.4.0; that slot went to the design-fidelity release — see `docs/roadmap.md`.)
+- **v1.6.0 — Side A/B Awareness:** Flip reminder on idle screen after Side A ends; Play Count will require both sides to complete before incrementing.
+- **v1.7.0 — Web Dashboard:** Minimal HTTP server at port 8080 for checking now-playing from any device on the local network.
 
 ## Accessibility & Inclusion
 

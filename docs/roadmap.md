@@ -250,7 +250,7 @@ from the v1.3.3 deep review; see `CHANGELOG.md` for full detail.
 - 271-test unit suite (+10: album-change splits, position-based
   last-track matching)
 
-### v1.3.5 ✅ (current)
+### v1.3.5 ✅
 
 **Bug-fix and hardening release — the final-pass audit.** A third review
 auditing the previous two sweeps' own work; see `CHANGELOG.md` for detail.
@@ -275,11 +275,45 @@ auditing the previous two sweeps' own work; see `CHANGELOG.md` for detail.
 
 ---
 
-## v1.4.0 — Idle Screen & Recent Plays
+## v1.4.0 — Design Fidelity (Phase 1 of the DESIGN.md translation) ✅ (current)
 
-**Why fourth:** the idle screen is currently a blank dark background (a TODO in
-`DisplayRenderer._render_idle()`). This is the most visible gap in the daily
-experience — the Pi is on all the time, and "nothing" is what you see most.
+**Why here:** the design side of the project produced a full design system
+(`DESIGN.md`, `design/DirectionA.jsx`) that the production renderer only
+partially implemented. This release closes the visual gap and pays the
+render-loop tax down at the same time. (This slot was previously reserved
+for the idle screen, which shifts to v1.5.0 — see the CHANGELOG versioning
+note.)
+
+**What shipped:**
+- Bundled OFL fonts implementing the DESIGN.md hierarchy (Inter Tight
+  SemiBold/Medium, Newsreader Italic, JetBrains Mono) with SysFont fallback
+- Letter-spaced mono labels via cached per-character rendering
+- Cover Lift shadow + hairline ring; status strip on solid `surface`;
+  spec-accurate 1.6s pulsing status dot with accent glow
+- Genre chips per spec (transparent, accent-alpha border, max 3 + `+N`)
+- Shrink-instead-of-ellipsis for hero, artist, and album (ellipsis only in
+  PREV/NEXT); album wraps to two Newsreader Italic lines
+- Muted-role WCAG 4.5:1 contrast clamp at palette extraction
+- `display.reduced_motion` config flag
+- Static-frame render cache: steady-state frames are one blit + the dot
+- 314-test unit suite (+17 typography/contrast/compose tests)
+
+**Phase 2 (planned next): Empty States** — boot/idle/error rendered in the
+full DirectionA frame (440×440 arc/stripe empty cover, 48px state hero,
+metadata suppression, time-progressive boot label), plus a new
+`PlayerStatus.ERROR` for ShazamIO no-match. The between/paused states from
+DESIGN.md need audio-silence heuristics and are deferred to their own
+effort.
+
+---
+
+## v1.5.0 — Idle Screen & Recent Plays
+
+**Why fifth:** the idle screen is currently a blank dark background. This is
+the most visible gap in the daily experience — the Pi is on all the time,
+and "nothing" is what you see most. (DESIGN.md likewise flags the current
+stripe placeholder as a design gap; any redesign must use the fallback
+palette and stay in the room-monitor vocabulary.)
 
 **What it adds:**
 - Grid of recently played album covers (pulled from session history or a small
@@ -292,9 +326,9 @@ experience — the Pi is on all the time, and "nothing" is what you see most.
 
 ---
 
-## v1.5.0 — Side A / Side B Awareness
+## v1.6.0 — Side A / Side B Awareness
 
-**Why fifth:** makes the listening completion logic meaningfully more accurate.
+**Why sixth:** makes the listening completion logic meaningfully more accurate.
 Right now the tracker treats every needle-drop-to-lift session the same way,
 so playing only Side A of a two-sided album can still trigger a Play Count
 increment if Side A happens to end on the last listed track. Side awareness closes
@@ -313,9 +347,9 @@ groundwork required.
 
 ---
 
-## v1.6.0 — Local Web Dashboard
+## v1.7.0 — Local Web Dashboard
 
-**Why sixth:** optional quality-of-life for multi-room or phone-checking use
+**Why seventh:** optional quality-of-life for multi-room or phone-checking use
 cases. Runs alongside the main app as a lightweight HTTP server.
 
 **What it adds:**

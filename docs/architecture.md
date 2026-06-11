@@ -420,31 +420,39 @@ pre-resolution result only.
 
 Manages the pygame window and renders state-appropriate screens.  The run
 loop sleeps at 30 fps while a palette transition is animating (for smooth
-lerping) and ~10 fps otherwise (fast enough for the 0.8s pulsing-dot
+lerping) and ~10 fps otherwise (fast enough for the 1.6s pulsing-dot
 animation, easier on the Pi's CPU).
 
 **Screens:**
 
 | State | Screen |
 |-------|--------|
-| `IDLE` | Radial gradient dark background (TODO v1.4.0: last-played art, clock) |
+| `IDLE` | Radial gradient dark background (interim; DESIGN.md stripe treatment lands with the empty-states work, full redesign planned for v1.5.0) |
 | `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey — fresh sessions only; side flips keep the card up (v1.3.4) |
 | `PLAYING` | Full "Museum Card" now-playing layout |
 
-**Now-playing layout (v1.2.1 "Museum Card" — dynamic push-down):**
-- Full-width header strip: pulsing `●` dot + `NOW PLAYING` label (left),
-  `SIDE A · 02 OF 03` position indicator (right), both in monospace
+**Now-playing layout (v1.2.1 "Museum Card" push-down + v1.4.0 fidelity):**
+- Full-width header strip on a solid `surface` background: pulsing `●` dot
+  with accent glow (1.6s eased opacity/scale pulse per DESIGN.md §5) +
+  letter-spaced `NOW PLAYING` label (left), `SIDE A · 02 OF 03` position
+  indicator (right), both JetBrains Mono
 - Left panel: square album art (~440px), downloaded from URL, MD5-keyed disk
-  cache at `display.cover_art_cache_dir`
-- Right panel: hero track title (72px bold, word-wrapped) is the unconstrained
-  primary element — it claims as much vertical space as it naturally needs.
-  The accent divider line, artist name (48px), album name (32px italic, accent
-  color), and genre/style chip badges (bordered pills, monospace) then flow
-  downward from the title's actual bottom edge (v1.2.1 dynamic push-down).
-  Meta footer (year · label · catalog, monospace muted) and prev/next track strip
-  remain bottom-anchored regardless of title height. Font size reduction is a
-  last resort, applied only if the title cannot fit even with the full available
-  space above the secondary block.
+  cache at `display.cover_art_cache_dir`; "Cover Lift" drop shadow beneath
+  (Pillow gaussian blur, cached per size) and a hairline ring above
+- Right panel: hero track title (Inter Tight SemiBold 72px, word-wrapped) is
+  the unconstrained primary element — it claims as much vertical space as it
+  naturally needs.  The accent divider line, artist name (Inter Tight Medium
+  48px), album name (Newsreader italic 32px, accent color, ≤2 wrapped
+  lines), and genre chips (transparent, accent @ ~33% alpha border, max 3 +
+  `+N` overflow) then flow downward from the title's actual bottom edge.
+  Meta footer (year · label · catalog, tracked mono muted) and the
+  prev/next panel (top divider at `surface` blended 40% toward `muted`;
+  PREV left / NEXT right-aligned) remain bottom-anchored regardless of
+  title height.
+- **Shrink-instead-of-ellipsis (v1.4.0):** hero, artist, and album all step
+  their font size down when the text genuinely cannot fit (hero 4px steps,
+  artist single-line, album two-line via `_fit_wrapped`).  Ellipsis appears
+  in exactly one place by design: the PREV/NEXT adjacent track names.
 
 **Dynamic color theming:**
 - On each new track, `_queue_palette()` runs PIL color quantization on the
@@ -464,30 +472,44 @@ animation, easier on the Pi's CPU).
   lerping a palette to itself
 - `display.dynamic_theming: false` disables extraction and uses `FALLBACK_PALETTE`
 
-**Font system:** four dicts pre-built at startup — `_fonts` (regular, with the
-track-title size overwritten by a bold variant), `_italic_fonts`, `_mono_fonts`,
-and `_bold_fonts` (bold title fonts at 4 px steps from the default size down to
-18 px, used by the v1.2.1 font-scaling fallback) — all keyed by pixel size.
-No SysFont calls during rendering.
+**Font system (v1.4.0 — bundled fonts):** the DESIGN.md type hierarchy ships
+with the app in `src/display/assets/fonts/` (all OFL-licensed): Inter Tight
+SemiBold (hero), Inter Tight Medium (artist + adjacent names), Newsreader
+Italic (album), JetBrains Mono (all labels).  `_font(role, size)` loads
+lazily and caches per `(role, size)`; missing files fall back to the DejaVu
+SysFont family so dev machines and CI without the assets still render.
+Letter-spacing — which SDL_ttf doesn't support — is reproduced for mono
+labels by `_render_tracked()` (per-character blits with a `tracking × size`
+advance, the same arithmetic as CSS em tracking), cached in a
+`_BoundedCache`.
 
-**Performance (v1.3.3 render-loop caching):** the now-playing screen
-re-renders continuously (~10 fps) to animate the pulsing dot, so per-frame
-work is effectively permanent work.  Three caches keep the hot path cheap,
-all built on a shared `_BoundedCache` helper (insertion-ordered,
-LRU-refresh-on-get, size-capped; unit-tested in
-`tests/test_renderer_caches.py`):
+**Performance (v1.3.3 caches + v1.4.0 static frame):** the now-playing
+screen previously re-rendered every element at ~10 fps just to animate the
+status dot.  The full frame — gradient, shadow, cover, ring, strip, all
+text — is now composed once per (track content, palette) onto an offscreen
+Surface by `_compose_now_playing()`; steady-state frames are one full-screen
+blit plus the dot (`_draw_status_dot`).  During the 1s palette lerp the key
+changes per frame, so composition runs at the transition cadence — same cost
+profile as before, for one second per track change.  The layout is computed
+once at startup (`self._layout`) instead of per frame.  Caches, all on the
+shared `_BoundedCache` helper (insertion-ordered, LRU-refresh-on-get,
+size-capped; unit-tested in `tests/test_renderer_caches.py`):
 
 | Cache | Key | Cap | Saves |
 |-------|-----|-----|-------|
 | `_palette_cache` | cover URL | 200 | PIL quantization per album |
-| `_cover_cache` | (url, w, h) | 16 | JPEG decode + smoothscale **per frame** |
-| gradient surface | (bg, surface, w, h) | 1 | 24 full-screen circle fills per frame |
+| `_cover_cache` | (url, w, h) | 16 | JPEG decode + smoothscale per compose |
+| gradient surface | (bg, surface, w, h) | 1 | 24 full-screen circle fills per compose |
+| `_label_cache` | (text, size, color, tracking) | 128 | per-character tracked-label rendering |
+| shadow surface | (w, h) | 1 | Pillow gaussian blur of the Cover Lift shadow |
+| `_static_surface` | (track content, palette) | 1 | **the entire frame** at steady state |
 
-The gradient regenerates only while a palette transition is actively lerping;
-at steady state every frame is one blit.  The `_dirty` flag prevents redraws
-when nothing changed; `DisplayRenderer._on_state_change()` is registered as a
-`PlayerState` listener and sets `_dirty = True` on any change.  Cover-art
-prefetch tasks are held in a `_bg_tasks` set (strong references) until done.
+The `_dirty` flag prevents redraws when nothing changed;
+`DisplayRenderer._on_state_change()` is registered as a `PlayerState`
+listener and sets `_dirty = True` on any change.  With
+`display.reduced_motion: true` the dot renders static and the loop goes
+fully quiet at steady state.  Cover-art prefetch tasks are held in a
+`_bg_tasks` set (strong references) until done.
 
 **Env vars set at import time:**
 - `SDL_AUDIODRIVER=dummy` — suppresses pygame audio (display-only device)

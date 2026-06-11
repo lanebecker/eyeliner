@@ -37,6 +37,39 @@ hot-path costs are therefore cached:
 
 Both use _BoundedCache, the same insertion-order/LRU-refresh strategy the
 palette cache has used since v1.3.2 (which now also uses it).
+
+Design fidelity (v1.4.0)
+------------------------
+Implements the full DESIGN.md type/visual spec from design/DirectionA.jsx:
+
+  - Bundled fonts (src/display/assets/fonts/, all OFL-licensed):
+    Inter Tight SemiBold (hero), Inter Tight Medium (artist, adjacent track
+    names), Newsreader Italic (album title), JetBrains Mono (all labels).
+    Falls back to DejaVu SysFonts if the files are missing.
+  - Letter-spacing for mono labels via per-character rendering
+    (_render_tracked), cached in a _BoundedCache.
+  - Shrink-to-fit typography everywhere: the hero keeps its step-down
+    behavior, and artist (single line) and album (two wrapped lines) now
+    shrink rather than clip.  Ellipsis appears only in the PREV/NEXT panel
+    (per design + product decision).
+  - Cover Lift shadow (Pillow gaussian blur, cached) + hairline ring.
+  - Status strip with solid `surface` background; status dot with spec
+    pulse (opacity/scale, 1.6s ease-in-out) and accent glow.
+  - Genre chips: transparent background, accent @ ~33% alpha border,
+    capped at 3 with a "+N" overflow chip.
+  - Muted palette role is contrast-clamped to ≥4.5:1 against bg at
+    extraction time (DESIGN.md Full-Opacity Rule).
+  - display.reduced_motion config flag freezes all animation
+    (translation of the design's prefers-reduced-motion requirement).
+
+Static-frame cache (v1.4.0)
+---------------------------
+The only animated element on the now-playing screen is the status dot, but
+the loop previously redrew everything at ~10 fps to keep it pulsing.  The
+full frame (gradient, cover, shadow, all text) is now composed once onto an
+offscreen Surface keyed by (track content, palette); steady-state frames are
+one blit plus the dot.  The layout is likewise computed once at startup
+(self._layout) instead of per frame.
 """
 
 import asyncio
@@ -71,6 +104,38 @@ _PALETTE_CACHE_MAX = 200
 # so 16 entries ≈ 12 MB — generous for a device that shows one cover at a time,
 # and tiny next to re-decoding a JPEG ten times a second.
 _COVER_CACHE_MAX = 16
+
+# Cap on the tracked-label Surface cache (letter-spaced mono labels).
+# Labels are tiny surfaces and mostly static per track; 128 is plenty.
+_LABEL_CACHE_MAX = 128
+
+# Status dot pulse period (seconds) — DESIGN.md: 1.6s ease-in-out infinite.
+_PULSE_SECS = 1.6
+
+# Bundled fonts (DESIGN.md §3).  Role → filename in assets/fonts/.
+# "display" = hero track (Inter Tight 600), "text" = artist + adjacent names
+# (Inter Tight 500), "title" = album (Newsreader italic 400), "mono" = all
+# labels/metadata (JetBrains Mono 400).
+_FONT_DIR = Path(__file__).parent / "assets" / "fonts"
+_FONT_FILES = {
+    "display": "InterTight-SemiBold.ttf",
+    "text": "InterTight-Medium.ttf",
+    "title": "Newsreader-Italic.ttf",
+    "mono": "JetBrainsMono-Regular.ttf",
+}
+# SysFont fallbacks if a bundled file is missing (name, bold, italic).
+_SYSFONT_FALLBACKS = {
+    "display": ("dejavu sans", True, False),
+    "text": ("dejavu sans", False, False),
+    "title": ("dejavu sans", False, True),
+    "mono": ("dejavu sans mono", False, False),
+}
+
+# Letter-spacing (em) per label context, from DESIGN.md §3.
+_TRACKING_LABEL = 0.16     # status strip, side counter
+_TRACKING_CHIP = 0.10      # genre chips
+_TRACKING_CATALOG = 0.08   # year · label · catalog footer
+_TRACKING_ADJACENT = 0.12  # PREV/NEXT labels
 
 
 class _BoundedCache:
@@ -139,6 +204,44 @@ def _clamp_luminance(color: tuple, min_lum: float = 0.25) -> tuple:
     return color
 
 
+def _relative_luminance(color: tuple) -> float:
+    """WCAG 2.x relative luminance of an sRGB color (0.0–1.0)."""
+    def chan(c: int) -> float:
+        c = c / 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = color
+    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+
+
+def _contrast_ratio(a: tuple, b: tuple) -> float:
+    """WCAG contrast ratio between two RGB colors (1.0–21.0)."""
+    la, lb = _relative_luminance(a), _relative_luminance(b)
+    lighter, darker = max(la, lb), min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _ensure_contrast(color: tuple, bg: tuple, min_ratio: float = 4.5) -> tuple:
+    """Lighten *color* until it reaches min_ratio contrast against *bg*.
+
+    DESIGN.md §2 (Full-Opacity Rule / muted role): secondary text must pass
+    4.5:1 against its album background at full opacity.  Cool-dark
+    backgrounds pull contrast down faster than neutral darks, so extracted
+    muted values are clamped here rather than trusted.  Blends toward white
+    in small steps; falls back to near-white if even that fails (cannot
+    happen for the dark backgrounds this product produces, but cheap to
+    guard).
+    """
+    if _contrast_ratio(color, bg) >= min_ratio:
+        return color
+    r, g, b = color
+    for step in range(1, 21):
+        t = step / 20.0
+        candidate = tuple(int(c + (255 - c) * t) for c in (r, g, b))
+        if _contrast_ratio(candidate, bg) >= min_ratio:
+            return candidate
+    return (235, 235, 235)
+
+
 def _extract_palette(image_path: Path) -> DisplayPalette:
     """Extract a 5-color display palette from a cached cover art image.
 
@@ -197,12 +300,14 @@ def _extract_palette(image_path: Path) -> DisplayPalette:
             min(255, 215 + int(dominant[2] * 0.03)),
         )
 
-        # Muted: medium gray, very slightly tinted
+        # Muted: medium gray, very slightly tinted — then contrast-clamped
+        # to ≥4.5:1 against this album's bg (DESIGN.md Full-Opacity Rule).
         muted = (
             min(200, 120 + int(dominant[0] * 0.08)),
             min(200, 118 + int(dominant[1] * 0.07)),
             min(200, 115 + int(dominant[2] * 0.06)),
         )
+        muted = _ensure_contrast(muted, bg, min_ratio=4.5)
 
         return DisplayPalette(bg=bg, surface=surface, accent=accent, text=text, muted=muted)
 
@@ -221,18 +326,23 @@ class DisplayRenderer:
         self.height: int = self.config["height"]
         self.fullscreen: bool = self.config.get("fullscreen", True)
         self.dynamic_theming: bool = self.config.get("dynamic_theming", True)
+        # Translation of the design's prefers-reduced-motion requirement:
+        # pygame has no OS media query, so it's a config flag.  When set,
+        # the status dot renders static (no pulse, no glow animation).
+        self.reduced_motion: bool = self.config.get("reduced_motion", False)
         self.cache_dir = Path(
             self.config.get("cover_art_cache_dir", "src/display/assets/cache")
         )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._screen = None
-        self._fonts: dict = {}          # size → pygame.font.Font
-        self._italic_fonts: dict = {}   # size → italic pygame.font.Font
-        self._mono_fonts: dict = {}     # size → monospace pygame.font.Font
-        self._bold_fonts: dict = {}     # size → bold pygame.font.Font (title scaling)
+        self._font_cache: dict = {}     # (role, size) → pygame.font.Font
         self._running = True
         self._dirty = True              # Force initial render
+
+        # Layout is a pure function of (width, height) — compute once
+        # instead of once per frame (v1.4.0).
+        self._layout: NowPlayingLayout = get_now_playing_layout(self.width, self.height)
 
         # Palette transition state
         self._current_palette: DisplayPalette = FALLBACK_PALETTE
@@ -244,6 +354,13 @@ class DisplayRenderer:
         self._cover_cache = _BoundedCache(_COVER_CACHE_MAX)  # (url, w, h) → scaled Surface
         self._gradient_key: Optional[tuple] = None           # (bg, surface, w, h)
         self._gradient_surface = None                        # pygame.Surface
+
+        # Render hot-path caches (v1.4.0)
+        self._label_cache = _BoundedCache(_LABEL_CACHE_MAX)  # tracked-label Surfaces
+        self._shadow_key: Optional[tuple] = None             # (w, h)
+        self._shadow_surface = None                          # Cover Lift shadow
+        self._static_key: Optional[tuple] = None             # (track content, palette)
+        self._static_surface = None                          # composed now-playing frame
 
         # Strong references to fire-and-forget tasks (cover prefetches).
         # asyncio only keeps weak references to tasks, so without this a
@@ -271,37 +388,33 @@ class DisplayRenderer:
         self._screen = pygame.display.set_mode((self.width, self.height), flags)
         pygame.display.set_caption("vinyl-now-playing")
         pygame.mouse.set_visible(False)
-        self._build_font_cache()
         log.info(f"Display initialized: {self.width}x{self.height} fullscreen={self.fullscreen}")
 
-    def _build_font_cache(self):
-        """Pre-build font objects for all sizes used by the layout."""
+    def _font(self, role: str, size: int):
+        """Return the bundled font for a role at a pixel size, cached.
+
+        Roles map to the DESIGN.md type hierarchy (see _FONT_FILES).  Loading
+        is lazy — a TTF is opened once per (role, size) and held forever
+        (fonts are a small, fixed set of sizes).  Falls back to the DejaVu
+        SysFont family if the bundled file is missing, so dev machines and
+        CI without the assets still render.
+        """
         import pygame
-        layout = get_now_playing_layout(self.width, self.height)
-        sizes = {
-            layout.font_size_track,
-            layout.font_size_artist,
-            layout.font_size_album,
-            layout.font_size_chips,
-            layout.font_size_meta,
-            layout.font_size_header,
-            layout.font_size_adjacent,
-            # Always include a couple of fallback sizes
-            16, 14, 12,
-        }
-        for sz in sizes:
-            self._fonts[sz] = pygame.font.SysFont("dejavu sans", sz, bold=False)
-            self._italic_fonts[sz] = pygame.font.SysFont("dejavu sans", sz, bold=False, italic=True)
-            self._mono_fonts[sz] = pygame.font.SysFont("dejavu sans mono", sz, bold=False)
-        # Bold variant for the track title
-        self._fonts[layout.font_size_track] = pygame.font.SysFont(
-            "dejavu sans", layout.font_size_track, bold=True
-        )
-        # Pre-build stepped-down bold variants for v1.2.1 title font-size fallback.
-        # Range covers the default size down to 18px in 4px steps.
-        track_sz = layout.font_size_track
-        for sz in range(track_sz, max(18, track_sz - 40), -4):
-            self._bold_fonts[sz] = pygame.font.SysFont("dejavu sans", sz, bold=True)
+
+        key = (role, size)
+        font = self._font_cache.get(key)
+        if font is not None:
+            return font
+
+        path = _FONT_DIR / _FONT_FILES[role]
+        try:
+            font = pygame.font.Font(str(path), size)
+        except (FileNotFoundError, OSError, pygame.error):
+            name, bold, italic = _SYSFONT_FALLBACKS[role]
+            font = pygame.font.SysFont(name, size, bold=bold, italic=italic)
+            log.warning(f"Bundled font missing ({path.name}); using SysFont fallback")
+        self._font_cache[key] = font
+        return font
 
     def _on_state_change(self, state: PlayerState):
         """Called by PlayerState whenever anything changes."""
@@ -340,7 +453,7 @@ class DisplayRenderer:
                 pygame.display.flip()
 
             # Sleep cadence: 30 fps while transitioning (smooth lerp), otherwise
-            # ~10 fps — fast enough for the 0.8s pulsing dot, but easy on the Pi.
+            # ~10 fps — fast enough for the 1.6s pulsing dot, but easy on the Pi.
             await asyncio.sleep(1 / 30 if transitioning else 1 / 10)
 
     # -----------------------------------------------------------------------
@@ -363,43 +476,77 @@ class DisplayRenderer:
     # -----------------------------------------------------------------------
 
     def _render_now_playing(self):
-        """Render the full now-playing layout — v1.2.1 dynamic push-down design.
+        """Render the now-playing screen: cached static frame + animated dot.
 
-        The track title is the hero element and claims as much vertical space as
-        it naturally needs.  Divider, artist, album, and genre chips then flow
-        downward from the title's actual bottom edge rather than from fixed
-        positions.  Meta footer and prev/next remain bottom-anchored.
+        Everything except the status dot is composed once per (track content,
+        palette) onto an offscreen Surface (_compose_now_playing).  Steady-
+        state frames — the overwhelming majority — are one full-screen blit
+        plus a few alpha circles for the dot, instead of re-rendering every
+        text element at 10 fps (v1.4.0).  During the 1s palette lerp the key
+        changes each frame, so the frame recomposes — same cost profile as
+        the pre-cache code, and only for one second per track change.
+        """
+        track = self.state.current_track
+        layout = self._layout
+        p = self._animated_palette()
 
-        Font size reduction is a last resort: it only kicks in when the title
-        genuinely cannot fit even after yielding all available space.
+        cover = self._load_cover(track.cover_art_url, layout.cover_art.w, layout.cover_art.h)
+
+        key = (
+            track.title, track.artist, track.album,
+            tuple(track.genres or ()),
+            track.year, track.label, track.catalog_number,
+            self._side_string(track),
+            track.prev_track_title, track.next_track_title,
+            id(cover),  # changes when the async cover download lands
+            p.bg, p.surface, p.accent, p.text, p.muted,
+        )
+        if self._static_key != key or self._static_surface is None:
+            self._static_surface = self._compose_now_playing(track, layout, p, cover)
+            self._static_key = key
+
+        self._screen.blit(self._static_surface, (0, 0))
+        self._draw_status_dot(self._screen, layout, p)
+
+        # Keep re-rendering so the dot stays animated; with reduced_motion
+        # the frame is fully static, so the loop can go quiet.
+        if not self.reduced_motion:
+            self._dirty = True
+
+    def _compose_now_playing(self, track, layout: NowPlayingLayout, p: DisplayPalette, cover):
+        """Compose the full static now-playing frame onto a new Surface.
+
+        Implements the v1.2.1 dynamic push-down design with v1.4.0 fidelity:
+        the hero claims the space it needs (stepping down in size as a last
+        resort), and the divider/artist/album/chips flow from its actual
+        bottom edge.  Artist and album use shrink-to-fit (never clipped, no
+        ellipsis); meta footer and prev/next stay bottom-anchored.
         """
         import pygame
 
-        track = self.state.current_track
-        layout = get_now_playing_layout(self.width, self.height)
-        p = self._animated_palette()
+        surf = pygame.Surface((self.width, self.height))
+        self._draw_gradient_bg(surf, p)
 
-        # --- Background ---
-        self._draw_gradient_bg(p)
-
-        # --- Cover art ---
-        cover = self._load_cover(track.cover_art_url, layout.cover_art.w, layout.cover_art.h)
+        # --- Cover: Lift shadow beneath, hairline ring above (DESIGN.md §4) ---
+        ca = layout.cover_art
+        shadow = self._cover_shadow(ca.w, ca.h)
+        pad = (shadow.get_width() - ca.w) // 2
+        offset_y = max(4, int(30 * min(self.width / 1024, self.height / 600)))
+        surf.blit(shadow, (ca.x - pad, ca.y - pad + offset_y))
         if cover:
-            self._screen.blit(cover, (layout.cover_art.x, layout.cover_art.y))
+            surf.blit(cover, (ca.x, ca.y))
         else:
-            pygame.draw.rect(
-                self._screen, p.surface,
-                (layout.cover_art.x, layout.cover_art.y,
-                 layout.cover_art.w, layout.cover_art.h),
-            )
+            pygame.draw.rect(surf, p.surface, (ca.x, ca.y, ca.w, ca.h))
+        ring = pygame.Surface((ca.w, ca.h), pygame.SRCALPHA)
+        pygame.draw.rect(ring, (255, 255, 255, 10), ring.get_rect(), 1)  # 0.04 alpha
+        surf.blit(ring, (ca.x, ca.y))
 
-        # --- Header strip ---
-        self._draw_header(layout, p, track)
+        # --- Status strip (minus the animated dot) ---
+        self._draw_header(surf, layout, p, track)
 
         # -----------------------------------------------------------------
-        # v1.2.1 dynamic push-down geometry
+        # Dynamic push-down geometry
         # -----------------------------------------------------------------
-        # Scale inter-element gaps proportionally from the 1024×600 reference.
         sy = self.height / 600
         GAP_BEFORE_DIV    = max(2, int(4  * sy))   # title bottom → divider top
         GAP_AFTER_DIV     = max(8, int(20 * sy))   # divider bottom → artist top
@@ -407,13 +554,30 @@ class DisplayRenderer:
         GAP_AFTER_ALBUM   = max(3, int(8  * sy))   # album bottom → chips top
         GAP_CHIPS_TO_META = max(8, int(16 * sy))   # chips bottom → meta top (min)
 
-        # Fixed heights of secondary elements (already scaled by layouts.py)
-        div_h    = max(2, layout.divider.h)
-        artist_h = layout.artist_text.h
-        album_h  = layout.album_text.h
-        chips_h  = layout.genre_chips.h
+        div_h   = max(2, layout.divider.h)
+        chips_h = layout.genre_chips.h
 
-        # Total vertical space the secondary block consumes below the title
+        # Shrink-to-fit (v1.4.0): artist stays on one line, album wraps to
+        # at most two (DESIGN.md 2-line clamp) — both reduce font size
+        # instead of clipping.  Heights are measured, not assumed, so the
+        # push-down geometry stays honest when the album takes two lines.
+        artist = track.artist or ""
+        album = track.album or ""
+        artist_size, _ = self._fit_wrapped(
+            artist, "text", layout.font_size_artist, layout.artist_text.w,
+            max_lines=1, min_size=18,
+        )
+        artist_h = self._measure_wrapped_text(
+            artist, "text", artist_size, layout.artist_text.w, line_height=1.04
+        )
+        album_size, _ = self._fit_wrapped(
+            album, "title", layout.font_size_album, layout.album_text.w,
+            max_lines=2, min_size=14,
+        )
+        album_h = self._measure_wrapped_text(
+            album, "title", album_size, layout.album_text.w, line_height=1.12
+        )
+
         secondary_h = (
             GAP_BEFORE_DIV + div_h + GAP_AFTER_DIV
             + artist_h + GAP_AFTER_ARTIST
@@ -421,23 +585,18 @@ class DisplayRenderer:
             + chips_h + GAP_CHIPS_TO_META
         )
 
-        # Maximum pixels the title can occupy before it would crowd the secondary block
+        # Maximum pixels the title can occupy before crowding the secondary block
         title_top   = layout.track_text.y
         meta_y      = layout.meta_text.y
         max_title_h = max(layout.font_size_track + 8, meta_y - title_top - secondary_h)
 
-        # Choose font size: try the layout default, step down 4 px at a time if needed
+        # Hero size: try the layout default, step down 4px at a time if needed
         font_size = layout.font_size_track
-        title_h   = self._measure_wrapped_text(
-            track.title, font_size, layout.track_text.w, bold=True
-        )
+        title_h   = self._measure_wrapped_text(track.title, "display", font_size, layout.track_text.w)
         if title_h > max_title_h:
-            for smaller in sorted(
-                [s for s in self._bold_fonts if s < font_size and s >= 18],
-                reverse=True,
-            ):
+            for smaller in range(font_size - 4, 17, -4):
                 candidate_h = self._measure_wrapped_text(
-                    track.title, smaller, layout.track_text.w, bold=True
+                    track.title, "display", smaller, layout.track_text.w
                 )
                 if candidate_h <= max_title_h:
                     font_size = smaller
@@ -446,84 +605,114 @@ class DisplayRenderer:
             else:
                 title_h = max_title_h   # absolute last resort: clip bottom lines
 
-        # Draw the title; rect height capped at max_title_h so overflow clips
         title_rect = Rect(layout.track_text.x, title_top, layout.track_text.w, max_title_h)
         actual_title_h = self._draw_wrapped_text(
-            track.title, font_size, title_rect, p.text, bold=True
+            surf, track.title, "display", font_size, title_rect, p.text
         )
         title_bottom = title_top + actual_title_h
 
-        # -----------------------------------------------------------------
-        # Secondary elements — positions derived from title_bottom
-        # -----------------------------------------------------------------
-
-        # Accent divider line
+        # Accent divider — fixed 64px-reference width (a punctuation mark,
+        # not a full-width divider; DESIGN.md §5)
         div_y = title_bottom + GAP_BEFORE_DIV
-        pygame.draw.rect(
-            self._screen, p.accent,
-            (layout.divider.x, div_y, layout.divider_width, div_h),
-        )
+        pygame.draw.rect(surf, p.accent, (layout.divider.x, div_y, layout.divider_width, div_h))
 
-        # Artist name
+        # Artist (Inter Tight Medium, lh 1.04)
         artist_y    = div_y + div_h + GAP_AFTER_DIV
-        artist_rect = Rect(layout.artist_text.x, artist_y, layout.artist_text.w, artist_h)
-        self._draw_text_clipped(track.artist, layout.font_size_artist, artist_rect, p.text)
+        artist_rect = Rect(layout.artist_text.x, artist_y, layout.artist_text.w, max(artist_h, 1))
+        self._draw_wrapped_text(surf, artist, "text", artist_size, artist_rect, p.text, line_height=1.04)
 
-        # Album name (italic)
+        # Album (Newsreader italic in accent, lh 1.12, ≤2 lines)
         album_y    = artist_y + artist_h + GAP_AFTER_ARTIST
-        album_rect = Rect(layout.album_text.x, album_y, layout.album_text.w, album_h)
-        self._draw_text_clipped(
-            track.album, layout.font_size_album, album_rect, p.accent, italic=True
-        )
+        album_rect = Rect(layout.album_text.x, album_y, layout.album_text.w, max(album_h, 1))
+        self._draw_wrapped_text(surf, album, "title", album_size, album_rect, p.accent, line_height=1.12)
 
         # Genre chips
         chips_y    = album_y + album_h + GAP_AFTER_ALBUM
         chips_rect = Rect(layout.genre_chips.x, chips_y, layout.genre_chips.w, chips_h)
         if track.genres:
-            self._draw_genre_chips(track.genres, layout, p, chips_rect=chips_rect)
+            self._draw_genre_chips(surf, track.genres, layout, p, chips_rect)
 
-        # -----------------------------------------------------------------
-        # Bottom-anchored elements — positions unchanged from layout
-        # -----------------------------------------------------------------
-
-        meta_parts = [x for x in [track.year, track.label, track.catalog_number] if x]
+        # Bottom-anchored: catalog footer (tracked mono) + adjacent panel
+        meta_parts = [str(x) for x in [track.year, track.label, track.catalog_number] if x]
         if meta_parts:
-            self._draw_mono_text(
-                " · ".join(meta_parts), layout.font_size_meta,
-                layout.meta_text, p.muted,
+            label = self._render_tracked(
+                " · ".join(meta_parts), layout.font_size_meta, p.muted, _TRACKING_CATALOG
             )
+            surf.blit(label, (layout.meta_text.x, layout.meta_text.y),
+                      area=(0, 0, layout.meta_text.w, layout.meta_text.h))
 
-        self._draw_prev_next(layout, p, track)
+        self._draw_prev_next(surf, layout, p, track)
+        return surf
 
-        # Keep re-rendering so the pulsing NOW PLAYING dot stays animated.
-        self._dirty = True
+    def _strip_pad_x(self) -> int:
+        """Status strip horizontal padding (26px at 1024-wide reference)."""
+        return max(8, int(26 * self.width / 1024))
 
-    def _draw_header(self, layout: NowPlayingLayout, p: DisplayPalette, track):
-        """Draw the full-width header strip: NOW PLAYING dot + SIDE info."""
+    def _dot_radius(self) -> int:
+        """Status dot radius — 8×8px dot at reference scale (DESIGN.md §5)."""
+        return max(3, int(4 * min(self.width / 1024, self.height / 600)))
+
+    def _draw_header(self, target, layout: NowPlayingLayout, p: DisplayPalette, track):
+        """Draw the status strip: solid surface background, tracked NOW
+        PLAYING label, right-aligned side counter.
+
+        The animated dot is deliberately NOT drawn here — it's the one
+        per-frame element (_draw_status_dot), so the strip can live in the
+        cached static frame.
+        """
         import pygame
+
         strip = layout.header_strip
-        font = self._mono_fonts.get(layout.font_size_header) or self._mono_fonts.get(12)
-        if not font:
-            return
+        # Solid surface background (DESIGN.md §5: grounds the strip without a border)
+        pygame.draw.rect(target, p.surface, (strip.x, strip.y, strip.w, strip.h))
 
-        # Pulsing dot — simple on/off every ~0.8s
-        dot_on = int(time.monotonic() / 0.8) % 2 == 0
-        dot_color = p.accent if dot_on else p.muted
-        dot_r = max(4, int(strip.h * 0.27))
-        dot_x = int(strip.h * 0.87)
-        dot_y = strip.h // 2
-        pygame.draw.circle(self._screen, dot_color, (dot_x, dot_y), dot_r)
+        pad_x = self._strip_pad_x()
+        dot_r = self._dot_radius()
 
-        # "NOW PLAYING" label
-        label_surf = font.render("NOW PLAYING", True, p.muted)
-        self._screen.blit(label_surf, (dot_x + dot_r + 8, (strip.h - label_surf.get_height()) // 2))
+        label = self._render_tracked("NOW PLAYING", layout.font_size_header, p.muted, _TRACKING_LABEL)
+        target.blit(label, (pad_x + dot_r * 2 + 8, (strip.h - label.get_height()) // 2))
 
-        # SIDE info (right-aligned)
         side_str = self._side_string(track)
         if side_str:
-            side_surf = font.render(side_str, True, p.muted)
-            x = self.width - int(layout.header_strip.h * 0.87) - side_surf.get_width()
-            self._screen.blit(side_surf, (x, (strip.h - side_surf.get_height()) // 2))
+            side = self._render_tracked(side_str, layout.font_size_header, p.muted, _TRACKING_LABEL)
+            target.blit(side, (self.width - pad_x - side.get_width(),
+                               (strip.h - side.get_height()) // 2))
+
+    def _draw_status_dot(self, target, layout: NowPlayingLayout, p: DisplayPalette):
+        """Draw the pulsing status dot — the single animated element.
+
+        DESIGN.md §5: 8×8 accent circle with glow while playing; pulse
+        keyframes 0%/100% {opacity 1, scale 1} → 50% {opacity 0.55, scale
+        0.9}, 1.6s ease-in-out infinite.  A raised cosine reproduces the
+        eased triangle exactly.  The glow approximates the CSS
+        `box-shadow: 0 0 8px accent` with two soft alpha circles.  With
+        reduced_motion the dot is static at full opacity (animation: none),
+        glow retained.
+        """
+        import math
+        import pygame
+
+        strip = layout.header_strip
+        r = self._dot_radius()
+        if self.reduced_motion:
+            k = 0.0
+        else:
+            phase = (time.monotonic() % _PULSE_SECS) / _PULSE_SECS
+            k = 0.5 - 0.5 * math.cos(2 * math.pi * phase)   # 0→1→0, eased
+        opacity = 1.0 - 0.45 * k
+        scale   = 1.0 - 0.10 * k
+
+        cx = self._strip_pad_x() + r
+        cy = strip.y + strip.h // 2
+
+        size = r * 6  # room for the glow halo
+        dot = pygame.Surface((size, size), pygame.SRCALPHA)
+        c = size // 2
+        glow_alpha = int(70 * opacity)
+        pygame.draw.circle(dot, (*p.accent, glow_alpha // 2), (c, c), int(r * 2.5))
+        pygame.draw.circle(dot, (*p.accent, glow_alpha), (c, c), int(r * 1.6))
+        pygame.draw.circle(dot, (*p.accent, int(255 * opacity)), (c, c), max(2, int(r * scale)))
+        target.blit(dot, (cx - c, cy - c))
 
     def _side_string(self, track) -> str:
         """Build the 'SIDE A · 04 OF 06' string, or '' if data is unavailable."""
@@ -536,94 +725,115 @@ class DisplayRenderer:
             return track.track_display
         return ""
 
+    def _chip_texts(self, genres: list) -> list:
+        """Cap chips at 3 with a '+N' overflow indicator (DESIGN.md §6).
+
+        Pure helper, unit-tested directly — Discogs can return 0 or 5+
+        genres and the catalog footer must stay anchored regardless.
+        """
+        shown = list(genres[:3])
+        if len(genres) > 3:
+            shown.append(f"+{len(genres) - 3}")
+        return shown
+
     def _draw_genre_chips(
         self,
+        target,
         genres: list,
         layout: NowPlayingLayout,
         p: DisplayPalette,
         chips_rect=None,
     ):
-        """Render genre/style pill badges, wrapping onto a second row if needed.
+        """Render genre chips per DESIGN.md §5: transparent background,
+        1px border in accent at ~33% alpha (the JSX `{accent}55`), tracked
+        muted mono text, sharp corners, max 3 + '+N' overflow.
 
         If *chips_rect* is supplied it overrides ``layout.genre_chips`` for the
         bounding box, allowing the caller to position chips dynamically.
         """
         import pygame
-        font = self._mono_fonts.get(layout.font_size_chips) or self._mono_fonts.get(12)
-        if not font:
-            return
 
         rect = chips_rect if chips_rect is not None else layout.genre_chips
         px = layout.chip_padding_x
         py = layout.chip_padding_y
         gap = layout.chip_gap
-        x0 = rect.x
-        y0 = rect.y
-        x = x0
-        y = y0
-        chip_h = font.get_height() + py * 2
+        x, y = rect.x, rect.y
+        border = (*p.accent, 0x55)
 
-        for genre in genres:
-            text_surf = font.render(genre, True, p.muted)
-            chip_w = text_surf.get_width() + px * 2
+        for text in self._chip_texts(genres):
+            label = self._render_tracked(text, layout.font_size_chips, p.muted, _TRACKING_CHIP)
+            chip_w = label.get_width() + px * 2
+            chip_h = label.get_height() + py * 2
 
             # Wrap to next row if we'd overflow the bounding box width
-            if x + chip_w > x0 + rect.w and x > x0:
-                x = x0
+            if x + chip_w > rect.x + rect.w and x > rect.x:
+                x = rect.x
                 y += chip_h + gap
-                # Stop if the new row's bottom would exceed the bounding box.
                 if y + chip_h > rect.y + rect.h:
                     break  # Out of room
 
-            # Draw border rect (sharp corners per design)
-            border_rect = pygame.Rect(x, y, chip_w, chip_h)
-            pygame.draw.rect(self._screen, p.surface, border_rect)
-            pygame.draw.rect(self._screen, p.muted, border_rect, 1)
-
-            # Draw label inside chip
-            self._screen.blit(text_surf, (x + px, y + py))
+            # Per-chip SRCALPHA surface so the border alpha actually blends
+            chip = pygame.Surface((chip_w, chip_h), pygame.SRCALPHA)
+            pygame.draw.rect(chip, border, chip.get_rect(), 1)
+            chip.blit(label, (px, py))
+            target.blit(chip, (x, y))
             x += chip_w + gap
 
-    def _draw_prev_next(self, layout: NowPlayingLayout, p: DisplayPalette, track):
-        """Draw the prev/next track navigation footer."""
+    def _draw_prev_next(self, target, layout: NowPlayingLayout, p: DisplayPalette, track):
+        """Draw the adjacent-track panel (DESIGN.md §5 PREV/NEXT spec).
+
+        Top divider in `surface`, PREV left-aligned, NEXT right-aligned so it
+        hangs from the metadata column's right edge.  Track names are Inter
+        Tight Medium with ellipsis truncation — the one place ellipsis is
+        sanctioned (product decision: everywhere else shrinks instead).
+        """
         import pygame
-        label_font = self._mono_fonts.get(layout.font_size_header) or self._mono_fonts.get(12)
-        name_font = self._fonts.get(layout.font_size_adjacent) or self._fonts.get(14)
-        if not label_font or not name_font:
+
+        prev = track.prev_track_title
+        nxt = track.next_track_title
+        if not prev and not nxt:
             return
 
         strip = layout.prev_next
-        half_w = strip.w // 2
+        # border-top divider.  The design spec says 1px `surface`, but
+        # surface-on-gradient is nearly invisible on the physical display
+        # at room distance — production blends 40% toward `muted` (still
+        # album-tinted, deliberately just-visible).  Product decision
+        # 2026-06-11.
+        divider = _lerp_color(p.surface, p.muted, 0.40)
+        pygame.draw.rect(target, divider, (strip.x, strip.y, strip.w, 1))
 
-        # PREV (left half)
-        prev = track.prev_track_title
+        name_font = self._font("text", layout.font_size_adjacent)
+        half_w = strip.w // 2 - 16
+        y0 = strip.y + max(3, int(8 * self.height / 600))
+
         if prev:
-            label = label_font.render("← PREV", True, p.muted)
-            self._screen.blit(label, (strip.x, strip.y))
-            name = name_font.render(prev, True, p.text)
-            # Clip to half-width
-            clip = pygame.Rect(strip.x, strip.y + label.get_height() + 4, half_w - 8, name.get_height())
-            self._screen.blit(name, clip.topleft, area=(0, 0, clip.w, clip.h))
+            label = self._render_tracked("← PREV", layout.font_size_header, p.muted, _TRACKING_ADJACENT)
+            target.blit(label, (strip.x, y0))
+            name = name_font.render(self._ellipsize(prev, name_font, half_w), True, p.text)
+            target.blit(name, (strip.x, y0 + label.get_height() + 4))
 
-        # NEXT (right half, right-aligned label)
-        nxt = track.next_track_title
         if nxt:
-            label = label_font.render("NEXT →", True, p.muted)
-            lx = strip.x + half_w + 8
-            self._screen.blit(label, (lx, strip.y))
-            name = name_font.render(nxt, True, p.text)
-            clip_w = half_w - 8
-            self._screen.blit(name, (lx, strip.y + label.get_height() + 4), area=(0, 0, clip_w, name.get_height()))
+            label = self._render_tracked("NEXT →", layout.font_size_header, p.muted, _TRACKING_ADJACENT)
+            right = strip.x + strip.w
+            target.blit(label, (right - label.get_width(), y0))
+            name = name_font.render(self._ellipsize(nxt, name_font, half_w), True, p.text)
+            target.blit(name, (right - name.get_width(), y0 + label.get_height() + 4))
 
     # -----------------------------------------------------------------------
     # Boot / idle / listening states
     # -----------------------------------------------------------------------
 
     def _render_listening(self):
-        """Render 'Identifying…' boot state while awaiting first recognition."""
+        """Render 'Identifying…' boot state while awaiting first recognition.
+
+        NOTE: interim visual — the full DESIGN.md empty-state spec (DirectionA
+        frame, 440×440 arc cover, 48px hero, progressive boot labels) lands in
+        the Phase 2 empty-states work.
+        """
         import pygame
         p = FALLBACK_PALETTE
-        self._draw_gradient_bg(p)
+        self._draw_gradient_bg(self._screen, p)
 
         # Spinning arc as a loading indicator (simple rotation)
         cx, cy = self.width // 2, self.height // 2
@@ -633,30 +843,124 @@ class DisplayRenderer:
         pygame.draw.circle(self._screen, p.surface, (cx, cy), r + 4, 1)
         # Draw a short arc via thick line (poor man's spinner)
         import math
-        for deg in range(0, 50, 3):
-            a = math.radians(angle + deg)
-            x1 = int(cx + r * math.cos(a))
-            y1 = int(cy + r * math.sin(a))
-            pygame.draw.circle(self._screen, p.accent, (x1, y1), 2)
+        if not self.reduced_motion:
+            for deg in range(0, 50, 3):
+                a = math.radians(angle + deg)
+                x1 = int(cx + r * math.cos(a))
+                y1 = int(cy + r * math.sin(a))
+                pygame.draw.circle(self._screen, p.accent, (x1, y1), 2)
 
-        font = self._mono_fonts.get(12) or list(self._mono_fonts.values())[0] if self._mono_fonts else None
-        if font:
-            surf = font.render("IDENTIFYING…", True, p.muted)
-            self._screen.blit(surf, surf.get_rect(center=(cx, cy + r + 20)))
-        self._dirty = True  # Keep animating
+        label = self._render_tracked("IDENTIFYING…", 12, p.muted, _TRACKING_LABEL)
+        self._screen.blit(label, label.get_rect(center=(cx, cy + r + 20)))
+        if not self.reduced_motion:
+            self._dirty = True  # Keep animating
 
     def _render_idle(self):
-        """Render idle/standby screen."""
+        """Render idle/standby screen.
+
+        NOTE: interim visual — the diagonal-stripe 'NO RECORD ON PLATTER'
+        treatment from DESIGN.md lands in the Phase 2 empty-states work
+        (and DESIGN.md itself flags the idle screen as a design gap).
+        """
         p = FALLBACK_PALETTE
-        self._draw_gradient_bg(p)
-        # TODO (v1.4.0): grid of recently played albums, clock, random suggestion
+        self._draw_gradient_bg(self._screen, p)
 
     # -----------------------------------------------------------------------
     # Drawing helpers
     # -----------------------------------------------------------------------
 
-    def _draw_gradient_bg(self, p: DisplayPalette):
-        """Fill the screen with a radial gradient from surface (centre) to bg (edges).
+    def _render_tracked(self, text: str, size: int, color: tuple, tracking: float):
+        """Render a mono label with letter-spacing, returning a Surface.
+
+        pygame/SDL_ttf has no tracking support, so each character is rendered
+        individually and blitted with an extra advance of (tracking × size)
+        pixels — the same arithmetic as CSS letter-spacing in em.  Surfaces
+        are cached (labels are small and mostly static per track).
+        """
+        import pygame
+
+        key = (text, size, color, tracking)
+        cached = self._label_cache.get(key)
+        if cached is not None:
+            return cached
+
+        font = self._font("mono", size)
+        extra = tracking * size
+        glyphs = [font.render(ch, True, color) for ch in text]
+        # Total width: glyph advances + tracking between characters (CSS adds
+        # tracking after every glyph including the last; trim it for cleaner
+        # right-alignment).
+        width = int(sum(g.get_width() for g in glyphs) + extra * max(0, len(glyphs) - 1))
+        surf = pygame.Surface((max(1, width), font.get_height()), pygame.SRCALPHA)
+        x = 0.0
+        for g in glyphs:
+            surf.blit(g, (int(x), 0))
+            x += g.get_width() + extra
+        self._label_cache.put(key, surf)
+        return surf
+
+    def _wrap_lines(self, text: str, font, max_width: int) -> list:
+        """Greedy word-wrap; the single source of truth for line breaking.
+
+        Used by both measurement and drawing so they can never disagree
+        (previously duplicated in _draw_wrapped_text/_measure_wrapped_text).
+        """
+        words = text.split()
+        lines = []
+        current = ""
+        for word in words:
+            test = (current + " " + word).strip()
+            if font.size(test)[0] <= max_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
+
+    def _fit_wrapped(
+        self, text: str, role: str, base_size: int, max_width: int,
+        max_lines: int, min_size: int = 14, step: int = 2,
+    ) -> tuple:
+        """Find the largest font size ≤ base_size at which *text* wraps into
+        ≤ max_lines within max_width.  Returns (size, lines).
+
+        This is the shrink-instead-of-ellipsis behavior (product decision):
+        long artist names and album titles reduce in size rather than
+        truncate.  If even min_size can't fit the line count, returns the
+        min_size wrap (caller clips — practically unreachable for real
+        metadata).
+        """
+        size = base_size
+        while size >= min_size:
+            lines = self._wrap_lines(text, self._font(role, size), max_width)
+            if len(lines) <= max_lines:
+                return size, lines
+            size -= step
+        return min_size, self._wrap_lines(text, self._font(role, min_size), max_width)
+
+    def _ellipsize(self, text: str, font, max_width: int) -> str:
+        """Trim *text* with a trailing ellipsis to fit max_width.
+
+        Only used by the PREV/NEXT adjacent panel — everywhere else the
+        design translation shrinks instead (see _fit_wrapped).
+        """
+        if font.size(text)[0] <= max_width:
+            return text
+        ell = "…"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.size(text[:mid].rstrip() + ell)[0] <= max_width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip() + ell
+
+    def _draw_gradient_bg(self, target, p: DisplayPalette):
+        """Fill *target* with a radial gradient from surface (centre) to bg (edges).
 
         Pygame has no built-in radial gradient, so we approximate with concentric
         circles drawn from the outer edge inward. The gradient is anchored at
@@ -690,99 +994,84 @@ class DisplayRenderer:
             self._gradient_key = key
             self._gradient_surface = surface
 
-        self._screen.blit(self._gradient_surface, (0, 0))
+        target.blit(self._gradient_surface, (0, 0))
+
+    def _cover_shadow(self, w: int, h: int):
+        """Pre-render the Cover Lift shadow (DESIGN.md §4) for a w×h cover.
+
+        CSS reference: `0 30px 60px rgba(0,0,0,0.55)` — a 30px downward
+        offset, 60px blur, 55% black.  Pillow renders a filled rect with a
+        gaussian blur once per cover size (a single size in practice);
+        the result is cached and blitted beneath the cover every compose.
+        The offset is applied at blit time, not baked into the surface.
+        """
+        import pygame
+        from PIL import Image, ImageDraw, ImageFilter
+
+        key = (w, h)
+        if self._shadow_key == key and self._shadow_surface is not None:
+            return self._shadow_surface
+
+        s = min(self.width / 1024, self.height / 600)
+        blur = max(8, int(30 * s))      # CSS 60px blur ≈ gaussian radius 30
+        pad = blur * 2                  # room for the blur to breathe
+        img = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((pad, pad, pad + w, pad + h), fill=(0, 0, 0, 140))  # 0.55 alpha
+        img = img.filter(ImageFilter.GaussianBlur(blur))
+        surf = pygame.image.frombuffer(img.tobytes(), img.size, "RGBA").convert_alpha()
+
+        self._shadow_key = key
+        self._shadow_surface = surf
+        return surf
 
     def _draw_wrapped_text(
-        self, text: str, size: int, rect, color: tuple, bold: bool = False
+        self, target, text: str, role: str, size: int, rect, color: tuple,
+        line_height: float = 0.98,
     ) -> int:
         """Render text with word-wrapping to fit within rect.w, clipped to rect.h.
 
-        Returns the actual rendered height in pixels (distance from rect.y to the
-        bottom of the last drawn line).  Returns 0 if nothing was drawn.
+        line_height is the CSS-style multiplier from DESIGN.md §3 (hero 0.98,
+        artist 1.04, album 1.12).  Returns the actual rendered height in
+        pixels (distance from rect.y to the bottom of the last drawn line);
+        0 if nothing was drawn.
         """
-        font = (self._bold_fonts if bold else self._fonts).get(size)
-        if not font or not text:
+        font = self._font(role, size)
+        if not text:
             return 0
 
-        words = text.split()
-        lines = []
-        current = ""
-
-        for word in words:
-            test = (current + " " + word).strip()
-            if font.size(test)[0] <= rect.w:
-                current = test
-            else:
-                if current:
-                    lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-
         y = rect.y
-        line_h = int(font.get_height() * 0.98)  # 0.98 lineHeight from JSX
+        line_h = int(font.get_height() * line_height)
         last_bottom = rect.y
-        for line in lines:
+        for line in self._wrap_lines(text, font, rect.w):
             if y + line_h > rect.y + rect.h:
                 break
             surf = font.render(line, True, color)
-            self._screen.blit(surf, (rect.x, y))
+            target.blit(surf, (rect.x, y))
             last_bottom = y + line_h
             y += line_h + 2
 
         return max(0, last_bottom - rect.y)
 
     def _measure_wrapped_text(
-        self, text: str, size: int, available_width: int, bold: bool = False
+        self, text: str, role: str, size: int, available_width: int,
+        line_height: float = 0.98,
     ) -> int:
         """Measure wrapped-text height without drawing anything.
 
-        Uses the same word-wrap algorithm as _draw_wrapped_text so that
-        measurements exactly match render output.  Returns total pixel height;
-        0 if font unavailable or text empty.
+        Uses _wrap_lines — the same algorithm as _draw_wrapped_text — so
+        measurements exactly match render output.  Returns total pixel
+        height; 0 if text is empty.
         """
-        font = (self._bold_fonts if bold else self._fonts).get(size)
-        if not font or not text:
+        font = self._font(role, size)
+        if not text:
             return 0
-
-        words = text.split()
-        lines = []
-        current = ""
-        for word in words:
-            test = (current + " " + word).strip()
-            if font.size(test)[0] <= available_width:
-                current = test
-            else:
-                if current:
-                    lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-
+        lines = self._wrap_lines(text, font, available_width)
         if not lines:
             return 0
-        line_h = int(font.get_height() * 0.98)
+        line_h = int(font.get_height() * line_height)
         # n lines: n × (line_h + 2) minus the trailing gap after the last line
         return len(lines) * (line_h + 2) - 2
-
-    def _draw_text_clipped(
-        self, text: str, size: int, rect, color: tuple, italic: bool = False
-    ):
-        """Render a single line of text, clipped to rect bounds."""
-        font_dict = self._italic_fonts if italic else self._fonts
-        font = font_dict.get(size)
-        if not font or not text:
-            return
-        surf = font.render(text, True, color)
-        self._screen.blit(surf, (rect.x, rect.y), area=(0, 0, rect.w, rect.h))
-
-    def _draw_mono_text(self, text: str, size: int, rect, color: tuple):
-        """Render a single line in the monospace font, clipped to rect."""
-        font = self._mono_fonts.get(size)
-        if not font or not text:
-            return
-        surf = font.render(text, True, color)
-        self._screen.blit(surf, (rect.x, rect.y), area=(0, 0, rect.w, rect.h))
 
     # -----------------------------------------------------------------------
     # Palette management

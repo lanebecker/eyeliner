@@ -1,6 +1,6 @@
 # vinyl-now-playing
 
-[![version](https://img.shields.io/badge/version-1.3.5-blueviolet)](VERSION)
+[![version](https://img.shields.io/badge/version-1.4.0-blueviolet)](VERSION)
 
 A Raspberry Pi app that listens to a vinyl record playing through a USB audio interface, identifies the current track via audio fingerprinting, enriches it with metadata from your Discogs collection, and displays the artist, album, track name, and cover art on an HDMI-connected LCD screen.
 
