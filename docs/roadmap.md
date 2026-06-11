@@ -298,7 +298,7 @@ note.)
 - Static-frame render cache: steady-state frames are one blit + the dot
 - 314-test unit suite (+17 typography/contrast/compose tests)
 
-### v1.4.1 — Empty States (Phase 2, completing the translation) ✅ (current)
+### v1.4.1 — Empty States (Phase 2, completing the translation) ✅
 
 Boot, idle, and the new error state rendered in the full DirectionA frame
 per DESIGN.md §5; see `CHANGELOG.md` for full detail.
@@ -319,6 +319,15 @@ per DESIGN.md §5; see `CHANGELOG.md` for full detail.
 
 The between-tracks/paused states from DESIGN.md need audio-silence
 heuristics and remain deferred to their own effort.
+
+### v1.4.2 — Original Year over Pressing Year ✅ (current)
+
+**Behavior-refinement release.** The catalog footer now shows the album's
+original release year, not the pressing's — a 2026 reissue of *Apologies to
+the Queen Mary* (2005) displays 2005. `DiscogsClient.get_original_year()`
+reads the master's year (one rate-limited GET per album, amortized by the
+album cache) with the pressing year as fallback. DESIGN.md §7 already
+specified this; the code now complies. 341-test unit suite (+7).
 
 ---
 

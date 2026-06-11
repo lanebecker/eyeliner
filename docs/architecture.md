@@ -332,6 +332,13 @@ Key fields: `title`, `artist`, `album`, `source`, `year`, `label`,
 `catalog_number`, `discogs_release_id`, `discogs_instance_id`,
 `cover_art_url`, `tracklist`, `genres`
 
+`year` is the album's ORIGINAL release year, not the pressing year
+(v1.4.2): `DiscogsClient._build_result` prefers
+`get_original_year()` — one rate-limited GET to `/masters/{id}`, run once
+per album thanks to the resolver's album cache — and falls back to
+`release.year` (the pressing year) when the release has no master or the
+lookup fails.  A 2026 reissue of a 2005 album displays 2005.
+
 Key properties:
 - `is_last_track` — True if the current entry's POSITION matches the final
   tracklist entry's position (v1.3.4; the entry itself is located by
@@ -793,5 +800,5 @@ All source modules are complete. The only remaining work requires hardware:
   stripe placeholder; the richer layout (last-played art grid, clock, random
   collection suggestion) is planned for v1.5.0
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (334 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (341 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.

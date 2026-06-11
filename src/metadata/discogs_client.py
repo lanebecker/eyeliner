@@ -455,6 +455,37 @@ class DiscogsClient:
         log.debug(f"Collection walk found nothing for '{artist} / {album}'.")
         return None
 
+    def get_original_year(self, release) -> Optional[str]:
+        """Fetch the ORIGINAL release year from the pressing's master.
+
+        A Discogs release carries the pressing year — a 2026 reissue of a
+        2005 album says 2026.  The master carries the original year, which
+        is what the display should show (DESIGN.md §7 album schema; product
+        decision 2026-06-11).
+
+        One extra GET per album, routed through the rate-limited _request
+        helper; the resolver's album-level cache means it runs once per
+        album per session.  Returns None when the release has no master or
+        the lookup fails — callers fall back to the pressing year.
+        """
+        try:
+            master = release.master
+            master_id = master.id if master else None
+        except Exception:
+            master_id = None
+        if not master_id:
+            return None
+
+        try:
+            resp = self._request("GET", f"{_API_BASE}/masters/{master_id}")
+            resp.raise_for_status()
+            year = resp.json().get("year")
+            if year and int(year) > 0:
+                return str(year)
+        except Exception as e:
+            log.debug(f"Master year lookup failed for master {master_id}: {e}")
+        return None
+
     def _build_result(self, release, instance_id: Optional[int]) -> dict:
         """Build a standardised result dict from a Discogs Release object.
 
@@ -486,13 +517,18 @@ class DiscogsClient:
         except Exception:
             pass
 
-        # Year — Discogs returns 0 for unknown years
-        year = None
-        try:
-            if release.year and release.year > 0:
-                year = str(release.year)
-        except Exception:
-            pass
+        # Year — prefer the album's ORIGINAL year from the master (v1.4.2);
+        # release.year is the pressing year, so a reissue would otherwise
+        # display its repress date.  Falls back to the pressing year when
+        # there's no master or the lookup fails.  (Discogs returns 0 for
+        # unknown years.)
+        year = self.get_original_year(release)
+        if year is None:
+            try:
+                if release.year and release.year > 0:
+                    year = str(release.year)
+            except Exception:
+                pass
 
         # Tracklist — fetch separately; log but don't fail on error
         tracklist = self.get_tracklist(release.id)

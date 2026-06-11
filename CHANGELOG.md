@@ -14,6 +14,36 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.4.2] — 2026-06-11
+
+**Behavior-refinement release — original year over pressing year.** The
+catalog footer's year now shows the album's original release year rather
+than the pressing's. Surfaced by rendering the 2026 pink-vinyl reissue of
+Wolf Parade's *Apologies to the Queen Mary* (2005): the display read 2026.
+DESIGN.md §7 already specified "original release year" — this is the code
+catching up to the spec. Test count: 334 → 341.
+
+### Changed
+
+- `DiscogsClient._build_result` now prefers the new
+  `get_original_year()` — a rate-limited GET to `/masters/{id}` reading the
+  master's year — and falls back to `release.year` (the pressing year) when
+  the release has no master, the master's year is 0/unknown, or the lookup
+  fails. Both Discogs tiers benefit; the MusicBrainz fallback still shows
+  no year (unchanged).
+- Cost: one extra Discogs API call per album resolve, amortized by the
+  v1.3.3 album-level metadata cache to once per album per session, and
+  routed through the v1.3.3 429-aware `_request` helper.
+
+### Tests
+
+- 341-test unit suite (+7 in `tests/test_discogs_client.py`):
+  master-year preferred over pressing year, no-master and zero-year and
+  network-failure fallbacks, lazy `.master` property raising, and
+  `_build_result` end-to-end preference/fallback.
+
+---
+
 ## [1.4.1] — 2026-06-11
 
 **Empty states release — Phase 2, completing the v1.4.0 design

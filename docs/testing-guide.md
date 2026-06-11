@@ -60,7 +60,7 @@ cp config.example.yaml config.yaml
 | `tests/test_capture.py` | AudioCapture device matching & config guards (stubbed sounddevice) | No | No |
 | `tests/test_player_state.py` | PlayerState transitions & change notifications | No | No |
 | `tests/test_listen_tracker.py` | Last-track detection & Discogs update logic | No | No |
-| `tests/test_discogs_client.py` | DiscogsClient Play Count, Last Played & rate-limit logic | No | No |
+| `tests/test_discogs_client.py` | DiscogsClient Play Count, Last Played, rate-limit & original-year logic | No | No |
 | `tests/test_lastfm_client.py` | LastFmClient scrobble & love logic | No | No |
 | `tests/test_resolver.py` | 3-step metadata fallback chain + album cache | No | No |
 | `tests/test_recognizer.py` | Recognition loop confirmation logic | No | No |
@@ -87,7 +87,7 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 334 items
+collected 341 items
 
 tests/test_capture.py ..........                                         [  3%]
 tests/test_chunking.py ................                                  [  8%]
@@ -112,7 +112,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 334 passed in 0.38s ==============================
+============================== 341 passed in 0.38s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -333,6 +333,15 @@ patched, so none of these actually wait):
 - **Two consecutive 429s:** second response returned as-is (no infinite retry)
 - **POST routing:** dispatches via `session.post` with default timeout applied
 - **End-to-end:** `increment_play_count` succeeds through one 429 on the POST
+
+Key cases — get_original_year / year preference (new in v1.4.2):
+- **Master year preferred:** a 2026 reissue with master year 2005 → `"2005"`,
+  fetched from `/masters/{id}` via the rate-limited `_request` helper
+- **No master:** returns `None`, no HTTP call made
+- **Master year 0:** Discogs's "unknown" sentinel → `None` (never displays "0")
+- **Network failure / lazy `.master` raising:** caught, returns `None`
+- **`_build_result` preference:** uses the original year when available and
+  falls back to the pressing year (`release.year`) when it isn't
 
 ### `test_lastfm_client.py` — Last.fm scrobble & love logic
 

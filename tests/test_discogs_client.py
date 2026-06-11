@@ -577,3 +577,94 @@ def test_increment_play_count_survives_one_rate_limit_on_post():
         assert client.increment_play_count(111, 222) is True
 
     assert client._session.post.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# get_original_year — original vs. pressing year (new in v1.4.2)
+# ---------------------------------------------------------------------------
+# A Discogs release carries its PRESSING year; the master carries the
+# original. The display prefers the original (DESIGN.md §7), so
+# get_original_year fetches /masters/{id} via the rate-limited _request
+# helper and _build_result falls back to release.year when it returns None.
+
+def _make_release(master_id=151481, pressing_year=2026):
+    """Mock python3-discogs-client Release: a 2026 reissue of a 2005 album."""
+    release = MagicMock()
+    release.year = pressing_year
+    if master_id is None:
+        release.master = None
+    else:
+        release.master = MagicMock()
+        release.master.id = master_id
+    return release
+
+
+def _mock_master_response(year):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"id": 151481, "year": year}
+    return resp
+
+
+def test_original_year_prefers_master_year():
+    client = make_client()
+    client._session.get = MagicMock(return_value=_mock_master_response(2005))
+    assert client.get_original_year(_make_release()) == "2005"
+    assert "masters/151481" in client._session.get.call_args[0][0]
+
+
+def test_original_year_none_when_no_master():
+    client = make_client()
+    client._session.get = MagicMock()
+    assert client.get_original_year(_make_release(master_id=None)) is None
+    client._session.get.assert_not_called()
+
+
+def test_original_year_none_when_master_year_is_zero():
+    """Discogs uses 0 for unknown years — must not display '0'."""
+    client = make_client()
+    client._session.get = MagicMock(return_value=_mock_master_response(0))
+    assert client.get_original_year(_make_release()) is None
+
+
+def test_original_year_none_when_fetch_raises():
+    client = make_client()
+    client._session.get = MagicMock(side_effect=ConnectionError("network down"))
+    assert client.get_original_year(_make_release()) is None
+
+
+def test_original_year_none_when_master_attr_raises():
+    """The lazy .master property can raise on a failed lib fetch."""
+    client = make_client()
+    release = MagicMock()
+    type(release).master = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert client.get_original_year(release) is None
+
+
+def _make_full_release(pressing_year=2026):
+    """Release mock complete enough for _build_result."""
+    release = _make_release(pressing_year=pressing_year)
+    release.id = 36664639
+    release.title = "Apologies To The Queen Mary"
+    release.images = []
+    release.labels = []
+    release.styles = ["Indie Rock"]
+    release.genres = ["Rock"]
+    return release
+
+
+def test_build_result_uses_original_year_over_pressing_year():
+    client = make_client()
+    client.get_tracklist = MagicMock(return_value=[])
+    client.get_original_year = MagicMock(return_value="2005")
+    result = client._build_result(_make_full_release(pressing_year=2026), instance_id=None)
+    assert result["year"] == "2005"
+
+
+def test_build_result_falls_back_to_pressing_year():
+    client = make_client()
+    client.get_tracklist = MagicMock(return_value=[])
+    client.get_original_year = MagicMock(return_value=None)
+    result = client._build_result(_make_full_release(pressing_year=2026), instance_id=None)
+    assert result["year"] == "2026"
