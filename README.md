@@ -8,7 +8,7 @@ When the last track of an album finishes, it automatically increments the Play C
 
 ## Now Playing Screen
 
-![Now Playing Screen — Wolf Parade, Dear Sons And Daughters Of Hungry Ghosts](docs/screenshot.svg)
+![Now Playing Screen — Wolf Parade, Dear Sons And Daughters Of Hungry Ghosts](docs/screenshot.png)
 
 ## Features
 
