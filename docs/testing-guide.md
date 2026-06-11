@@ -85,21 +85,22 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 297 items
+collected 314 items
 
 tests/test_capture.py ..........                                         [  3%]
 tests/test_chunking.py ................                                  [  8%]
-tests/test_discogs_client.py .............................               [ 18%]
-tests/test_lastfm_client.py ...............                              [ 23%]
-tests/test_layouts.py .....................................              [ 36%]
-tests/test_listen_tracker.py .............................               [ 45%]
-tests/test_models.py ................................................... [ 62%]
-............                                                             [ 67%]
-tests/test_player_state.py .........                                     [ 70%]
-tests/test_recognizer.py ...................                             [ 76%]
-tests/test_renderer_caches.py .............                              [ 80%]
-tests/test_renderer_palette.py ......                                    [ 82%]
-tests/test_resolver.py .............................                     [ 92%]
+tests/test_discogs_client.py .............................               [ 17%]
+tests/test_lastfm_client.py ...............                              [ 22%]
+tests/test_layouts.py .....................................              [ 34%]
+tests/test_listen_tracker.py .............................               [ 43%]
+tests/test_models.py ................................................... [ 59%]
+............                                                             [ 63%]
+tests/test_player_state.py .........                                     [ 66%]
+tests/test_recognizer.py ...................                             [ 72%]
+tests/test_renderer_caches.py .............                              [ 76%]
+tests/test_renderer_palette.py ......                                    [ 78%]
+tests/test_renderer_typography.py .................                      [ 84%]
+tests/test_resolver.py .............................                     [ 93%]
 tests/test_silence.py ......................                             [100%]
 
 =============================== warnings summary ===============================
@@ -108,7 +109,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 297 passed in 0.38s ==============================
+============================== 314 passed in 0.38s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -421,6 +422,32 @@ Key cases:
   restart the 1s transition (previously every track commit re-triggered
   30 fps rendering lerping a palette to itself)
 - A genuinely different palette retargets and restarts the timer
+
+### `test_renderer_typography.py` — Typography & fidelity helpers (new in v1.4.0)
+
+Covers the design-translation behaviors from the v1.4.0 fidelity release.
+Uses the `__new__` renderer-skeleton pattern; pygame.font is initialized
+module-wide, and the compose smoke test runs under SDL's dummy video driver
+(set via env vars at the top of the file), so the whole module is headless.
+
+Key cases:
+- `_wrap_lines` — short text stays on one line, long text wraps within the
+  available width, empty text produces no lines
+- `_fit_wrapped` (shrink-instead-of-ellipsis) — text that fits keeps the
+  base size; a long album shrinks until it fits two lines; a long artist
+  shrinks to a single line; the `min_size` floor is respected even for
+  text that can never fit
+- `_ellipsize` — short text passes through; truncated text ends with `…`
+  and fits the available width (PREV/NEXT panel only)
+- `_chip_texts` — ≤3 genres pass through; 5 genres collapse to 3 + `+2`;
+  empty list stays empty
+- `_contrast_ratio` / `_ensure_contrast` — black-on-white is 21:1; the
+  fallback muted already passes against the fallback bg; failing colors are
+  lightened until ≥4.5:1, including against cool-dark backgrounds (the
+  DESIGN.md Cavetown case)
+- **Compose smoke test:** `_compose_now_playing` renders a full 1024×600
+  frame headlessly without error, and `_draw_status_dot` draws over it —
+  one test that catches API drift across every drawing helper
 
 ### `test_layouts.py` — Display geometry
 

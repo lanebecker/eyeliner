@@ -111,7 +111,7 @@ class TrackMetadata:
         return ""
 
     # ------------------------------------------------------------------
-    # Side-awareness (v1.2.0 display; foundation for v1.5.0 logic)
+    # Side-awareness (v1.2.0 display; foundation for v1.6.0 logic)
     # ------------------------------------------------------------------
 
     @property

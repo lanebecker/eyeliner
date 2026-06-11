@@ -769,5 +769,5 @@ All source modules are complete. The only remaining work requires hardware:
 - **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
   nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (297 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (314 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
