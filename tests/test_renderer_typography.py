@@ -225,6 +225,6 @@ def test_compose_now_playing_smoke():
         # The animated dot draws over the composed frame without error too
         screen = pygame.display.get_surface()
         screen.blit(frame, (0, 0))
-        r._draw_status_dot(screen, r._layout, FALLBACK_PALETTE)
+        r._draw_status_dot(screen, r._layout, FALLBACK_PALETTE.accent, animate=True, glow=True)
     finally:
         pygame.display.quit()

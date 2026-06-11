@@ -57,6 +57,9 @@ recognition:
   poll_interval_seconds: 30
   # How many consecutive matching results before we commit a track change
   confirmation_required: 2
+  # Consecutive failed recognitions (while awaiting the first identification)
+  # before the display shows "NO MATCH FOUND". Reposition the needle to retry.
+  error_after_misses: 6
 
   # Only needed if backend is "acrcloud"
   acrcloud:

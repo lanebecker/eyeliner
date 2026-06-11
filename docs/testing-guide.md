@@ -67,6 +67,8 @@ cp config.example.yaml config.yaml
 | `tests/test_layouts.py` | Display layout geometry | No | No |
 | `tests/test_renderer_caches.py` | Renderer bounded caches & palette color math | No | No |
 | `tests/test_renderer_palette.py` | _queue_palette transition decisions (headless) | No | No |
+| `tests/test_renderer_typography.py` | Typography/fidelity helpers + compose smoke test (headless) | No | No |
+| `tests/test_error_state.py` | ERROR state, miss counting, boot label, empty-state composes | No | No |
 | `test_discogs_live.py` | Live Discogs API integration | No | **Yes** |
 
 ---
@@ -85,12 +87,13 @@ in the `tests/` directory. Expected output:
 ```
 ============================= test session starts ==============================
 platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 314 items
+collected 334 items
 
 tests/test_capture.py ..........                                         [  3%]
 tests/test_chunking.py ................                                  [  8%]
-tests/test_discogs_client.py .............................               [ 17%]
-tests/test_lastfm_client.py ...............                              [ 22%]
+tests/test_discogs_client.py .............................               [ 16%]
+tests/test_error_state.py ....................                           [ 22%]
+tests/test_lastfm_client.py ...............                              [ 27%]
 tests/test_layouts.py .....................................              [ 34%]
 tests/test_listen_tracker.py .............................               [ 43%]
 tests/test_models.py ................................................... [ 59%]
@@ -109,7 +112,7 @@ venv/lib/python3.9/site-packages/urllib3/__init__.py:35
   'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
   urllib3/urllib3/issues/3020
 
-============================== 314 passed in 0.38s ==============================
+============================== 334 passed in 0.38s ==============================
 ```
 
 The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
@@ -130,6 +133,8 @@ pytest tests/test_recognizer.py
 pytest tests/test_layouts.py
 pytest tests/test_renderer_caches.py
 pytest tests/test_renderer_palette.py
+pytest tests/test_renderer_typography.py
+pytest tests/test_error_state.py
 ```
 
 ### With verbose output (see each test name)
@@ -448,6 +453,28 @@ Key cases:
 - **Compose smoke test:** `_compose_now_playing` renders a full 1024×600
   frame headlessly without error, and `_draw_status_dot` draws over it —
   one test that catches API drift across every drawing helper
+
+### `test_error_state.py` — ERROR state & empty-state rendering (new in v1.4.1)
+
+Covers the Phase 2 design-translation work: the new `PlayerStatus.ERROR`,
+`RecognitionLoop` miss counting, the time-progressive boot label, and the
+boot/idle/error empty-state composition.  Same headless patterns as the rest
+of the suite (MagicMock-backed loop, `__new__` renderer skeleton, SDL dummy
+video driver).
+
+Key cases:
+- ERROR recovers to IDLE via `clear()` and to PLAYING via `set_track()`
+- `error_after_misses` consecutive misses while LISTENING surface ERROR;
+  one fewer stays LISTENING
+- **Misses during PLAYING never error** — surface noise and quiet passages
+  must not put NO MATCH FOUND over a correctly identified record
+- Misses in IDLE are ignored; the streak resets when leaving LISTENING
+- A successful recognition resets the miss count (`_handle_result` path)
+- Boot label progression: WARMING UP (0–19s) → STILL LISTENING… (20–59s) →
+  IDENTIFYING… M:SS (60s+), boundary values pinned
+- All three empty-state frames compose headlessly at full screen size
+- The empty static-frame cache is reused while the boot label is unchanged
+  and recomposes when the label ticks
 
 ### `test_layouts.py` — Display geometry
 

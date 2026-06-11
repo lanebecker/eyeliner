@@ -275,7 +275,7 @@ auditing the previous two sweeps' own work; see `CHANGELOG.md` for detail.
 
 ---
 
-## v1.4.0 — Design Fidelity (Phase 1 of the DESIGN.md translation) ✅ (current)
+## v1.4.0 — Design Fidelity (Phase 1 of the DESIGN.md translation) ✅
 
 **Why here:** the design side of the project produced a full design system
 (`DESIGN.md`, `design/DirectionA.jsx`) that the production renderer only
@@ -298,12 +298,27 @@ note.)
 - Static-frame render cache: steady-state frames are one blit + the dot
 - 314-test unit suite (+17 typography/contrast/compose tests)
 
-**Phase 2 (planned next): Empty States** — boot/idle/error rendered in the
-full DirectionA frame (440×440 arc/stripe empty cover, 48px state hero,
-metadata suppression, time-progressive boot label), plus a new
-`PlayerStatus.ERROR` for ShazamIO no-match. The between/paused states from
-DESIGN.md need audio-silence heuristics and are deferred to their own
-effort.
+### v1.4.1 — Empty States (Phase 2, completing the translation) ✅ (current)
+
+Boot, idle, and the new error state rendered in the full DirectionA frame
+per DESIGN.md §5; see `CHANGELOG.md` for full detail.
+
+- New `PlayerStatus.ERROR`: `recognition.error_after_misses` consecutive
+  failed recognitions while LISTENING (default 6) → "NO MATCH FOUND" with
+  static red arc + "REPOSITION NEEDLE TO RETRY"; recovered by repositioning
+  the needle or a successful commit. Misses during PLAYING/IDLE never error.
+- Boot: ghost ring + rotating accent arc (1.4s linear), time-progressive
+  label (WARMING UP → STILL LISTENING… → IDENTIFYING… M:SS), hero
+  "Listening…" at 48px
+- Idle: 135° diagonal-stripe cover + "NO RECORD ON PLATTER", hero "Waiting
+  for a record" (still the minimal placeholder; rich redesign is v1.5.0)
+- All empty states: fallback palette (smoothly lerped to), metadata fully
+  suppressed, state-mapped dot, Cover Lift shadow retained; idle and error
+  are fully static so the render loop goes quiet
+- 334-test unit suite (+20 in `tests/test_error_state.py`)
+
+The between-tracks/paused states from DESIGN.md need audio-silence
+heuristics and remain deferred to their own effort.
 
 ---
 

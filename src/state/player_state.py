@@ -25,6 +25,9 @@ class PlayerStatus(Enum):
     IDLE = auto()           # Startup or after session ended
     LISTENING = auto()      # Music detected, awaiting first recognition
     PLAYING = auto()        # Track identified and displayed
+    ERROR = auto()          # Music detected but recognition repeatedly failed
+                            # (v1.4.1 — "NO MATCH FOUND"; recovered by
+                            # repositioning the needle or a successful commit)
 
 
 class PlayerState:

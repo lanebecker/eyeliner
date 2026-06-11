@@ -13,6 +13,8 @@ from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
+from src.state.player_state import PlayerStatus
+
 if TYPE_CHECKING:
     from src.metadata.resolver import MetadataResolver
     from src.state.player_state import PlayerState
@@ -124,9 +126,15 @@ class RecognitionLoop:
         self.lastfm = lastfm
         self.poll_interval: int = self.config["poll_interval_seconds"]
         self.confirmation_required: int = self.config.get("confirmation_required", 2)
+        # Consecutive failed recognitions while LISTENING before the display
+        # shows the error state (v1.4.1).  At ~10-12s per chunk, the default
+        # of 6 puts "NO MATCH FOUND" on screen after roughly a minute of
+        # music that ShazamIO can't identify.
+        self.error_after_misses: int = self.config.get("error_after_misses", 6)
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
         self._pending_result: Optional[RawRecognitionResult] = None
         self._pending_count: int = 0
+        self._miss_count: int = 0
         self.backend: RecognizerBackend = self._init_backend()
 
     def _init_backend(self) -> RecognizerBackend:
@@ -197,7 +205,9 @@ class RecognitionLoop:
         if result is None:
             self._pending_result = None
             self._pending_count = 0
+            self._register_miss()
             return
+        self._miss_count = 0
 
         if self._same_track(result, self.state.current_raw):
             return  # Same track still playing
@@ -213,6 +223,28 @@ class RecognitionLoop:
             await self._commit_track(result)
             self._pending_result = None
             self._pending_count = 0
+
+    def _register_miss(self):
+        """Count a failed recognition; surface ERROR after enough of them.
+
+        Misses only matter while LISTENING — before the first successful
+        identification.  During PLAYING, surface noise and quiet passages
+        produce routine misses that mean nothing; in IDLE there's no needle
+        down; in ERROR we're already showing the failure.  ERROR is recovered
+        by repositioning the needle (silence → music re-enters LISTENING) or
+        by a successful commit (set_track → PLAYING).
+        """
+        if self.state.status == PlayerStatus.LISTENING:
+            self._miss_count += 1
+            if self._miss_count >= self.error_after_misses:
+                log.info(
+                    "Recognition failed %d consecutive times while listening — "
+                    "showing NO MATCH FOUND.", self._miss_count,
+                )
+                self._miss_count = 0
+                self.state.set_status(PlayerStatus.ERROR)
+        else:
+            self._miss_count = 0
 
     async def _commit_track(self, raw: RawRecognitionResult):
         """Resolve full metadata and update state + tracker + Last.fm scrobble."""

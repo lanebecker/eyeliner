@@ -81,7 +81,9 @@ async def main():
             # session (e.g. a side flip), keep the now-playing card on
             # screen — it updates in place when the next track commits —
             # instead of dropping to the IDENTIFYING spinner for ~25s.
-            if state.status == PlayerStatus.IDLE:
+            # v1.4.1: ERROR also re-enters LISTENING — "REPOSITION NEEDLE
+            # TO RETRY" recovers when music starts again after the lift.
+            if state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR):
                 state.set_status(PlayerStatus.LISTENING)
         elif event == AudioEvent.SESSION_ENDED:
             state.clear()

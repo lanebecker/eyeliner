@@ -14,6 +14,62 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.4.1] — 2026-06-11
+
+**Empty states release — Phase 2, completing the v1.4.0 design
+translation.** Boot, idle, and the new error state now render in the full
+DirectionA frame per DESIGN.md §5, replacing the interim centered spinner
+and bare gradient. Test count: 314 → 334.
+
+### Added
+
+- **`PlayerStatus.ERROR`** — set by `RecognitionLoop._register_miss()` after
+  `recognition.error_after_misses` consecutive failed recognitions (default
+  6, ≈1 minute) while LISTENING. Misses during PLAYING (routine surface
+  noise) and IDLE never trigger it. Recovery: repositioning the needle
+  (music restart re-enters LISTENING) or a successful commit (→ PLAYING);
+  session end clears to IDLE.
+- **Error screen** — static muted-red arc (`#c85050`) in the ghost ring,
+  "NO MATCH FOUND" + "REPOSITION NEEDLE TO RETRY" labels, hero "Couldn't
+  identify". Deliberately motionless: boot spins, error sits.
+- **Boot screen** (replaces the centered spinner) — full DirectionA frame
+  with ghost ring + rotating accent arc (1.4s linear, per the design's
+  rotate keyframe), hero "Listening…" at 48px, and the time-progressive
+  cover label: WARMING UP (0–19s) → STILL LISTENING… (20–59s) →
+  IDENTIFYING… M:SS (60s+), so a hung process is distinguishable from
+  active identification across the room.
+- **Idle screen** (replaces the bare gradient) — 135° diagonal-stripe
+  empty cover (12px surface/bg bands) with "NO RECORD ON PLATTER", hero
+  "Waiting for a record". Still the minimal DESIGN.md placeholder; the
+  rich idle redesign remains v1.5.0.
+- New `recognition.error_after_misses` config key (default 6).
+
+### Changed
+
+- All empty states render on the fallback palette (lerped to smoothly from
+  the last album's palette rather than jump-cutting), suppress all album
+  metadata (artist, album, chips, catalog, PREV/NEXT — per DESIGN.md
+  production behavior), keep the Cover Lift shadow, and show the status
+  strip with state-mapped dot: boot pulses + glows in accent; idle sits
+  static in muted; error sits static in red. The hero renders at 48px (the
+  DESIGN.md empty-state font size exception) above the accent rule.
+- `MUSIC_STARTED` now re-enters LISTENING from ERROR as well as IDLE
+  (`main.py`) — the "reposition needle" recovery path.
+- `_draw_header` and `_draw_status_dot` generalized (state label / dot
+  color, animation, and glow are now parameters shared by the now-playing
+  and empty screens).
+- Idle and error frames are fully static, so the render loop goes quiet in
+  those states (previously the idle screen still woke at 10 fps).
+
+### Tests
+
+- 334-test unit suite (+20 in `tests/test_error_state.py`): ERROR
+  transitions and recovery, miss-counting rules across all states, boot
+  label progression, headless compose smoke tests for all three empty
+  states, and static-frame cache behavior across boot-label ticks.
+
+---
+
 ## [1.4.0] — 2026-06-11
 
 **Design fidelity release — Phase 1 of the DESIGN.md production

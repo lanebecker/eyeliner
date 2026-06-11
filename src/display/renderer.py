@@ -62,6 +62,16 @@ Implements the full DESIGN.md type/visual spec from design/DirectionA.jsx:
   - display.reduced_motion config flag freezes all animation
     (translation of the design's prefers-reduced-motion requirement).
 
+Empty states (v1.4.1)
+---------------------
+Boot (LISTENING), idle, and error (the v1.4.1 PlayerStatus.ERROR) render in
+the full DirectionA frame per DESIGN.md §5: fallback palette (lerped to
+smoothly), state-labelled status strip with state-mapped dot, the cover area
+replaced by the state's treatment (rotating accent arc + time-progressive
+label / 135° stripes / static red arc + recovery hint), the hero at 48px
+with a state-specific string, and all album metadata suppressed.  Idle and
+error are fully static frames — the render loop goes quiet; boot animates.
+
 Static-frame cache (v1.4.0)
 ---------------------------
 The only animated element on the now-playing screen is the status dot, but
@@ -111,6 +121,29 @@ _LABEL_CACHE_MAX = 128
 
 # Status dot pulse period (seconds) — DESIGN.md: 1.6s ease-in-out infinite.
 _PULSE_SECS = 1.6
+
+# Boot arc rotation period (seconds) — DESIGN.md: 1.4s linear infinite.
+_ARC_SECS = 1.4
+
+# Muted red for the error state (DESIGN.md §5: #c85050).
+_ERROR_RED = (200, 80, 80)
+
+# Status strip labels per state (DESIGN.md stateLabel mapping; paused and
+# between-tracks arrive with their states in a later release).
+_STATE_LABELS = {
+    "playing": "NOW PLAYING",
+    "boot": "IDENTIFYING…",
+    "idle": "IDLE",
+    "error": "NO MATCH FOUND",
+}
+
+# Hero placeholder strings for the empty states, rendered at 48px
+# (DESIGN.md empty-state font size exception).
+_EMPTY_HEROES = {
+    "boot": "Listening…",
+    "idle": "Waiting for a record",
+    "error": "Couldn't identify",
+}
 
 # Bundled fonts (DESIGN.md §3).  Role → filename in assets/fonts/.
 # "display" = hero track (Inter Tight 600), "text" = artist + adjacent names
@@ -360,7 +393,11 @@ class DisplayRenderer:
         self._shadow_key: Optional[tuple] = None             # (w, h)
         self._shadow_surface = None                          # Cover Lift shadow
         self._static_key: Optional[tuple] = None             # (track content, palette)
-        self._static_surface = None                          # composed now-playing frame
+        self._static_surface = None                          # composed frame (any screen)
+
+        # Empty-state machinery (v1.4.1)
+        self._listening_since: Optional[float] = None        # boot-label elapsed clock
+        self._arc_segment = None                             # pre-rendered boot/error arc
 
         # Strong references to fire-and-forget tasks (cover prefetches).
         # asyncio only keeps weak references to tasks, so without this a
@@ -419,12 +456,23 @@ class DisplayRenderer:
     def _on_state_change(self, state: PlayerState):
         """Called by PlayerState whenever anything changes."""
         self._dirty = True
+        # Boot-label elapsed clock (v1.4.1): starts when LISTENING begins,
+        # cleared on any other state so the next session starts fresh.
+        if state.status == PlayerStatus.LISTENING:
+            if self._listening_since is None:
+                self._listening_since = time.monotonic()
+        else:
+            self._listening_since = None
         # When a new track arrives, queue a palette transition and prefetch cover art
         if state.status == PlayerStatus.PLAYING and state.current_track:
             url = state.current_track.cover_art_url
             self._queue_palette(url)
             if url:
                 self._spawn(self._prefetch_cover(url))
+        elif state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR, PlayerStatus.LISTENING):
+            # Empty states always use the fallback palette (DESIGN.md §2);
+            # lerp back smoothly rather than jump-cutting.
+            self._queue_palette(None)
 
     # -----------------------------------------------------------------------
     # Async render loop
@@ -446,7 +494,7 @@ class DisplayRenderer:
             transitioning = (time.monotonic() - self._transition_start) < _TRANSITION_SECS
             if self._dirty or transitioning:
                 # Reset BEFORE rendering so _render_now_playing /
-                # _render_listening can set self._dirty = True to request
+                # _render_empty can set self._dirty = True to request
                 # another frame for animations (pulsing dot, spinner).
                 self._dirty = False
                 self._render()
@@ -463,13 +511,15 @@ class DisplayRenderer:
     def _render(self):
         """Dispatch to the appropriate layout based on current player status."""
         if self.state.status == PlayerStatus.IDLE:
-            self._render_idle()
+            self._render_empty("idle")
         elif self.state.status == PlayerStatus.LISTENING:
-            self._render_listening()
+            self._render_empty("boot")
+        elif self.state.status == PlayerStatus.ERROR:
+            self._render_empty("error")
         elif self.state.status == PlayerStatus.PLAYING and self.state.current_track:
             self._render_now_playing()
         else:
-            self._render_listening()
+            self._render_empty("boot")
 
     # -----------------------------------------------------------------------
     # Now-playing screen
@@ -506,7 +556,7 @@ class DisplayRenderer:
             self._static_key = key
 
         self._screen.blit(self._static_surface, (0, 0))
-        self._draw_status_dot(self._screen, layout, p)
+        self._draw_status_dot(self._screen, layout, p.accent, animate=True, glow=True)
 
         # Keep re-rendering so the dot stays animated; with reduced_motion
         # the frame is fully static, so the loop can go quiet.
@@ -542,7 +592,7 @@ class DisplayRenderer:
         surf.blit(ring, (ca.x, ca.y))
 
         # --- Status strip (minus the animated dot) ---
-        self._draw_header(surf, layout, p, track)
+        self._draw_header(surf, layout, p, _STATE_LABELS["playing"], self._side_string(track))
 
         # -----------------------------------------------------------------
         # Dynamic push-down geometry
@@ -652,9 +702,11 @@ class DisplayRenderer:
         """Status dot radius — 8×8px dot at reference scale (DESIGN.md §5)."""
         return max(3, int(4 * min(self.width / 1024, self.height / 600)))
 
-    def _draw_header(self, target, layout: NowPlayingLayout, p: DisplayPalette, track):
-        """Draw the status strip: solid surface background, tracked NOW
-        PLAYING label, right-aligned side counter.
+    def _draw_header(self, target, layout: NowPlayingLayout, p: DisplayPalette,
+                     label_text: str, side_str: Optional[str] = None):
+        """Draw the status strip: solid surface background, tracked state
+        label, optional right-aligned side counter (suppressed in the empty
+        states, which have no side to count).
 
         The animated dot is deliberately NOT drawn here — it's the one
         per-frame element (_draw_status_dot), so the strip can live in the
@@ -669,32 +721,33 @@ class DisplayRenderer:
         pad_x = self._strip_pad_x()
         dot_r = self._dot_radius()
 
-        label = self._render_tracked("NOW PLAYING", layout.font_size_header, p.muted, _TRACKING_LABEL)
+        label = self._render_tracked(label_text, layout.font_size_header, p.muted, _TRACKING_LABEL)
         target.blit(label, (pad_x + dot_r * 2 + 8, (strip.h - label.get_height()) // 2))
 
-        side_str = self._side_string(track)
         if side_str:
             side = self._render_tracked(side_str, layout.font_size_header, p.muted, _TRACKING_LABEL)
             target.blit(side, (self.width - pad_x - side.get_width(),
                                (strip.h - side.get_height()) // 2))
 
-    def _draw_status_dot(self, target, layout: NowPlayingLayout, p: DisplayPalette):
-        """Draw the pulsing status dot — the single animated element.
+    def _draw_status_dot(self, target, layout: NowPlayingLayout, color: tuple,
+                         animate: bool = True, glow: bool = True):
+        """Draw the status dot — the strip's animated element.
 
-        DESIGN.md §5: 8×8 accent circle with glow while playing; pulse
-        keyframes 0%/100% {opacity 1, scale 1} → 50% {opacity 0.55, scale
-        0.9}, 1.6s ease-in-out infinite.  A raised cosine reproduces the
-        eased triangle exactly.  The glow approximates the CSS
-        `box-shadow: 0 0 8px accent` with two soft alpha circles.  With
-        reduced_motion the dot is static at full opacity (animation: none),
-        glow retained.
+        DESIGN.md §5: 8×8 circle; color maps to playback state (accent while
+        playing/boot, muted in idle, muted red in error).  Pulse keyframes
+        0%/100% {opacity 1, scale 1} → 50% {opacity 0.55, scale 0.9}, 1.6s
+        ease-in-out infinite — a raised cosine reproduces the eased triangle
+        exactly.  The glow approximates `box-shadow: 0 0 8px` with two soft
+        alpha circles; per the spec it appears only in glowing states
+        (playing/boot).  `animate=False` (idle, error, reduced_motion)
+        renders the dot static at full opacity.
         """
         import math
         import pygame
 
         strip = layout.header_strip
         r = self._dot_radius()
-        if self.reduced_motion:
+        if not animate or self.reduced_motion:
             k = 0.0
         else:
             phase = (time.monotonic() % _PULSE_SECS) / _PULSE_SECS
@@ -708,10 +761,11 @@ class DisplayRenderer:
         size = r * 6  # room for the glow halo
         dot = pygame.Surface((size, size), pygame.SRCALPHA)
         c = size // 2
-        glow_alpha = int(70 * opacity)
-        pygame.draw.circle(dot, (*p.accent, glow_alpha // 2), (c, c), int(r * 2.5))
-        pygame.draw.circle(dot, (*p.accent, glow_alpha), (c, c), int(r * 1.6))
-        pygame.draw.circle(dot, (*p.accent, int(255 * opacity)), (c, c), max(2, int(r * scale)))
+        if glow:
+            glow_alpha = int(70 * opacity)
+            pygame.draw.circle(dot, (*color, glow_alpha // 2), (c, c), int(r * 2.5))
+            pygame.draw.circle(dot, (*color, glow_alpha), (c, c), int(r * 1.6))
+        pygame.draw.circle(dot, (*color, int(255 * opacity)), (c, c), max(2, int(r * scale)))
         target.blit(dot, (cx - c, cy - c))
 
     def _side_string(self, track) -> str:
@@ -824,46 +878,192 @@ class DisplayRenderer:
     # Boot / idle / listening states
     # -----------------------------------------------------------------------
 
-    def _render_listening(self):
-        """Render 'Identifying…' boot state while awaiting first recognition.
+    @staticmethod
+    def _boot_label(elapsed: float) -> str:
+        """Time-progressive boot label (DESIGN.md §5).
 
-        NOTE: interim visual — the full DESIGN.md empty-state spec (DirectionA
-        frame, 440×440 arc cover, 48px hero, progressive boot labels) lands in
-        the Phase 2 empty-states work.
+        Lets the room listener distinguish active identification from a hung
+        process without walking to the Pi: WARMING UP (0–19s), STILL
+        LISTENING… (20–59s), IDENTIFYING… M:SS (60s+).
+        """
+        if elapsed < 20:
+            return "WARMING UP"
+        if elapsed < 60:
+            return "STILL LISTENING…"
+        m = int(elapsed // 60)
+        s = int(elapsed % 60)
+        return f"IDENTIFYING… {m}:{s:02d}"
+
+    def _render_empty(self, kind: str):
+        """Render a boot/idle/error empty state (v1.4.1, DESIGN.md §5).
+
+        Full DirectionA frame on the (lerped-to-)fallback palette: status
+        strip with state label (no side counter), the 440×440 cover area
+        replaced by the state's empty-cover treatment, the hero at 48px with
+        a state-specific string, and all album metadata suppressed.
+
+        Animation budget per state: boot animates (rotating arc + pulsing
+        dot + ticking label); idle and error are fully static, so the render
+        loop goes quiet — the stillness of the error arc is the signal
+        (boot spins; error sits).
+        """
+        layout = self._layout
+        p = self._animated_palette()
+
+        elapsed = time.monotonic() - self._listening_since if self._listening_since else 0.0
+        boot_label = self._boot_label(elapsed) if kind == "boot" else None
+
+        key = ("empty", kind, boot_label, p.bg, p.surface, p.accent, p.text, p.muted)
+        if self._static_key != key or self._static_surface is None:
+            self._static_surface = self._compose_empty(kind, layout, p, boot_label)
+            self._static_key = key
+
+        self._screen.blit(self._static_surface, (0, 0))
+
+        # State-mapped dot (DESIGN.md §5): boot pulses+glows in accent;
+        # idle sits static in muted; error sits static in muted red.
+        if kind == "boot":
+            self._draw_status_dot(self._screen, layout, p.accent, animate=True, glow=True)
+            self._draw_boot_arc(self._screen, layout, p, elapsed)
+            self._dirty = True  # arc + dot + label all tick
+        elif kind == "error":
+            self._draw_status_dot(self._screen, layout, _ERROR_RED, animate=False, glow=False)
+        else:  # idle
+            self._draw_status_dot(self._screen, layout, p.muted, animate=False, glow=False)
+
+    def _compose_empty(self, kind: str, layout: NowPlayingLayout,
+                       p: DisplayPalette, boot_label: Optional[str]):
+        """Compose the static portion of an empty-state frame.
+
+        Includes everything except the dot and (in boot) the rotating arc:
+        gradient, cover shadow + treatment + ring, strip, hero, labels.
         """
         import pygame
-        p = FALLBACK_PALETTE
-        self._draw_gradient_bg(self._screen, p)
 
-        # Spinning arc as a loading indicator (simple rotation)
-        cx, cy = self.width // 2, self.height // 2
-        r = int(min(self.width, self.height) * 0.08)
-        angle = (time.monotonic() * 200) % 360
+        surf = pygame.Surface((self.width, self.height))
+        self._draw_gradient_bg(surf, p)
 
-        pygame.draw.circle(self._screen, p.surface, (cx, cy), r + 4, 1)
-        # Draw a short arc via thick line (poor man's spinner)
-        import math
-        if not self.reduced_motion:
-            for deg in range(0, 50, 3):
-                a = math.radians(angle + deg)
-                x1 = int(cx + r * math.cos(a))
-                y1 = int(cy + r * math.sin(a))
-                pygame.draw.circle(self._screen, p.accent, (x1, y1), 2)
+        s = min(self.width / 1024, self.height / 600)
+        ca = layout.cover_art
 
-        label = self._render_tracked("IDENTIFYING…", 12, p.muted, _TRACKING_LABEL)
-        self._screen.blit(label, label.get_rect(center=(cx, cy + r + 20)))
-        if not self.reduced_motion:
-            self._dirty = True  # Keep animating
+        # Cover Lift shadow stays — the empty cover is still the physical
+        # object slot (the JSX applies the container shadow in all states).
+        shadow = self._cover_shadow(ca.w, ca.h)
+        pad = (shadow.get_width() - ca.w) // 2
+        surf.blit(shadow, (ca.x - pad, ca.y - pad + max(4, int(30 * s))))
 
-    def _render_idle(self):
-        """Render idle/standby screen.
+        # --- Empty-cover treatment ---
+        if kind == "idle":
+            self._draw_stripes(surf, ca, p)
+            label = self._render_tracked("NO RECORD ON PLATTER", layout.font_size_header,
+                                         p.muted, _TRACKING_LABEL)
+            surf.blit(label, (ca.x + (ca.w - label.get_width()) // 2,
+                              ca.y + (ca.h - label.get_height()) // 2))
+        else:
+            pygame.draw.rect(surf, p.surface, (ca.x, ca.y, ca.w, ca.h))
+            cx = ca.x + ca.w // 2
+            arc_r = int(32 * s)
+            arc_cy = ca.y + ca.h // 2 - int(24 * s)   # arc sits above its label(s)
+            # Ghost ring: stable circular frame so the arc reads as contained
+            # rotation (muted @ 40% opacity, 1px)
+            ring = pygame.Surface((arc_r * 2 + 4, arc_r * 2 + 4), pygame.SRCALPHA)
+            pygame.draw.circle(ring, (*p.muted, 102), (arc_r + 2, arc_r + 2), arc_r, 1)
+            surf.blit(ring, (cx - arc_r - 2, arc_cy - arc_r - 2))
 
-        NOTE: interim visual — the diagonal-stripe 'NO RECORD ON PLATTER'
-        treatment from DESIGN.md lands in the Phase 2 empty-states work
-        (and DESIGN.md itself flags the idle screen as a design gap).
+            label_y = arc_cy + arc_r + int(18 * s)
+            if kind == "boot":
+                label = self._render_tracked(boot_label or "WARMING UP",
+                                             layout.font_size_header, p.muted, 0.20)
+                surf.blit(label, (cx - label.get_width() // 2, label_y))
+            else:  # error — static arc + primary label + recovery hint
+                arc = self._get_arc_segment(arc_r, _ERROR_RED)
+                surf.blit(arc, arc.get_rect(center=(cx, arc_cy)))
+                label = self._render_tracked("NO MATCH FOUND", layout.font_size_header,
+                                             p.muted, 0.20)
+                surf.blit(label, (cx - label.get_width() // 2, label_y))
+                hint = self._render_tracked("REPOSITION NEEDLE TO RETRY",
+                                            layout.font_size_header, p.muted, _TRACKING_ADJACENT)
+                surf.blit(hint, (cx - hint.get_width() // 2,
+                                 label_y + label.get_height() + int(8 * s)))
+
+        # Hairline ring on the cover edge (all treatments)
+        ring = pygame.Surface((ca.w, ca.h), pygame.SRCALPHA)
+        pygame.draw.rect(ring, (255, 255, 255, 10), ring.get_rect(), 1)
+        surf.blit(ring, (ca.x, ca.y))
+
+        # --- Status strip (no side counter in empty states) ---
+        self._draw_header(surf, layout, p, _STATE_LABELS[kind])
+
+        # --- Hero at 48px (empty-state font size exception) + accent rule;
+        #     all album metadata suppressed ---
+        hero_size = max(18, int(48 * s))
+        hero_rect = Rect(layout.track_text.x, layout.track_text.y,
+                         layout.track_text.w, layout.track_text.h)
+        hero_h = self._draw_wrapped_text(surf, _EMPTY_HEROES[kind], "display",
+                                         hero_size, hero_rect, p.text)
+        div_y = layout.track_text.y + hero_h + max(2, int(4 * self.height / 600))
+        pygame.draw.rect(surf, p.accent,
+                         (layout.divider.x, div_y, layout.divider_width,
+                          max(2, layout.divider.h)))
+        return surf
+
+    def _draw_stripes(self, target, ca, p: DisplayPalette):
+        """Idle empty cover: repeating 135° diagonal stripes, 12px bands
+        alternating surface/bg (DESIGN.md §5 idle treatment)."""
+        import pygame
+
+        s = min(self.width / 1024, self.height / 600)
+        band = max(6, int(12 * s))
+        tile = pygame.Surface((ca.w, ca.h))
+        tile.fill(p.bg)
+        # 135° stripes: lines running bottom-left → top-right, advancing
+        # along the x axis at 2-band spacing
+        for off in range(-ca.h, ca.w + ca.h, band * 2):
+            pygame.draw.line(tile, p.surface, (off, ca.h), (off + ca.h, 0), band)
+        target.blit(tile, (ca.x, ca.y))
+
+    def _get_arc_segment(self, radius: int, color: tuple):
+        """Pre-render the quarter-circle arc segment (dasharray 50/200 ≈ 89°
+        of a r=32 circle, round caps, 1.5px stroke), used static for error
+        and rotated per frame for boot.  Stamped as small filled circles
+        along the path — pygame.draw.arc moirés at thin widths.
         """
-        p = FALLBACK_PALETTE
-        self._draw_gradient_bg(self._screen, p)
+        import math
+        import pygame
+
+        key = (radius, color)
+        if self._arc_segment is not None and self._arc_segment[0] == key:
+            return self._arc_segment[1]
+
+        size = radius * 2 + 6
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        c = size // 2
+        stroke = max(1, round(radius / 21))   # ≈1.5px at the 32px reference
+        for deg in range(0, 90):              # ~quarter circle
+            a = math.radians(deg)
+            x = c + radius * math.cos(a)
+            y = c + radius * math.sin(a)
+            pygame.draw.circle(surf, color, (int(x), int(y)), stroke)
+        self._arc_segment = (key, surf)
+        return surf
+
+    def _draw_boot_arc(self, target, layout: NowPlayingLayout,
+                       p: DisplayPalette, elapsed: float):
+        """Rotate the accent arc segment over the boot empty cover
+        (1.4s linear infinite; static under reduced_motion)."""
+        import pygame
+
+        s = min(self.width / 1024, self.height / 600)
+        ca = layout.cover_art
+        arc_r = int(32 * s)
+        cx = ca.x + ca.w // 2
+        cy = ca.y + ca.h // 2 - int(24 * s)
+
+        arc = self._get_arc_segment(arc_r, p.accent)
+        if not self.reduced_motion:
+            angle = -(elapsed % _ARC_SECS) / _ARC_SECS * 360.0
+            arc = pygame.transform.rotate(arc, angle)
+        target.blit(arc, arc.get_rect(center=(cx, cy)))
 
     # -----------------------------------------------------------------------
     # Drawing helpers

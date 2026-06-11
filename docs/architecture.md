@@ -375,29 +375,40 @@ latched pair which only collection-owned tracks set)
 Central in-memory state. Single source of truth for the display and all
 components that need to know what's currently playing.
 
-**`PlayerStatus`** (enum) — three values:
+**`PlayerStatus`** (enum) — four values:
 
 | Value | Meaning |
 |-------|---------|
 | `IDLE` | Startup state, or after a session completes |
 | `LISTENING` | Awaiting the first recognition of a fresh session |
 | `PLAYING` | Track identified and displayed |
+| `ERROR` | Music detected but recognition repeatedly failed (v1.4.1, "NO MATCH FOUND") |
 
 Transitions:
 
 ```
 IDLE ──(MUSIC_STARTED)──→ LISTENING ──(track committed)──→ PLAYING
-  ↑                                                            │
+  ↑                        │      ↑                            │
+  │     (N straight misses)│      │(MUSIC_STARTED — needle     │
+  │                        ▼      │  repositioned)             │
+  │                      ERROR ───┘──(track committed)→ PLAYING│
   └──────────────(SESSION_ENDED AudioEvent / clear())─────────┘
 ```
 
 When `SESSION_ENDED` fires as an `AudioEvent`, `main.py` calls `state.clear()`
-which transitions directly to `IDLE`.  (A `PlayerStatus.SESSION_ENDED` enum
-value existed through v1.3.3 but was never set by any code path; it was
-removed in v1.3.4.)  Since v1.3.4, `MUSIC_STARTED` transitions to LISTENING
-**only from IDLE** — during an active session (a side flip), the status stays
-PLAYING so the now-playing card remains on screen and updates in place when
-the next track commits.
+which transitions directly to `IDLE` from any state.  (A
+`PlayerStatus.SESSION_ENDED` enum value existed through v1.3.3 but was never
+set by any code path; it was removed in v1.3.4.)  Since v1.3.4,
+`MUSIC_STARTED` transitions to LISTENING **only from IDLE** (and, since
+v1.4.1, from ERROR — the "REPOSITION NEEDLE TO RETRY" recovery) — during an
+active session (a side flip), the status stays PLAYING so the now-playing
+card remains on screen and updates in place when the next track commits.
+
+`ERROR` is set by `RecognitionLoop._register_miss()` after
+`recognition.error_after_misses` consecutive failed recognitions (default 6,
+≈1 minute of unidentifiable music) **while LISTENING only** — misses during
+PLAYING are routine surface noise; misses in IDLE mean nothing.  A
+successful commit (`set_track`) recovers ERROR → PLAYING directly.
 
 **Fields:** `status`, `current_track: Optional[TrackMetadata]`,
 `current_raw: Optional[RawRecognitionResult]`
@@ -427,9 +438,19 @@ animation, easier on the Pi's CPU).
 
 | State | Screen |
 |-------|--------|
-| `IDLE` | Radial gradient dark background (interim; DESIGN.md stripe treatment lands with the empty-states work, full redesign planned for v1.5.0) |
-| `LISTENING` | Spinning arc + "IDENTIFYING…" label in muted grey — fresh sessions only; side flips keep the card up (v1.3.4) |
+| `IDLE` | DirectionA empty frame: 135° diagonal-stripe cover + "NO RECORD ON PLATTER", hero "Waiting for a record" (v1.4.1; richer idle redesign still planned for v1.5.0) |
+| `LISTENING` | DirectionA empty frame: ghost ring + rotating accent arc (1.4s linear), time-progressive cover label (WARMING UP → STILL LISTENING… → IDENTIFYING… M:SS), hero "Listening…" — fresh sessions only; side flips keep the card up (v1.3.4) |
+| `ERROR` | DirectionA empty frame: static muted-red arc, "NO MATCH FOUND" + "REPOSITION NEEDLE TO RETRY", hero "Couldn't identify" — the stillness is the signal (boot spins; error sits) |
 | `PLAYING` | Full "Museum Card" now-playing layout |
+
+All three empty states (v1.4.1) share `_render_empty`/`_compose_empty`: the
+full 1024×600 frame on the fallback palette (lerped to smoothly), status
+strip with state label and state-mapped dot (boot pulses+glows accent; idle
+sits static muted; error sits static red), Cover Lift shadow retained, hero
+at 48px (the DESIGN.md empty-state font size exception), and ALL album
+metadata suppressed — artist, album, chips, catalog footer, PREV/NEXT.
+Idle and error are fully static frames, so the render loop goes quiet;
+boot animates (arc + dot + ticking label).
 
 **Now-playing layout (v1.2.1 "Museum Card" push-down + v1.4.0 fidelity):**
 - Full-width header strip on a solid `surface` background: pulsing `●` dot
@@ -662,12 +683,14 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 1. AudioCapture.run()        InputStream streams continuously;
                              ChunkAssembler emits a 15s window every 10s
 2. SilenceDetector.process() RMS >= threshold → emit MUSIC_STARTED
-3. main.py handler           PlayerState.set_status(LISTENING) [from IDLE only]
+3. main.py handler           PlayerState.set_status(LISTENING) [from IDLE or ERROR]
                              ListenTracker._start_session()
 4. RecognitionLoop.run()     dequeues chunk → ShazamIOBackend.recognize()
                              → RawRecognitionResult (or None)
 5. _handle_result()          confirmation_required=2: need 2 matches
                              second match → _commit_track()
+                             (None while LISTENING: _register_miss();
+                             error_after_misses straight misses → ERROR)
 6. MetadataResolver.resolve()  album cache miss → step 1: Discogs collection
                                hit → TrackMetadata (DISCOGS_COLLECTION);
                                result cached for the album's remaining tracks
@@ -766,8 +789,9 @@ All source modules are complete. The only remaining work requires hardware:
 - **Shazam recognition testing** — needs real audio input
 - **Display rendering testing** — needs the Waveshare HDMI display
 - **End-to-end integration** — full needle-drop → Discogs-updated flow on hardware
-- **Idle screen** — `DisplayRenderer._render_idle()` renders a blank dark screen; a
-  nicer idle layout (last-played art, clock, etc.) is marked TODO in the code
+- **Idle screen richness** — the v1.4.1 idle frame is the deliberate DESIGN.md
+  stripe placeholder; the richer layout (last-played art grid, clock, random
+  collection suggestion) is planned for v1.5.0
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (314 tests)
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (334 tests)
 and `docs/pi-setup-guide.md` for hardware bring-up instructions.
