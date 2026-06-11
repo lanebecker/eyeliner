@@ -171,10 +171,12 @@ The core artboard: 1024×600px, hard-fixed dimensions. Cover on the left (440×4
 
 The metadata column orders vertically: display track name → accent rule → headline artist → title album → genre chips (auto-flex to bottom) → catalog footer → PREV/NEXT context (when showing adjacent).
 
+In **between** state, a `NEXT` eyebrow label (11px Label scale, `p.muted`, `marginBottom: 8px`) precedes the track name hero. `trackText` returns `album.next.track` rather than the current track, so the hero still runs at full 72px display scale — the eyebrow carries the contextual "what's coming" signal without demoting the track name to a subtitle role.
+
 ### Idle, Boot, and Error States
 - **Boot** (`state === 'boot'`): Rotating SVG arc in `p.accent` over a `p.surface` background. "WARMING UP" label in JetBrains Mono. Track name shows "Listening…".
 - **Idle** (`state === 'idle'`): Repeating 135° diagonal stripe pattern (`p.surface` / `p.bg`). "NO RECORD ON PLATTER" label. Track name shows "Waiting for a record".
-- **Error** (`state === 'error'`): Static (non-rotating) SVG arc in `#c85050` (muted red) over `p.surface`. "NO MATCH FOUND" label. Track name shows "Couldn't identify". Signals that ShazamIO completed but found no matching release — distinct from boot (still trying) and idle (no audio).
+- **Error** (`state === 'error'`): Static (non-rotating) SVG arc in `#c85050` (muted red) over `p.surface`. "NO MATCH FOUND" primary label + "REPOSITION NEEDLE TO RETRY" recovery hint, both at 11px Label scale. Track name shows "Couldn't identify". Signals that ShazamIO completed but found no matching release — distinct from boot (still trying) and idle (no audio).
 
 All three states replace the cover image and show no album metadata. The track name, artist, album, genre chips, and catalog footer are suppressed.
 
