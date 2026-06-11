@@ -80,7 +80,7 @@ The target device is the Waveshare 7" HDMI LCD (H) at exactly 1024×600, driven 
 - Fallback palette (below) activates when no album is loaded
 - Smooth 1-second lerp between palettes on track change — no jump cuts
 
-**Implementation note:** `Vinyl Now Playing.html` (React/Babel) is the primary design prototype; all geometry in this document is derived from it. The production renderer is Python/Pillow/pygame (`src/display/layouts.py`, `src/display/renderer.py`). The two are intentionally kept in sync — the prototype is the design-intent source.
+**Implementation note:** `design/index.html` (React/Babel, in the `design/` directory of the repo) is the primary design prototype; all geometry in this document is derived from it. The production renderer is Python/Pillow/pygame (`src/display/layouts.py`, `src/display/renderer.py`). The two are intentionally kept in sync — the prototype is the design-intent source.
 
 ## 2. Colors: The Adaptive Palette
 
@@ -105,7 +105,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 
 **The Full-Opacity Rule.** Secondary text (`muted`) already conveys its subdued role through hue. Never compound with opacity. `p.muted` at `opacity: 0.65` over a dark bg fails contrast. Use the color as-is; reduce saturation or lightness in the palette if it reads too heavy.
 
-**The Per-Album Rule.** The five palette roles (`bg`, `surface`, `accent`, `text`, `muted`) are architecture, not values. Treat the fallback palette as the null state; treat each album's extraction as the real design. New album additions require a new palette entry in `data.js`, not a design change.
+**The Per-Album Rule.** The five palette roles (`bg`, `surface`, `accent`, `text`, `muted`) are architecture, not values. Treat the fallback palette as the null state; treat each album's extraction as the real design. New album additions require a new palette entry in `design/src/data.js`, not a design change.
 
 **The Hue Diversity Rule.** Extracted `accent` colors must maintain ≥60° hue separation (in OKLCH/LCH space) from every other album's accent in the collection. Unconstrained extraction clusters toward warm orange (hue 40–60°), making distinct records indistinguishable at a glance. When a new extraction lands within 60° of an existing accent, either: (a) use the cover's second-most-prominent hue, or (b) shift the accent's hue ±60°+ while preserving its lightness and chroma. The five prototype albums span the hue wheel: orange (Sister ~55°), olive (Bachelor ~125°), blue (Repeater ~225°), violet (Bush of Ghosts ~290°), rose (Cavetown ~345°). All pairs maintain ≥60° separation.
 
@@ -223,7 +223,7 @@ An optional context row that appears below the catalog footer line. Shows the tr
 
 ### Do:
 - **Do** use the `muted` role at full opacity for secondary text. Its color already communicates subdued; additional opacity stacks invisibly against dark backgrounds and fails contrast.
-- **Do** enforce ≥60° hue separation between any two albums' `accent` colors in `data.js`. Unconstrained extraction clusters toward warm orange; the collection needs to span the hue wheel.
+- **Do** enforce ≥60° hue separation between any two albums' `accent` colors in `design/src/data.js`. Unconstrained extraction clusters toward warm orange; the collection needs to span the hue wheel.
 - **Do** set `alt` on album cover images to `"{artist} — {album}"`. The cover is the primary visual element; marking it decorative (`alt=""`) erases it from screen readers.
 - **Do** include `@media (prefers-reduced-motion: reduce)` on every `@keyframes` animation. The pulse and rotate animations are continuous; they need static fallbacks.
 - **Do** protect long album titles from overflow. The `title` level (32px Newsreader italic) needs `overflow: hidden` and `-webkit-line-clamp: 2` or equivalent; "Bachelor No. 2 or, the Last Remains of the Dodo" at 32px will overflow without it.
