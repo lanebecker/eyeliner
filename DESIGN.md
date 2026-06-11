@@ -174,11 +174,13 @@ The metadata column orders vertically: display track name → accent rule → he
 In **between** state, a `NEXT` eyebrow label (11px Label scale, `p.muted`, `marginBottom: 8px`) precedes the track name hero. `trackText` returns `album.next.track` rather than the current track, so the hero still runs at full 72px display scale — the eyebrow carries the contextual "what's coming" signal without demoting the track name to a subtitle role.
 
 ### Idle, Boot, and Error States
-- **Boot** (`state === 'boot'`): Rotating SVG arc in `p.accent` over a `p.surface` background. "WARMING UP" label in JetBrains Mono. Track name shows "Listening…".
+- **Boot** (`state === 'boot'`): Rotating SVG arc in `p.accent` over a `p.surface` background. Progressive elapsed label: "WARMING UP" (0–20s), "STILL LISTENING…" (20–60s), "IDENTIFYING… M:SS" (60s+). Track name shows "Listening…".
 - **Idle** (`state === 'idle'`): Repeating 135° diagonal stripe pattern (`p.surface` / `p.bg`). "NO RECORD ON PLATTER" label. Track name shows "Waiting for a record".
 - **Error** (`state === 'error'`): Static (non-rotating) SVG arc in `#c85050` (muted red) over `p.surface`. "NO MATCH FOUND" primary label + "REPOSITION NEEDLE TO RETRY" recovery hint, both at 11px Label scale. Track name shows "Couldn't identify". Signals that ShazamIO completed but found no matching release — distinct from boot (still trying) and idle (no audio).
 
-All three states replace the cover image and show no album metadata. The track name, artist, album, genre chips, and catalog footer are suppressed.
+**Production behavior:** All three states replace the cover image with the empty cover component and show no album metadata. The track name shows a state-specific string ("Listening…", "Waiting for a record", "Couldn't identify"); artist, album, genre chips, and catalog footer are suppressed. When the system enters idle cold (no album ever loaded), these fields have no data to display. When it enters boot or error after a prior album, displaying stale metadata from the previous record would be misleading.
+
+**Prototype behavior:** `DirectionA.jsx` always renders the full meta column regardless of state. Sample data is always present in the prototype, so the fields are never undefined — suppression is not needed for design-review purposes. The cover is replaced with `DirAEmptyCover`, and the track name text changes, but artist/album/chips/catalog remain visible. This is intentional for the prototype: it lets you evaluate the full layout for each state with real album data in the meta column. The production Python renderer should implement the suppression described above.
 
 **Idle screen is a v1.4.0 design gap.** The diagonal stripe placeholder is intentionally minimal and temporary. The planned redesign will show a grid of recently played album covers, optional clock/date, and a random Discogs collection suggestion during extended idle. Any idle screen design must: use the fallback palette, preserve sharp-corner vocabulary, and feel like a continuation of the room monitor — not a different product.
 
