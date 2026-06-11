@@ -11,19 +11,19 @@ colors:
 typography:
   display:
     fontFamily: "Inter Tight, DejaVu Sans, Arial, sans-serif"
-    fontSize: "80px"
+    fontSize: "72px"
     fontWeight: 600
     lineHeight: 1.0
     letterSpacing: "-0.03em"
   headline:
     fontFamily: "Inter Tight, DejaVu Sans, Arial, sans-serif"
-    fontSize: "54px"
+    fontSize: "48px"
     fontWeight: 500
     lineHeight: 1.04
     letterSpacing: "-0.022em"
   title:
     fontFamily: "Newsreader, Georgia, serif"
-    fontSize: "36px"
+    fontSize: "32px"
     fontWeight: 400
     lineHeight: 1.12
     letterSpacing: "normal"
@@ -100,7 +100,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 
 **The Per-Album Rule.** The five palette roles (`bg`, `surface`, `accent`, `text`, `muted`) are architecture, not values. Treat the fallback palette as the null state; treat each album's extraction as the real design. New album additions require a new palette entry in `data.js`, not a design change.
 
-**The Hue Diversity Rule.** Extracted `accent` colors must maintain ≥60° hue separation (in OKLCH/LCH space) from every other album's accent in the collection. Unconstrained extraction clusters toward warm orange (hue 40–60°), making distinct records indistinguishable at a glance. When a new extraction lands within 60° of an existing accent, either: (a) use the cover's second-most-prominent hue, or (b) shift the accent's hue ±60°+ while preserving its lightness and chroma. The current five albums should span the hue wheel: orange (Sister), blue (Repeater), olive (Bachelor) are the anchors; Bush of Ghosts and Cavetown both currently cluster with Sister and need correction.
+**The Hue Diversity Rule.** Extracted `accent` colors must maintain ≥60° hue separation (in OKLCH/LCH space) from every other album's accent in the collection. Unconstrained extraction clusters toward warm orange (hue 40–60°), making distinct records indistinguishable at a glance. When a new extraction lands within 60° of an existing accent, either: (a) use the cover's second-most-prominent hue, or (b) shift the accent's hue ±60°+ while preserving its lightness and chroma. The five prototype albums span the hue wheel: orange (Sister ~55°), olive (Bachelor ~125°), blue (Repeater ~225°), violet (Bush of Ghosts ~290°), rose (Cavetown ~345°). All pairs maintain ≥60° separation.
 
 ## 3. Typography
 
@@ -111,9 +111,9 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 **Character:** A tight geometric sans paired with a warm editorial serif, mediated by a precise monospace. The sans compresses; the serif breathes; the mono anchors. Three families with maximum contrast between them — structural, warm, technical.
 
 ### Hierarchy
-- **Display** (Inter Tight 600, 80px, lh 0.98, ls -0.03em): Track name. The single most important piece of information. `textWrap: balance` to prevent awkward orphans. Set in `p.text`.
-- **Headline** (Inter Tight 500, 54px, lh 1.04, ls -0.022em): Artist name. Large but lighter weight than the track name to establish clear subordination. Set in `p.text`.
-- **Title** (Newsreader italic 400, 36px, lh 1.12): Album title only. The one serif-italic moment. Set in `p.accent` — the color contrast ties the album name to the cover.
+- **Display** (Inter Tight 600, 72px, lh 0.98, ls -0.03em): Track name. The single most important piece of information. `textWrap: balance` to prevent awkward orphans. Set in `p.text`.
+- **Headline** (Inter Tight 500, 48px, lh 1.04, ls -0.022em): Artist name. Large but lighter weight than the track name to establish clear subordination. Set in `p.text`.
+- **Title** (Newsreader italic 400, 32px, lh 1.12): Album title only. The one serif-italic moment. Set in `p.accent` — the color contrast ties the album name to the cover.
 - **Chip** (JetBrains Mono 400, 12px, ls 0.1em): Genre chip labels. Technical classification, not editorial copy.
 - **Label** (JetBrains Mono 400, 11px, ls 0.16em, uppercase): Status strip, catalog line, PREV/NEXT labels, side/position counter. All instrumental metadata. Set in `p.muted`.
 
@@ -179,7 +179,7 @@ Both states replace the cover image. The track name shifts to "Listening…" (bo
 - **Do** enforce ≥60° hue separation between any two albums' `accent` colors in `data.js`. Unconstrained extraction clusters toward warm orange; the collection needs to span the hue wheel.
 - **Do** set `alt` on album cover images to `"{artist} — {album}"`. The cover is the primary visual element; marking it decorative (`alt=""`) erases it from screen readers.
 - **Do** include `@media (prefers-reduced-motion: reduce)` on every `@keyframes` animation. The pulse and rotate animations are continuous; they need static fallbacks.
-- **Do** protect long album titles from overflow. The `title` level (36px Newsreader italic) needs `overflow: hidden` and `-webkit-line-clamp: 2` or equivalent; "Bachelor No. 2 or, the Last Remains of the Dodo" at 36px will overflow without it.
+- **Do** protect long album titles from overflow. The `title` level (32px Newsreader italic) needs `overflow: hidden` and `-webkit-line-clamp: 2` or equivalent; "Bachelor No. 2 or, the Last Remains of the Dodo" at 32px will overflow without it.
 - **Do** keep the five palette roles semantic (`bg`, `surface`, `accent`, `text`, `muted`). Adding album-specific tokens outside this structure breaks the theming architecture.
 
 ### Don't:
