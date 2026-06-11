@@ -145,6 +145,9 @@ const FALLBACK_PALETTE = {
 };
 
 // Helper: format mm:ss
+// NOTE: duration/elapsed are NOT rendered in the display — the design is intentionally
+// static (no progress bars, no elapsed time). See DESIGN.md §"No progress bars".
+// fmtTime is reserved for the v1.4.0 idle screen if it surfaces playback context.
 function fmtTime(s) {
   const m = Math.floor(s / 60);
   const r = Math.floor(s % 60);

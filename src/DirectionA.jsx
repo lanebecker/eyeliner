@@ -52,7 +52,7 @@ function DirectionA({
 
       {/* status strip */}
       {showTopStrip && (
-        <div style={{
+        <div aria-live="polite" style={{
           position: 'absolute', top: 0, left: 0, right: 0, height: 30,
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           padding: '0 26px', gap: 16,
@@ -183,8 +183,9 @@ function DirectionA({
           }}>{album.album}</div>
 
           {/* genre chips — max 3 displayed; "+N" overflow indicator if more */}
+          {/* album.genres guarded: Discogs can return null/undefined for some pressings */}
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 'auto', minHeight: 28 }}>
-            {album.genres.slice(0, 3).map(g => (
+            {(album.genres ?? []).slice(0, 3).map(g => (
               <span key={g} style={{
                 padding: '5px 12px',
                 fontFamily: '"JetBrains Mono", monospace',
@@ -193,14 +194,14 @@ function DirectionA({
                 borderRadius: 2,
               }}>{g}</span>
             ))}
-            {album.genres.length > 3 && (
+            {(album.genres ?? []).length > 3 && (
               <span style={{
                 padding: '5px 12px',
                 fontFamily: '"JetBrains Mono", monospace',
                 fontSize: 12, letterSpacing: '0.1em',
                 color: p.muted, border: `1px solid ${p.muted}55`,
                 borderRadius: 2,
-              }}>+{album.genres.length - 3}</span>
+              }}>+{(album.genres ?? []).length - 3}</span>
             )}
           </div>
 
@@ -215,29 +216,35 @@ function DirectionA({
             {album.year} · {album.label} · {album.catalog}
           </div>
 
-          {showAdjacent && state === 'playing' && (
+          {showAdjacent && state === 'playing' && (album.prev || album.next) && (
             <div style={{
               marginTop: 12, display: 'flex', gap: 32,
               fontFamily: '"JetBrains Mono", monospace',
               fontSize: 11, letterSpacing: '0.12em',
             }}>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ color: p.muted }}>← PREV</div>
-                <div style={{
-                  color: p.text, marginTop: 4,
-                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  letterSpacing: 0, fontFamily: '"Inter Tight", "DejaVu Sans", Arial, sans-serif', fontSize: 14,
-                }}>{album.prev.track}</div>
-              </div>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ color: p.muted }}>NEXT →</div>
-                <div style={{
-                  color: p.text, marginTop: 4,
-                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  letterSpacing: 0, fontFamily: '"Inter Tight", "DejaVu Sans", Arial, sans-serif', fontSize: 14,
-                  fontWeight: 500,
-                }}>{album.next.track}</div>
-              </div>
+              {/* PREV — hidden for first track on a side (no predecessor) */}
+              {album.prev && (
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ color: p.muted }}>← PREV</div>
+                  <div style={{
+                    color: p.text, marginTop: 4,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    letterSpacing: 0, fontFamily: '"Inter Tight", "DejaVu Sans", Arial, sans-serif', fontSize: 14,
+                  }}>{album.prev.track}</div>
+                </div>
+              )}
+              {/* NEXT — hidden for last track on a side (no successor) */}
+              {album.next && (
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ color: p.muted }}>NEXT →</div>
+                  <div style={{
+                    color: p.text, marginTop: 4,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    letterSpacing: 0, fontFamily: '"Inter Tight", "DejaVu Sans", Arial, sans-serif', fontSize: 14,
+                    fontWeight: 500,
+                  }}>{album.next.track}</div>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -263,7 +270,30 @@ function DirAStatus({ state, accent, muted }) {
   );
 }
 
+// Boot state elapsed-time hook — counts seconds since the cover mounted in boot state.
+// Lets the listener distinguish "still identifying" from "hung" after a long wait.
+function useBootElapsed(state) {
+  const [elapsed, setElapsed] = React.useState(0);
+  React.useEffect(() => {
+    if (state !== 'boot') { setElapsed(0); return; }
+    setElapsed(0);
+    const t = setInterval(() => setElapsed(s => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [state]);
+  return elapsed;
+}
+
 function DirAEmptyCover({ state, p }) {
+  const elapsed = useBootElapsed(state);
+  // Label transitions: first 20s → "WARMING UP", 20-59s → "STILL LISTENING…", 60s+ → "IDENTIFYING… 1:mm"
+  const bootLabel = React.useMemo(() => {
+    if (elapsed < 20) return 'WARMING UP';
+    if (elapsed < 60) return 'STILL LISTENING…';
+    const m = Math.floor(elapsed / 60);
+    const s = String(elapsed % 60).padStart(2, '0');
+    return `IDENTIFYING… ${m}:${s}`;
+  }, [elapsed]);
+
   if (state === 'error') {
     return (
       <div style={{
@@ -305,7 +335,7 @@ function DirAEmptyCover({ state, p }) {
         <div style={{
           fontFamily: '"JetBrains Mono", monospace',
           fontSize: 11, letterSpacing: '0.2em', color: p.muted,
-        }}>WARMING UP</div>
+        }}>{bootLabel}</div>
       </div>
     );
   }
