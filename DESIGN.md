@@ -147,7 +147,7 @@ The single animated element: an 8×8px circle whose color maps to playback state
 
 All animation must include a `@media (prefers-reduced-motion: reduce)` block that sets `animation: none`.
 
-State color mapping: playing → `accent`; between-tracks → `#e0a040` (warm amber); paused → `muted`; idle → `muted`; boot → `accent`.
+State color mapping: playing → `accent`; between-tracks → `#e0a040` (warm amber); paused → `muted`; idle → `muted`; boot → `accent`; error → `#c85050` (muted red — ShazamIO failed to identify).
 
 ### Genre Chips
 - **Shape:** Nearly square corners (2px radius)
@@ -157,18 +157,19 @@ State color mapping: playing → `accent`; between-tracks → `#e0a040` (warm am
 - **No hover or active state** — purely informational, non-interactive
 
 ### Accent Rule
-A 64×2px horizontal rule in `p.accent` at 0.65 opacity. Appears between the track name and the artist name. Its width is fixed, not responsive to the column — a deliberate punctuation mark, not a divider that spans the full width.
+A 64×2px horizontal rule in `p.accent` at full opacity. Appears between the track name and the artist name. Its width is fixed, not responsive to the column — a deliberate punctuation mark, not a divider that spans the full width.
 
 ### Display Layout (DirectionA)
 The core artboard: 1024×600px, hard-fixed dimensions. Cover on the left (440×440px), metadata on the right (1fr). Top status strip (30px, suppressed in compact variant). Inset: 60px top, 50px sides, 40px bottom. Grid gap: 44px.
 
 The metadata column orders vertically: display track name → accent rule → headline artist → title album → genre chips (auto-flex to bottom) → catalog footer → PREV/NEXT context (when showing adjacent).
 
-### Idle and Boot States
-- **Boot** (`state === 'boot'`): Rotating SVG arc in `p.accent` over a `p.surface` background. "WARMING UP" label in JetBrains Mono.
-- **Idle** (`state === 'idle'`): Repeating 135° diagonal stripe pattern (`p.surface` / `p.bg`). "NO RECORD ON PLATTER" label.
+### Idle, Boot, and Error States
+- **Boot** (`state === 'boot'`): Rotating SVG arc in `p.accent` over a `p.surface` background. "WARMING UP" label in JetBrains Mono. Track name shows "Listening…".
+- **Idle** (`state === 'idle'`): Repeating 135° diagonal stripe pattern (`p.surface` / `p.bg`). "NO RECORD ON PLATTER" label. Track name shows "Waiting for a record".
+- **Error** (`state === 'error'`): Static (non-rotating) SVG arc in `#c85050` (muted red) over `p.surface`. "NO MATCH FOUND" label. Track name shows "Couldn't identify". Signals that ShazamIO completed but found no matching release — distinct from boot (still trying) and idle (no audio).
 
-Both states replace the cover image. The track name shifts to "Listening…" (boot) or "Waiting for a record" (idle) — these are the only non-track strings in the display type.
+All three states replace the cover image and show no album metadata. The track name, artist, album, genre chips, and catalog footer are suppressed.
 
 **Idle screen is a v1.4.0 design gap.** The diagonal stripe placeholder is intentionally minimal and temporary. The planned redesign will show a grid of recently played album covers, optional clock/date, and a random Discogs collection suggestion during extended idle. Any idle screen design must: use the fallback palette, preserve sharp-corner vocabulary, and feel like a continuation of the room monitor — not a different product.
 
@@ -180,6 +181,8 @@ Both states replace the cover image. The track name shifts to "Listening…" (bo
 - **Do** set `alt` on album cover images to `"{artist} — {album}"`. The cover is the primary visual element; marking it decorative (`alt=""`) erases it from screen readers.
 - **Do** include `@media (prefers-reduced-motion: reduce)` on every `@keyframes` animation. The pulse and rotate animations are continuous; they need static fallbacks.
 - **Do** protect long album titles from overflow. The `title` level (32px Newsreader italic) needs `overflow: hidden` and `-webkit-line-clamp: 2` or equivalent; "Bachelor No. 2 or, the Last Remains of the Dodo" at 32px will overflow without it.
+- **Do** protect long track names from overflow. The `display` level (72px Inter Tight) needs `overflow: hidden` and `-webkit-line-clamp: 3`; production track names can be long.
+- **Do** cap genre chip display at 3 with a `+N` overflow indicator, and set `minHeight: 28` on the chip container. Discogs can return 0 or 5+ genres; the catalog footer must stay anchored regardless.
 - **Do** keep the five palette roles semantic (`bg`, `surface`, `accent`, `text`, `muted`). Adding album-specific tokens outside this structure breaks the theming architecture.
 
 ### Don't:
