@@ -27,6 +27,12 @@ typography:
     fontWeight: 400
     lineHeight: 1.12
     letterSpacing: "normal"
+  catalog:
+    fontFamily: "JetBrains Mono, ui-monospace, monospace"
+    fontSize: "13px"
+    fontWeight: 400
+    lineHeight: 1.4
+    letterSpacing: "0.08em"
   label:
     fontFamily: "JetBrains Mono, ui-monospace, monospace"
     fontSize: "11px"
@@ -88,7 +94,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 
 ### Neutral
 - **Near-White Text** (`#ebe6dc`): Primary text. Warm off-white; slight warmth prevents harshness. Each album replaces this with a tinted near-white matching the cover's dominant hue.
-- **Muted Secondary** (`#8a857c`): Secondary text. Status labels, catalog text, PREV/NEXT labels, genre chip text. Must pass 4.5:1 contrast against its album bg at full opacity — never stack with additional opacity reductions.
+- **Muted Secondary** (`#8a857c`): Secondary text. Status labels, catalog text, PREV/NEXT labels, genre chip text. Must pass 4.5:1 contrast against its album bg at full opacity — never stack with additional opacity reductions. When extracting a muted value for a new album, verify the ratio; cool-dark backgrounds (e.g., Cavetown `#0e1a2a`) pull contrast down faster than neutral darks.
 
 **Canvas Chrome** (`#f0eee9`): The design-tool background. Never part of the now-playing display.
 
@@ -115,7 +121,8 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 - **Headline** (Inter Tight 500, 48px, lh 1.04, ls -0.022em): Artist name. Large but lighter weight than the track name to establish clear subordination. Set in `p.text`.
 - **Title** (Newsreader italic 400, 32px, lh 1.12): Album title only. The one serif-italic moment. Set in `p.accent` — the color contrast ties the album name to the cover.
 - **Chip** (JetBrains Mono 400, 12px, ls 0.1em): Genre chip labels. Technical classification, not editorial copy.
-- **Label** (JetBrains Mono 400, 11px, ls 0.16em, uppercase): Status strip, catalog line, PREV/NEXT labels, side/position counter. All instrumental metadata. Set in `p.muted`.
+- **Catalog** (JetBrains Mono 400, 13px, ls 0.08em): Catalog footer line only (`{year} · {label} · {catalog}`). Slightly larger than Label for room-monitor legibility at 6–10ft — the catalog line is dense metadata that benefits from one step of breathing room above 11px.
+- **Label** (JetBrains Mono 400, 11px, ls 0.16em, uppercase): Status strip, PREV/NEXT labels, side/position counter, status indicator. All instrumental metadata. Set in `p.muted`.
 
 ### Named Rules
 
@@ -181,9 +188,9 @@ All three states replace the cover image and show no album metadata. The track n
 - **Do** set `alt` on album cover images to `"{artist} — {album}"`. The cover is the primary visual element; marking it decorative (`alt=""`) erases it from screen readers.
 - **Do** include `@media (prefers-reduced-motion: reduce)` on every `@keyframes` animation. The pulse and rotate animations are continuous; they need static fallbacks.
 - **Do** protect long album titles from overflow. The `title` level (32px Newsreader italic) needs `overflow: hidden` and `-webkit-line-clamp: 2` or equivalent; "Bachelor No. 2 or, the Last Remains of the Dodo" at 32px will overflow without it.
+- **Do** keep the five palette roles semantic (`bg`, `surface`, `accent`, `text`, `muted`). Adding album-specific tokens outside this structure breaks the theming architecture.
 - **Do** protect long track names from overflow. The `display` level (72px Inter Tight) needs `overflow: hidden` and `-webkit-line-clamp: 3`; production track names can be long.
 - **Do** cap genre chip display at 3 with a `+N` overflow indicator, and set `minHeight: 28` on the chip container. Discogs can return 0 or 5+ genres; the catalog footer must stay anchored regardless.
-- **Do** keep the five palette roles semantic (`bg`, `surface`, `accent`, `text`, `muted`). Adding album-specific tokens outside this structure breaks the theming architecture.
 
 ### Don't:
 - **Don't** introduce the streaming-app aesthetic: no rounded album tiles, no progress bars, no playhead dots, no shuffle/repeat/heart icons. This display has no playback controls and should not imply any.
