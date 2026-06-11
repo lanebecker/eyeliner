@@ -13,7 +13,7 @@ typography:
     fontFamily: "Inter Tight, DejaVu Sans, Arial, sans-serif"
     fontSize: "72px"
     fontWeight: 600
-    lineHeight: 1.0
+    lineHeight: 0.98
     letterSpacing: "-0.03em"
   headline:
     fontFamily: "Inter Tight, DejaVu Sans, Arial, sans-serif"
@@ -50,6 +50,7 @@ components:
   genre-chip:
     backgroundColor: "transparent"
     textColor: "{colors.muted}"
+    borderColor: "{colors.accent}55"
     rounded: "{rounded.chip}"
     padding: "5px 12px"
 ---
@@ -177,7 +178,7 @@ The `stroke-dasharray: "50 200"` produces roughly a quarter-circle arc at any ro
 - **Shape:** Nearly square corners (2px radius)
 - **Background:** Transparent
 - **Text:** `p.muted`, JetBrains Mono 12px, letter-spacing 0.1em, no transform
-- **Border:** `1px solid {muted}55` — the muted color at ~33% opacity
+- **Border:** `1px solid {accent}55` — the accent color at ~33% opacity. Ties the chips visually to the accent rule and album title color without competing with the muted text inside.
 - **No hover or active state** — purely informational, non-interactive
 
 ### Accent Rule
@@ -185,6 +186,8 @@ A 64×2px horizontal rule in `p.accent` at full opacity. Appears between the tra
 
 ### Display Layout (DirectionA)
 The core artboard: 1024×600px, hard-fixed dimensions. Cover on the left (440×440px), metadata on the right (1fr). Top status strip (30px, suppressed in compact variant). Inset: 60px top, 50px sides, 40px bottom. Grid gap: 44px.
+
+**Status strip background:** The strip uses `p.surface` as a solid background color, visually distinguishing it from the main artboard without a visible border. This grounds the status information at the top edge and provides a natural anchor for the status dot and side/position counter.
 
 The metadata column orders vertically: display track name → accent rule → headline artist → title album → genre chips (auto-flex to bottom) → catalog footer → PREV/NEXT adjacent panel (when showing adjacent, playing state only).
 
@@ -199,9 +202,10 @@ In **between** state, a `NEXT` eyebrow label (11px JetBrains Mono, ls 0.22em —
 An optional context row that appears below the catalog footer line. Shows the tracks immediately before and after the current position on the same side.
 
 - **Visibility:** `playing` state only. Hidden during `between`, `paused`, `idle`, `boot`, and `error`. PREV is hidden when `album.prev` is null (first track on a side). NEXT is hidden when `album.next` is null (last track on a side). The panel is omitted entirely if both prev and next are null.
-- **Layout:** Flex row, `marginTop: 12px`, gap 32px. Each track occupies `flex: 1` with `minWidth: 0` (required for text-overflow ellipsis on long track names).
+- **Layout:** Flex row, `marginTop: 12px`, `paddingTop: 12px`, `borderTop: 1px solid p.surface`, gap 32px. The border-top creates a subtle divider between the catalog footer line and the adjacent track panel. Each track occupies `flex: 1` with `minWidth: 0` (required for text-overflow ellipsis on long track names).
 - **Label:** "← PREV" or "NEXT →" — 11px JetBrains Mono 400, ls 0.12em, uppercase, `p.muted`.
 - **Track name:** 14px Inter Tight 500, `p.text`, `marginTop: 4px`. Single line, `overflow: hidden; text-overflow: ellipsis; white-space: nowrap`. Note: `letter-spacing: 0` (reset from the parent mono context).
+- **Alignment:** The PREV column is left-aligned (default). The NEXT column is **right-aligned** (`text-align: right`), so its label and track name hang from the right edge of the metadata column — 50px from the screen's right edge, mirroring the left margin before the album cover.
 - **Relationship to between state:** The `between` state's NEXT eyebrow is the primary "what's coming next" signal — it appears at the start of the 72px hero during the literal groove gap between tracks. The adjacent panel is a supplementary reference visible while the current track is playing.
 
 ### Idle, Boot, and Error States
