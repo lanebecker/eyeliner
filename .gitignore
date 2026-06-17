@@ -38,3 +38,6 @@ log.md
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local-only code review reports (findings live in GitHub issues; see MEMORY)
+CODE_REVIEW_*.md
