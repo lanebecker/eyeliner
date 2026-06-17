@@ -23,6 +23,7 @@ src/display/assets/cache/
 # Logs
 *.log
 logs/
+log.md
 
 # IDE
 .vscode/
