@@ -27,6 +27,8 @@ from src.display.renderer import (  # noqa: E402
     DisplayRenderer,
     _BoundedCache,
     _LABEL_CACHE_MAX,
+    _FONT_CACHE_MAX,
+    _DOT_CACHE_MAX,
     _contrast_ratio,
     _ensure_contrast,
 )
@@ -52,8 +54,9 @@ def _pygame_font():
 def make_renderer():
     """Renderer skeleton with only what the typography helpers touch."""
     r = DisplayRenderer.__new__(DisplayRenderer)
-    r._font_cache = {}
+    r._font_cache = _BoundedCache(_FONT_CACHE_MAX)
     r._label_cache = _BoundedCache(_LABEL_CACHE_MAX)
+    r._dot_cache = _BoundedCache(_DOT_CACHE_MAX)
     return r
 
 

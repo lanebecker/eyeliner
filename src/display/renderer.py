@@ -248,6 +248,20 @@ _COVER_CACHE_MAX = 16
 # Labels are tiny surfaces and mostly static per track; 128 is plenty.
 _LABEL_CACHE_MAX = 128
 
+# Cap on the font cache.  The shrink-to-fit logic probes many sizes per role,
+# so over long uptime this accumulates dozens of Font objects; bound it like
+# every other cache rather than leaving it the one unbounded dict (P-8).  Fonts
+# are a small, fixed working set, so eviction is rare.
+_FONT_CACHE_MAX = 64
+
+# Cap on the pre-rendered status-dot Surface cache: one Surface per
+# (colour, glow, pulse-phase bucket).  Steady state needs _DOT_PULSE_BUCKETS
+# per colour; the rest is churn during the 1s palette lerp (P-3).
+_DOT_CACHE_MAX = 64
+# Pulse phase buckets — the dot pulse (1.6s) is sampled at ~10 fps (≈16 frames
+# per pulse), so 16 pre-rendered phases match the cadence with no visible step.
+_DOT_PULSE_BUCKETS = 16
+
 # Status dot pulse period (seconds) — DESIGN.md: 1.6s ease-in-out infinite.
 _PULSE_SECS = 1.6
 
@@ -352,6 +366,33 @@ def _lerp_palette(a: DisplayPalette, b: DisplayPalette, t: float) -> DisplayPale
     )
 
 
+# Quantization step (per RGB channel) applied to the in-flight lerp palette so
+# the per-frame palette — and the static-frame + tracked-label cache keys that
+# include it — only changes ~16 times over the 1s transition instead of every
+# frame, avoiding thousands of glyph re-renders per track change (P-4).  The
+# stepping is imperceptible at the gradient's low bg→surface contrast, and the
+# final (settled) palette is the exact target, not a quantized value.
+_PALETTE_LERP_QUANTIZE = 16
+
+
+def _quantize_palette(p: DisplayPalette) -> DisplayPalette:
+    q = _PALETTE_LERP_QUANTIZE
+
+    def snap(color):
+        return tuple((c // q) * q for c in color)
+
+    bg = snap(p.bg)
+    # Re-assert the Full-Opacity Rule after quantizing: flooring `muted` toward
+    # black could otherwise transiently drop it below the 4.5:1 WCAG floor vs
+    # `bg` during the lerp.  _ensure_contrast is deterministic in its (quantized)
+    # inputs, so the cache key stays stable while readability is preserved.
+    muted = _ensure_contrast(snap(p.muted), bg, min_ratio=4.5)
+    return DisplayPalette(
+        bg=bg, surface=snap(p.surface), accent=snap(p.accent),
+        text=snap(p.text), muted=muted,
+    )
+
+
 def _clamp_luminance(color: tuple, min_lum: float = 0.25) -> tuple:
     """Ensure a color is bright enough to read against a dark background.
 
@@ -436,11 +477,13 @@ def _extract_palette(image_path: Path) -> DisplayPalette:
             return FALLBACK_PALETTE
 
         # Count how often each palette index appears (most → most dominant).
-        pixel_data = list(quantized.getdata())
-        counts = [0] * n_colors
-        for idx in pixel_data:
-            if 0 <= idx < n_colors:
-                counts[idx] += 1
+        # numpy.bincount over the index array instead of a 6,400-iteration pure
+        # Python loop on the event loop (P-5) — and np.asarray reads the palette
+        # indices directly, avoiding the deprecated Image.getdata() (#60).
+        import numpy as np
+
+        idx_array = np.asarray(quantized).ravel()
+        counts = np.bincount(idx_array, minlength=n_colors).tolist()
 
         # Build (count, RGB) tuples, sorted by dominance descending
         palette_colors = [
@@ -512,7 +555,7 @@ class DisplayRenderer:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._screen = None
-        self._font_cache: dict = {}     # (role, size) → pygame.font.Font
+        self._font_cache = _BoundedCache(_FONT_CACHE_MAX)  # (role, size) → Font (P-8)
         self._running = True
         self._dirty = True              # Force initial render
 
@@ -533,6 +576,7 @@ class DisplayRenderer:
 
         # Render hot-path caches (v1.4.0)
         self._label_cache = _BoundedCache(_LABEL_CACHE_MAX)  # tracked-label Surfaces
+        self._dot_cache = _BoundedCache(_DOT_CACHE_MAX)      # pre-rendered dot phases (P-3)
         self._shadow_key: Optional[tuple] = None             # (w, h)
         self._shadow_surface = None                          # Cover Lift shadow
         self._static_key: Optional[tuple] = None             # (track content, palette)
@@ -593,7 +637,7 @@ class DisplayRenderer:
             name, bold, italic = _SYSFONT_FALLBACKS[role]
             font = pygame.font.SysFont(name, size, bold=bold, italic=italic)
             log.warning(f"Bundled font missing ({path.name}); using SysFont fallback")
-        self._font_cache[key] = font
+        self._font_cache.put(key, font)
         return font
 
     def _on_state_change(self, state: PlayerState):
@@ -886,21 +930,39 @@ class DisplayRenderer:
         renders the dot static at full opacity.
         """
         import math
-        import pygame
 
         strip = layout.header_strip
         r = self._dot_radius()
+        # Quantize the pulse to a phase bucket so the dot Surface is rendered
+        # once per (colour, glow, bucket) and reused — not freshly allocated +
+        # drawn every frame, ~10×/sec forever (P-3).
         if not animate or self.reduced_motion:
+            bucket = -1            # static, full opacity
             k = 0.0
         else:
             phase = (time.monotonic() % _PULSE_SECS) / _PULSE_SECS
-            k = 0.5 - 0.5 * math.cos(2 * math.pi * phase)   # 0→1→0, eased
-        opacity = 1.0 - 0.45 * k
-        scale   = 1.0 - 0.10 * k
+            bucket = int(phase * _DOT_PULSE_BUCKETS) % _DOT_PULSE_BUCKETS
+            k = 0.5 - 0.5 * math.cos(2 * math.pi * (bucket / _DOT_PULSE_BUCKETS))
 
+        cache_key = (color, glow, r, bucket)
+        dot = self._dot_cache.get(cache_key)
+        if dot is None:
+            dot = self._render_dot_surface(color, k, glow, r)
+            self._dot_cache.put(cache_key, dot)
+
+        c = dot.get_width() // 2
         cx = self._strip_pad_x() + r
         cy = strip.y + strip.h // 2
+        target.blit(dot, (cx - c, cy - c))
 
+    @staticmethod
+    def _render_dot_surface(color: tuple, k: float, glow: bool, r: int):
+        """Render one status-dot Surface for pulse value k (0→1).  Cached and
+        reused by _draw_status_dot (P-3); k=0 is the full-opacity resting dot."""
+        import pygame
+
+        opacity = 1.0 - 0.45 * k
+        scale   = 1.0 - 0.10 * k
         size = r * 6  # room for the glow halo
         dot = pygame.Surface((size, size), pygame.SRCALPHA)
         c = size // 2
@@ -909,7 +971,7 @@ class DisplayRenderer:
             pygame.draw.circle(dot, (*color, glow_alpha // 2), (c, c), int(r * 2.5))
             pygame.draw.circle(dot, (*color, glow_alpha), (c, c), int(r * 1.6))
         pygame.draw.circle(dot, (*color, int(255 * opacity)), (c, c), max(2, int(r * scale)))
-        target.blit(dot, (cx - c, cy - c))
+        return dot
 
     def _side_string(self, track) -> str:
         """Build the 'SIDE A · 04 OF 06' string, or '' if data is unavailable."""
@@ -1472,7 +1534,11 @@ class DisplayRenderer:
         if t >= 1.0:
             self._current_palette = self._target_palette
             return self._target_palette
-        return _lerp_palette(self._current_palette, self._target_palette, t)
+        # Quantize the in-flight palette so the per-frame cache keys stay stable
+        # across many frames during the lerp (P-4).
+        return _quantize_palette(
+            _lerp_palette(self._current_palette, self._target_palette, t)
+        )
 
     # -----------------------------------------------------------------------
     # Cover art — async fetch + sync load from cache

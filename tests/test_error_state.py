@@ -28,6 +28,8 @@ from src.display.renderer import (  # noqa: E402
     DisplayRenderer,
     _BoundedCache,
     _LABEL_CACHE_MAX,
+    _FONT_CACHE_MAX,
+    _DOT_CACHE_MAX,
 )
 from src.display.layouts import get_now_playing_layout  # noqa: E402
 from src.metadata.models import FALLBACK_PALETTE  # noqa: E402
@@ -59,8 +61,9 @@ def make_renderer():
     r = DisplayRenderer.__new__(DisplayRenderer)
     r.width, r.height = 1024, 600
     r.reduced_motion = False
-    r._font_cache = {}
+    r._font_cache = _BoundedCache(_FONT_CACHE_MAX)
     r._label_cache = _BoundedCache(_LABEL_CACHE_MAX)
+    r._dot_cache = _BoundedCache(_DOT_CACHE_MAX)
     r._layout = get_now_playing_layout(1024, 600)
     r._gradient_key = None
     r._gradient_surface = None

@@ -31,8 +31,9 @@ def _pygame_font():
 
 def make_renderer():
     r = DisplayRenderer.__new__(DisplayRenderer)
-    r._font_cache = {}
+    r._font_cache = _BoundedCache(64)   # P-8: matches the real bounded cache
     r._label_cache = _BoundedCache(64)
+    r._dot_cache = _BoundedCache(64)
     return r
 
 
