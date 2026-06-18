@@ -307,11 +307,8 @@ _SYSFONT_FALLBACKS = {
     "mono": ("dejavu sans mono", False, False),
 }
 
-# Letter-spacing (em) per label context, from DESIGN.md §3.
-_TRACKING_LABEL = 0.16     # status strip, side counter
-_TRACKING_CHIP = 0.10      # genre chips
-_TRACKING_CATALOG = 0.08   # year · label · catalog footer
-_TRACKING_ADJACENT = 0.12  # PREV/NEXT labels
+# Letter-spacing (em) per label context now lives on NowPlayingLayout
+# (layouts.py) so a restyle is "edit layouts.py" — see tracking_* fields (A-14).
 
 
 class _BoundedCache:
@@ -873,7 +870,7 @@ class DisplayRenderer:
         meta_parts = [str(x) for x in [track.year, track.label, track.catalog_number] if x]
         if meta_parts:
             label = self._render_tracked(
-                " · ".join(meta_parts), layout.font_size_meta, p.muted, _TRACKING_CATALOG
+                " · ".join(meta_parts), layout.font_size_meta, p.muted, layout.tracking_catalog
             )
             surf.blit(label, (layout.meta_text.x, layout.meta_text.y),
                       area=(0, 0, layout.meta_text.w, layout.meta_text.h))
@@ -908,11 +905,11 @@ class DisplayRenderer:
         pad_x = self._strip_pad_x()
         dot_r = self._dot_radius()
 
-        label = self._render_tracked(label_text, layout.font_size_header, p.muted, _TRACKING_LABEL)
+        label = self._render_tracked(label_text, layout.font_size_header, p.muted, layout.tracking_label)
         target.blit(label, (pad_x + dot_r * 2 + 8, (strip.h - label.get_height()) // 2))
 
         if side_str:
-            side = self._render_tracked(side_str, layout.font_size_header, p.muted, _TRACKING_LABEL)
+            side = self._render_tracked(side_str, layout.font_size_header, p.muted, layout.tracking_label)
             target.blit(side, (self.width - pad_x - side.get_width(),
                                (strip.h - side.get_height()) // 2))
 
@@ -1006,13 +1003,13 @@ class DisplayRenderer:
         py = layout.chip_padding_y
         gap = layout.chip_gap
         x, y = rect.x, rect.y
-        border = (*p.accent, 0x55)
+        border = (*p.accent, layout.chip_border_alpha)
 
         def draw_chip(text) -> bool:
             """Draw one chip at the running (x, y), wrapping rows as needed.
             Returns False if it didn't fit (out of vertical room)."""
             nonlocal x, y
-            label = self._render_tracked(text, layout.font_size_chips, p.muted, _TRACKING_CHIP)
+            label = self._render_tracked(text, layout.font_size_chips, p.muted, layout.tracking_chip)
             chip_w = label.get_width() + px * 2
             chip_h = label.get_height() + py * 2
 
@@ -1073,13 +1070,13 @@ class DisplayRenderer:
         y0 = strip.y + max(3, int(8 * self.height / 600))
 
         if prev:
-            label = self._render_tracked("← PREV", layout.font_size_header, p.muted, _TRACKING_ADJACENT)
+            label = self._render_tracked("← PREV", layout.font_size_header, p.muted, layout.tracking_adjacent)
             target.blit(label, (strip.x, y0))
             name = name_font.render(self._ellipsize(prev, name_font, half_w), True, p.text)
             target.blit(name, (strip.x, y0 + label.get_height() + 4))
 
         if nxt:
-            label = self._render_tracked("NEXT →", layout.font_size_header, p.muted, _TRACKING_ADJACENT)
+            label = self._render_tracked("NEXT →", layout.font_size_header, p.muted, layout.tracking_adjacent)
             right = strip.x + strip.w
             target.blit(label, (right - label.get_width(), y0))
             name = name_font.render(self._ellipsize(nxt, name_font, half_w), True, p.text)
@@ -1167,7 +1164,7 @@ class DisplayRenderer:
         if kind == "idle":
             self._draw_stripes(surf, ca, p)
             label = self._render_tracked("NO RECORD ON PLATTER", layout.font_size_header,
-                                         p.muted, _TRACKING_LABEL)
+                                         p.muted, layout.tracking_label)
             surf.blit(label, (ca.x + (ca.w - label.get_width()) // 2,
                               ca.y + (ca.h - label.get_height()) // 2))
         else:
@@ -1184,16 +1181,17 @@ class DisplayRenderer:
             label_y = arc_cy + arc_r + int(18 * s)
             if kind == "boot":
                 label = self._render_tracked(boot_label or "WARMING UP",
-                                             layout.font_size_header, p.muted, 0.20)
+                                             layout.font_size_header, p.muted,
+                                             layout.tracking_empty_label)
                 surf.blit(label, (cx - label.get_width() // 2, label_y))
             else:  # error — static arc + primary label + recovery hint
                 arc = self._get_arc_segment(arc_r, _ERROR_RED)
                 surf.blit(arc, arc.get_rect(center=(cx, arc_cy)))
                 label = self._render_tracked("NO MATCH FOUND", layout.font_size_header,
-                                             p.muted, 0.20)
+                                             p.muted, layout.tracking_empty_label)
                 surf.blit(label, (cx - label.get_width() // 2, label_y))
                 hint = self._render_tracked("REPOSITION NEEDLE TO RETRY",
-                                            layout.font_size_header, p.muted, _TRACKING_ADJACENT)
+                                            layout.font_size_header, p.muted, layout.tracking_adjacent)
                 surf.blit(hint, (cx - hint.get_width() // 2,
                                  label_y + label.get_height() + int(8 * s)))
 

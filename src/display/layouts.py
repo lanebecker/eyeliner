@@ -75,6 +75,16 @@ class NowPlayingLayout:
     chip_padding_y: int    # Vertical padding inside each chip badge
     chip_gap: int          # Gap between adjacent chips
     chip_radius: int       # Corner radius (0 = sharp-cornered, per design)
+    chip_border_alpha: int  # Genre-chip border alpha over accent (DESIGN.md {accent}55)
+
+    # Letter-spacing (em-relative, so NOT scaled by `s`).  These live here so a
+    # restyle is "edit layouts.py" — chip tracking + border alpha used to sit in
+    # renderer.py (A-14).
+    tracking_label: float        # Status strip, side counter, idle center label
+    tracking_chip: float         # Genre chips
+    tracking_catalog: float      # Year · label · catalog footer
+    tracking_adjacent: float     # PREV/NEXT labels + recovery hint
+    tracking_empty_label: float  # Empty-state hero labels (boot / error center)
 
 
 def get_now_playing_layout(width: int, height: int) -> NowPlayingLayout:
@@ -161,4 +171,11 @@ def get_now_playing_layout(width: int, height: int) -> NowPlayingLayout:
         chip_padding_y=max(3, int(5 * s)),
         chip_gap=max(4, int(6 * s)),
         chip_radius=0,
+        chip_border_alpha=0x55,
+
+        tracking_label=0.16,
+        tracking_chip=0.10,
+        tracking_catalog=0.08,
+        tracking_adjacent=0.12,
+        tracking_empty_label=0.20,
     )

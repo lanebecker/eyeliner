@@ -27,6 +27,27 @@ TEXT_PANEL_NAMES = (
 ALL_RECT_NAMES = ("header_strip", "cover_art") + TEXT_PANEL_NAMES
 
 
+def test_chip_and_tracking_style_live_on_the_layout():
+    """A-14: genre-chip border alpha + per-context letter-spacing moved out of
+    renderer.py onto the layout, so a restyle is 'edit layouts.py'."""
+    layout = get_now_playing_layout(1024, 600)
+    assert layout.chip_border_alpha == 0x55
+    assert layout.tracking_chip == 0.10
+    assert layout.tracking_label == 0.16
+    assert layout.tracking_catalog == 0.08
+    assert layout.tracking_adjacent == 0.12
+    assert layout.tracking_empty_label == 0.20
+
+
+def test_tracking_is_resolution_independent():
+    """Letter-spacing is em-relative, so it must NOT scale with resolution."""
+    a = get_now_playing_layout(1024, 600)
+    b = get_now_playing_layout(2048, 1200)
+    assert a.tracking_chip == b.tracking_chip
+    assert a.tracking_label == b.tracking_label
+    assert a.chip_border_alpha == b.chip_border_alpha
+
+
 def all_rects(layout):
     return {name: getattr(layout, name) for name in ALL_RECT_NAMES}
 
