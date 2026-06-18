@@ -99,9 +99,20 @@ async def run_pipeline(tasks, capture, display):
         for t in pending:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        # Log EVERY faulted leg before re-raising the first (B-14).  Previously
+        # `t.result()` re-raised on the first done task and left the loop, so if
+        # several legs died simultaneously only one exception was ever surfaced.
+        first_exc = None
         for t in done:
-            if not t.cancelled():
-                t.result()  # Re-raises if the leg died with an exception
+            if t.cancelled():
+                continue
+            exc = t.exception()
+            if exc is not None:
+                log.error(f"Pipeline leg '{t.get_name()}' failed: {exc!r}")
+                if first_exc is None:
+                    first_exc = exc
+        if first_exc is not None:
+            raise first_exc
         log.info("Pipeline stopped.")
     finally:
         capture.stop()

@@ -105,3 +105,33 @@ async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
     display.stop.assert_called_once()
     # …and the other leg was cancelled.
     assert pending_leg.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_logs_every_faulted_leg(caplog):
+    """B-14: when several legs die at once, ALL their exceptions are logged
+    (not just the first), and one is still re-raised."""
+    import logging
+
+    capture, display = MagicMock(), MagicMock()
+
+    async def boom_a():
+        raise RuntimeError("leg A died")
+
+    async def boom_b():
+        raise ValueError("leg B died")
+
+    leg_a = asyncio.create_task(boom_a(), name="legA")
+    leg_b = asyncio.create_task(boom_b(), name="legB")
+    # Let both finish so both land in `done` deterministically.
+    await asyncio.gather(leg_a, leg_b, return_exceptions=True)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises((RuntimeError, ValueError)):
+            await run_pipeline([leg_a, leg_b], capture, display)
+
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "leg A died" in logged
+    assert "leg B died" in logged
+    capture.stop.assert_called_once()
+    display.stop.assert_called_once()
