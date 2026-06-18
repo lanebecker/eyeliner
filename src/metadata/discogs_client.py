@@ -38,8 +38,15 @@ _HTTP_TIMEOUT = 15
 # Discogs allows 60 requests/minute for authenticated callers and answers
 # excess traffic with HTTP 429 + a Retry-After header (seconds).  When that
 # happens we honour the header once per request, capped so a pathological
-# header value can't park an executor thread for minutes.
-_RATE_LIMIT_MAX_WAIT = 30
+# header value can't park an executor thread for long.
+#
+# The cap is 10s (was 30s): _request runs on the SHARED run_in_executor(None,…)
+# pool, which also serves cover downloads and Last.fm scrobbles, so a long
+# sleep here parks a worker those tasks could use (P-2).  10s still honours any
+# realistic Retry-After (Discogs rarely asks for more than a few seconds) while
+# bounding the worst-case stall — and the P-1 collection index slashed Discogs
+# request volume, making 429 bursts far less likely in the first place.
+_RATE_LIMIT_MAX_WAIT = 10
 _RATE_LIMIT_DEFAULT_WAIT = 2
 
 
@@ -115,6 +122,11 @@ class DiscogsClient:
         })
 
         self._collection_fields: Optional[dict] = None  # Lazily fetched, then cached
+        # Lazily-built, session-cached index of the user's collection:
+        #   {release_id: {"instance_id", "title", "artists"}}.
+        # The collection is static within a session, so building this ONCE and
+        # matching locally replaces the per-candidate N+1 membership GETs (P-1).
+        self._collection_index: Optional[dict] = None
 
     # -------------------------------------------------------------------------
     # HTTP plumbing
@@ -175,40 +187,62 @@ class DiscogsClient:
     def search_collection(self, artist: str, album: str) -> Optional[dict]:
         """Search the user's Discogs collection for a release matching artist + album.
 
+        Both strategies match against a session-cached in-memory index of the
+        collection (built once, the collection being static within a session),
+        so neither pays a per-candidate HTTP cost (P-1):
+
         Strategy 1 — database cross-reference (fast):
-          Search the Discogs database for up to 25 candidates. For each, call
-          the collection membership endpoint to see if the user owns that pressing.
-          Returns the first hit found.
+          Search the Discogs database for up to 25 candidates and check each
+          against the local index by release_id.  Returns the first hit.
 
-        Strategy 2 — collection walk (slower, catches rare/obscure pressings):
-          If strategy 1 finds nothing, page through the user's whole collection
-          and fuzzy-match on artist + album title.
+        Strategy 2 — index fuzzy-match (catches rare/obscure pressings):
+          If strategy 1 finds nothing, fuzzy-match the index entries on
+          artist + album title.
 
-        Returns None if the release is not found in the collection.
+        Returns None if the release is not found in the collection.  The index
+        build raises on a hard error so the resolver treats it as
+        "couldn't determine" (leaves the album uncached, retries next track)
+        rather than a false "not owned" (B-4/B-13).
         """
-        # Strategy 1: database candidates → collection membership check.
-        # A membership check returns None ONLY for a definitive 404 ("you don't
-        # own this pressing") → try the next candidate.  Any other error
-        # (timeout, 5xx) is a "couldn't determine" and is allowed to propagate
-        # so the resolver leaves the album uncached and retries on the next
-        # track, instead of silently downgrading an owned record to a
-        # database/fallback result for the rest of the session (B-4).
+        index = self._get_collection_index()
+
+        # Strategy 1: database candidates, matched locally against the index.
         candidates = self._database_search(artist, album, limit=25)
         for release in candidates:
-            instance_id = self._get_collection_instance_id(release.id)
-            if instance_id is not None:
+            entry = index.get(release.id)
+            if entry is not None:
                 log.debug(
                     f"Found in collection (strategy 1): '{release.title}' "
-                    f"(release {release.id}, instance {instance_id})"
+                    f"(release {release.id}, instance {entry['instance_id']})"
                 )
-                return self._build_result(release, instance_id=instance_id)
+                return self._build_result(release, instance_id=entry["instance_id"])
 
-        # Strategy 2: walk the collection and fuzzy-match
+        # Strategy 2: fuzzy-match the index locally (no extra HTTP).
         log.debug(
             f"Strategy 1 found nothing for '{artist} / {album}'; "
-            f"falling back to collection walk."
+            f"fuzzy-matching the collection index."
         )
-        return self._search_collection_walk(artist, album)
+        artist_lower = artist.lower()
+        album_lower = album.lower()
+        # dict iteration is insertion order = collection "added desc", so on a
+        # substring collision the most-recently-added owned album wins (matches
+        # the old collection walk's first-hit-wins behaviour).
+        for release_id, entry in index.items():
+            title = entry["title"].lower()
+            artists = [a.lower() for a in entry["artists"]]
+            if album_lower in title and any(artist_lower in a for a in artists):
+                log.debug(
+                    f"Found in collection (strategy 2): '{entry['title']}' "
+                    f"(release {release_id}, instance {entry['instance_id']})"
+                )
+                # Fetch + build like strategy 1.  A fetch/build error is allowed
+                # to PROPAGATE rather than be swallowed as "not owned": the index
+                # says the user owns this, so a transient blip should leave the
+                # album uncached for retry, not downgrade it (B-4/B-13 parity).
+                release_obj = self._client.release(release_id)
+                return self._build_result(release_obj, instance_id=entry["instance_id"])
+
+        return None
 
     def search_database(self, artist: str, album: str) -> Optional[dict]:
         """Search the full Discogs database (not just the user's collection).
@@ -452,52 +486,34 @@ class DiscogsClient:
         results = self._client.search(album, artist=artist, type="release")
         return list(results.page(1)[:limit])
 
-    def _get_collection_instance_id(self, release_id: int) -> Optional[int]:
-        """Check whether a release is in the user's collection.
+    def _get_collection_index(self) -> dict:
+        """Build (once per session) and return an in-memory index of the user's
+        collection: ``{release_id: {"instance_id", "title", "artists"}}``.
 
-        Returns the instance_id if found, or None if not in the collection.
-        The instance_id is needed to update per-item custom fields.
+        Replaces the old per-candidate membership GET (one per database
+        candidate, up to 25) and the full re-walk with a single paginated fetch
+        + local lookups (P-1).  The collection is static within a session and
+        the process restarts daily, so there is no TTL.
+
+        Raises on a hard fetch error so the caller (search_collection) lets it
+        propagate to the resolver, which treats it as "couldn't determine" and
+        leaves the album uncached for retry — rather than a false "not owned"
+        that pins a downgrade for the session (B-4/B-13).  A successfully built
+        (possibly empty) index is cached.
         """
-        resp = self._request(
-            "GET",
-            f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}",
-        )
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        instances = resp.json().get("releases", [])
-        if not instances:
-            return None
-        # If the user owns multiple copies, use the first instance
-        return instances[0].get("instance_id")
+        if self._collection_index is not None:
+            return self._collection_index
 
-    def _search_collection_walk(self, artist: str, album: str) -> Optional[dict]:
-        """Walk the user's collection pages and fuzzy-match on artist + album.
-
-        This is the slow path — used only when the database cross-reference
-        strategy fails to find the release (e.g. rare pressings, unusual
-        artist/album string formatting in the database).
-        """
-        artist_lower = artist.lower()
-        album_lower = album.lower()
+        index: dict = {}
         page = 1
-
         while True:
-            try:
-                resp = self._request(
-                    "GET",
-                    f"{_API_BASE}/users/{self.username}/collection/folders/0/releases",
-                    params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                # A page fetch failing is "couldn't determine," not "walked
-                # everything and found no match" — re-raise so the resolver
-                # doesn't cache an owned record as a downgrade (B-13).  A
-                # genuine no-match falls through to the `return None` below.
-                log.warning(f"Collection walk failed on page {page}: {e}")
-                raise
+            resp = self._request(
+                "GET",
+                f"{_API_BASE}/users/{self.username}/collection/folders/0/releases",
+                params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             releases = data.get("releases", [])
             if not releases:
@@ -505,31 +521,26 @@ class DiscogsClient:
 
             for item in releases:
                 basic = item.get("basic_information", {})
-                title = basic.get("title", "").lower()
-                artists = [a.get("name", "").lower() for a in basic.get("artists", [])]
+                release_id = basic.get("id")
+                if release_id is None:
+                    continue
+                # Keep the first instance seen per release (mirrors the old
+                # "use instances[0]" behaviour for users who own duplicates).
+                if release_id not in index:
+                    index[release_id] = {
+                        "instance_id": item.get("instance_id"),
+                        "title": basic.get("title", ""),
+                        "artists": [a.get("name", "") for a in basic.get("artists", [])],
+                    }
 
-                if album_lower in title and any(artist_lower in a for a in artists):
-                    release_id = basic.get("id")
-                    instance_id = item.get("instance_id")
-                    log.debug(
-                        f"Found in collection (strategy 2): '{basic.get('title')}' "
-                        f"(release {release_id}, instance {instance_id})"
-                    )
-                    try:
-                        release_obj = self._client.release(release_id)
-                        return self._build_result(release_obj, instance_id=instance_id)
-                    except Exception as e:
-                        log.debug(f"Failed to build result for collection item {release_id}: {e}")
-                        continue
-
-            # Check if there are more pages
             pagination = data.get("pagination", {})
             if page >= pagination.get("pages", 1):
                 break
             page += 1
 
-        log.debug(f"Collection walk found nothing for '{artist} / {album}'.")
-        return None
+        self._collection_index = index
+        log.debug(f"Built collection index: {len(index)} release(s).")
+        return index
 
     def get_original_year(self, release) -> Optional[str]:
         """Fetch the ORIGINAL release year from the pressing's master.

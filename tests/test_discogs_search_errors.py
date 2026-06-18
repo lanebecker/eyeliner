@@ -36,18 +36,22 @@ def test_database_search_returns_empty_on_genuine_no_match():
 
 
 # ---------------------------------------------------------------------------
-# B-13 — the collection walk re-raises a hard page error (vs. None for no-match)
+# B-13 / B-4 — a hard error building the collection index propagates as
+# "couldn't determine" (vs. a false "not owned").  With the P-1 index, the only
+# HTTP during matching is the one-time index build; once built, matching is
+# local, so there is no per-candidate membership error to swallow.
 # ---------------------------------------------------------------------------
 
-def test_collection_walk_reraises_on_page_error():
+def test_collection_index_build_error_propagates():
     client = make_client()
+    client._collection_index = None
     client._request = MagicMock(side_effect=requests.exceptions.Timeout("slow"))
     with pytest.raises(requests.exceptions.Timeout):
-        client._search_collection_walk("artist", "album")
+        client.search_collection("artist", "album")
 
 
 # ---------------------------------------------------------------------------
-# B-4 — search_collection: 404 → "not owned" (continue); other errors propagate
+# B-4 / P-1 — local index matching: owned → result; not-owned → None
 # ---------------------------------------------------------------------------
 
 def _candidate(release_id=111, title="Sister"):
@@ -57,32 +61,53 @@ def _candidate(release_id=111, title="Sister"):
     return rel
 
 
-def test_transient_membership_error_propagates():
-    client = make_client()
-    client._database_search = MagicMock(return_value=[_candidate()])
-    # A 500/timeout on the membership check → couldn't determine → must raise.
-    client._get_collection_instance_id = MagicMock(
-        side_effect=requests.exceptions.HTTPError("500")
-    )
-    with pytest.raises(requests.exceptions.HTTPError):
-        client.search_collection("artist", "album")
-
-
-def test_404_candidate_is_treated_as_not_owned_and_falls_through_to_walk():
-    client = make_client()
-    client._database_search = MagicMock(return_value=[_candidate()])
-    client._get_collection_instance_id = MagicMock(return_value=None)  # 404 → not owned
-    client._search_collection_walk = MagicMock(return_value=None)      # genuine no-match
-
-    assert client.search_collection("artist", "album") is None
-    client._search_collection_walk.assert_called_once()
+def _index(release_id=111, instance_id=42, title="Sister", artists=("Sonic Youth",)):
+    return {release_id: {"instance_id": instance_id, "title": title, "artists": list(artists)}}
 
 
 def test_owned_candidate_returns_built_result():
     client = make_client()
-    client._database_search = MagicMock(return_value=[_candidate()])
-    client._get_collection_instance_id = MagicMock(return_value=42)
+    client._collection_index = _index(111, 42)        # pre-built index (no HTTP)
+    client._database_search = MagicMock(return_value=[_candidate(111)])
     client._build_result = MagicMock(return_value={"release_id": 111, "instance_id": 42})
 
-    result = client.search_collection("artist", "album")
+    result = client.search_collection("Sonic Youth", "Sister")
     assert result == {"release_id": 111, "instance_id": 42}
+    client._build_result.assert_called_once()
+
+
+def test_candidate_not_in_index_is_not_owned():
+    client = make_client()
+    client._collection_index = _index(999, 7)         # owns a DIFFERENT release
+    client._database_search = MagicMock(return_value=[_candidate(111)])  # candidate not owned
+
+    # No id match and no fuzzy match → not in collection.
+    assert client.search_collection("Some Artist", "Other Album") is None
+
+
+def test_strategy_2_fuzzy_matches_index_without_extra_http():
+    """A candidate whose release_id isn't owned still resolves if the index has
+    a fuzzy artist+album match — matched locally, no per-release GET."""
+    client = make_client()
+    client._collection_index = _index(111, 42, title="Sister", artists=("Sonic Youth",))
+    client._database_search = MagicMock(return_value=[])  # strategy 1 finds nothing
+    client._client = MagicMock()
+    client._client.release.return_value = MagicMock()
+    client._build_result = MagicMock(return_value={"release_id": 111, "instance_id": 42})
+
+    result = client.search_collection("sonic youth", "sister")
+    assert result == {"release_id": 111, "instance_id": 42}
+    client._client.release.assert_called_once_with(111)
+
+
+def test_strategy_2_release_fetch_error_propagates():
+    """A transient error fetching the matched release in strategy 2 must
+    propagate (couldn't-determine), not be swallowed as 'not owned' (B-4)."""
+    client = make_client()
+    client._collection_index = _index(111, 42, title="Sister", artists=("Sonic Youth",))
+    client._database_search = MagicMock(return_value=[])
+    client._client = MagicMock()
+    client._client.release.side_effect = requests.exceptions.Timeout("slow")
+
+    with pytest.raises(requests.exceptions.Timeout):
+        client.search_collection("sonic youth", "sister")
