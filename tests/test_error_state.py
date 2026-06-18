@@ -50,10 +50,16 @@ def make_loop(error_after_misses=3):
         error_after_misses=error_after_misses,
     )
     state = PlayerState()
-    resolver = MagicMock()
-    tracker = MagicMock()
+
+    async def commit(r):
+        # Stand in for TrackCommitService.commit: a confirmed track lands as
+        # PLAYING so any miss-streak-reset-on-commit assertions hold.
+        state.set_track(MagicMock())
+        state.set_raw(r)
+        return True
+
     with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
-        loop = RecognitionLoop(config, state, resolver, tracker)
+        loop = RecognitionLoop(config, state, commit)
     return loop, state
 
 

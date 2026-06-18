@@ -3,6 +3,12 @@
 Tests the 2-of-N consecutive match requirement that prevents flickering
 when Shazam returns a noisy or wrong result for a single chunk.
 
+After A-9 the loop no longer commits anything itself: on confirmation it awaits
+its injected ``on_confirmed`` callback (wired to TrackCommitService.commit in
+production) with the confirmed RawRecognitionResult.  These tests therefore
+assert on that emission; the resolve→state→track→scrobble side effects are
+covered by tests/test_track_commit_service.py.
+
 No audio hardware, network, or actual Shazam API calls needed.
 The backend is replaced with a MagicMock; we drive _handle_result() directly.
 """
@@ -24,23 +30,24 @@ def make_raw(title="So What", artist="Miles Davis", album="Kind of Blue"):
 
 
 def make_loop(confirmation_required=2):
+    """Build a RecognitionLoop with a mock state and an AsyncMock on_confirmed.
+
+    Returns (loop, state, on_confirmed).  on_confirmed stands in for
+    TrackCommitService.commit; assert on it to check whether a confirmed track
+    was emitted.
+    """
     config = make_recognition_config(confirmation_required=confirmation_required)
     state = MagicMock()
     state.current_raw = None
     state.current_track = None
 
-    resolver = MagicMock()
-    resolved_track = MagicMock()
-    resolver.resolve = AsyncMock(return_value=resolved_track)
-
-    tracker = MagicMock()
-    tracker.on_track_identified = AsyncMock()
+    on_confirmed = AsyncMock()
 
     # Bypass _init_backend so we don't need ShazamIO installed during tests
     with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
-        loop = RecognitionLoop(config, state, resolver, tracker)
+        loop = RecognitionLoop(config, state, on_confirmed)
 
-    return loop, state, resolver, tracker
+    return loop, state, on_confirmed
 
 
 # ---------------------------------------------------------------------------
@@ -49,18 +56,17 @@ def make_loop(confirmation_required=2):
 
 @pytest.mark.asyncio
 async def test_single_result_does_not_commit():
-    loop, state, resolver, tracker = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw())
 
-    resolver.resolve.assert_not_called()
-    tracker.on_track_identified.assert_not_called()
+    on_confirmed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_single_result_increments_pending_count_to_one():
-    loop, state, _, _ = make_loop(confirmation_required=2)
+    loop, state, _ = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw())
@@ -74,22 +80,21 @@ async def test_single_result_increments_pending_count_to_one():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_two_matching_results_commit_track():
-    loop, state, resolver, tracker = make_loop(confirmation_required=2)
+async def test_two_matching_results_emit_confirmed_track():
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     raw = make_raw()
     await loop._handle_result(raw)
     await loop._handle_result(raw)
 
-    resolver.resolve.assert_called_once_with(raw)
-    tracker.on_track_identified.assert_called_once()
+    on_confirmed.assert_awaited_once_with(raw)
 
 
 @pytest.mark.asyncio
 async def test_commit_clears_pending_state():
     """After a commit, pending_count and pending_result should reset."""
-    loop, state, _, _ = make_loop(confirmation_required=2)
+    loop, state, _ = make_loop(confirmation_required=2)
     state.current_raw = None
 
     raw = make_raw()
@@ -100,27 +105,13 @@ async def test_commit_clears_pending_state():
     assert loop._pending_result is None
 
 
-@pytest.mark.asyncio
-async def test_commit_updates_player_state():
-    """_commit_track should call state.set_raw() and state.set_track()."""
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
-    state.current_raw = None
-
-    raw = make_raw()
-    await loop._handle_result(raw)
-    await loop._handle_result(raw)
-
-    state.set_raw.assert_called_once_with(raw)
-    state.set_track.assert_called_once()
-
-
 # ---------------------------------------------------------------------------
 # Mismatch resets counter
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_different_title_resets_pending_count():
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw("So What", "Miles Davis"))
@@ -128,34 +119,34 @@ async def test_different_title_resets_pending_count():
 
     assert loop._pending_count == 1
     assert loop._pending_result.title == "Blue in Green"
-    resolver.resolve.assert_not_called()
+    on_confirmed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_different_artist_resets_pending_count():
     """Title match alone is not enough — artist must also match."""
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw("So What", "Miles Davis"))
     await loop._handle_result(make_raw("So What", "Cover Band"))  # Same title, different artist
 
     assert loop._pending_count == 1
-    resolver.resolve.assert_not_called()
+    on_confirmed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_mismatch_then_two_matching_commits():
     """A mismatch resets, but the next run of matching results still commits."""
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw("So What"))     # count = 1
     await loop._handle_result(make_raw("Blue in Green"))  # reset, count = 1
     await loop._handle_result(make_raw("Blue in Green"))  # count = 2, commit
 
-    resolver.resolve.assert_called_once()
-    assert resolver.resolve.call_args[0][0].title == "Blue in Green"
+    on_confirmed.assert_awaited_once()
+    assert on_confirmed.await_args[0][0].title == "Blue in Green"
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +155,17 @@ async def test_mismatch_then_two_matching_commits():
 
 @pytest.mark.asyncio
 async def test_none_result_does_not_commit():
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(None)
 
-    resolver.resolve.assert_not_called()
+    on_confirmed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_none_result_clears_pending_state():
-    loop, state, _, _ = make_loop(confirmation_required=2)
+    loop, state, _ = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw())  # count = 1
@@ -187,14 +178,14 @@ async def test_none_result_clears_pending_state():
 @pytest.mark.asyncio
 async def test_none_after_one_then_two_matching_does_not_commit():
     """None mid-sequence breaks the streak; must start fresh."""
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw("So What"))  # count = 1
     await loop._handle_result(None)                  # reset
     await loop._handle_result(make_raw("So What"))  # count = 1 again (not 2)
 
-    resolver.resolve.assert_not_called()
+    on_confirmed.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -204,27 +195,27 @@ async def test_none_after_one_then_two_matching_does_not_commit():
 @pytest.mark.asyncio
 async def test_same_as_current_raw_does_not_re_commit():
     """If the recognized track matches what's already playing, do nothing."""
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = make_raw("So What", "Miles Davis")
 
     # Both results match the current track
     await loop._handle_result(make_raw("So What", "Miles Davis"))
     await loop._handle_result(make_raw("So What", "Miles Davis"))
 
-    resolver.resolve.assert_not_called()
+    on_confirmed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_new_track_after_current_triggers_confirmation():
     """A different track from the current one should start the confirmation cycle."""
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = make_raw("So What", "Miles Davis")  # Already playing
 
     new_raw = make_raw("All Blues", "Miles Davis")
     await loop._handle_result(new_raw)
     await loop._handle_result(new_raw)
 
-    resolver.resolve.assert_called_once_with(new_raw)
+    on_confirmed.assert_awaited_once_with(new_raw)
 
 
 # ---------------------------------------------------------------------------
@@ -233,36 +224,36 @@ async def test_new_track_after_current_triggers_confirmation():
 
 @pytest.mark.asyncio
 async def test_three_required_does_not_commit_on_two():
-    loop, state, resolver, _ = make_loop(confirmation_required=3)
+    loop, state, on_confirmed = make_loop(confirmation_required=3)
     state.current_raw = None
 
     raw = make_raw()
     await loop._handle_result(raw)
     await loop._handle_result(raw)  # count = 2
 
-    resolver.resolve.assert_not_called()
+    on_confirmed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_three_required_commits_on_three():
-    loop, state, resolver, _ = make_loop(confirmation_required=3)
+    loop, state, on_confirmed = make_loop(confirmation_required=3)
     state.current_raw = None
 
     raw = make_raw()
     for _ in range(3):
         await loop._handle_result(raw)
 
-    resolver.resolve.assert_called_once()
+    on_confirmed.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_one_required_commits_immediately():
-    loop, state, resolver, _ = make_loop(confirmation_required=1)
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
     state.current_raw = None
 
     await loop._handle_result(make_raw())
 
-    resolver.resolve.assert_called_once()
+    on_confirmed.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -273,21 +264,21 @@ async def test_one_required_commits_immediately():
 async def test_no_double_commit_after_success():
     """After committing, subsequent identical results should not re-commit
     (because current_raw now matches)."""
-    loop, state, resolver, _ = make_loop(confirmation_required=2)
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     raw = make_raw()
     await loop._handle_result(raw)
-    await loop._handle_result(raw)  # Commits; state.set_raw(raw) is called
+    await loop._handle_result(raw)  # Commits; emits the confirmed raw
 
-    # Simulate state.current_raw being updated (as set_raw would do in prod)
+    # Simulate state.current_raw being updated (as the commit service would do).
     state.current_raw = raw
 
     # More results for the same track — should be skipped
     await loop._handle_result(raw)
     await loop._handle_result(raw)
 
-    assert resolver.resolve.call_count == 1  # Still only called once
+    assert on_confirmed.await_count == 1  # Still only emitted once
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +291,7 @@ async def test_no_double_commit_after_success():
 # ---------------------------------------------------------------------------
 
 async def test_enqueue_drops_oldest_when_full():
-    loop_obj, _, _, _ = make_loop()
+    loop_obj, _, _ = make_loop()
     maxsize = loop_obj._audio_queue.maxsize
 
     for i in range(maxsize):
@@ -321,7 +312,7 @@ async def test_enqueue_drops_oldest_when_full():
 
 
 async def test_enqueue_below_capacity_keeps_everything():
-    loop_obj, _, _, _ = make_loop()
+    loop_obj, _, _ = make_loop()
     await loop_obj.enqueue(np.full(4, 1.0, dtype=np.float32), 44100)
     await loop_obj.enqueue(np.full(4, 2.0, dtype=np.float32), 44100)
     assert loop_obj._audio_queue.qsize() == 2

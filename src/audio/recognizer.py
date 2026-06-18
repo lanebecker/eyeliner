@@ -6,10 +6,9 @@ ACRCloud, or AudD can be swapped via config without touching this file.
 
 import asyncio
 import logging
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 import numpy as np
 
@@ -17,10 +16,7 @@ from src.state.player_state import PlayerStatus
 
 if TYPE_CHECKING:
     from src.config import RecognitionConfig
-    from src.metadata.resolver import MetadataResolver
     from src.state.player_state import PlayerState
-    from src.tracking.lastfm_client import LastFmClient
-    from src.tracking.listen_tracker import ListenTracker
 
 log = logging.getLogger(__name__)
 
@@ -151,14 +147,13 @@ class RecognitionLoop:
         self,
         config: "RecognitionConfig",
         state: "PlayerState",
-        resolver: "MetadataResolver",
-        tracker: "ListenTracker",
-        lastfm: Optional["LastFmClient"] = None,
+        on_confirmed: Callable[["RawRecognitionResult"], Awaitable[object]],
     ):
         self.state = state
-        self.resolver = resolver
-        self.tracker = tracker
-        self.lastfm = lastfm
+        # Called with a confirmed RawRecognitionResult; owns resolve → state →
+        # track → scrobble (A-9).  The loop awaits it but doesn't inspect the
+        # result — it no longer knows about the resolver/tracker/lastfm.
+        self.on_confirmed = on_confirmed
         self.poll_interval: int = config.poll_interval_seconds
         self.confirmation_required: int = config.confirmation_required
         # Consecutive failed recognitions while LISTENING before the display
@@ -256,7 +251,10 @@ class RecognitionLoop:
         if self._pending_count >= self.confirmation_required:
             log.info(f"Track confirmed: {result.artist} — {result.title}")
             self._miss_count = 0  # a real commit — recognition works (B-7)
-            await self._commit_track(result)
+            # Hand the confirmed result to the commit service (A-9).  We await
+            # it so the next chunk isn't processed until current_raw has been
+            # advanced (the dedup at the top depends on that ordering).
+            await self.on_confirmed(result)
             self._pending_result = None
             self._pending_count = 0
         else:
@@ -289,40 +287,3 @@ class RecognitionLoop:
                 self.state.set_status(PlayerStatus.ERROR)
         else:
             self._miss_count = 0
-
-    async def _commit_track(self, raw: RawRecognitionResult):
-        """Resolve full metadata and update state + tracker + Last.fm scrobble."""
-        timestamp = int(time.time())
-        # Capture the session token before the resolve await.  resolve() yields
-        # the event loop, during which a SESSION_ENDED (needle lift) can run
-        # state.clear() and bump the epoch.  If that happens, this commit is for
-        # audio that has already stopped: displaying it would resurrect a dead
-        # track, and logging/scrobbling it would corrupt a fresh session (B-1).
-        commit_epoch = self.state.session_epoch
-        metadata = await self.resolver.resolve(raw)
-        if self.state.session_epoch != commit_epoch:
-            log.info(
-                "Discarding stale commit for %s — %s: the session ended while "
-                "metadata was resolving.",
-                raw.artist, raw.title,
-            )
-            return
-        self.state.set_track(metadata)
-        # Advance current_raw only AFTER the resolved track is displayed (B-11).
-        # If set_raw ran first and resolve/set_track then failed, current_raw
-        # would be ahead of current_track, so the dedup at the top of
-        # _handle_result would treat the new track as "already playing" and the
-        # loop would never re-attempt it — display stuck on the old track.
-        self.state.set_raw(raw)
-        await self.tracker.on_track_identified(metadata)
-        log.info(
-            f"Now playing: {metadata.artist} / {metadata.album} / "
-            f"{metadata.title} [{metadata.source.name}]"
-        )
-        if self.lastfm:
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, self.lastfm.scrobble, metadata, timestamp
-                )
-            except Exception as e:
-                log.warning(f"Last.fm scrobble error: {e}")

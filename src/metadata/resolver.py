@@ -30,7 +30,7 @@ tracks together.  Those tracks would resolve identically anyway, so the
 collision is harmless and saves further duplicate lookups.
 
 Concurrency: resolve() is only ever awaited sequentially from
-RecognitionLoop._commit_track on the single event loop, so the cache needs
+TrackCommitService.commit on the single event loop, so the cache needs
 no locking.
 """
 

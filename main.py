@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 from src.config import load_config, ConfigError
+from src.app.track_commit_service import TrackCommitService
 from src.audio.capture import AudioCapture
 from src.audio.silence import SilenceDetector, AudioEvent
 from src.audio.recognizer import RecognitionLoop
@@ -123,9 +124,12 @@ async def main():
     # A-3: the resolver and tracker share one DiscogsClient by explicit
     # composition — the tracker is injected with it directly.
     tracker = ListenTracker(resolver.discogs, lastfm)
+    # A-9: the application-layer commit service owns resolve → state → track →
+    # scrobble; the recognition loop just confirms a result and hands it off.
+    commit_service = TrackCommitService(state, resolver, tracker, lastfm)
     display = DisplayRenderer(config.display, state)
     silence = SilenceDetector(config.audio)
-    recognizer = RecognitionLoop(config.recognition, state, resolver, tracker, lastfm)
+    recognizer = RecognitionLoop(config.recognition, state, commit_service.commit)
     capture = AudioCapture(config.audio, silence, recognizer)
 
     # Wire silence events into state and tracker (logic in handle_silence_event,
