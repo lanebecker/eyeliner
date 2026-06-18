@@ -125,7 +125,9 @@ async def main():
     state = PlayerState()
     resolver = MetadataResolver(config)
     lastfm = LastFmClient(config)
-    tracker = ListenTracker(resolver, lastfm)
+    # A-3: the resolver and tracker share one DiscogsClient by explicit
+    # composition — the tracker is injected with it directly.
+    tracker = ListenTracker(resolver.discogs, lastfm)
     display = DisplayRenderer(config, state)
     silence = SilenceDetector(config)
     recognizer = RecognitionLoop(config, state, resolver, tracker, lastfm)

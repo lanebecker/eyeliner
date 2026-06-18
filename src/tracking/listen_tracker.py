@@ -38,7 +38,7 @@ from src.metadata.models import PlaySession, TrackMetadata
 from src.audio.silence import AudioEvent
 
 if TYPE_CHECKING:
-    from src.metadata.resolver import MetadataResolver
+    from src.metadata.discogs_client import DiscogsClient
     from src.tracking.lastfm_client import LastFmClient
 
 log = logging.getLogger(__name__)
@@ -53,12 +53,13 @@ class ListenTracker:
 
     def __init__(
         self,
-        resolver: "MetadataResolver",
+        discogs: "DiscogsClient",
         lastfm: Optional["LastFmClient"] = None,
     ):
-        # v1.3.4: the unused `config` parameter was removed — ListenTracker
-        # reads everything it needs from the resolver's DiscogsClient.
-        self.discogs = resolver.discogs
+        # A-3: depend on a DiscogsClient by explicit composition, injected in
+        # main.py — not dug out of the resolver's internals (`resolver.discogs`),
+        # which coupled the tracker to the resolver's attribute layout.
+        self.discogs = discogs
         self.lastfm = lastfm
         self._session: Optional[PlaySession] = None
         # Strong references to in-flight _end_session tasks.  asyncio only

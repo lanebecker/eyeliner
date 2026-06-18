@@ -88,13 +88,22 @@ def make_tracker(
         last_played_field_name=last_played_field_name,
         update_last_played_return=update_last_played_return,
     )
-    tracker = ListenTracker(resolver)
+    # A-3: ListenTracker now takes a DiscogsClient directly (was resolver).
+    tracker = ListenTracker(resolver.discogs)
     return tracker, resolver
 
 
 # ---------------------------------------------------------------------------
 # Session lifecycle via on_silence_event
 # ---------------------------------------------------------------------------
+
+def test_tracker_uses_the_injected_discogs_client():
+    """A-3: the tracker depends on a DiscogsClient injected directly, not one
+    dug out of a resolver's internals."""
+    discogs = MagicMock()
+    tracker = ListenTracker(discogs)
+    assert tracker.discogs is discogs
+
 
 def test_session_is_none_at_start():
     tracker, _ = make_tracker()
@@ -397,7 +406,7 @@ async def test_update_last_played_returning_false_does_not_raise():
 # ---------------------------------------------------------------------------
 
 async def test_session_ended_task_is_referenced_until_done():
-    tracker = ListenTracker(make_resolver())
+    tracker = ListenTracker(make_resolver().discogs)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
 
     tracker.on_silence_event(AudioEvent.SESSION_ENDED)
