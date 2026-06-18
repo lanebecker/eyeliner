@@ -15,8 +15,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-import yaml
-
 # ---------------------------------------------------------------------------
 # Test parameters — change to an album you know is in your Discogs collection
 # ---------------------------------------------------------------------------
@@ -36,16 +34,6 @@ def sep(title=""):
 def ok(msg):   print(f"  ✓  {msg}")
 def fail(msg): print(f"  ✗  {msg}")
 def info(msg): print(f"     {msg}")
-
-
-def load_config() -> dict:
-    path = Path("config.yaml")
-    if not path.exists():
-        print("\n  ✗  config.yaml not found.")
-        print("     Copy config.example.yaml to config.yaml and fill in your values.\n")
-        sys.exit(1)
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 # ---------------------------------------------------------------------------
@@ -190,13 +178,18 @@ def main():
     print("  ║    vinyl-now-playing  ·  Discogs live test           ║")
     print("  ╚══════════════════════════════════════════════════════╝")
 
-    config = load_config()
-
     # Make sure src/ imports resolve when running from the project root
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from src.config import load_config, ConfigError
     from src.metadata.discogs_client import DiscogsClient
 
-    client = DiscogsClient(config)
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"\n  ✗  {e}\n")
+        sys.exit(1)
+
+    client = DiscogsClient(config.discogs)
 
     print()
     info(f"User:             {client.username}")

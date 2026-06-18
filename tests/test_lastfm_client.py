@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.tracking.lastfm_client import LastFmClient
+from tests.factories import make_lastfm_config
 
 
 # ---------------------------------------------------------------------------
@@ -39,33 +40,26 @@ def _make_pylast_mock():
     return mock
 
 
-_FULL_CONFIG = {
-    "lastfm": {
-        "scrobble_enabled": True,
-        "api_key": "fake-api-key",
-        "api_secret": "fake-api-secret",
-        "session_key": "fake-session-key",
-        "love_on_completion": False,
-    }
-}
+_FULL_CONFIG = make_lastfm_config(
+    scrobble_enabled=True,
+    api_key="fake-api-key",
+    api_secret="fake-api-secret",
+    session_key="fake-session-key",
+)
 
-_LOVE_CONFIG = {
-    "lastfm": {
-        "scrobble_enabled": True,
-        "api_key": "fake-api-key",
-        "api_secret": "fake-api-secret",
-        "session_key": "fake-session-key",
-        "love_on_completion": True,
-    }
-}
+_LOVE_CONFIG = make_lastfm_config(
+    scrobble_enabled=True,
+    api_key="fake-api-key",
+    api_secret="fake-api-secret",
+    session_key="fake-session-key",
+    love_on_completion=True,
+)
 
-_DISABLED_CONFIG = {
-    "lastfm": {
-        "scrobble_enabled": False,
-    }
-}
+_DISABLED_CONFIG = make_lastfm_config(scrobble_enabled=False)
 
-_MISSING_CONFIG: dict = {}  # no lastfm key at all
+# An absent [lastfm] section resolves (in AppConfig.from_dict) to a
+# default LastFmConfig — scrobbling disabled.
+_MISSING_CONFIG = make_lastfm_config()
 
 
 def _make_track(
@@ -114,14 +108,12 @@ def test_missing_lastfm_section_not_enabled():
 
 def test_missing_session_key_not_enabled():
     """Credentials incomplete (session_key absent) → warns, not enabled."""
-    config = {
-        "lastfm": {
-            "scrobble_enabled": True,
-            "api_key": "key",
-            "api_secret": "secret",
-            # session_key missing
-        }
-    }
+    # session_key omitted → defaults to "" → credentials incomplete
+    config = make_lastfm_config(
+        scrobble_enabled=True,
+        api_key="key",
+        api_secret="secret",
+    )
     pylast_mock = _make_pylast_mock()
     with patch.dict(sys.modules, {"pylast": pylast_mock}):
         client = LastFmClient(config)

@@ -11,13 +11,14 @@ import numpy as np
 import pytest
 
 from src.audio.silence import SilenceDetector, AudioEvent
+from tests.factories import make_audio_config
 
 
 def make_detector(threshold=0.1, session_end=45):
-    cfg = {"audio": {
-        "silence_threshold_rms": threshold,
-        "session_end_silence_seconds": session_end,
-    }}
+    cfg = make_audio_config(
+        silence_threshold_rms=threshold,
+        session_end_silence_seconds=session_end,
+    )
     d = SilenceDetector(cfg)
     events = []
     d.on_event(events.append)

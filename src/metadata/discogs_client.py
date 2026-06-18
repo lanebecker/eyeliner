@@ -18,12 +18,15 @@ Design notes:
 import logging
 import time
 from datetime import date
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import discogs_client
 import requests
 
 from src.metadata.models import TracklistEntry
+
+if TYPE_CHECKING:
+    from src.config import DiscogsConfig
 
 log = logging.getLogger(__name__)
 
@@ -95,12 +98,11 @@ def _redact_url(url: str) -> str:
 class DiscogsClient:
     """Wraps python3-discogs-client and the Discogs REST API for collection lookups."""
 
-    def __init__(self, config: dict):
-        cfg = config["discogs"]
-        self.username: str = cfg["username"]
-        self.play_count_field_name: str = cfg["play_count_field_name"]
-        self.last_played_field_name: Optional[str] = cfg.get("last_played_field_name")
-        self._token: str = cfg["user_token"]
+    def __init__(self, config: "DiscogsConfig"):
+        self.username: str = config.username
+        self.play_count_field_name: str = config.play_count_field_name
+        self.last_played_field_name: Optional[str] = config.last_played_field_name
+        self._token: str = config.user_token
 
         # High-level client — used for search() and release() lookups.
         # set_timeout() applies the same timeout discipline to the library's

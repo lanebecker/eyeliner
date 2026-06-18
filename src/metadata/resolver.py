@@ -45,6 +45,7 @@ from src.metadata.errors import is_transient
 
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
+    from src.config import DiscogsConfig
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ _ALBUM_CACHE_MAX = 64
 class MetadataResolver:
     """Resolves a RawRecognitionResult into a full TrackMetadata."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: "DiscogsConfig"):
         self.discogs = DiscogsClient(config)
         self.coverart = CoverArtFallback()
         # (artist_lower, album_lower) → (MetadataSource, payload)

@@ -34,19 +34,14 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 
 from src.metadata.discogs_client import DiscogsClient
+from tests.factories import make_discogs_config
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_BASE_CONFIG = {
-    "discogs": {
-        "username": "testuser",
-        "user_token": "fake-token",
-        "play_count_field_name": "Play Count",
-    }
-}
+_BASE_CONFIG = make_discogs_config()
 
 # Arbitrary integers used to keep mock request/response data internally
 # consistent. All HTTP calls are mocked, so these never touch the real
@@ -66,14 +61,7 @@ def make_client():
 
 def make_client_with_last_played():
     """Build a DiscogsClient configured with last_played_field_name."""
-    config = {
-        "discogs": {
-            "username": "testuser",
-            "user_token": "fake-token",
-            "play_count_field_name": "Play Count",
-            "last_played_field_name": "Last Played",
-        }
-    }
+    config = make_discogs_config(last_played_field_name="Last Played")
     with patch("src.metadata.discogs_client.discogs_client.Client"):
         client = DiscogsClient(config)
     # Pre-populate both fields in the cache

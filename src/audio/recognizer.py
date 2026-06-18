@@ -16,6 +16,7 @@ import numpy as np
 from src.state.player_state import PlayerStatus
 
 if TYPE_CHECKING:
+    from src.config import RecognitionConfig
     from src.metadata.resolver import MetadataResolver
     from src.state.player_state import PlayerState
     from src.tracking.lastfm_client import LastFmClient
@@ -148,24 +149,24 @@ class RecognitionLoop:
 
     def __init__(
         self,
-        config: dict,
+        config: "RecognitionConfig",
         state: "PlayerState",
         resolver: "MetadataResolver",
         tracker: "ListenTracker",
         lastfm: Optional["LastFmClient"] = None,
     ):
-        self.config = config["recognition"]
         self.state = state
         self.resolver = resolver
         self.tracker = tracker
         self.lastfm = lastfm
-        self.poll_interval: int = self.config["poll_interval_seconds"]
-        self.confirmation_required: int = self.config.get("confirmation_required", 2)
+        self.poll_interval: int = config.poll_interval_seconds
+        self.confirmation_required: int = config.confirmation_required
         # Consecutive failed recognitions while LISTENING before the display
         # shows the error state (v1.4.1).  At ~10-12s per chunk, the default
         # of 6 puts "NO MATCH FOUND" on screen after roughly a minute of
         # music that ShazamIO can't identify.
-        self.error_after_misses: int = self.config.get("error_after_misses", 6)
+        self.error_after_misses: int = config.error_after_misses
+        self.backend_name: str = config.backend
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
         self._pending_result: Optional[RawRecognitionResult] = None
         self._pending_count: int = 0
@@ -173,11 +174,10 @@ class RecognitionLoop:
         self.backend: RecognizerBackend = self._init_backend()
 
     def _init_backend(self) -> RecognizerBackend:
-        backend_name = self.config.get("backend", "shazamio")
-        if backend_name == "shazamio":
+        if self.backend_name == "shazamio":
             return ShazamIOBackend()
         # TODO: add AcrcloudBackend, AuddBackend
-        raise ValueError(f"Unknown recognition backend: '{backend_name}'")
+        raise ValueError(f"Unknown recognition backend: '{self.backend_name}'")
 
     async def enqueue(self, audio: np.ndarray, sample_rate: int):
         """Called by AudioCapture to hand off a chunk for recognition.

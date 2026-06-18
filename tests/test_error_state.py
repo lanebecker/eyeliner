@@ -36,6 +36,7 @@ from src.display.renderer import (  # noqa: E402
 )
 from src.display.layouts import get_now_playing_layout  # noqa: E402
 from src.metadata.models import FALLBACK_PALETTE  # noqa: E402
+from tests.factories import make_recognition_config  # noqa: E402
 from src.state.player_state import PlayerState, PlayerStatus  # noqa: E402
 
 
@@ -44,14 +45,10 @@ from src.state.player_state import PlayerState, PlayerStatus  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def make_loop(error_after_misses=3):
-    config = {
-        "recognition": {
-            "backend": "shazamio",
-            "poll_interval_seconds": 30,
-            "confirmation_required": 2,
-            "error_after_misses": error_after_misses,
-        }
-    }
+    config = make_recognition_config(
+        confirmation_required=2,
+        error_after_misses=error_after_misses,
+    )
     state = PlayerState()
     resolver = MagicMock()
     tracker = MagicMock()

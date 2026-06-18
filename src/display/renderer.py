@@ -92,7 +92,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import requests
@@ -101,6 +101,9 @@ from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
 from src.display.palette import extract_palette, ensure_contrast, validate_image_file
+
+if TYPE_CHECKING:
+    from src.config import DisplayConfig
 
 log = logging.getLogger(__name__)
 
@@ -422,20 +425,17 @@ def _quantize_palette(p: DisplayPalette) -> DisplayPalette:
 class DisplayRenderer:
     """Renders now-playing info to an HDMI screen via pygame."""
 
-    def __init__(self, config: dict, state: PlayerState):
-        self.config = config["display"]
+    def __init__(self, config: "DisplayConfig", state: PlayerState):
         self.state = state
-        self.width: int = self.config["width"]
-        self.height: int = self.config["height"]
-        self.fullscreen: bool = self.config.get("fullscreen", True)
-        self.dynamic_theming: bool = self.config.get("dynamic_theming", True)
+        self.width: int = config.width
+        self.height: int = config.height
+        self.fullscreen: bool = config.fullscreen
+        self.dynamic_theming: bool = config.dynamic_theming
         # Translation of the design's prefers-reduced-motion requirement:
         # pygame has no OS media query, so it's a config flag.  When set,
         # the status dot renders static (no pulse, no glow animation).
-        self.reduced_motion: bool = self.config.get("reduced_motion", False)
-        self.cache_dir = Path(
-            self.config.get("cover_art_cache_dir", "src/display/assets/cache")
-        )
+        self.reduced_motion: bool = config.reduced_motion
+        self.cache_dir = Path(config.cover_art_cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._screen = None

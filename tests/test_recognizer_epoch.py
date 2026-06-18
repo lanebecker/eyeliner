@@ -12,6 +12,7 @@ import pytest
 
 from src.audio.recognizer import RawRecognitionResult, RecognitionLoop
 from src.state.player_state import PlayerState, PlayerStatus
+from tests.factories import make_recognition_config
 
 
 def make_raw(title="So What", artist="Miles Davis", album="Kind of Blue"):
@@ -20,13 +21,7 @@ def make_raw(title="So What", artist="Miles Davis", album="Kind of Blue"):
 
 def make_loop_real_state():
     """RecognitionLoop wired to a real PlayerState so the epoch logic is live."""
-    config = {
-        "recognition": {
-            "backend": "shazamio",
-            "poll_interval_seconds": 30,
-            "confirmation_required": 2,
-        }
-    }
+    config = make_recognition_config(confirmation_required=2)
     state = PlayerState()
     resolver = MagicMock()
     tracker = MagicMock()

@@ -16,15 +16,14 @@ import pytest
 
 from src.audio.recognizer import RawRecognitionResult, RecognitionLoop
 from src.state.player_state import PlayerState, PlayerStatus
+from tests.factories import make_recognition_config
 
 
 def make_loop(confirmation_required=2, error_after_misses=3):
-    config = {"recognition": {
-        "backend": "shazamio",
-        "poll_interval_seconds": 30,
-        "confirmation_required": confirmation_required,
-        "error_after_misses": error_after_misses,
-    }}
+    config = make_recognition_config(
+        confirmation_required=confirmation_required,
+        error_after_misses=error_after_misses,
+    )
     state = PlayerState()
     resolver = MagicMock()
     resolver.resolve = AsyncMock(return_value=MagicMock())

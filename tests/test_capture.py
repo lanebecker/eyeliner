@@ -33,6 +33,7 @@ sys.modules.setdefault("sounddevice", MagicMock())
 
 from src.audio import capture as capture_module  # noqa: E402
 from src.audio.capture import AudioCapture  # noqa: E402
+from tests.factories import make_audio_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -40,14 +41,11 @@ from src.audio.capture import AudioCapture  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def make_config(device_name="USB Audio Codec", chunk_seconds=15, overlap_seconds=5):
-    return {
-        "audio": {
-            "device_name": device_name,
-            "sample_rate": 44100,
-            "chunk_seconds": chunk_seconds,
-            "overlap_seconds": overlap_seconds,
-        }
-    }
+    return make_audio_config(
+        device_name=device_name,
+        chunk_seconds=chunk_seconds,
+        overlap_seconds=overlap_seconds,
+    )
 
 
 def make_capture(**config_kwargs):
@@ -71,8 +69,9 @@ def test_constructor_reads_audio_config():
 
 
 def test_overlap_defaults_to_five_seconds():
-    config = make_config()
-    del config["audio"]["overlap_seconds"]
+    # overlap_seconds omitted → AudioConfig's own default (5) applies, and
+    # AudioCapture reads it straight through.
+    config = make_audio_config()
     cap = AudioCapture(config, MagicMock(), MagicMock())
     assert cap.overlap_seconds == 5
 

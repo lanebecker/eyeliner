@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from src.audio.recognizer import RawRecognitionResult, RecognitionLoop
+from tests.factories import make_recognition_config
 
 
 # ---------------------------------------------------------------------------
@@ -23,13 +24,7 @@ def make_raw(title="So What", artist="Miles Davis", album="Kind of Blue"):
 
 
 def make_loop(confirmation_required=2):
-    config = {
-        "recognition": {
-            "backend": "shazamio",
-            "poll_interval_seconds": 30,
-            "confirmation_required": confirmation_required,
-        }
-    }
+    config = make_recognition_config(confirmation_required=confirmation_required)
     state = MagicMock()
     state.current_raw = None
     state.current_track = None

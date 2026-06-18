@@ -7,11 +7,14 @@ Emits AudioEvents when music starts, stops, or a full session ends.
 import logging
 import time
 from enum import Enum, auto
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
 
 import numpy as np
 
 from src.util.signal import Signal
+
+if TYPE_CHECKING:
+    from src.config import AudioConfig
 
 log = logging.getLogger(__name__)
 
@@ -31,10 +34,9 @@ class SilenceDetector:
         SESSION_ENDED  — silence persists beyond session_end_silence_seconds
     """
 
-    def __init__(self, config: dict):
-        cfg = config["audio"]
-        self.threshold: float = cfg["silence_threshold_rms"]
-        self.session_end_seconds: int = cfg["session_end_silence_seconds"]
+    def __init__(self, config: "AudioConfig"):
+        self.threshold: float = config.silence_threshold_rms
+        self.session_end_seconds: int = config.session_end_silence_seconds
         self._is_music = False
         self._silence_since: Optional[float] = None
         self._session_ended = False

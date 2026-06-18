@@ -11,6 +11,7 @@ import numpy as np
 from src.util.signal import Signal
 from src.audio.silence import SilenceDetector, AudioEvent
 from src.state.player_state import PlayerState, PlayerStatus
+from tests.factories import make_audio_config
 
 
 def test_signal_delivers_to_all_listeners_in_order():
@@ -45,7 +46,7 @@ def test_signal_logs_and_continues_on_listener_error(caplog):
 # ---------------------------------------------------------------------------
 
 def test_silence_detector_survives_a_throwing_listener():
-    cfg = {"audio": {"silence_threshold_rms": 0.1, "session_end_silence_seconds": 45}}
+    cfg = make_audio_config(silence_threshold_rms=0.1, session_end_silence_seconds=45)
     d = SilenceDetector(cfg)
     got = []
 

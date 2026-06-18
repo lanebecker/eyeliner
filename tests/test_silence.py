@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 
 from src.audio.silence import SilenceDetector, AudioEvent
+from tests.factories import make_audio_config
 
 
 # ---------------------------------------------------------------------------
@@ -19,12 +20,10 @@ SAMPLE_RATE = 44100
 
 
 def make_config(threshold=0.01, session_end_seconds=45):
-    return {
-        "audio": {
-            "silence_threshold_rms": threshold,
-            "session_end_silence_seconds": session_end_seconds,
-        }
-    }
+    return make_audio_config(
+        silence_threshold_rms=threshold,
+        session_end_silence_seconds=session_end_seconds,
+    )
 
 
 def music_chunk(rms=0.05, samples=4096):

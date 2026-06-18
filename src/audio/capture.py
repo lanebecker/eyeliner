@@ -35,6 +35,7 @@ from src.audio.chunking import ChunkAssembler
 if TYPE_CHECKING:
     from src.audio.silence import SilenceDetector
     from src.audio.recognizer import RecognitionLoop
+    from src.config import AudioConfig
 
 log = logging.getLogger(__name__)
 
@@ -56,17 +57,16 @@ _SILENCE_TICK_SECONDS = 1.0
 class AudioCapture:
     """Wraps sounddevice to stream overlapping audio chunks from the USB interface."""
 
-    def __init__(self, config: dict, silence: "SilenceDetector", recognizer: "RecognitionLoop"):
-        self.config = config["audio"]
+    def __init__(self, config: "AudioConfig", silence: "SilenceDetector", recognizer: "RecognitionLoop"):
         self.silence = silence
         self.recognizer = recognizer
         self._running = False
         self._blocks: Optional[asyncio.Queue] = None
 
-        self.sample_rate: int = self.config["sample_rate"]
-        self.chunk_seconds: int = self.config["chunk_seconds"]
-        self.overlap_seconds: int = self.config.get("overlap_seconds", 5)
-        self.device_name: str = self.config["device_name"]
+        self.sample_rate: int = config.sample_rate
+        self.chunk_seconds: int = config.chunk_seconds
+        self.overlap_seconds: int = config.overlap_seconds
+        self.device_name: str = config.device_name
 
         # Guard against a misconfigured overlap: hop must stay >= 1 frame.
         # overlap >= chunk would mean each chunk advances zero (or negative)

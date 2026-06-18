@@ -23,8 +23,7 @@ import signal
 import sys
 from pathlib import Path
 
-import yaml
-
+from src.config import load_config, ConfigError
 from src.audio.capture import AudioCapture
 from src.audio.silence import SilenceDetector, AudioEvent
 from src.audio.recognizer import RecognitionLoop
@@ -47,18 +46,6 @@ def read_version() -> str:
         return (Path(__file__).resolve().parent / "VERSION").read_text().strip()
     except Exception:
         return "unknown"
-
-
-def load_config(path: str = "config.yaml") -> dict:
-    config_path = Path(path)
-    if not config_path.exists():
-        log.error(
-            "config.yaml not found. "
-            "Copy config.example.yaml to config.yaml and fill in your values."
-        )
-        sys.exit(1)
-    with open(config_path) as f:
-        return yaml.safe_load(f)
 
 
 def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenTracker):
@@ -120,18 +107,26 @@ async def run_pipeline(tasks, capture, display):
 
 
 async def main():
-    config = load_config()
+    # A-2: parse + validate the YAML once into a typed AppConfig; every
+    # component below receives its own typed section object (config.audio,
+    # config.discogs, …) instead of reaching into a raw dict.  A bad config is
+    # one friendly startup failure here, not a KeyError deep in a constructor.
+    try:
+        config = load_config()
+    except ConfigError as e:
+        log.error(f"Configuration error:\n{e}")
+        sys.exit(1)
 
     state = PlayerState()
-    resolver = MetadataResolver(config)
-    lastfm = LastFmClient(config)
+    resolver = MetadataResolver(config.discogs)
+    lastfm = LastFmClient(config.lastfm)
     # A-3: the resolver and tracker share one DiscogsClient by explicit
     # composition — the tracker is injected with it directly.
     tracker = ListenTracker(resolver.discogs, lastfm)
-    display = DisplayRenderer(config, state)
-    silence = SilenceDetector(config)
-    recognizer = RecognitionLoop(config, state, resolver, tracker, lastfm)
-    capture = AudioCapture(config, silence, recognizer)
+    display = DisplayRenderer(config.display, state)
+    silence = SilenceDetector(config.audio)
+    recognizer = RecognitionLoop(config.recognition, state, resolver, tracker, lastfm)
+    capture = AudioCapture(config.audio, silence, recognizer)
 
     # Wire silence events into state and tracker (logic in handle_silence_event,
     # extracted for testability — T-1).

@@ -17,6 +17,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from src.config import LastFmConfig
     from src.metadata.models import TrackMetadata
 
 log = logging.getLogger(__name__)
@@ -31,18 +32,17 @@ class LastFmClient:
     itself in that case.
     """
 
-    def __init__(self, config: dict):
-        cfg = config.get("lastfm", {})
-        self._love_on_completion: bool = cfg.get("love_on_completion", False)
+    def __init__(self, config: "LastFmConfig"):
+        self._love_on_completion: bool = config.love_on_completion
         self._network = None  # pylast.LastFMNetwork, or None when disabled
 
-        if not cfg.get("scrobble_enabled", False):
+        if not config.scrobble_enabled:
             log.debug("Last.fm scrobbling is disabled (scrobble_enabled: false).")
             return
 
-        api_key    = cfg.get("api_key", "").strip()
-        api_secret = cfg.get("api_secret", "").strip()
-        session_key = cfg.get("session_key", "").strip()
+        api_key    = config.api_key.strip()
+        api_secret = config.api_secret.strip()
+        session_key = config.session_key.strip()
 
         if not all([api_key, api_secret, session_key]):
             log.warning(
