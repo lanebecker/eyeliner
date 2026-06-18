@@ -7,7 +7,7 @@ Covers the design-translation behaviors added in the Phase 1 fidelity work:
     album (2 lines): long strings step DOWN in size, short strings keep
     the base size
   ✓ _ellipsize — the one sanctioned ellipsis (PREV/NEXT panel only)
-  ✓ _contrast_ratio / _ensure_contrast — WCAG math + the muted-role
+  ✓ contrast_ratio / ensure_contrast — WCAG math + the muted-role
     4.5:1 clamp from DESIGN.md's Full-Opacity Rule
   ✓ a full headless _compose_now_playing smoke test (dummy SDL driver)
 
@@ -29,9 +29,8 @@ from src.display.renderer import (  # noqa: E402
     _LABEL_CACHE_MAX,
     _FONT_CACHE_MAX,
     _DOT_CACHE_MAX,
-    _contrast_ratio,
-    _ensure_contrast,
 )
+from src.display.palette import contrast_ratio, ensure_contrast
 from src.display.layouts import get_now_playing_layout  # noqa: E402
 from src.metadata.models import FALLBACK_PALETTE  # noqa: E402
 
@@ -159,26 +158,26 @@ def test_ellipsize_truncates_with_ellipsis_and_fits():
 # ---------------------------------------------------------------------------
 
 def test_contrast_ratio_black_vs_white_is_21():
-    assert _contrast_ratio((0, 0, 0), (255, 255, 255)) == pytest.approx(21.0)
+    assert contrast_ratio((0, 0, 0), (255, 255, 255)) == pytest.approx(21.0)
 
 
 def test_ensure_contrast_passes_through_compliant_colors():
     # Fallback muted (#8a857c) against fallback bg (#0a0a0a) already passes
-    assert _ensure_contrast(FALLBACK_PALETTE.muted, FALLBACK_PALETTE.bg) == FALLBACK_PALETTE.muted
+    assert ensure_contrast(FALLBACK_PALETTE.muted, FALLBACK_PALETTE.bg) == FALLBACK_PALETTE.muted
 
 
 def test_ensure_contrast_lightens_failing_colors():
     dark_muted = (60, 60, 60)  # ~1.9:1 against near-black — fails
-    fixed = _ensure_contrast(dark_muted, (10, 10, 10), min_ratio=4.5)
+    fixed = ensure_contrast(dark_muted, (10, 10, 10), min_ratio=4.5)
     assert fixed != dark_muted
-    assert _contrast_ratio(fixed, (10, 10, 10)) >= 4.5
+    assert contrast_ratio(fixed, (10, 10, 10)) >= 4.5
 
 
 def test_ensure_contrast_on_cool_dark_background():
     # DESIGN.md calls out Cavetown's #0e1a2a as a contrast hazard
     cool_bg = (14, 26, 42)
-    fixed = _ensure_contrast((90, 88, 84), cool_bg, min_ratio=4.5)
-    assert _contrast_ratio(fixed, cool_bg) >= 4.5
+    fixed = ensure_contrast((90, 88, 84), cool_bg, min_ratio=4.5)
+    assert contrast_ratio(fixed, cool_bg) >= 4.5
 
 
 # ---------------------------------------------------------------------------

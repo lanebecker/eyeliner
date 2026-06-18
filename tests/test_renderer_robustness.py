@@ -1,6 +1,6 @@
 """Regression tests for B-12, B-17, B-18 (renderer robustness).
 
-B-12 — _extract_palette must not IndexError on a degenerate cover (solid colour
+B-12 — extract_palette must not IndexError on a degenerate cover (solid colour
        / tiny image) that quantizes to fewer than 8 palette entries.
 B-17 — the genre "+N" overflow chip must reflect how many chips ACTUALLY fit,
        not a fixed cap of 3.
@@ -18,7 +18,8 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from src.display.renderer import DisplayRenderer, _BoundedCache, _extract_palette  # noqa: E402
+from src.display.renderer import DisplayRenderer, _BoundedCache  # noqa: E402
+from src.display.palette import extract_palette  # noqa: E402
 from src.display.layouts import get_now_playing_layout, Rect  # noqa: E402
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE  # noqa: E402
 
@@ -49,7 +50,7 @@ def make_renderer():
 def test_extract_palette_survives_degenerate_cover(tmp_path, size, color):
     p = tmp_path / "cover.png"
     Image.new("RGB", size, color).save(p)
-    pal = _extract_palette(p)           # must not raise
+    pal = extract_palette(p)           # must not raise
     assert isinstance(pal, DisplayPalette)
     # A real palette was derived, not the IndexError→FALLBACK degradation.
     assert pal is not FALLBACK_PALETTE

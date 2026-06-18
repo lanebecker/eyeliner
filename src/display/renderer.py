@@ -89,8 +89,10 @@ import os
 import socket
 import tempfile
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, Tuple
 from urllib.parse import urlsplit
 
 import requests
@@ -98,6 +100,7 @@ import requests
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
+from src.display.palette import extract_palette, ensure_contrast, validate_image_file
 
 log = logging.getLogger(__name__)
 
@@ -133,9 +136,6 @@ _ALLOWED_COVER_APEX_DOMAINS = (
 _MAX_COVER_BYTES = 10 * 1024 * 1024   # 10 MB ceiling on a downloaded cover
 _MAX_COVER_REDIRECTS = 5              # cap redirect chains
 _COVER_CONNECT_READ_TIMEOUT = 15     # seconds, per HTTP request
-# Reject images larger than this many total pixels (decompression-bomb guard).
-# 6000×6000 ≈ 36 MP comfortably exceeds any real album-cover scan.
-_MAX_IMAGE_PIXELS = 6000 * 6000
 
 
 def _host_is_allowed(host: Optional[str]) -> bool:
@@ -202,31 +202,6 @@ def _validate_cover_url(url: str) -> str:
     return url
 
 
-def _validate_image_file(path: str) -> None:
-    """Verify a downloaded file is a sane, bounded image before it is cached.
-
-    Uses Pillow's `verify()` to reject truncated / malformed files and caps the
-    pixel count to guard against decompression bombs (S-2).  Raises ValueError
-    on anything suspicious.
-    """
-    from PIL import Image
-
-    # Belt-and-suspenders: bound Pillow's own decompression-bomb threshold too.
-    Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
-
-    try:
-        with Image.open(path) as probe:
-            fmt = probe.format
-            width, height = probe.size
-            probe.verify()  # structural integrity check; consumes the file object
-    except Exception as e:
-        raise ValueError(f"not a decodable image: {e}")
-
-    if fmt not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
-        raise ValueError(f"unexpected image format: {fmt!r}")
-    if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
-        raise ValueError(f"image dimensions out of bounds: {width}x{height}")
-
 # Suppress pygame audio (we're output-only) and point to the right display
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("DISPLAY", ":0")  # Needed when running headless / via SSH
@@ -271,21 +246,75 @@ _ARC_SECS = 1.4
 # Muted red for the error state (DESIGN.md §5: #c85050).
 _ERROR_RED = (200, 80, 80)
 
-# Status strip labels per state (DESIGN.md stateLabel mapping; paused and
-# between-tracks arrive with their states in a later release).
-_STATE_LABELS = {
-    "playing": "NOW PLAYING",
-    "boot": "IDENTIFYING…",
-    "idle": "IDLE",
-    "error": "NO MATCH FOUND",
-}
+# Status-strip label for the now-playing screen (DESIGN.md stateLabel mapping;
+# paused and between-tracks arrive with their states in a later release).
+_NOW_PLAYING_LABEL = "NOW PLAYING"
 
-# Hero placeholder strings for the empty states, rendered at 48px
-# (DESIGN.md empty-state font size exception).
-_EMPTY_HEROES = {
-    "boot": "Listening…",
-    "idle": "Waiting for a record",
-    "error": "Couldn't identify",
+
+class EmptyState(Enum):
+    """The three non-playing screens (DESIGN.md §5).
+
+    Replaces the former stringly-typed ``kind`` argument: an enum makes the
+    valid set closed and explicit, so a typo is a NameError at author time
+    rather than a silent KeyError (or wrong branch) at render time.
+    """
+    BOOT = "boot"      # listening / identifying
+    IDLE = "idle"      # no record on the platter
+    ERROR = "error"    # recognition gave up
+
+
+@dataclass(frozen=True)
+class _EmptyStateSpec:
+    """Table-driven presentation for one :class:`EmptyState`.
+
+    Everything that differs *as data* between the empty screens lives here, so
+    the render code reads one descriptor instead of consulting three parallel
+    dicts plus a chain of ``kind == "…"`` comparisons:
+
+      * ``status_label`` — status-strip text (DESIGN.md stateLabel)
+      * ``hero``         — 48px hero placeholder (empty-state font exception)
+      * ``dot_color``    — resolves the status-dot colour from the live
+                           (lerped) palette; only ERROR is palette-independent
+      * ``dot_animate`` / ``dot_glow`` — dot behaviour (boot pulses+glows;
+                           idle/error sit still — "boot spins; error sits")
+      * ``animates``     — whether the frame must keep re-rendering (boot only)
+    """
+    status_label: str
+    hero: str
+    dot_color: Callable[[DisplayPalette], Tuple[int, int, int]]
+    dot_animate: bool
+    dot_glow: bool
+    animates: bool
+
+
+# The single source of truth for empty-state presentation.  Adding a state =
+# adding one row here; the render path needs no new branches except for the
+# genuinely-different cover treatments (stripes vs. spinner vs. static arc).
+_EMPTY_STATES = {
+    EmptyState.BOOT: _EmptyStateSpec(
+        status_label="IDENTIFYING…",
+        hero="Listening…",
+        dot_color=lambda p: p.accent,
+        dot_animate=True,
+        dot_glow=True,
+        animates=True,
+    ),
+    EmptyState.IDLE: _EmptyStateSpec(
+        status_label="IDLE",
+        hero="Waiting for a record",
+        dot_color=lambda p: p.muted,
+        dot_animate=False,
+        dot_glow=False,
+        animates=False,
+    ),
+    EmptyState.ERROR: _EmptyStateSpec(
+        status_label="NO MATCH FOUND",
+        hero="Couldn't identify",
+        dot_color=lambda p: _ERROR_RED,
+        dot_animate=False,
+        dot_glow=False,
+        animates=False,
+    ),
 }
 
 # Bundled fonts (DESIGN.md §3).  Role → filename in assets/fonts/.
@@ -381,155 +410,13 @@ def _quantize_palette(p: DisplayPalette) -> DisplayPalette:
     bg = snap(p.bg)
     # Re-assert the Full-Opacity Rule after quantizing: flooring `muted` toward
     # black could otherwise transiently drop it below the 4.5:1 WCAG floor vs
-    # `bg` during the lerp.  _ensure_contrast is deterministic in its (quantized)
+    # `bg` during the lerp.  ensure_contrast is deterministic in its (quantized)
     # inputs, so the cache key stays stable while readability is preserved.
-    muted = _ensure_contrast(snap(p.muted), bg, min_ratio=4.5)
+    muted = ensure_contrast(snap(p.muted), bg, min_ratio=4.5)
     return DisplayPalette(
         bg=bg, surface=snap(p.surface), accent=snap(p.accent),
         text=snap(p.text), muted=muted,
     )
-
-
-def _clamp_luminance(color: tuple, min_lum: float = 0.25) -> tuple:
-    """Ensure a color is bright enough to read against a dark background.
-
-    Uses a simple perceived-brightness formula. If the color is too dark,
-    it's brightened proportionally until it hits min_lum.
-    """
-    r, g, b = color
-    lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
-    if lum < min_lum and lum > 0:
-        scale = min_lum / lum
-        return tuple(min(255, int(c * scale)) for c in (r, g, b))
-    return color
-
-
-def _relative_luminance(color: tuple) -> float:
-    """WCAG 2.x relative luminance of an sRGB color (0.0–1.0)."""
-    def chan(c: int) -> float:
-        c = c / 255.0
-        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
-    r, g, b = color
-    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
-
-
-def _contrast_ratio(a: tuple, b: tuple) -> float:
-    """WCAG contrast ratio between two RGB colors (1.0–21.0)."""
-    la, lb = _relative_luminance(a), _relative_luminance(b)
-    lighter, darker = max(la, lb), min(la, lb)
-    return (lighter + 0.05) / (darker + 0.05)
-
-
-def _ensure_contrast(color: tuple, bg: tuple, min_ratio: float = 4.5) -> tuple:
-    """Lighten *color* until it reaches min_ratio contrast against *bg*.
-
-    DESIGN.md §2 (Full-Opacity Rule / muted role): secondary text must pass
-    4.5:1 against its album background at full opacity.  Cool-dark
-    backgrounds pull contrast down faster than neutral darks, so extracted
-    muted values are clamped here rather than trusted.  Blends toward white
-    in small steps; falls back to near-white if even that fails (cannot
-    happen for the dark backgrounds this product produces, but cheap to
-    guard).
-    """
-    if _contrast_ratio(color, bg) >= min_ratio:
-        return color
-    r, g, b = color
-    for step in range(1, 21):
-        t = step / 20.0
-        candidate = tuple(int(c + (255 - c) * t) for c in (r, g, b))
-        if _contrast_ratio(candidate, bg) >= min_ratio:
-            return candidate
-    return (235, 235, 235)
-
-
-def _extract_palette(image_path: Path) -> DisplayPalette:
-    """Extract a 5-color display palette from a cached cover art image.
-
-    Uses Pillow's color quantization to find the dominant hues, then
-    derives the full palette (bg, surface, accent, text, muted) from them.
-
-    Falls back to FALLBACK_PALETTE on any error.
-    """
-    try:
-        from PIL import Image
-
-        # Validate before decoding (S-2): the download path already checks, but
-        # palette extraction can also run against pre-existing cache files, so
-        # guard here too against malformed images / decompression bombs.
-        _validate_image_file(str(image_path))
-
-        img = Image.open(image_path).convert("RGB")
-        img = img.resize((80, 80), Image.LANCZOS)
-
-        # Quantize to up to 8 colors; getpalette returns a flat R,G,B,R,G,B,...
-        # list — but a solid-colour or tiny cover can quantize to FEWER than 8
-        # entries (or a different length depending on Pillow), so the palette
-        # size must be read from the actual list, not hardcoded to 8.  Reading
-        # raw[i*3+2] for i up to 7 against a short palette used to IndexError
-        # (caught → silent theming loss) (B-12).
-        quantized = img.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
-        raw = quantized.getpalette() or []
-        n_colors = len(raw) // 3
-        if n_colors == 0:
-            return FALLBACK_PALETTE
-
-        # Count how often each palette index appears (most → most dominant).
-        # numpy.bincount over the index array instead of a 6,400-iteration pure
-        # Python loop on the event loop (P-5) — and np.asarray reads the palette
-        # indices directly, avoiding the deprecated Image.getdata() (#60).
-        import numpy as np
-
-        idx_array = np.asarray(quantized).ravel()
-        counts = np.bincount(idx_array, minlength=n_colors).tolist()
-
-        # Build (count, RGB) tuples, sorted by dominance descending
-        palette_colors = [
-            (counts[i], (raw[i * 3], raw[i * 3 + 1], raw[i * 3 + 2]))
-            for i in range(n_colors)
-        ]
-        palette_colors.sort(key=lambda x: x[0], reverse=True)
-        colors = [c for _, c in palette_colors]
-
-        # Most dominant color → tint for bg/surface
-        dominant = colors[0]
-
-        # Most *vibrant* color → accent (highest saturation)
-        def saturation(rgb):
-            r, g, b = [x / 255.0 for x in rgb]
-            mx, mn = max(r, g, b), min(r, g, b)
-            return (mx - mn) / mx if mx > 0 else 0
-
-        accent_raw = max(colors, key=saturation)
-        accent = _clamp_luminance(accent_raw, min_lum=0.30)
-
-        # Derive bg: darken dominant significantly (target ~15% brightness)
-        scale_bg = 0.18
-        bg = tuple(max(8, int(c * scale_bg + dominant[i] * 0.04)) for i, c in enumerate(dominant))
-
-        # Surface: slightly lighter than bg
-        surface = tuple(min(255, int(c * 1.6)) for c in bg)
-
-        # Text: near-white with a slight warm tint from dominant
-        text = (
-            min(255, 230 + int(dominant[0] * 0.04)),
-            min(255, 225 + int(dominant[1] * 0.03)),
-            min(255, 215 + int(dominant[2] * 0.03)),
-        )
-
-        # Muted: medium gray, very slightly tinted — then contrast-clamped
-        # to ≥4.5:1 against this album's bg (DESIGN.md Full-Opacity Rule).
-        muted = (
-            min(200, 120 + int(dominant[0] * 0.08)),
-            min(200, 118 + int(dominant[1] * 0.07)),
-            min(200, 115 + int(dominant[2] * 0.06)),
-        )
-        muted = _ensure_contrast(muted, bg, min_ratio=4.5)
-
-        return DisplayPalette(bg=bg, surface=surface, accent=accent, text=text, muted=muted)
-
-    except Exception as e:
-        log.warning(f"Palette extraction failed for {image_path}: {e}")
-        return FALLBACK_PALETTE
 
 
 class DisplayRenderer:
@@ -695,15 +582,15 @@ class DisplayRenderer:
     def _render(self):
         """Dispatch to the appropriate layout based on current player status."""
         if self.state.status == PlayerStatus.IDLE:
-            self._render_empty("idle")
+            self._render_empty(EmptyState.IDLE)
         elif self.state.status == PlayerStatus.LISTENING:
-            self._render_empty("boot")
+            self._render_empty(EmptyState.BOOT)
         elif self.state.status == PlayerStatus.ERROR:
-            self._render_empty("error")
+            self._render_empty(EmptyState.ERROR)
         elif self.state.status == PlayerStatus.PLAYING and self.state.current_track:
             self._render_now_playing()
         else:
-            self._render_empty("boot")
+            self._render_empty(EmptyState.BOOT)
 
     # -----------------------------------------------------------------------
     # Now-playing screen
@@ -776,7 +663,7 @@ class DisplayRenderer:
         surf.blit(ring, (ca.x, ca.y))
 
         # --- Status strip (minus the animated dot) ---
-        self._draw_header(surf, layout, p, _STATE_LABELS["playing"], self._side_string(track))
+        self._draw_header(surf, layout, p, _NOW_PLAYING_LABEL, self._side_string(track))
 
         # -----------------------------------------------------------------
         # Dynamic push-down geometry
@@ -1102,7 +989,7 @@ class DisplayRenderer:
         s = int(elapsed % 60)
         return f"IDENTIFYING… {m}:{s:02d}"
 
-    def _render_empty(self, kind: str):
+    def _render_empty(self, state: EmptyState):
         """Render a boot/idle/error empty state (v1.4.1, DESIGN.md §5).
 
         Full DirectionA frame on the (lerped-to-)fallback palette: status
@@ -1115,31 +1002,37 @@ class DisplayRenderer:
         loop goes quiet — the stillness of the error arc is the signal
         (boot spins; error sits).
         """
+        spec = _EMPTY_STATES[state]
         layout = self._layout
         p = self._animated_palette()
 
         elapsed = time.monotonic() - self._listening_since if self._listening_since else 0.0
-        boot_label = self._boot_label(elapsed) if kind == "boot" else None
+        boot_label = self._boot_label(elapsed) if state is EmptyState.BOOT else None
 
-        key = ("empty", kind, boot_label, p.bg, p.surface, p.accent, p.text, p.muted)
+        key = ("empty", state, boot_label, p.bg, p.surface, p.accent, p.text, p.muted)
         if self._static_key != key or self._static_surface is None:
-            self._static_surface = self._compose_empty(kind, layout, p, boot_label)
+            self._static_surface = self._compose_empty(state, layout, p, boot_label)
             self._static_key = key
 
         self._screen.blit(self._static_surface, (0, 0))
 
-        # State-mapped dot (DESIGN.md §5): boot pulses+glows in accent;
-        # idle sits static in muted; error sits static in muted red.
-        if kind == "boot":
-            self._draw_status_dot(self._screen, layout, p.accent, animate=True, glow=True)
-            self._draw_boot_arc(self._screen, layout, p, elapsed)
-            self._dirty = True  # arc + dot + label all tick
-        elif kind == "error":
-            self._draw_status_dot(self._screen, layout, _ERROR_RED, animate=False, glow=False)
-        else:  # idle
-            self._draw_status_dot(self._screen, layout, p.muted, animate=False, glow=False)
+        # State-mapped dot (DESIGN.md §5), driven entirely from the descriptor:
+        # boot pulses+glows in accent; idle sits static in muted; error sits
+        # static in muted red.
+        self._draw_status_dot(self._screen, layout, spec.dot_color(p),
+                              animate=spec.dot_animate, glow=spec.dot_glow)
 
-    def _compose_empty(self, kind: str, layout: NowPlayingLayout,
+        # Boot is the only state with a rotating-arc overlay (boot spins; error
+        # sits) — that draw is state-specific.
+        if state is EmptyState.BOOT:
+            self._draw_boot_arc(self._screen, layout, p, elapsed)
+
+        # Animated states keep the loop awake so the arc + pulsing dot + ticking
+        # label advance; static states let it go quiet (driven by the table).
+        if spec.animates:
+            self._dirty = True
+
+    def _compose_empty(self, state: EmptyState, layout: NowPlayingLayout,
                        p: DisplayPalette, boot_label: Optional[str]):
         """Compose the static portion of an empty-state frame.
 
@@ -1148,6 +1041,7 @@ class DisplayRenderer:
         """
         import pygame
 
+        spec = _EMPTY_STATES[state]
         surf = pygame.Surface((self.width, self.height))
         self._draw_gradient_bg(surf, p)
 
@@ -1160,8 +1054,8 @@ class DisplayRenderer:
         pad = (shadow.get_width() - ca.w) // 2
         surf.blit(shadow, (ca.x - pad, ca.y - pad + max(4, int(30 * s))))
 
-        # --- Empty-cover treatment ---
-        if kind == "idle":
+        # --- Empty-cover treatment (irreducibly different per state) ---
+        if state is EmptyState.IDLE:
             self._draw_stripes(surf, ca, p)
             label = self._render_tracked("NO RECORD ON PLATTER", layout.font_size_header,
                                          p.muted, layout.tracking_label)
@@ -1179,7 +1073,7 @@ class DisplayRenderer:
             surf.blit(ring, (cx - arc_r - 2, arc_cy - arc_r - 2))
 
             label_y = arc_cy + arc_r + int(18 * s)
-            if kind == "boot":
+            if state is EmptyState.BOOT:
                 label = self._render_tracked(boot_label or "WARMING UP",
                                              layout.font_size_header, p.muted,
                                              layout.tracking_empty_label)
@@ -1201,14 +1095,14 @@ class DisplayRenderer:
         surf.blit(ring, (ca.x, ca.y))
 
         # --- Status strip (no side counter in empty states) ---
-        self._draw_header(surf, layout, p, _STATE_LABELS[kind])
+        self._draw_header(surf, layout, p, spec.status_label)
 
         # --- Hero at 48px (empty-state font size exception) + accent rule;
         #     all album metadata suppressed ---
         hero_size = max(18, int(48 * s))
         hero_rect = Rect(layout.track_text.x, layout.track_text.y,
                          layout.track_text.w, layout.track_text.h)
-        hero_h = self._draw_wrapped_text(surf, _EMPTY_HEROES[kind], "display",
+        hero_h = self._draw_wrapped_text(surf, spec.hero, "display",
                                          hero_size, hero_rect, p.text)
         div_y = layout.track_text.y + hero_h + max(2, int(4 * self.height / 600))
         pygame.draw.rect(surf, p.accent,
@@ -1506,7 +1400,7 @@ class DisplayRenderer:
             cache_key = self._url_to_cache_key(cover_url)
             cache_path = self.cache_dir / cache_key
             if cache_path.exists():
-                target = _extract_palette(cache_path)
+                target = extract_palette(cache_path)
                 self._palette_cache.put(cover_url, target)  # put() handles eviction
             else:
                 target = FALLBACK_PALETTE
@@ -1650,7 +1544,7 @@ class DisplayRenderer:
                             )
                         f.write(chunk)
                 # Validate the decoded image before exposing it to the cache (S-2).
-                _validate_image_file(tmp.name)
+                validate_image_file(tmp.name)
                 os.replace(tmp.name, str(cache_path))  # atomic on POSIX
             except Exception:
                 # Clean up partial / rejected file before re-raising

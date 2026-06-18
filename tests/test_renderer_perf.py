@@ -18,8 +18,9 @@ import pygame  # noqa: E402
 
 from src.display.renderer import (  # noqa: E402
     DisplayRenderer, _BoundedCache, _DOT_CACHE_MAX, _FONT_CACHE_MAX,
-    _quantize_palette, _PALETTE_LERP_QUANTIZE, _TRANSITION_SECS, _contrast_ratio,
+    _quantize_palette, _PALETTE_LERP_QUANTIZE, _TRANSITION_SECS,
 )
+from src.display.palette import contrast_ratio
 from src.display.layouts import get_now_playing_layout  # noqa: E402
 from src.metadata.models import DisplayPalette  # noqa: E402
 
@@ -105,7 +106,7 @@ def test_quantize_palette_preserves_muted_contrast():
         text=(240, 240, 240), muted=(70, 70, 70),   # low contrast vs bg
     )
     q = _quantize_palette(p)
-    assert _contrast_ratio(q.muted, q.bg) >= 4.5
+    assert contrast_ratio(q.muted, q.bg) >= 4.5
 
 
 def test_animated_palette_is_quantized_mid_transition(monkeypatch):
@@ -126,7 +127,7 @@ def test_animated_palette_is_quantized_mid_transition(monkeypatch):
         for v in channel:
             assert v % _PALETTE_LERP_QUANTIZE == 0       # raw lerp would be odd
     assert pal.bg != a.bg and pal.bg != b.bg             # genuinely mid-transition
-    assert _contrast_ratio(pal.muted, pal.bg) >= 4.5     # invariant held
+    assert contrast_ratio(pal.muted, pal.bg) >= 4.5     # invariant held
 
 
 def test_animated_palette_settles_to_exact_target(monkeypatch):

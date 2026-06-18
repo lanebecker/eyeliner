@@ -18,6 +18,7 @@ import pytest
 from PIL import Image
 
 import src.display.renderer as r
+import src.display.palette as palette
 
 
 # ---------------------------------------------------------------------------
@@ -160,29 +161,29 @@ def test_public_ip_fails_closed_on_dns_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _validate_image_file (S-2)
+# validate_image_file (S-2) — relocated to src.display.palette (A-8)
 # ---------------------------------------------------------------------------
 
 def test_image_validation_accepts_png(tmp_path):
     p = tmp_path / "ok.png"
     p.write_bytes(_png_bytes())
-    r._validate_image_file(str(p))  # should not raise
+    palette.validate_image_file(str(p))  # should not raise
 
 
 def test_image_validation_rejects_non_image(tmp_path):
     p = tmp_path / "not.png"
     p.write_bytes(b"this is definitely not an image")
     with pytest.raises(ValueError):
-        r._validate_image_file(str(p))
+        palette.validate_image_file(str(p))
 
 
 def test_image_validation_rejects_oversized(tmp_path, monkeypatch):
     # Drop the pixel cap below the test image so the bounds check trips.
-    monkeypatch.setattr(r, "_MAX_IMAGE_PIXELS", 100)
+    monkeypatch.setattr(palette, "MAX_IMAGE_PIXELS", 100)
     p = tmp_path / "big.png"
     p.write_bytes(_png_bytes(64, 64))  # 4096 px > 100
     with pytest.raises(ValueError):
-        r._validate_image_file(str(p))
+        palette.validate_image_file(str(p))
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,9 @@ from src.display.renderer import (  # noqa: E402
     _LABEL_CACHE_MAX,
     _FONT_CACHE_MAX,
     _DOT_CACHE_MAX,
+    _EMPTY_STATES,
+    _ERROR_RED,
+    EmptyState,
 )
 from src.display.layouts import get_now_playing_layout  # noqa: E402
 from src.metadata.models import FALLBACK_PALETTE  # noqa: E402
@@ -209,15 +212,15 @@ def _display():
     pygame.display.quit()
 
 
-@pytest.mark.parametrize("kind,boot_label", [
-    ("boot", "WARMING UP"),
-    ("idle", None),
-    ("error", None),
+@pytest.mark.parametrize("state,boot_label", [
+    (EmptyState.BOOT, "WARMING UP"),
+    (EmptyState.IDLE, None),
+    (EmptyState.ERROR, None),
 ])
-def test_compose_empty_smoke(_display, kind, boot_label):
+def test_compose_empty_smoke(_display, state, boot_label):
     """Each empty-state frame composes headlessly at full screen size."""
     r = make_renderer()
-    frame = r._compose_empty(kind, r._layout, FALLBACK_PALETTE, boot_label)
+    frame = r._compose_empty(state, r._layout, FALLBACK_PALETTE, boot_label)
     assert frame.get_size() == (1024, 600)
 
 
@@ -238,11 +241,61 @@ def test_render_empty_caches_until_boot_label_ticks(_display):
     r._dirty = False
 
     r._listening_since = time.monotonic() - 5   # WARMING UP bucket
-    r._render_empty("boot")
+    r._render_empty(EmptyState.BOOT)
     first = r._static_surface
-    r._render_empty("boot")
+    r._render_empty(EmptyState.BOOT)
     assert r._static_surface is first            # same label → cache hit
 
     r._listening_since = time.monotonic() - 30  # STILL LISTENING… bucket
-    r._render_empty("boot")
+    r._render_empty(EmptyState.BOOT)
     assert r._static_surface is not first        # label ticked → recompose
+
+
+# ---------------------------------------------------------------------------
+# Empty-state descriptor table (A-7) — one enum-keyed table replaced the
+# stringly-typed "kind" plus three parallel dicts.
+# ---------------------------------------------------------------------------
+
+def test_every_empty_state_has_a_spec():
+    """The table is total over the enum — no state can render without a row."""
+    assert set(_EMPTY_STATES) == set(EmptyState)
+
+
+def test_empty_state_dot_colors_resolve_from_palette():
+    """boot pulses in accent, idle sits in muted, error sits in muted red —
+    all driven by the descriptor's dot_color resolver."""
+    p = FALLBACK_PALETTE
+    assert _EMPTY_STATES[EmptyState.BOOT].dot_color(p) == p.accent
+    assert _EMPTY_STATES[EmptyState.IDLE].dot_color(p) == p.muted
+    assert _EMPTY_STATES[EmptyState.ERROR].dot_color(p) == _ERROR_RED
+
+
+def test_only_boot_animates():
+    """boot is the lone animated empty state (boot spins; idle/error sit)."""
+    assert _EMPTY_STATES[EmptyState.BOOT].animates is True
+    assert _EMPTY_STATES[EmptyState.IDLE].animates is False
+    assert _EMPTY_STATES[EmptyState.ERROR].animates is False
+
+
+@pytest.mark.parametrize("state,expect_dirty", [
+    (EmptyState.BOOT, True),
+    (EmptyState.IDLE, False),
+    (EmptyState.ERROR, False),
+])
+def test_render_empty_sets_dirty_only_for_animated_states(_display, state, expect_dirty):
+    """_render_empty re-arms the render loop iff the state animates."""
+    r = make_renderer()
+    r._screen = pygame.display.get_surface()
+
+    class _State:
+        pass
+
+    r.state = _State()
+    r._current_palette = FALLBACK_PALETTE
+    r._target_palette = FALLBACK_PALETTE
+    r._transition_start = 0.0
+    r._listening_since = time.monotonic() - 5
+    r._dirty = False
+
+    r._render_empty(state)
+    assert r._dirty is expect_dirty

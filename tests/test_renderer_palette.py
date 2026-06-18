@@ -1,6 +1,6 @@
 """Unit tests for DisplayRenderer._queue_palette — headless (new in v1.3.5).
 
-_queue_palette never imports pygame (only _extract_palette touches PIL, and
+_queue_palette never imports pygame (only extract_palette touches PIL, and
 these tests avoid that path or go through the in-memory palette cache), so
 the renderer's palette-transition decisions can be pinned down anywhere the
 rest of the suite runs.  The renderer is built via __new__ with just the
