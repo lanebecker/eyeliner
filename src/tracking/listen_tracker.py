@@ -43,6 +43,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Sentinel for _end_session(expected=...): "end whatever session is current"
+# as opposed to "end only if the current session is this specific one".
+_CURRENT_SESSION = object()
+
 
 class ListenTracker:
     """Manages play sessions and triggers Discogs field updates on album completion."""
@@ -62,13 +66,22 @@ class ListenTracker:
         # could in principle be garbage-collected mid-flight — and this is the
         # task that performs the Discogs play-count write, so it must survive.
         self._bg_tasks: set = set()
+        # Serializes every session-lifecycle transition (start / end / the
+        # split's end-then-start).  Without it, the album-split path and a
+        # fire-and-forget SESSION_ENDED task can interleave and end the wrong
+        # session (B-2).
+        self._lifecycle_lock = asyncio.Lock()
 
     def on_silence_event(self, event: AudioEvent):
         """Receive silence events from SilenceDetector (wired up in main.py)."""
         if event == AudioEvent.MUSIC_STARTED:
             self._start_session()
         elif event == AudioEvent.SESSION_ENDED:
-            task = asyncio.create_task(self._end_session())
+            # Bind this end to the session that is active *now*.  If an album
+            # split later replaces it, the task below sees the session changed
+            # and becomes a no-op instead of ending the new session (B-2).
+            target = self._session
+            task = asyncio.create_task(self._end_session(expected=target))
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
 
@@ -77,14 +90,44 @@ class ListenTracker:
             self._session = PlaySession()
             log.info("Play session started.")
 
-    async def _end_session(self):
-        """Called when sustained silence signals end of album/side."""
+    async def _end_session(self, expected=_CURRENT_SESSION):
+        """End the active session, holding the lifecycle lock.
+
+        `expected` lets a scheduled SESSION_ENDED bind to the session that was
+        active when the silence fired; if an album split has since swapped in a
+        new session, ending is skipped.  The default sentinel means "end
+        whatever session is current" (used by the direct-await callers and the
+        existing test suite).
+        """
+        async with self._lifecycle_lock:
+            await self._end_session_locked(expected=expected)
+
+    async def _end_session_locked(self, expected=_CURRENT_SESSION):
+        """End the active session.  The caller MUST hold self._lifecycle_lock.
+
+        Split into this lock-free body so the album-split path can end and then
+        restart a session under a single lock acquisition without deadlocking
+        on a re-entrant lock.
+        """
         if self._session is None:
+            return
+        if expected is not _CURRENT_SESSION and self._session is not expected:
+            # A stale SESSION_ENDED whose session was already ended by an album
+            # split (and possibly replaced by a new one) — do nothing.
+            log.debug("Ignoring stale SESSION_ENDED for an already-replaced session.")
             return
 
         session = self._session
         self._session = None
+        await self._finalize_session(session)
 
+    async def _finalize_session(self, session: PlaySession):
+        """Do the end-of-session crediting work for an already-detached session.
+
+        Operates on a local `session` reference (self._session has already been
+        cleared by the caller), so it is safe to await the Discogs/Last.fm
+        executor calls here without another coroutine mutating it.
+        """
         track_count = len(session.identified_tracks)
         log.info(
             f"Play session ended. "
@@ -160,22 +203,25 @@ class ListenTracker:
         means nothing to compare, and a missing track ID (FALLBACK metadata)
         means the album can't be distinguished.
         """
-        if self._session is None:
-            self._start_session()
+        async with self._lifecycle_lock:
+            if self._session is None:
+                self._start_session()
 
-        if (
-            self._session.last_release_id is not None
-            and track.discogs_release_id is not None
-            and track.discogs_release_id != self._session.last_release_id
-        ):
-            log.info(
-                f"Album change detected mid-session "
-                f"(release {self._session.last_release_id} → "
-                f"{track.discogs_release_id}) — splitting session."
-            )
-            await self._end_session()
-            self._start_session()
+            if (
+                self._session.last_release_id is not None
+                and track.discogs_release_id is not None
+                and track.discogs_release_id != self._session.last_release_id
+            ):
+                log.info(
+                    f"Album change detected mid-session "
+                    f"(release {self._session.last_release_id} → "
+                    f"{track.discogs_release_id}) — splitting session."
+                )
+                # End + restart atomically under the lock so a concurrently
+                # scheduled SESSION_ENDED can't slip between them (B-2).
+                await self._end_session_locked()
+                self._start_session()
 
-        self._session.log_track(track)
-        if track.is_last_track:
-            log.info(f"Last track of album identified: '{track.title}' — watching for session end.")
+            self._session.log_track(track)
+            if track.is_last_track:
+                log.info(f"Last track of album identified: '{track.title}' — watching for session end.")
