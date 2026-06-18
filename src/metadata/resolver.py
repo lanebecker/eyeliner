@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.metadata.discogs_client import DiscogsClient
 from src.metadata.coverart import CoverArtFallback
+from src.metadata.errors import is_transient
 
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
@@ -114,7 +115,10 @@ class MetadataResolver:
         # a raised exception (network blip, 429) must stay retryable.
         discogs_completed = True
 
-        # Step 1: User's Discogs collection
+        # Step 1: User's Discogs collection.  This run_in_executor call is a
+        # true error boundary (A-6): a transient failure is expected and leaves
+        # the album uncached/retryable (B-4); anything else is an unexpected bug
+        # and is logged loudly so it isn't mistaken for a routine miss.
         try:
             result = await loop.run_in_executor(
                 None, self.discogs.search_collection, raw.artist, raw.album
@@ -123,11 +127,12 @@ class MetadataResolver:
                 log.debug(f"Resolved from Discogs collection: {raw.artist} / {raw.album}")
                 self._cache_store(key, MetadataSource.DISCOGS_COLLECTION, result)
                 return self._from_discogs(raw, result, MetadataSource.DISCOGS_COLLECTION)
-        except NotImplementedError:
-            pass  # Not yet implemented — fall through
         except Exception as e:
             discogs_completed = False
-            log.warning(f"Discogs collection search failed: {e}")
+            if is_transient(e):
+                log.info(f"Discogs collection search couldn't determine (transient): {e}")
+            else:
+                log.warning(f"Unexpected error in Discogs collection search: {e}")
 
         # Step 2: Discogs database
         try:
@@ -146,11 +151,12 @@ class MetadataResolver:
                 if discogs_completed:
                     self._cache_store(key, MetadataSource.DISCOGS_DATABASE, result)
                 return self._from_discogs(raw, result, MetadataSource.DISCOGS_DATABASE)
-        except NotImplementedError:
-            pass  # Not yet implemented — fall through
         except Exception as e:
             discogs_completed = False
-            log.warning(f"Discogs database search failed: {e}")
+            if is_transient(e):
+                log.info(f"Discogs database search couldn't determine (transient): {e}")
+            else:
+                log.warning(f"Unexpected error in Discogs database search: {e}")
 
         # Step 3: Fallback — Shazam data + MusicBrainz cover art
         log.info(f"Using fallback metadata for: {raw.artist} / {raw.album}")

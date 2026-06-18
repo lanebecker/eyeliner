@@ -576,8 +576,15 @@ class DiscogsClient:
     def _build_result(self, release, instance_id: Optional[int]) -> dict:
         """Build a standardised result dict from a Discogs Release object.
 
-        All fields are extracted defensively — a missing field logs a debug
-        message and falls back to None rather than raising.
+        Per-field defensive extraction is an INTENTIONAL design choice, not a
+        swallowed error (A-6): the identity fields the rest of the pipeline gates
+        on — `release_id` and `instance_id` — are passed in by the caller and are
+        always trustworthy; the enrichment fields below (cover, year, label,
+        catalog, genres, tracklist) are best-effort decoration, so a missing or
+        malformed one degrades that field to None/[] rather than failing the
+        whole resolve.  This is graceful degradation of optional data, distinct
+        from the transient-vs-unexpected error taxonomy in errors.py that governs
+        the resolve *boundary*.
         """
         # Cover art — prefer primary image, fall back to first available
         cover_url = None

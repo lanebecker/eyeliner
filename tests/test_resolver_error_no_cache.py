@@ -76,6 +76,36 @@ async def test_clean_collection_miss_then_database_hit_is_cached():
 
 
 @pytest.mark.asyncio
+async def test_transient_vs_unexpected_collection_errors_log_differently(caplog):
+    """A-6: a transient (requests) error is an expected 'couldn't determine'
+    (info); a non-transient error is an unexpected bug (warning).  Both still
+    leave the album uncached."""
+    import logging
+
+    # Transient → info, "transient" in the message.
+    r1 = make_resolver()
+    r1.discogs.search_collection.side_effect = ConnectionError("blip")
+    r1.discogs.search_database.return_value = None
+    with caplog.at_level(logging.INFO):
+        await r1.resolve(make_raw())
+    transient_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("transient" in m for m in transient_msgs)
+    assert r1._album_cache == {}
+
+    caplog.clear()
+
+    # Unexpected (a real bug) → warning, "Unexpected" in the message.
+    r2 = make_resolver()
+    r2.discogs.search_collection.side_effect = ValueError("a real bug")
+    r2.discogs.search_database.return_value = None
+    with caplog.at_level(logging.INFO):
+        await r2.resolve(make_raw())
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Unexpected" in m for m in warn_msgs)
+    assert r2._album_cache == {}          # unexpected also stays uncached
+
+
+@pytest.mark.asyncio
 async def test_clean_miss_is_cached():
     r = make_resolver()
     r.discogs.search_collection.return_value = None  # clean "not owned"
