@@ -224,12 +224,30 @@ class PlaySession:
     # DB-resolved (nothing latched → no difference detected → record 2 could
     # be phantom-credited with record 1's completed play).
     last_release_id: Optional[int] = None
+    # Set True once this session's Play Count has been credited, so a re-entrant
+    # end (the B-2 race, or a split misfire that finalizes the same session
+    # twice) cannot double-increment the same release (B-8).
+    credited: bool = False
 
     def log_track(self, track: TrackMetadata):
         """Record a newly identified track in this session."""
-        # Avoid duplicate consecutive entries
-        if self.identified_tracks and self.identified_tracks[-1].title == track.title:
-            return
+        # Avoid duplicate *consecutive* entries (the same physical track
+        # re-identified across overlapping chunks).  Dedup on the full identity
+        # (release_id, title, artist) — NOT title alone (B-3): otherwise a
+        # swapped-in record whose first track shares a title with the previous
+        # record's last logged track ("Intro", a self-titled track, a
+        # compilation repeat) is silently dropped — so that record never
+        # latches its release and can never earn a Play Count — and a genuinely
+        # different track that merely shares the previous title corrupts
+        # is_last_track accounting.
+        if self.identified_tracks:
+            last = self.identified_tracks[-1]
+            if (
+                last.title == track.title
+                and last.artist == track.artist
+                and last.discogs_release_id == track.discogs_release_id
+            ):
+                return
         self.identified_tracks.append(track)
         if track.is_last_track:
             self.potential_last_track = True

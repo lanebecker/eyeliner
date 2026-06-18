@@ -128,6 +128,13 @@ class ListenTracker:
         cleared by the caller), so it is safe to await the Discogs/Last.fm
         executor calls here without another coroutine mutating it.
         """
+        # Idempotency guard: never credit one session's Play Count twice, even
+        # if a re-entrant end somehow finalizes the same session object again
+        # (B-8).  Pairs with the B-2 lifecycle lock as defense-in-depth.
+        if session.credited:
+            log.debug("Session already credited — skipping to stay idempotent (B-8).")
+            return
+
         track_count = len(session.identified_tracks)
         log.info(
             f"Play session ended. "
@@ -136,6 +143,10 @@ class ListenTracker:
         )
 
         if session.potential_last_track and session.album_release_id:
+            # Mark credited *before* the await so a re-entrant finalize that
+            # slips in mid-write sees the flag and bails instead of issuing a
+            # second increment for the same release (B-8).
+            session.credited = True
             log.info(
                 f"Last track confirmed for release {session.album_release_id} — "
                 f"incrementing Play Count and updating Last Played in Discogs."
