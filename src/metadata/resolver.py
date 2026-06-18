@@ -184,7 +184,12 @@ class MetadataResolver:
             discogs_release_id=discogs_result.get("release_id"),
             discogs_instance_id=discogs_result.get("instance_id"),
             cover_art_url=discogs_result.get("cover_art_url"),
-            tracklist=discogs_result.get("tracklist", []),
-            genres=discogs_result.get("genres", []),
+            # Shallow-copy the cached tracklist so each track of an album gets
+            # its own list object — a defensive .sort()/append on one track's
+            # tracklist can't corrupt its siblings'.  `or []` normalizes an
+            # explicit None to an empty list so the tracklist properties never
+            # see None (B-9).
+            tracklist=list(discogs_result.get("tracklist") or []),
+            genres=list(discogs_result.get("genres") or []),
             source=source,
         )

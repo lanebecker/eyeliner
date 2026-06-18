@@ -48,8 +48,11 @@ FALLBACK_PALETTE = DisplayPalette(
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class TracklistEntry:
+    """One tracklist row.  Frozen (immutable) so the entry objects can be
+    shared across an album's per-track TrackMetadata without one track's code
+    accidentally mutating a sibling's view of the tracklist (B-9)."""
     position: str       # e.g. "A1", "B2"
     title: str
     duration: Optional[str] = None  # e.g. "5:32"
@@ -167,46 +170,70 @@ class TrackMetadata:
         return len(entries) if entries else None
 
     @property
-    def prev_track_title(self) -> Optional[str]:
-        """Title of the previous track, or None if this is the very first track.
+    def _global_index(self) -> Optional[int]:
+        """This track's index in the global tracklist, located by POSITION.
 
-        Searches within the current side first.  When this track is the first
-        on its side (i == 0), falls back to the global tracklist to find the
-        preceding track — e.g. B1 correctly returns A7 (the last track of
-        Side A) rather than None.
+        Prev/next neighbours are simply global-tracklist adjacency (vinyl sides
+        are contiguous, so "within-side then fall back across the boundary" was
+        only ever a roundabout way to compute the same thing).  Resolving by the
+        entry's unique `position` string instead of re-scanning by title fixes
+        two bugs:
+
+          - B-5: a title that repeats across sides (e.g. a reprise) no longer
+            returns the wrong side's neighbour.  The side filter disambiguates
+            the occurrence; its position then pins the exact global index.
+          - B-10: a numbered tracklist ('1'..'10') has no side letter, so the
+            old side-loop never ran and prev/next were always None.  This path
+            falls back to the title match and still yields adjacency.
         """
+        if not self.tracklist:
+            return None
+
+        # Prefer the side-disambiguated entry (handles duplicate titles across
+        # sides); fall back to the first title match for numbered tracklists.
         title_key = self.title.lower().strip()
-        entries = self._side_entries
-        for i, entry in enumerate(entries):
+        target_position = None
+        for entry in self._side_entries:
             if entry.title.lower().strip() == title_key:
-                if i > 0:
-                    return entries[i - 1].title
-                # First track on this side — fall back to global tracklist
-                for j, global_entry in enumerate(self.tracklist):
-                    if global_entry.title.lower().strip() == title_key:
-                        return self.tracklist[j - 1].title if j > 0 else None
-        return None
+                target_position = entry.position
+                break
+        if target_position is None:
+            entry = self._current_entry
+            if entry is None:
+                return None
+            target_position = entry.position
+
+        # Resolve to the global index.  Prefer an entry matching BOTH position
+        # and title (robust if two rows ever share a position string); fall
+        # back to the first position match.
+        fallback = None
+        for i, e in enumerate(self.tracklist):
+            if e.position == target_position:
+                if e.title.lower().strip() == title_key:
+                    return i
+                if fallback is None:
+                    fallback = i
+        return fallback
+
+    @property
+    def prev_track_title(self) -> Optional[str]:
+        """Title of the previous track in the album, or None if this is the
+        very first track.  B1 correctly returns A-side's last track; the first
+        track of the album returns None."""
+        idx = self._global_index
+        if idx is None or idx == 0:
+            return None
+        return self.tracklist[idx - 1].title
 
     @property
     def next_track_title(self) -> Optional[str]:
-        """Title of the next track, or None if this is the very last track.
-
-        Searches within the current side first.  When this track is the last
-        on its side, falls back to the global tracklist to find the following
-        track — e.g. A7 correctly returns B1 (the first track of Side B)
-        rather than None.
-        """
-        title_key = self.title.lower().strip()
-        entries = self._side_entries
-        for i, entry in enumerate(entries):
-            if entry.title.lower().strip() == title_key:
-                if i < len(entries) - 1:
-                    return entries[i + 1].title
-                # Last track on this side — fall back to global tracklist
-                for j, global_entry in enumerate(self.tracklist):
-                    if global_entry.title.lower().strip() == title_key:
-                        return self.tracklist[j + 1].title if j < len(self.tracklist) - 1 else None
-        return None
+        """Title of the next track in the album, or None if this is the very
+        last track.  The A-side's last track correctly returns B1; the album's
+        closer returns None."""
+        idx = self._global_index
+        if idx is None or idx >= len(self.tracklist) - 1:
+            return None
+        return self.tracklist[idx + 1].title
 
 
 @dataclass
