@@ -207,9 +207,9 @@ class RecognitionLoop:
             self._pending_count = 0
             self._register_miss()
             return
-        self._miss_count = 0
 
         if self._same_track(result, self.state.current_raw):
+            self._miss_count = 0  # same track still playing — recognition works (B-7)
             return  # Same track still playing
 
         if self._same_track(result, self._pending_result):
@@ -220,9 +220,18 @@ class RecognitionLoop:
 
         if self._pending_count >= self.confirmation_required:
             log.info(f"Track confirmed: {result.artist} — {result.title}")
+            self._miss_count = 0  # a real commit — recognition works (B-7)
             await self._commit_track(result)
             self._pending_result = None
             self._pending_count = 0
+        else:
+            # A non-None result that neither matches the current track nor (yet)
+            # confirms — unconfirmable churn (a noisy room, two records bleeding
+            # together).  Count it toward ERROR so the display doesn't spin on
+            # the boot/IDENTIFYING screen forever.  Previously _miss_count was
+            # reset on EVERY non-None result, so neither churn nor interspersed
+            # None-misses could ever accumulate to surface ERROR (B-7).
+            self._register_miss()
 
     def _register_miss(self):
         """Count a failed recognition; surface ERROR after enough of them.
@@ -248,7 +257,6 @@ class RecognitionLoop:
 
     async def _commit_track(self, raw: RawRecognitionResult):
         """Resolve full metadata and update state + tracker + Last.fm scrobble."""
-        self.state.set_raw(raw)
         timestamp = int(time.time())
         # Capture the session token before the resolve await.  resolve() yields
         # the event loop, during which a SESSION_ENDED (needle lift) can run
@@ -265,6 +273,12 @@ class RecognitionLoop:
             )
             return
         self.state.set_track(metadata)
+        # Advance current_raw only AFTER the resolved track is displayed (B-11).
+        # If set_raw ran first and resolve/set_track then failed, current_raw
+        # would be ahead of current_track, so the dedup at the top of
+        # _handle_result would treat the new track as "already playing" and the
+        # loop would never re-attempt it — display stuck on the old track.
+        self.state.set_raw(raw)
         await self.tracker.on_track_identified(metadata)
         log.info(
             f"Now playing: {metadata.artist} / {metadata.album} / "

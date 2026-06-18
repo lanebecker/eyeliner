@@ -147,16 +147,34 @@ def test_miss_count_resets_outside_listening():
 
 
 @pytest.mark.asyncio
-async def test_handle_result_hit_resets_miss_count():
+async def test_same_as_current_hit_resets_miss_count():
+    """A result that matches the currently-playing track means recognition is
+    working again — it resets the miss streak (B-7)."""
     from tests.test_recognizer import make_raw
     loop, state = make_loop(error_after_misses=3)
     state.set_status(PlayerStatus.LISTENING)
     await loop._handle_result(None)
     await loop._handle_result(None)
     assert loop._miss_count == 2
-    await loop._handle_result(make_raw())   # a hit — streak broken
+    state.current_raw = make_raw()           # this track is now "playing"
+    await loop._handle_result(make_raw())    # same as current → streak reset
     assert loop._miss_count == 0
     assert state.status == PlayerStatus.LISTENING
+
+
+@pytest.mark.asyncio
+async def test_non_confirming_hit_no_longer_wipes_miss_streak():
+    """B-7: a single *new* non-confirming result is unconfirmable churn, not
+    progress.  It used to reset the miss count to 0 on every non-None result —
+    so persistent failure (or alternating churn) could never surface ERROR.
+    Now it counts toward the streak instead of hiding it."""
+    from tests.test_recognizer import make_raw
+    loop, state = make_loop(error_after_misses=3)
+    state.set_status(PlayerStatus.LISTENING)
+    await loop._handle_result(None)          # no-progress 1
+    await loop._handle_result(None)          # no-progress 2
+    await loop._handle_result(make_raw())    # churn → no-progress 3 → ERROR
+    assert state.status == PlayerStatus.ERROR
 
 
 # ---------------------------------------------------------------------------
