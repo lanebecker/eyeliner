@@ -83,12 +83,15 @@ one blit plus the dot.  The layout is likewise computed once at startup
 """
 
 import asyncio
+import ipaddress
 import logging
 import os
+import socket
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -97,6 +100,118 @@ from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Cover-art download safety (findings S-1 / S-2)
+# ---------------------------------------------------------------------------
+# `cover_art_url` originates from untrusted external APIs (Discogs image `uri`,
+# the MusicBrainz Cover Art Archive).  A poisoned entry — or a MITM, since we do
+# not pin certificates — could otherwise point the fetch at an internal LAN host
+# (SSRF), a multi-gigabyte response that fills the SD card, or a malicious image
+# that exploits a stale decoder.  The download path therefore:
+#   * requires https,
+#   * restricts the host to an allow-list of known cover-art providers,
+#   * refuses any hop whose host resolves to a private / loopback / link-local IP
+#     (defends against DNS rebinding and redirect-to-internal),
+#   * follows redirects manually so every hop is re-validated,
+#   * aborts after _MAX_COVER_BYTES,
+#   * requires an image/* Content-Type, and
+#   * verifies the decoded image (type + pixel bounds) before it is cached.
+
+# Host suffixes we trust to serve cover art.  Cover Art Archive 307-redirects to
+# the Internet Archive (archive.org), so that is included for the redirect hop.
+_ALLOWED_COVER_HOST_SUFFIXES = (
+    ".discogs.com",
+    "coverartarchive.org",
+    ".coverartarchive.org",
+    ".archive.org",
+    ".mzstatic.com",
+)
+
+_MAX_COVER_BYTES = 10 * 1024 * 1024   # 10 MB ceiling on a downloaded cover
+_MAX_COVER_REDIRECTS = 5              # cap redirect chains
+_COVER_CONNECT_READ_TIMEOUT = 15     # seconds, per HTTP request
+# Reject images larger than this many total pixels (decompression-bomb guard).
+# 6000×6000 ≈ 36 MP comfortably exceeds any real album-cover scan.
+_MAX_IMAGE_PIXELS = 6000 * 6000
+
+
+def _host_is_allowed(host: Optional[str]) -> bool:
+    """True if `host` matches the cover-art provider allow-list."""
+    if not host:
+        return False
+    host = host.lower().rstrip(".")
+    return any(
+        host == suffix.lstrip(".") or host.endswith(suffix)
+        for suffix in _ALLOWED_COVER_HOST_SUFFIXES
+    )
+
+
+def _host_resolves_to_public_ip(host: str) -> bool:
+    """True only if every DNS result for `host` is a global (public) address.
+
+    Blocks an allow-listed name that resolves to a private / loopback /
+    link-local / reserved address — the DNS-rebinding and redirect-to-internal
+    SSRF vectors (S-1).  Fails closed: any resolution error returns False.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local:
+            return False
+    return True
+
+
+def _validate_cover_url(url: str) -> str:
+    """Validate a single cover-art URL hop; return the host on success.
+
+    Raises ValueError if the scheme is not https, the host is not allow-listed,
+    or the host resolves to a non-public address (S-1).
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError(f"cover URL must be https, got scheme {parts.scheme!r}")
+    host = parts.hostname
+    if not _host_is_allowed(host):
+        raise ValueError(f"cover URL host not allow-listed: {host!r}")
+    if not _host_resolves_to_public_ip(host):
+        raise ValueError(f"cover URL host resolves to a non-public address: {host!r}")
+    return host
+
+
+def _validate_image_file(path: str) -> None:
+    """Verify a downloaded file is a sane, bounded image before it is cached.
+
+    Uses Pillow's `verify()` to reject truncated / malformed files and caps the
+    pixel count to guard against decompression bombs (S-2).  Raises ValueError
+    on anything suspicious.
+    """
+    from PIL import Image
+
+    # Belt-and-suspenders: bound Pillow's own decompression-bomb threshold too.
+    Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
+
+    try:
+        with Image.open(path) as probe:
+            fmt = probe.format
+            width, height = probe.size
+            probe.verify()  # structural integrity check; consumes the file object
+    except Exception as e:
+        raise ValueError(f"not a decodable image: {e}")
+
+    if fmt not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
+        raise ValueError(f"unexpected image format: {fmt!r}")
+    if width <= 0 or height <= 0 or width * height > _MAX_IMAGE_PIXELS:
+        raise ValueError(f"image dimensions out of bounds: {width}x{height}")
 
 # Suppress pygame audio (we're output-only) and point to the right display
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -285,6 +400,11 @@ def _extract_palette(image_path: Path) -> DisplayPalette:
     """
     try:
         from PIL import Image
+
+        # Validate before decoding (S-2): the download path already checks, but
+        # palette extraction can also run against pre-existing cache files, so
+        # guard here too against malformed images / decompression bombs.
+        _validate_image_file(str(image_path))
 
         img = Image.open(image_path).convert("RGB")
         img = img.resize((80, 80), Image.LANCZOS)
@@ -1367,12 +1487,56 @@ class DisplayRenderer:
     def _download_cover_blocking(self, url: str, cache_path: Path):
         """Synchronous cover-art download — must run in an executor.
 
-        Streams the response into a tempfile in the cache directory, then
-        atomically renames into the final cache path on success.  The 15s
-        timeout covers both connection setup and per-chunk reads.
+        Hardened against SSRF, oversized responses, and malicious images
+        (findings S-1 / S-2):
+
+          - Every URL hop is validated (https + allow-listed host + public IP)
+            via _validate_cover_url before any request is made.
+          - Redirects are followed manually (allow_redirects=False) so each hop
+            is re-validated; the chain is capped at _MAX_COVER_REDIRECTS.
+          - The final response must carry an image/* Content-Type.
+          - The body is streamed with a running byte counter that aborts past
+            _MAX_COVER_BYTES.
+          - The written file is image-verified before it is atomically renamed
+            into the cache, so neither pygame nor Pillow ever decodes an
+            unvalidated file.
+
+        The 15s timeout covers both connection setup and per-chunk reads.
         """
-        with requests.get(url, timeout=15, stream=True) as resp:
+        # Walk the redirect chain ourselves, validating every hop.
+        current_url = url
+        resp = None
+        try:
+            for _ in range(_MAX_COVER_REDIRECTS + 1):
+                _validate_cover_url(current_url)
+                resp = requests.get(
+                    current_url,
+                    timeout=_COVER_CONNECT_READ_TIMEOUT,
+                    stream=True,
+                    allow_redirects=False,
+                )
+                if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location")
+                    resp.close()
+                    if not location:
+                        raise ValueError("redirect with no Location header")
+                    # Resolve relative redirects against the current URL.
+                    current_url = requests.compat.urljoin(current_url, location)
+                    resp = None
+                    continue
+                break
+            else:
+                raise ValueError("too many redirects fetching cover art")
+
+            if resp is None:
+                raise ValueError("no response fetching cover art")
+
             resp.raise_for_status()
+
+            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not content_type.startswith("image/"):
+                raise ValueError(f"unexpected Content-Type for cover art: {content_type!r}")
+
             # delete=False so we can rename after closing; we clean up manually on error
             tmp = tempfile.NamedTemporaryFile(
                 dir=str(self.cache_dir),
@@ -1381,18 +1545,30 @@ class DisplayRenderer:
                 delete=False,
             )
             try:
+                total = 0
                 with tmp as f:
                     for chunk in resp.iter_content(chunk_size=64 * 1024):
-                        if chunk:
-                            f.write(chunk)
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > _MAX_COVER_BYTES:
+                            raise ValueError(
+                                f"cover art exceeds {_MAX_COVER_BYTES} byte cap"
+                            )
+                        f.write(chunk)
+                # Validate the decoded image before exposing it to the cache (S-2).
+                _validate_image_file(tmp.name)
                 os.replace(tmp.name, str(cache_path))  # atomic on POSIX
             except Exception:
-                # Clean up partial file before re-raising
+                # Clean up partial / rejected file before re-raising
                 try:
                     os.unlink(tmp.name)
                 except OSError:
                     pass
                 raise
+        finally:
+            if resp is not None:
+                resp.close()
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
         """Load and scale cover art from the local file cache.
