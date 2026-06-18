@@ -51,9 +51,9 @@ class ShazamIOBackend(RecognizerBackend):
     The Shazam client is created once on first use and reused for every
     subsequent recognition (v1.3.3) — constructing a fresh client per chunk
     threw away its internal HTTP session several times a minute for no
-    benefit.  The shazamio/soundfile imports stay inside recognize() on
-    purpose: they keep this module importable (and the rest of the suite
-    testable) on machines without the audio stack installed.
+    benefit.  The shazamio import (recognize) and soundfile import (_encode_wav)
+    are kept lazy on purpose: they keep this module importable (and the rest of
+    the suite testable) on machines without the audio stack installed.
     """
 
     def __init__(self):
@@ -63,18 +63,20 @@ class ShazamIOBackend(RecognizerBackend):
         self, audio: np.ndarray, sample_rate: int
     ) -> Optional[RawRecognitionResult]:
         try:
-            import io
-            import soundfile as sf
             from shazamio import Shazam
 
-            # ShazamIO expects bytes; serialize audio to an in-memory WAV
-            buf = io.BytesIO()
-            sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")
-            buf.seek(0)
+            # ShazamIO expects bytes; serialize the chunk to an in-memory WAV in
+            # an executor.  soundfile's sf.write is a blocking C call (~1.3 MB
+            # encode from a ~2.6 MB float32 chunk) that would otherwise stall the
+            # event loop inline on every chunk, every ~10-30s (P-6).
+            loop = asyncio.get_running_loop()
+            wav_bytes = await loop.run_in_executor(
+                None, self._encode_wav, audio, sample_rate
+            )
 
             if self._shazam is None:
                 self._shazam = Shazam()
-            result = await self._shazam.recognize(buf.read())
+            result = await self._shazam.recognize(wav_bytes)
 
             track = result.get("track")
             if not track:
@@ -102,6 +104,20 @@ class ShazamIOBackend(RecognizerBackend):
         except Exception as e:
             log.warning(f"ShazamIO recognition failed: {e}")
             return None
+
+    @staticmethod
+    def _encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
+        """Serialize an audio chunk to in-memory WAV bytes (PCM_16).
+
+        Pure CPU/IO with no event-loop interaction, so it runs in an executor
+        (see recognize) — sf.write is a blocking C call (P-6).
+        """
+        import io
+        import soundfile as sf
+
+        buf = io.BytesIO()
+        sf.write(buf, audio, sample_rate, format="WAV", subtype="PCM_16")
+        return buf.getvalue()
 
 
 class RecognitionLoop:
