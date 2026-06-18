@@ -423,20 +423,29 @@ def _extract_palette(image_path: Path) -> DisplayPalette:
         img = Image.open(image_path).convert("RGB")
         img = img.resize((80, 80), Image.LANCZOS)
 
-        # Quantize to 8 colors; getpalette returns flat R,G,B,R,G,B,... list
+        # Quantize to up to 8 colors; getpalette returns a flat R,G,B,R,G,B,...
+        # list — but a solid-colour or tiny cover can quantize to FEWER than 8
+        # entries (or a different length depending on Pillow), so the palette
+        # size must be read from the actual list, not hardcoded to 8.  Reading
+        # raw[i*3+2] for i up to 7 against a short palette used to IndexError
+        # (caught → silent theming loss) (B-12).
         quantized = img.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
-        raw = quantized.getpalette()  # 768 values: 8 colors × 3 channels
+        raw = quantized.getpalette() or []
+        n_colors = len(raw) // 3
+        if n_colors == 0:
+            return FALLBACK_PALETTE
 
-        # Count how often each palette index appears (most → most dominant)
+        # Count how often each palette index appears (most → most dominant).
         pixel_data = list(quantized.getdata())
-        counts = [0] * 8
+        counts = [0] * n_colors
         for idx in pixel_data:
-            counts[idx] += 1
+            if 0 <= idx < n_colors:
+                counts[idx] += 1
 
         # Build (count, RGB) tuples, sorted by dominance descending
         palette_colors = [
             (counts[i], (raw[i * 3], raw[i * 3 + 1], raw[i * 3 + 2]))
-            for i in range(8)
+            for i in range(n_colors)
         ]
         palette_colors.sort(key=lambda x: x[0], reverse=True)
         colors = [c for _, c in palette_colors]
@@ -913,17 +922,6 @@ class DisplayRenderer:
             return track.track_display
         return ""
 
-    def _chip_texts(self, genres: list) -> list:
-        """Cap chips at 3 with a '+N' overflow indicator (DESIGN.md §6).
-
-        Pure helper, unit-tested directly — Discogs can return 0 or 5+
-        genres and the catalog footer must stay anchored regardless.
-        """
-        shown = list(genres[:3])
-        if len(genres) > 3:
-            shown.append(f"+{len(genres) - 3}")
-        return shown
-
     def _draw_genre_chips(
         self,
         target,
@@ -948,7 +946,10 @@ class DisplayRenderer:
         x, y = rect.x, rect.y
         border = (*p.accent, 0x55)
 
-        for text in self._chip_texts(genres):
+        def draw_chip(text) -> bool:
+            """Draw one chip at the running (x, y), wrapping rows as needed.
+            Returns False if it didn't fit (out of vertical room)."""
+            nonlocal x, y
             label = self._render_tracked(text, layout.font_size_chips, p.muted, _TRACKING_CHIP)
             chip_w = label.get_width() + px * 2
             chip_h = label.get_height() + py * 2
@@ -958,7 +959,7 @@ class DisplayRenderer:
                 x = rect.x
                 y += chip_h + gap
                 if y + chip_h > rect.y + rect.h:
-                    break  # Out of room
+                    return False  # Out of room
 
             # Per-chip SRCALPHA surface so the border alpha actually blends
             chip = pygame.Surface((chip_w, chip_h), pygame.SRCALPHA)
@@ -966,6 +967,20 @@ class DisplayRenderer:
             chip.blit(label, (px, py))
             target.blit(chip, (x, y))
             x += chip_w + gap
+            return True
+
+        # Draw up to 3 genre chips (DESIGN.md §6 cap), stopping at the first
+        # that doesn't fit.  The "+N" overflow then reflects what ACTUALLY fit,
+        # not a fixed cap of 3 — so it can't read "+2" while 3 are hidden (B-17).
+        drawn = 0
+        for genre in genres[:3]:
+            if not draw_chip(genre):
+                break
+            drawn += 1
+
+        hidden = len(genres) - drawn
+        if hidden > 0:
+            draw_chip(f"+{hidden}")
 
     def _draw_prev_next(self, target, layout: NowPlayingLayout, p: DisplayPalette, track):
         """Draw the adjacent-track panel (DESIGN.md §5 PREV/NEXT spec).
@@ -1618,6 +1633,18 @@ class DisplayRenderer:
         except Exception as e:
             log.warning(f"Failed to load cached cover art: {e}")
             cache_path.unlink(missing_ok=True)
+            # The cached file was corrupt (partial write, decoder hiccup).  Kick
+            # off a re-fetch now so the cover can recover within this track,
+            # rather than showing the placeholder until the next state change
+            # re-triggers a prefetch (B-18).  Guard the spawn so a call outside
+            # the event loop (e.g. a unit test) degrades gracefully.
+            if url:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass  # No running loop (e.g. unit test) — nothing to schedule
+                else:
+                    self._spawn(self._prefetch_cover(url))
             return None
 
     def stop(self):

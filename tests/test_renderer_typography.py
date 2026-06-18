@@ -7,7 +7,6 @@ Covers the design-translation behaviors added in the Phase 1 fidelity work:
     album (2 lines): long strings step DOWN in size, short strings keep
     the base size
   ✓ _ellipsize — the one sanctioned ellipsis (PREV/NEXT panel only)
-  ✓ _chip_texts — genre chips capped at 3 with a '+N' overflow indicator
   ✓ _contrast_ratio / _ensure_contrast — WCAG math + the muted-role
     4.5:1 clamp from DESIGN.md's Full-Opacity Rule
   ✓ a full headless _compose_now_playing smoke test (dummy SDL driver)
@@ -150,26 +149,6 @@ def test_ellipsize_truncates_with_ellipsis_and_fits():
     out = r._ellipsize("The Diamond Sea (Live at the Continental Club)", font, 120)
     assert out.endswith("…")
     assert font.size(out)[0] <= 120
-
-
-# ---------------------------------------------------------------------------
-# _chip_texts — cap at 3 with +N overflow
-# ---------------------------------------------------------------------------
-
-def test_chip_texts_three_or_fewer_pass_through():
-    r = make_renderer()
-    assert r._chip_texts(["Folk"]) == ["Folk"]
-    assert r._chip_texts(["A", "B", "C"]) == ["A", "B", "C"]
-
-
-def test_chip_texts_overflow_collapses_to_plus_n():
-    r = make_renderer()
-    assert r._chip_texts(["A", "B", "C", "D", "E"]) == ["A", "B", "C", "+2"]
-
-
-def test_chip_texts_empty_is_empty():
-    r = make_renderer()
-    assert r._chip_texts([]) == []
 
 
 # ---------------------------------------------------------------------------
