@@ -11,6 +11,8 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from src.util.signal import Signal
+
 log = logging.getLogger(__name__)
 
 
@@ -36,16 +38,17 @@ class SilenceDetector:
         self._is_music = False
         self._silence_since: Optional[float] = None
         self._session_ended = False
-        self._listeners: list[Callable[[AudioEvent], None]] = []
+        # Shared Signal: log-and-continue delivery, so a throwing listener no
+        # longer kills delivery to the rest mid-process() (A-11).
+        self._on_event: "Signal[AudioEvent]" = Signal("SilenceDetector")
 
     def on_event(self, callback: Callable[[AudioEvent], None]):
         """Register a callback to receive AudioEvents."""
-        self._listeners.append(callback)
+        self._on_event.connect(callback)
 
     def _emit(self, event: AudioEvent):
         log.debug(f"SilenceDetector → {event.name}")
-        for cb in self._listeners:
-            cb(event)
+        self._on_event.emit(event)
 
     def process(self, audio: np.ndarray, sample_rate: int):
         """Process one audio chunk. Called synchronously from AudioCapture."""

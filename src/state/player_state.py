@@ -7,6 +7,8 @@ import logging
 from enum import Enum, auto
 from typing import Optional, TYPE_CHECKING
 
+from src.util.signal import Signal
+
 if TYPE_CHECKING:
     from src.metadata.models import TrackMetadata
     from src.audio.recognizer import RawRecognitionResult
@@ -31,13 +33,24 @@ class PlayerStatus(Enum):
 
 
 class PlayerState:
-    """Holds the current status, raw recognition result, and resolved track metadata."""
+    """Holds the current status, raw recognition result, and resolved track metadata.
+
+    Threading contract (A-12): PlayerState is **event-loop-thread-only**.  There
+    is no locking; correctness relies entirely on cooperative single-threaded
+    asyncio — every mutation (set_status/set_track/set_raw/clear) and every
+    on_change listener runs on the one event-loop thread.  `_notify` invokes
+    listeners **synchronously inside the setter**, so a state mutation has
+    re-entrant side effects (e.g. the display's on_change prefetches cover art
+    and queues palette work).  Listeners must not block.  This synchronous-hub
+    design is the structural soil B-1's stale-commit race grew in, which is why
+    set_track is epoch-guarded at its one caller (see session_epoch / B-1).
+    """
 
     def __init__(self):
         self.status: PlayerStatus = PlayerStatus.IDLE
         self.current_track: Optional["TrackMetadata"] = None
         self.current_raw: Optional["RawRecognitionResult"] = None
-        self._listeners: list = []
+        self._on_change: "Signal[PlayerState]" = Signal("PlayerState")
         # Monotonic session token, bumped every time a session ends (clear()).
         # A coroutine that yields the loop across an await (e.g. metadata
         # resolution) can capture this before and compare after: if it changed,
@@ -47,14 +60,10 @@ class PlayerState:
 
     def on_change(self, callback):
         """Register a callback to be called whenever state changes."""
-        self._listeners.append(callback)
+        self._on_change.connect(callback)
 
     def _notify(self):
-        for cb in self._listeners:
-            try:
-                cb(self)
-            except Exception as e:
-                log.error(f"State change listener error: {e}")
+        self._on_change.emit(self)
 
     def set_status(self, status: PlayerStatus):
         if self.status != status:
