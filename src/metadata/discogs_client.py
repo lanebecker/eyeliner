@@ -120,7 +120,9 @@ class DiscogsClient:
     # HTTP plumbing
     # -------------------------------------------------------------------------
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+    def _request(
+        self, method: str, url: str, retry_on_429: Optional[bool] = None, **kwargs
+    ) -> requests.Response:
         """Issue a session request with rate-limit awareness (v1.3.3).
 
         All direct REST calls in this module go through here so that an HTTP
@@ -128,6 +130,13 @@ class DiscogsClient:
         server-suggested Retry-After (clamped to _RATE_LIMIT_MAX_WAIT, with
         _RATE_LIMIT_DEFAULT_WAIT as the fallback when the header is missing
         or unparseable).
+
+        `retry_on_429` controls whether that one retry happens.  It defaults to
+        True for GET (always safe to repeat) and False for POST: a blind POST
+        retry is only safe when the body is an idempotent absolute-set, not a
+        server-side increment (B-15).  The two POST callers here (Play Count and
+        Last Played) write absolute values, so they opt in explicitly; any
+        future non-idempotent POST gets no surprise double-submit.
 
         This runs on an executor thread (every caller is dispatched via
         run_in_executor), so the time.sleep() here never blocks the event
@@ -141,9 +150,11 @@ class DiscogsClient:
         single HTTP seam.
         """
         kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+        if retry_on_429 is None:
+            retry_on_429 = (method == "GET")
         send = self._session.get if method == "GET" else self._session.post
         resp = send(url, **kwargs)
-        if resp.status_code == 429:
+        if resp.status_code == 429 and retry_on_429:
             try:
                 wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_DEFAULT_WAIT))
             except (TypeError, ValueError):
@@ -267,10 +278,15 @@ class DiscogsClient:
                 )
                 return False
 
-            # Read current value; fall back to 0 if blank, missing, or GET fails
+            # Read current value; fall back to 0 if blank, missing, or GET fails.
+            # Coerce via str() before .strip(): the value is normally a string,
+            # but if Discogs ever returns it as a JSON number, calling .strip()
+            # on an int would raise AttributeError and silently skip the
+            # increment (B-16).
             raw_value = self._get_field_value(release_id, instance_id, field_id)
+            text = str(raw_value).strip() if raw_value is not None else ""
             try:
-                current_count = int(raw_value) if raw_value and raw_value.strip() else 0
+                current_count = int(text) if text else 0
             except (ValueError, TypeError):
                 log.warning(
                     f"Play Count field for release {release_id} / instance {instance_id} "
@@ -287,7 +303,11 @@ class DiscogsClient:
                 f"/instances/{_as_id(instance_id, 'instance_id')}"
                 f"/fields/{_as_id(field_id, 'field_id')}"
             )
-            resp = self._request("POST", url, json={"value": str(new_count)})
+            # Idempotent absolute-set (writes new_count, not an increment), so a
+            # single 429 retry is safe (B-15).
+            resp = self._request(
+                "POST", url, retry_on_429=True, json={"value": str(new_count)}
+            )
 
             if resp.status_code == 204:
                 log.info(
@@ -338,7 +358,9 @@ class DiscogsClient:
                 f"/instances/{_as_id(instance_id, 'instance_id')}"
                 f"/fields/{_as_id(field_id, 'field_id')}"
             )
-            resp = self._request("POST", url, json={"value": today})
+            # Idempotent absolute-set (writes today's date), so a single 429
+            # retry is safe (B-15).
+            resp = self._request("POST", url, retry_on_429=True, json={"value": today})
 
             if resp.status_code == 204:
                 log.info(
