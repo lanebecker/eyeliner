@@ -38,6 +38,12 @@ class PlayerState:
         self.current_track: Optional["TrackMetadata"] = None
         self.current_raw: Optional["RawRecognitionResult"] = None
         self._listeners: list = []
+        # Monotonic session token, bumped every time a session ends (clear()).
+        # A coroutine that yields the loop across an await (e.g. metadata
+        # resolution) can capture this before and compare after: if it changed,
+        # the needle lifted and the session ended mid-flight, so whatever the
+        # coroutine was about to commit is stale and must be dropped (B-1).
+        self.session_epoch: int = 0
 
     def on_change(self, callback):
         """Register a callback to be called whenever state changes."""
@@ -78,7 +84,13 @@ class PlayerState:
             self._notify()  # status unchanged, but the track did change
 
     def clear(self):
-        """Reset to idle state (call on SESSION_ENDED)."""
+        """Reset to idle state (call on SESSION_ENDED).
+
+        Bumps session_epoch so any in-flight commit that began before the
+        needle lifted can detect that its session ended and discard itself
+        instead of resurrecting a stale track onto the screen (B-1).
+        """
         self.current_track = None
         self.current_raw = None
+        self.session_epoch += 1
         self.set_status(PlayerStatus.IDLE)

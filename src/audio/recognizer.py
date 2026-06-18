@@ -250,7 +250,20 @@ class RecognitionLoop:
         """Resolve full metadata and update state + tracker + Last.fm scrobble."""
         self.state.set_raw(raw)
         timestamp = int(time.time())
+        # Capture the session token before the resolve await.  resolve() yields
+        # the event loop, during which a SESSION_ENDED (needle lift) can run
+        # state.clear() and bump the epoch.  If that happens, this commit is for
+        # audio that has already stopped: displaying it would resurrect a dead
+        # track, and logging/scrobbling it would corrupt a fresh session (B-1).
+        commit_epoch = self.state.session_epoch
         metadata = await self.resolver.resolve(raw)
+        if self.state.session_epoch != commit_epoch:
+            log.info(
+                "Discarding stale commit for %s — %s: the session ended while "
+                "metadata was resolving.",
+                raw.artist, raw.title,
+            )
+            return
         self.state.set_track(metadata)
         await self.tracker.on_track_identified(metadata)
         log.info(
