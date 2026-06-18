@@ -43,6 +43,48 @@ _RATE_LIMIT_MAX_WAIT = 30
 _RATE_LIMIT_DEFAULT_WAIT = 2
 
 
+def _as_id(value, name: str) -> int:
+    """Coerce an identifier to a positive int before it is interpolated into a
+    write URL.
+
+    `release_id`, `instance_id`, and `field_id` come from Discogs' own API
+    responses and are interpolated directly into the collection-field POST path
+    (finding S-5).  They are normally well-formed, but a corrupt or unexpected
+    API response could otherwise build a surprising request path silently.
+    Coercing here makes a malformed value fail loudly at the boundary instead.
+    """
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if coerced <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {coerced}")
+    return coerced
+
+
+def _redact_url(url: str) -> str:
+    """Return a log-safe version of a Discogs URL: path only, with the username
+    segment masked and the query string dropped (finding S-4).
+
+    The auth token rides in a header (never the URL), so this isn't a live leak
+    today, but the full request path embeds the account username and any future
+    query-string credential would otherwise land in the logs verbatim.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        segments = parts.path.split("/")
+        # Mask the segment immediately after ".../users/" if present.
+        for i, seg in enumerate(segments):
+            if seg == "users" and i + 1 < len(segments) and segments[i + 1]:
+                segments[i + 1] = "{user}"
+                break
+        return "/".join(segments) or url
+    except Exception:
+        return "<unparseable-url>"
+
+
 class DiscogsClient:
     """Wraps python3-discogs-client and the Discogs REST API for collection lookups."""
 
@@ -108,7 +150,7 @@ class DiscogsClient:
                 wait = _RATE_LIMIT_DEFAULT_WAIT
             wait = max(1, min(wait, _RATE_LIMIT_MAX_WAIT))
             log.warning(
-                f"Discogs rate limit hit (429) for {method} {url}; "
+                f"Discogs rate limit hit (429) for {method} {_redact_url(url)}; "
                 f"retrying once in {wait}s."
             )
             time.sleep(wait)
@@ -236,10 +278,12 @@ class DiscogsClient:
 
             new_count = current_count + 1
 
+            # Validate every ID before it lands in the write URL (S-5).
             url = (
                 f"{_API_BASE}/users/{self.username}/collection"
-                f"/folders/0/releases/{release_id}"
-                f"/instances/{instance_id}/fields/{field_id}"
+                f"/folders/0/releases/{_as_id(release_id, 'release_id')}"
+                f"/instances/{_as_id(instance_id, 'instance_id')}"
+                f"/fields/{_as_id(field_id, 'field_id')}"
             )
             resp = self._request("POST", url, json={"value": str(new_count)})
 
@@ -250,9 +294,8 @@ class DiscogsClient:
                 )
                 return True
 
-            log.error(
-                f"Discogs field update returned {resp.status_code}: {resp.text[:200]}"
-            )
+            # Log the status code only; the raw 4xx body is not logged (S-4).
+            log.error(f"Discogs field update returned {resp.status_code}.")
             return False
 
         except Exception as e:
@@ -286,10 +329,12 @@ class DiscogsClient:
 
             today = date.today().isoformat()  # e.g. "2026-05-24"
 
+            # Validate every ID before it lands in the write URL (S-5).
             url = (
                 f"{_API_BASE}/users/{self.username}/collection"
-                f"/folders/0/releases/{release_id}"
-                f"/instances/{instance_id}/fields/{field_id}"
+                f"/folders/0/releases/{_as_id(release_id, 'release_id')}"
+                f"/instances/{_as_id(instance_id, 'instance_id')}"
+                f"/fields/{_as_id(field_id, 'field_id')}"
             )
             resp = self._request("POST", url, json={"value": today})
 
@@ -300,9 +345,8 @@ class DiscogsClient:
                 )
                 return True
 
-            log.error(
-                f"Discogs Last Played update returned {resp.status_code}: {resp.text[:200]}"
-            )
+            # Log the status code only; the raw 4xx body is not logged (S-4).
+            log.error(f"Discogs Last Played update returned {resp.status_code}.")
             return False
 
         except Exception as e:
@@ -346,7 +390,8 @@ class DiscogsClient:
         try:
             resp = self._request(
                 "GET",
-                f"{_API_BASE}/users/{self.username}/collection/releases/{release_id}",
+                f"{_API_BASE}/users/{self.username}/collection"
+                f"/releases/{_as_id(release_id, 'release_id')}",
             )
             if resp.status_code != 200:
                 log.debug(
