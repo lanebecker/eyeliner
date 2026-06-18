@@ -3,6 +3,7 @@
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from functools import cached_property
 from typing import Optional
 import time
 
@@ -58,6 +59,143 @@ class TracklistEntry:
     duration: Optional[str] = None  # e.g. "5:32"
 
 
+@dataclass(frozen=True)
+class SideIndex:
+    """Every positional fact about one track within its album's tracklist,
+    computed **once** from ``(tracklist, title)`` (A-5).
+
+    These facts used to live as eight separate ``TrackMetadata`` properties,
+    each re-scanning the tracklist by title on every access — and the renderer
+    touches roughly six of them per frame (~10 fps), so the same linear scans
+    ran thousands of times per track.  Bundling them into one immutable value
+    object that ``TrackMetadata`` caches keeps the model thin and does the work
+    exactly once.  The :meth:`from_tracklist` factory is the single home for the
+    position-matching logic (and the B-5 / B-10 correctness fixes it encodes).
+
+    All fields are derived; an absent tracklist (or a title that doesn't appear
+    in it) yields :meth:`empty`, where every positional fact degrades to
+    ``None`` / ``""`` / ``False`` exactly as the old per-property fallbacks did.
+    """
+    track_display: str                 # Discogs position string, e.g. "A1" ("" if unknown)
+    side_letter: Optional[str]         # "A", "B", … (None for numbered tracklists)
+    side_position: Optional[int]       # 1-indexed position within the side
+    side_total: Optional[int]          # number of tracks on this side
+    global_index: Optional[int]        # index in the full tracklist (prev/next anchor)
+    is_last_track: bool                # True iff this is the album's final track
+    prev_track_title: Optional[str]    # neighbour by global-tracklist adjacency
+    next_track_title: Optional[str]
+
+    @classmethod
+    def empty(cls) -> "SideIndex":
+        """The neutral SideIndex for an empty tracklist / unmatched title."""
+        return cls("", None, None, None, None, False, None, None)
+
+    @classmethod
+    def from_tracklist(cls, tracklist: list["TracklistEntry"], title: str) -> "SideIndex":
+        """Compute the full positional picture for *title* within *tracklist*.
+
+        The current entry is located by title; its position string yields the
+        side letter and the within-side ordinal.  Prev/next neighbours are pure
+        global-tracklist adjacency (vinyl sides are contiguous), resolved via
+        the entry's unique ``position`` string rather than re-scanning by title.
+        That position-anchoring is what fixes two historical bugs:
+
+          - **B-5**: a title repeated across sides (e.g. a reprise) no longer
+            returns the wrong side's neighbour — the side filter disambiguates
+            the occurrence, and its position then pins the exact global index.
+          - **B-10**: a numbered tracklist ('1'..'10') has no side letter, so
+            the side filter is empty; the logic falls back to the title match
+            and still yields correct adjacency.
+
+        ``is_last_track`` is matched by POSITION (not title): it is the sole
+        gate on Discogs play-count updates, and pure title matching let an
+        earlier track sharing the closer's title (reprises, live sets) latch a
+        phantom "last track".  The deliberately conservative failure mode
+        remains: when a GENUINE closer duplicates an earlier title, the current
+        entry resolves to the first occurrence and ``is_last_track`` is False —
+        a missed play count rather than a phantom one.
+        """
+        if not tracklist:
+            return cls.empty()
+
+        title_key = title.lower().strip()
+
+        # The current track's row, matched by title (first occurrence).
+        current = next(
+            (e for e in tracklist if e.title.lower().strip() == title_key), None
+        )
+
+        track_display = current.position if current else ""
+
+        # Side letter from the position prefix (None for numbered tracklists).
+        side_letter = None
+        if current is not None:
+            m = _SIDE_RE.match(current.position)
+            side_letter = m.group(1).upper() if m else None
+
+        # All entries sharing this side letter, in tracklist order.
+        side_entries: list[TracklistEntry] = []
+        if side_letter:
+            side_entries = [
+                e for e in tracklist
+                if (m := _SIDE_RE.match(e.position)) and m.group(1).upper() == side_letter
+            ]
+
+        # 1-indexed ordinal within the side (by title), and the side's length.
+        side_position = None
+        for i, entry in enumerate(side_entries):
+            if entry.title.lower().strip() == title_key:
+                side_position = i + 1
+                break
+        side_total = len(side_entries) if side_entries else None
+
+        # Global index — prefer the side-disambiguated occurrence (B-5); fall
+        # back to the plain title match for numbered tracklists (B-10).
+        target_position = None
+        for entry in side_entries:
+            if entry.title.lower().strip() == title_key:
+                target_position = entry.position
+                break
+        if target_position is None and current is not None:
+            target_position = current.position
+
+        global_index = None
+        if target_position is not None:
+            # Prefer an entry matching BOTH position and title (robust if two
+            # rows ever share a position string); else the first position match.
+            fallback = None
+            for i, e in enumerate(tracklist):
+                if e.position == target_position:
+                    if e.title.lower().strip() == title_key:
+                        global_index = i
+                        break
+                    if fallback is None:
+                        fallback = i
+            if global_index is None:
+                global_index = fallback
+
+        is_last_track = bool(current and current.position == tracklist[-1].position)
+
+        prev_title = None
+        next_title = None
+        if global_index is not None:
+            if global_index > 0:
+                prev_title = tracklist[global_index - 1].title
+            if global_index < len(tracklist) - 1:
+                next_title = tracklist[global_index + 1].title
+
+        return cls(
+            track_display=track_display,
+            side_letter=side_letter,
+            side_position=side_position,
+            side_total=side_total,
+            global_index=global_index,
+            is_last_track=is_last_track,
+            prev_track_title=prev_title,
+            next_track_title=next_title,
+        )
+
+
 @dataclass
 class TrackMetadata:
     """Fully resolved metadata for a track, ready for display and tracking."""
@@ -77,163 +215,59 @@ class TrackMetadata:
     genres: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------
-    # Last-track detection
+    # Positional facts (side-awareness + last-track detection)
+    #
+    # All of these are derived from (tracklist, title) by a single SideIndex
+    # value object (A-5), computed once and cached.  TrackMetadata stays thin:
+    # the properties below are pure delegations, and the position-matching
+    # logic (with its B-5 / B-10 correctness fixes) lives in SideIndex, not
+    # here.  cached_property means the linear scans run once per track even
+    # though the renderer reads these ~6×/frame at ~10 fps.
     # ------------------------------------------------------------------
+
+    @cached_property
+    def side_index(self) -> "SideIndex":
+        """The track's full positional picture, computed once from the
+        tracklist.  See :class:`SideIndex` for the per-field semantics."""
+        return SideIndex.from_tracklist(self.tracklist, self.title)
 
     @property
     def is_last_track(self) -> bool:
-        """True if this track is the final track on the album.
-
-        Matched by tracklist POSITION rather than by title (v1.3.4): the
-        current entry is located by title via _current_entry, then its
-        position string is compared to the final entry's position.
-
-        Why: this property is the sole gate on Discogs play-count updates.
-        Pure title matching let any earlier track that shares the closer's
-        title (title-track reprises, live sets) latch potential_last_track
-        from side A, producing a phantom play count if the session ended
-        there.  Note the deliberately conservative failure mode that remains:
-        when an album's GENUINE closer duplicates an earlier title,
-        _current_entry resolves to the first occurrence and this returns
-        False — a missed play count rather than a phantom one, matching the
-        tracker's listening-completion philosophy.
-        """
-        if not self.tracklist:
-            return False
-        entry = self._current_entry
-        if entry is None:
-            return False
-        return entry.position == self.tracklist[-1].position
+        """True iff this is the album's final track (the sole gate on Discogs
+        play-count updates).  See :meth:`SideIndex.from_tracklist`."""
+        return self.side_index.is_last_track
 
     @property
     def track_display(self) -> str:
-        """Human-readable track position, e.g. 'A1'."""
-        for entry in self.tracklist:
-            if entry.title.lower().strip() == self.title.lower().strip():
-                return entry.position
-        return ""
-
-    # ------------------------------------------------------------------
-    # Side-awareness (v1.2.0 display; foundation for v1.6.0 logic)
-    # ------------------------------------------------------------------
-
-    @property
-    def _current_entry(self) -> Optional["TracklistEntry"]:
-        """The TracklistEntry for this track, matched by title."""
-        title_key = self.title.lower().strip()
-        for entry in self.tracklist:
-            if entry.title.lower().strip() == title_key:
-                return entry
-        return None
+        """Human-readable track position, e.g. 'A1' ('' if not in tracklist)."""
+        return self.side_index.track_display
 
     @property
     def side_letter(self) -> Optional[str]:
-        """The side letter for this track (e.g. 'A', 'B'), or None.
-
-        Returns None when the position string has no alphabetic prefix
-        (e.g. numbered-only tracklists like '1', '2', '3').
-        """
-        entry = self._current_entry
-        if not entry:
-            return None
-        m = _SIDE_RE.match(entry.position)
-        return m.group(1).upper() if m else None
-
-    @property
-    def _side_entries(self) -> list["TracklistEntry"]:
-        """All tracklist entries that share this track's side letter, in order."""
-        letter = self.side_letter
-        if not letter:
-            return []
-        return [
-            e for e in self.tracklist
-            if (m := _SIDE_RE.match(e.position)) and m.group(1).upper() == letter
-        ]
+        """The side letter (e.g. 'A'), or None for numbered tracklists."""
+        return self.side_index.side_letter
 
     @property
     def side_position(self) -> Optional[int]:
-        """1-indexed position of this track within its side.
-
-        E.g. the 3rd track on Side A returns 3, regardless of whether
-        its Discogs position string is 'A3' or something else.
-        """
-        title_key = self.title.lower().strip()
-        for i, entry in enumerate(self._side_entries):
-            if entry.title.lower().strip() == title_key:
-                return i + 1
-        return None
+        """1-indexed position of this track within its side, or None."""
+        return self.side_index.side_position
 
     @property
     def side_total(self) -> Optional[int]:
-        """Total number of tracks on this track's side."""
-        entries = self._side_entries
-        return len(entries) if entries else None
-
-    @property
-    def _global_index(self) -> Optional[int]:
-        """This track's index in the global tracklist, located by POSITION.
-
-        Prev/next neighbours are simply global-tracklist adjacency (vinyl sides
-        are contiguous, so "within-side then fall back across the boundary" was
-        only ever a roundabout way to compute the same thing).  Resolving by the
-        entry's unique `position` string instead of re-scanning by title fixes
-        two bugs:
-
-          - B-5: a title that repeats across sides (e.g. a reprise) no longer
-            returns the wrong side's neighbour.  The side filter disambiguates
-            the occurrence; its position then pins the exact global index.
-          - B-10: a numbered tracklist ('1'..'10') has no side letter, so the
-            old side-loop never ran and prev/next were always None.  This path
-            falls back to the title match and still yields adjacency.
-        """
-        if not self.tracklist:
-            return None
-
-        # Prefer the side-disambiguated entry (handles duplicate titles across
-        # sides); fall back to the first title match for numbered tracklists.
-        title_key = self.title.lower().strip()
-        target_position = None
-        for entry in self._side_entries:
-            if entry.title.lower().strip() == title_key:
-                target_position = entry.position
-                break
-        if target_position is None:
-            entry = self._current_entry
-            if entry is None:
-                return None
-            target_position = entry.position
-
-        # Resolve to the global index.  Prefer an entry matching BOTH position
-        # and title (robust if two rows ever share a position string); fall
-        # back to the first position match.
-        fallback = None
-        for i, e in enumerate(self.tracklist):
-            if e.position == target_position:
-                if e.title.lower().strip() == title_key:
-                    return i
-                if fallback is None:
-                    fallback = i
-        return fallback
+        """Total number of tracks on this track's side, or None."""
+        return self.side_index.side_total
 
     @property
     def prev_track_title(self) -> Optional[str]:
         """Title of the previous track in the album, or None if this is the
-        very first track.  B1 correctly returns A-side's last track; the first
-        track of the album returns None."""
-        idx = self._global_index
-        if idx is None or idx == 0:
-            return None
-        return self.tracklist[idx - 1].title
+        very first track."""
+        return self.side_index.prev_track_title
 
     @property
     def next_track_title(self) -> Optional[str]:
         """Title of the next track in the album, or None if this is the very
-        last track.  The A-side's last track correctly returns B1; the album's
-        closer returns None."""
-        idx = self._global_index
-        if idx is None or idx >= len(self.tracklist) - 1:
-            return None
-        return self.tracklist[idx + 1].title
+        last track."""
+        return self.side_index.next_track_title
 
 
 @dataclass

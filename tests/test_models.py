@@ -3,9 +3,11 @@ DisplayPalette, and the new v1.2.0 side-awareness properties.
 
 No hardware, network, or external dependencies required.
 """
+import pytest
+
 from src.metadata.models import (
     MetadataSource, TracklistEntry, TrackMetadata, PlaySession,
-    DisplayPalette, FALLBACK_PALETTE, _SIDE_RE,
+    DisplayPalette, FALLBACK_PALETTE, SideIndex, _SIDE_RE,
 )
 
 
@@ -550,3 +552,79 @@ def test_last_release_id_unchanged_by_fallback_tracks():
     )
     session.log_track(fallback)
     assert session.last_release_id == 100
+
+
+# ---------------------------------------------------------------------------
+# SideIndex value object (A-5) — the positional facts now live in one
+# computed-once object; TrackMetadata's properties are thin delegations to it.
+# ---------------------------------------------------------------------------
+
+def test_side_index_is_computed_once_and_cached():
+    """TrackMetadata.side_index is a cached_property: the same instance is
+    returned on every access, so the tracklist scans run exactly once."""
+    track = make_track("Catholic Block")
+    first = track.side_index
+    assert track.side_index is first          # cached, not recomputed
+    assert isinstance(first, SideIndex)
+
+
+def test_track_properties_delegate_to_side_index():
+    """Every positional property reads straight off the cached SideIndex."""
+    track = make_track("Stereo Sanctity")  # A3 on Sister
+    si = track.side_index
+    assert track.track_display == si.track_display
+    assert track.side_letter == si.side_letter
+    assert track.side_position == si.side_position
+    assert track.side_total == si.side_total
+    assert track.is_last_track == si.is_last_track
+    assert track.prev_track_title == si.prev_track_title
+    assert track.next_track_title == si.next_track_title
+
+
+def test_side_index_from_empty_tracklist_is_neutral():
+    """An empty tracklist yields the neutral SideIndex — every fact degrades
+    exactly as the old per-property fallbacks did."""
+    si = SideIndex.from_tracklist([], "Anything")
+    assert si == SideIndex.empty()
+    assert si.track_display == ""
+    assert si.side_letter is None
+    assert si.side_position is None
+    assert si.side_total is None
+    assert si.global_index is None
+    assert si.is_last_track is False
+    assert si.prev_track_title is None
+    assert si.next_track_title is None
+
+
+def test_side_index_reprise_uses_side_disambiguated_neighbour():
+    """B-5: a title repeated across sides resolves neighbours by the
+    side-disambiguated occurrence, not the first title match."""
+    tl = [
+        TracklistEntry("A1", "Intro"),
+        TracklistEntry("A2", "Song Two"),
+        TracklistEntry("B1", "Intro"),     # reprise of A1's title
+        TracklistEntry("B2", "Closer"),
+    ]
+    closer = SideIndex.from_tracklist(tl, "Closer")
+    assert closer.is_last_track is True
+    assert closer.prev_track_title == "Intro"     # the B1 reprise, not A1
+    assert closer.global_index == 3
+
+
+def test_side_index_numbered_tracklist_has_neighbours_without_sides():
+    """B-10: a numbered tracklist has no side letters, but prev/next still
+    resolve via the plain title match."""
+    tl = [TracklistEntry("1", "One"), TracklistEntry("2", "Two"),
+          TracklistEntry("3", "Three")]
+    si = SideIndex.from_tracklist(tl, "Two")
+    assert si.side_letter is None
+    assert si.side_position is None
+    assert si.prev_track_title == "One"
+    assert si.next_track_title == "Three"
+
+
+def test_side_index_is_frozen():
+    """The value object is immutable — its facts are settled at resolve time."""
+    si = SideIndex.from_tracklist([TracklistEntry("A1", "Only")], "Only")
+    with pytest.raises(Exception):
+        si.track_display = "B2"  # frozen dataclass → FrozenInstanceError
