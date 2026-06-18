@@ -78,6 +78,9 @@ def test_allowed_hosts(host):
 @pytest.mark.parametrize("host", [
     "evil.com", "discogs.com.attacker.net", "192.168.1.1",
     "localhost", "", None, "notdiscogs.com",
+    # Suffix-confusion lookalikes — must NOT match the apex allow-list.
+    "evilcoverartarchive.org", "notcoverartarchive.org",
+    "xmzstatic.com", "evilarchive.org", "coverartarchive.org.attacker.net",
 ])
 def test_disallowed_hosts(host):
     assert r._host_is_allowed(host) is False
@@ -87,10 +90,12 @@ def test_disallowed_hosts(host):
 # _validate_cover_url
 # ---------------------------------------------------------------------------
 
-def test_validate_rejects_http(monkeypatch):
+def test_validate_rejects_http_to_disallowed_host(monkeypatch):
+    # http is only upgraded for allow-listed hosts; an unknown host is rejected
+    # regardless of scheme.
     monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
     with pytest.raises(ValueError):
-        r._validate_cover_url("http://i.discogs.com/cover.jpg")
+        r._validate_cover_url("http://evil.example/cover.jpg")
 
 
 def test_validate_rejects_disallowed_host(monkeypatch):
@@ -108,7 +113,22 @@ def test_validate_rejects_private_ip(monkeypatch):
 
 def test_validate_accepts_good_url(monkeypatch):
     monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
-    assert r._validate_cover_url("https://i.discogs.com/cover.jpg") == "i.discogs.com"
+    # Returns the URL to fetch (unchanged for an already-https URL).
+    assert r._validate_cover_url("https://i.discogs.com/cover.jpg") == \
+        "https://i.discogs.com/cover.jpg"
+
+
+def test_validate_upgrades_http_to_https_for_allowlisted_host(monkeypatch):
+    # Cover Art Archive sometimes returns http; we upgrade rather than reject.
+    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
+    out = r._validate_cover_url("http://coverartarchive.org/release/x/front")
+    assert out == "https://coverartarchive.org/release/x/front"
+
+
+def test_validate_rejects_non_http_scheme(monkeypatch):
+    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
+    with pytest.raises(ValueError):
+        r._validate_cover_url("file:///etc/passwd")
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +257,8 @@ def test_download_follows_validated_redirect(tmp_path, monkeypatch):
             )
         return _FakeResp(headers={"Content-Type": "image/png"}, body=_png_bytes())
 
-    monkeypatch.setattr(r, "_validate_cover_url", lambda u: r.urlsplit(u).hostname)
+    # _validate_cover_url returns the (normalized) URL to fetch; here it's a no-op.
+    monkeypatch.setattr(r, "_validate_cover_url", lambda u: u)
     monkeypatch.setattr(r.requests, "get", fake_get)
 
     stub = _renderer_stub(tmp_path)

@@ -118,14 +118,16 @@ log = logging.getLogger(__name__)
 #   * requires an image/* Content-Type, and
 #   * verifies the decoded image (type + pixel bounds) before it is cached.
 
-# Host suffixes we trust to serve cover art.  Cover Art Archive 307-redirects to
-# the Internet Archive (archive.org), so that is included for the redirect hop.
-_ALLOWED_COVER_HOST_SUFFIXES = (
-    ".discogs.com",
+# Apex domains we trust to serve cover art.  A host matches if it IS one of
+# these or is a dotted subdomain of one — never merely a string that ends with
+# one (so "evilcoverartarchive.org" is rejected, not allowed).  Cover Art
+# Archive 307-redirects to the Internet Archive (archive.org), so that apex is
+# included for the redirect hop.
+_ALLOWED_COVER_APEX_DOMAINS = (
+    "discogs.com",
     "coverartarchive.org",
-    ".coverartarchive.org",
-    ".archive.org",
-    ".mzstatic.com",
+    "archive.org",
+    "mzstatic.com",
 )
 
 _MAX_COVER_BYTES = 10 * 1024 * 1024   # 10 MB ceiling on a downloaded cover
@@ -137,13 +139,18 @@ _MAX_IMAGE_PIXELS = 6000 * 6000
 
 
 def _host_is_allowed(host: Optional[str]) -> bool:
-    """True if `host` matches the cover-art provider allow-list."""
+    """True if `host` is an allow-listed apex domain or a dotted subdomain of one.
+
+    Matching is exact-or-dot-boundary (`host == apex` or `host.endswith("." +
+    apex)`), never a bare suffix test — otherwise "evilcoverartarchive.org"
+    would be accepted as if it were "coverartarchive.org".
+    """
     if not host:
         return False
     host = host.lower().rstrip(".")
     return any(
-        host == suffix.lstrip(".") or host.endswith(suffix)
-        for suffix in _ALLOWED_COVER_HOST_SUFFIXES
+        host == apex or host.endswith("." + apex)
+        for apex in _ALLOWED_COVER_APEX_DOMAINS
     )
 
 
@@ -172,20 +179,27 @@ def _host_resolves_to_public_ip(host: str) -> bool:
 
 
 def _validate_cover_url(url: str) -> str:
-    """Validate a single cover-art URL hop; return the host on success.
+    """Validate and normalize a single cover-art URL hop; return the URL to fetch.
 
-    Raises ValueError if the scheme is not https, the host is not allow-listed,
-    or the host resolves to a non-public address (S-1).
+    - The host must be allow-listed and resolve to a public address (S-1).
+    - http is upgraded to https for allow-listed hosts (the MusicBrainz Cover
+      Art Archive sometimes returns http URLs; upgrading only ever makes the
+      request more secure, and avoids silently dropping every fallback cover).
+
+    Raises ValueError if the scheme is not http(s), the host is not allow-listed,
+    or the host resolves to a non-public address.
     """
     parts = urlsplit(url)
-    if parts.scheme != "https":
-        raise ValueError(f"cover URL must be https, got scheme {parts.scheme!r}")
     host = parts.hostname
+    if parts.scheme not in ("http", "https"):
+        raise ValueError(f"cover URL scheme not allowed: {parts.scheme!r}")
     if not _host_is_allowed(host):
         raise ValueError(f"cover URL host not allow-listed: {host!r}")
     if not _host_resolves_to_public_ip(host):
         raise ValueError(f"cover URL host resolves to a non-public address: {host!r}")
-    return host
+    if parts.scheme == "http":
+        url = parts._replace(scheme="https").geturl()
+    return url
 
 
 def _validate_image_file(path: str) -> None:
@@ -1508,7 +1522,7 @@ class DisplayRenderer:
         resp = None
         try:
             for _ in range(_MAX_COVER_REDIRECTS + 1):
-                _validate_cover_url(current_url)
+                current_url = _validate_cover_url(current_url)
                 resp = requests.get(
                     current_url,
                     timeout=_COVER_CONNECT_READ_TIMEOUT,

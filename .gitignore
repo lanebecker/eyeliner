@@ -1,6 +1,9 @@
 # Project config (contains API tokens — never commit)
 config.yaml
 
+# Last.fm session key emitted by get_lastfm_session_key.py (write-scope secret)
+lastfm_session_key.txt
+
 # Python
 __pycache__/
 *.py[cod]
