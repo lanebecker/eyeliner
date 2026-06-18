@@ -61,6 +61,53 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenTracker):
+    """Route a silence event to the tracker and the player state.
+
+    Extracted from main() (T-1) so the wiring is unit-testable — in particular
+    the IDLE/ERROR → LISTENING transition and SESSION_ENDED → clear(), the exact
+    paths the B-1 epoch guard depends on.
+
+      - MUSIC_STARTED: only enter LISTENING from IDLE or ERROR.  During an
+        active session (e.g. a side flip) keep the now-playing card on screen
+        instead of dropping to the IDENTIFYING spinner; from ERROR,
+        "REPOSITION NEEDLE TO RETRY" recovers when music returns.
+      - SESSION_ENDED: clear() → IDLE (and bumps the session epoch, B-1).
+    """
+    tracker.on_silence_event(event)
+    if event == AudioEvent.MUSIC_STARTED:
+        if state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR):
+            state.set_status(PlayerStatus.LISTENING)
+    elif event == AudioEvent.SESSION_ENDED:
+        state.clear()
+
+
+async def run_pipeline(tasks, capture, display):
+    """Run the pipeline legs until the first one finishes, then shut down.
+
+    Extracted from main() (T-1) so the shutdown semantics are testable without
+    real audio/display:
+      - the moment ANY leg exits, cancel the rest (FIRST_COMPLETED) — this is
+        the v1.3.5 "ESC zombie" fix;
+      - re-raise a faulted leg's exception after cleanup;
+      - always stop capture and display in the finally.
+    """
+    try:
+        done, pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for t in done:
+            if not t.cancelled():
+                t.result()  # Re-raises if the leg died with an exception
+        log.info("Pipeline stopped.")
+    finally:
+        capture.stop()
+        display.stop()
+
+
 async def main():
     config = load_config()
 
@@ -73,22 +120,9 @@ async def main():
     recognizer = RecognitionLoop(config, state, resolver, tracker, lastfm)
     capture = AudioCapture(config, silence, recognizer)
 
-    # Wire silence events into state and tracker
-    def on_silence_event(event: AudioEvent):
-        tracker.on_silence_event(event)
-        if event == AudioEvent.MUSIC_STARTED:
-            # v1.3.4: only enter LISTENING from IDLE.  During an active
-            # session (e.g. a side flip), keep the now-playing card on
-            # screen — it updates in place when the next track commits —
-            # instead of dropping to the IDENTIFYING spinner for ~25s.
-            # v1.4.1: ERROR also re-enters LISTENING — "REPOSITION NEEDLE
-            # TO RETRY" recovers when music starts again after the lift.
-            if state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR):
-                state.set_status(PlayerStatus.LISTENING)
-        elif event == AudioEvent.SESSION_ENDED:
-            state.clear()
-
-    silence.on_event(on_silence_event)
+    # Wire silence events into state and tracker (logic in handle_silence_event,
+    # extracted for testability — T-1).
+    silence.on_event(lambda event: handle_silence_event(event, state, tracker))
 
     log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
     display.start()
@@ -112,24 +146,9 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _cancel_all)
 
-    try:
-        # FIRST_COMPLETED (v1.3.5): if ANY leg exits, shut everything down.
-        # Before this, asyncio.gather waited for ALL legs — so quitting the
-        # display with ESC left capture and recognition running invisibly,
-        # still scrobbling and writing play counts with no screen attached.
-        done, pending = await asyncio.wait(
-            tasks, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for t in done:
-            if not t.cancelled():
-                t.result()  # Re-raises if the leg died with an exception
-        log.info("Pipeline stopped.")
-    finally:
-        capture.stop()
-        display.stop()
+    # FIRST_COMPLETED shutdown + cleanup live in run_pipeline (extracted for
+    # testability — T-1).
+    await run_pipeline(tasks, capture, display)
 
 
 if __name__ == "__main__":
