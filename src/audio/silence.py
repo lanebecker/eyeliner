@@ -65,11 +65,52 @@ class SilenceDetector:
                 self._is_music = False
                 self._silence_since = now
                 self._emit(AudioEvent.MUSIC_STOPPED)
-            elif self._silence_since is not None and not self._session_ended:
-                elapsed = now - self._silence_since
-                if elapsed >= self.session_end_seconds:
-                    self._session_ended = True
-                    self._emit(AudioEvent.SESSION_ENDED)
+            else:
+                self._check_session_end(now)
+
+    def _check_session_end(self, now: float):
+        """Fire SESSION_ENDED if sustained silence has elapsed.  Idempotent.
+
+        Factored out so both process() (chunk-driven) and tick() (time-driven)
+        evaluate the end-of-session timer identically.
+        """
+        if (
+            not self._is_music
+            and self._silence_since is not None
+            and not self._session_ended
+            and now - self._silence_since >= self.session_end_seconds
+        ):
+            self._session_ended = True
+            self._emit(AudioEvent.SESSION_ENDED)
+
+    def tick(self):
+        """Re-evaluate the end-of-session timer WITHOUT a new audio chunk (B-6).
+
+        process() only runs when a chunk arrives, so if capture stalls during
+        silence (an InputStream error parks the loop in its retry sleep, or the
+        block queue drains) the 45s timer is never sampled and a completed
+        album is never credited.  A periodic caller (AudioCapture) invokes this
+        so the timer fires on wall-clock time regardless of chunk flow.
+        """
+        self._check_session_end(time.monotonic())
+
+    def reset_music_state(self):
+        """Clear a stuck "music playing" flag on audio-stream (re)start (B-6).
+
+        Without this, a >45s mid-music stall that tears down and rebuilds the
+        stream leaves _is_music=True, so when audio returns process() sees no
+        False→True transition and never emits MUSIC_STARTED (the now-playing
+        card would stay stuck on the pre-stall track).
+
+        Deliberately resets ONLY the music flag — NOT _silence_since /
+        _session_ended.  If the stall happens during post-album silence, the
+        end-of-session timer must keep running (it's the tick()/process() path
+        that credits the album); clearing it here would re-create the very
+        lost-Play-Count bug B-6 fixes.  The music invariant guarantees this is
+        safe: _is_music is True only while _silence_since is None, so forcing
+        the flag False never strands an armed silence timer.
+        """
+        self._is_music = False
 
     @property
     def is_music_playing(self) -> bool:

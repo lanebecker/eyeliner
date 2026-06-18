@@ -47,6 +47,11 @@ _BLOCK_SECONDS = 0.25
 # of slack before the drop-oldest policy kicks in.
 _BLOCK_QUEUE_MAX = 64
 
+# How often the silence ticker re-evaluates the end-of-session timer when no
+# audio chunks are arriving (B-6).  The session-end threshold is tens of
+# seconds, so 1s granularity is plenty and the cost (one comparison) is trivial.
+_SILENCE_TICK_SECONDS = 1.0
+
 
 class AudioCapture:
     """Wraps sounddevice to stream overlapping audio chunks from the USB interface."""
@@ -136,6 +141,20 @@ class AudioCapture:
 
         return callback
 
+    async def _silence_ticker(self):
+        """Periodically poke the SilenceDetector so the end-of-session timer is
+        evaluated even when no audio chunks are arriving (B-6).
+
+        process() only runs on chunk arrival, so a stall during silence (an
+        InputStream error parking run() in its retry sleep, or a drained block
+        queue) would otherwise leave a completed album's SESSION_ENDED unfired
+        and its Play Count never credited.  This task ticks on wall-clock time
+        independently of chunk flow.
+        """
+        while self._running:
+            await asyncio.sleep(_SILENCE_TICK_SECONDS)
+            self.silence.tick()
+
     async def run(self):
         """Main capture loop. Streams audio and dispatches overlapping chunks."""
         device_index = self._find_device_index()
@@ -156,34 +175,49 @@ class AudioCapture:
             f"({self.overlap_seconds}s overlap)"
         )
 
-        while self._running:
-            assembler = ChunkAssembler(chunk_frames, hop_frames)
-            blocks: asyncio.Queue = asyncio.Queue(maxsize=_BLOCK_QUEUE_MAX)
-            self._blocks = blocks
+        # Independent timer tick so SESSION_ENDED fires on wall-clock time even
+        # while the stream is down and no chunks flow (B-6).
+        ticker = asyncio.create_task(self._silence_ticker())
+        try:
+            while self._running:
+                # Clear any stuck "music playing" flag from a previous stream
+                # so recovered audio re-emits MUSIC_STARTED (B-6).
+                self.silence.reset_music_state()
+                assembler = ChunkAssembler(chunk_frames, hop_frames)
+                blocks: asyncio.Queue = asyncio.Queue(maxsize=_BLOCK_QUEUE_MAX)
+                self._blocks = blocks
+                try:
+                    stream = sd.InputStream(
+                        samplerate=self.sample_rate,
+                        channels=1,
+                        dtype="float32",
+                        device=device_index,
+                        blocksize=int(_BLOCK_SECONDS * self.sample_rate),
+                        callback=self._make_callback(loop, blocks),
+                    )
+                    with stream:
+                        while self._running:
+                            block = await blocks.get()
+                            if block is None:
+                                continue  # stop() sentinel — re-check self._running
+                            for chunk in assembler.feed(block):
+                                # Silence detection is sync and fast (one RMS).
+                                self.silence.process(chunk, self.sample_rate)
+                                # Recognition enqueue never blocks (drops when full).
+                                await self.recognizer.enqueue(chunk, self.sample_rate)
+                except Exception as e:
+                    # CancelledError is BaseException and intentionally NOT caught
+                    # here — shutdown cancellation propagates to main() cleanly.
+                    log.error(f"Audio capture error: {e}")
+                    await asyncio.sleep(1)  # Then retry with a fresh stream
+        finally:
+            # Tear the ticker down with the capture loop (covers normal exit and
+            # cancellation), and await it so it doesn't outlive run().
+            ticker.cancel()
             try:
-                stream = sd.InputStream(
-                    samplerate=self.sample_rate,
-                    channels=1,
-                    dtype="float32",
-                    device=device_index,
-                    blocksize=int(_BLOCK_SECONDS * self.sample_rate),
-                    callback=self._make_callback(loop, blocks),
-                )
-                with stream:
-                    while self._running:
-                        block = await blocks.get()
-                        if block is None:
-                            continue  # stop() sentinel — re-check self._running
-                        for chunk in assembler.feed(block):
-                            # Silence detection is sync and fast (one RMS).
-                            self.silence.process(chunk, self.sample_rate)
-                            # Recognition enqueue never blocks (drops when full).
-                            await self.recognizer.enqueue(chunk, self.sample_rate)
-            except Exception as e:
-                # CancelledError is BaseException and intentionally NOT caught
-                # here — shutdown cancellation propagates to main() cleanly.
-                log.error(f"Audio capture error: {e}")
-                await asyncio.sleep(1)  # Then retry with a fresh stream
+                await ticker
+            except asyncio.CancelledError:
+                pass
 
     def stop(self):
         self._running = False
