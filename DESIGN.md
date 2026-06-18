@@ -69,7 +69,7 @@ Typography carries the same logic. The track name is large and tight because it 
 
 This system explicitly rejects the streaming-app aesthetic (Spotify, Apple Music): no rounded album tiles, no soft gradient scrubbers, no "Now Playing" headers with shuffle icons. The display is not a player. It has no controls and no chrome that implies it might. It is also not a timeline — no progress bars, no elapsed time, no duration. Vinyl is not an experience you track; it is one you inhabit.
 
-The target device is the Waveshare 7" HDMI LCD (H) at exactly 1024×600, driven by a Raspberry Pi. This is a fixed-size deployment, not a responsive one. The artboard dimensions are the screen dimensions.
+The target device is the Waveshare 7" HDMI LCD (H) at exactly 1024×600, driven by a Raspberry Pi — a fixed deployment. Note, however, that the **production renderer is implemented resolution-independently**: it reads width/height from config and scales every geometry constant by `s = min(width/1024, height/600)` off a 1024×600 reference, rather than hard-coding the artboard. The 1024×600 figures below are that reference, not a hard constraint in the code. (A-10)
 
 **Key Characteristics:**
 - Per-album palette theming: every record tints its own display
@@ -107,7 +107,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 
 **The Per-Album Rule.** The five palette roles (`bg`, `surface`, `accent`, `text`, `muted`) are architecture, not values. Treat the fallback palette as the null state; treat each album's extraction as the real design. New album additions require a new palette entry in `design/src/data.js`, not a design change.
 
-**The Hue Diversity Rule.** Extracted `accent` colors must maintain ≥60° hue separation (in OKLCH/LCH space) from every other album's accent in the collection. Unconstrained extraction clusters toward warm orange (hue 40–60°), making distinct records indistinguishable at a glance. When a new extraction lands within 60° of an existing accent, either: (a) use the cover's second-most-prominent hue, or (b) shift the accent's hue ±60°+ while preserving its lightness and chroma. The five prototype albums span the hue wheel: orange (Sister ~55°), olive (Bachelor ~125°), blue (Repeater ~225°), violet (Bush of Ghosts ~290°), rose (Cavetown ~345°). All pairs maintain ≥60° separation.
+**The Hue Diversity Rule.** *(⚠️ Aspirational — not implemented in the production renderer; see §6 and A-1. The shipped code has no cross-album accent registry, no OKLCH/LCH conversion, and no separation check; `accent` is the most-saturated quantized color of the current cover in isolation. The rule below is a design goal, hand-tuned in the prototype's `data.js`.)* Extracted `accent` colors should maintain ≥60° hue separation (in OKLCH/LCH space) from every other album's accent in the collection. Unconstrained extraction clusters toward warm orange (hue 40–60°), making distinct records indistinguishable at a glance. When a new extraction lands within 60° of an existing accent, either: (a) use the cover's second-most-prominent hue, or (b) shift the accent's hue ±60°+ while preserving its lightness and chroma. The five prototype albums span the hue wheel: orange (Sister ~55°), olive (Bachelor ~125°), blue (Repeater ~225°), violet (Bush of Ghosts ~290°), rose (Cavetown ~345°). All pairs maintain ≥60° separation.
 
 ## 3. Typography
 
@@ -185,7 +185,7 @@ The `stroke-dasharray: "50 200"` produces roughly a quarter-circle arc at any ro
 A 64×2px horizontal rule in `p.accent` at full opacity. Appears between the track name and the artist name. Its width is fixed, not responsive to the column — a deliberate punctuation mark, not a divider that spans the full width.
 
 ### Display Layout (DirectionA)
-The core artboard: 1024×600px, hard-fixed dimensions. Cover on the left (440×440px), metadata on the right (1fr). Top status strip (30px, suppressed in compact variant). Inset: 60px top, 50px sides, 40px bottom. Grid gap: 44px.
+The core artboard: 1024×600px **reference** dimensions (the production renderer scales these proportionally — see the resolution-independence note above; this is not a hard-fixed artboard in code). Cover on the left (440×440px), metadata on the right (1fr). Top status strip (30px, suppressed in compact variant). Inset: 60px top, 50px sides, 40px bottom. Grid gap: 44px.
 
 **Status strip background:** The strip uses `p.surface` as a solid background color, visually distinguishing it from the main artboard without a visible border. This grounds the status information at the top edge and provides a natural anchor for the status dot and side/position counter.
 
@@ -223,7 +223,7 @@ An optional context row that appears below the catalog footer line. Shows the tr
 
 ### Do:
 - **Do** use the `muted` role at full opacity for secondary text. Its color already communicates subdued; additional opacity stacks invisibly against dark backgrounds and fails contrast.
-- **Do** enforce ≥60° hue separation between any two albums' `accent` colors in `design/src/data.js`. Unconstrained extraction clusters toward warm orange; the collection needs to span the hue wheel.
+- **Do** enforce ≥60° hue separation between any two albums' `accent` colors in `design/src/data.js`. Unconstrained extraction clusters toward warm orange; the collection needs to span the hue wheel. **⚠️ Aspirational / prototype-only (A-1):** this is a hand-tuned guideline for the prototype's `data.js`. The **production renderer does not implement it** — there is no cross-album accent registry, no OKLCH conversion, and no hue-separation check; `accent` is the single most-saturated quantized color of the *current* cover, in isolation. Treat the "Hue Diversity Rule" as a design goal, not a shipped invariant, until it's actually built.
 - **Do** set `alt` on album cover images to `"{artist} — {album}"`. The cover is the primary visual element; marking it decorative (`alt=""`) erases it from screen readers.
 - **Do** include `@media (prefers-reduced-motion: reduce)` on every `@keyframes` animation. The pulse and rotate animations are continuous; they need static fallbacks.
 - **Do** protect long album titles from overflow. The `title` level (32px Newsreader italic) needs `overflow: hidden` and `-webkit-line-clamp: 2` or equivalent; "Bachelor No. 2 or, the Last Remains of the Dodo" at 32px will overflow without it.
