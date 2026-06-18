@@ -51,9 +51,12 @@ class ShazamIOBackend(RecognizerBackend):
     The Shazam client is created once on first use and reused for every
     subsequent recognition (v1.3.3) — constructing a fresh client per chunk
     threw away its internal HTTP session several times a minute for no
-    benefit.  The shazamio import (recognize) and soundfile import (_encode_wav)
-    are kept lazy on purpose: they keep this module importable (and the rest of
-    the suite testable) on machines without the audio stack installed.
+    benefit.  recognize() is split into three isolated stages (A-13):
+    `_encode_wav` (executor), `_call_shazam` (transport), and the pure
+    `_parse_shazam` (response-shape parsing).  The shazamio import (_call_shazam)
+    and soundfile import (_encode_wav) are kept lazy on purpose: they keep this
+    module importable (and the rest of the suite testable) on machines without
+    the audio stack installed.
     """
 
     def __init__(self):
@@ -62,48 +65,64 @@ class ShazamIOBackend(RecognizerBackend):
     async def recognize(
         self, audio: np.ndarray, sample_rate: int
     ) -> Optional[RawRecognitionResult]:
+        # Three isolated stages (A-13): encode (executor) → call Shazam
+        # (transport) → parse (pure).  One broad except is the true boundary
+        # back to the recognition loop, which treats any failure as a miss.
         try:
-            from shazamio import Shazam
-
-            # ShazamIO expects bytes; serialize the chunk to an in-memory WAV in
-            # an executor.  soundfile's sf.write is a blocking C call (~1.3 MB
-            # encode from a ~2.6 MB float32 chunk) that would otherwise stall the
-            # event loop inline on every chunk, every ~10-30s (P-6).
+            # Serialize the chunk to an in-memory WAV in an executor — soundfile's
+            # sf.write is a blocking C call (~1.3 MB encode from a ~2.6 MB float32
+            # chunk) that would otherwise stall the event loop inline (P-6).
             loop = asyncio.get_running_loop()
             wav_bytes = await loop.run_in_executor(
                 None, self._encode_wav, audio, sample_rate
             )
-
-            if self._shazam is None:
-                self._shazam = Shazam()
-            result = await self._shazam.recognize(wav_bytes)
-
-            track = result.get("track")
-            if not track:
-                return None
-
-            # Pull album from the metadata section if present.
-            # Break both loops as soon as the album is found — without the
-            # outer break the inner break only exits the metadata loop and
-            # subsequent sections could overwrite the value.
-            album = ""
-            for section in track.get("sections", []):
-                for meta in section.get("metadata", []):
-                    if meta.get("title", "").lower() == "album":
-                        album = meta.get("text", "")
-                        break
-                if album:
-                    break
-
-            return RawRecognitionResult(
-                title=track.get("title", ""),
-                artist=track.get("subtitle", ""),
-                album=album,
-                isrc=track.get("isrc"),
-            )
+            result = await self._call_shazam(wav_bytes)
+            return self._parse_shazam(result)
         except Exception as e:
             log.warning(f"ShazamIO recognition failed: {e}")
             return None
+
+    async def _call_shazam(self, wav_bytes: bytes) -> dict:
+        """Transport-only: lazily build the Shazam client and call it.
+
+        The shazamio import is kept lazy here so the module stays importable
+        (and the suite testable) on machines without the audio stack (A-13).
+        """
+        from shazamio import Shazam
+
+        if self._shazam is None:
+            self._shazam = Shazam()
+        return await self._shazam.recognize(wav_bytes)
+
+    @staticmethod
+    def _parse_shazam(result: dict) -> Optional[RawRecognitionResult]:
+        """Pure parse of a Shazam JSON response → RawRecognitionResult or None.
+
+        No I/O, no imports — unit-testable against captured JSON, isolating the
+        fragile Shazam response-shape knowledge from transport (A-13).
+        """
+        track = (result or {}).get("track")
+        if not track:
+            return None
+
+        # Pull album from the metadata section if present.  Break BOTH loops as
+        # soon as the album is found — without the outer break the inner break
+        # only exits the metadata loop and a later section could overwrite it.
+        album = ""
+        for section in track.get("sections", []):
+            for meta in section.get("metadata", []):
+                if meta.get("title", "").lower() == "album":
+                    album = meta.get("text", "")
+                    break
+            if album:
+                break
+
+        return RawRecognitionResult(
+            title=track.get("title", ""),
+            artist=track.get("subtitle", ""),
+            album=album,
+            isrc=track.get("isrc"),
+        )
 
     @staticmethod
     def _encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
