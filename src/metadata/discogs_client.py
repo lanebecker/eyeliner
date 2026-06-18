@@ -175,20 +175,22 @@ class DiscogsClient:
 
         Returns None if the release is not found in the collection.
         """
-        # Strategy 1: database candidates → collection membership check
+        # Strategy 1: database candidates → collection membership check.
+        # A membership check returns None ONLY for a definitive 404 ("you don't
+        # own this pressing") → try the next candidate.  Any other error
+        # (timeout, 5xx) is a "couldn't determine" and is allowed to propagate
+        # so the resolver leaves the album uncached and retries on the next
+        # track, instead of silently downgrading an owned record to a
+        # database/fallback result for the rest of the session (B-4).
         candidates = self._database_search(artist, album, limit=25)
         for release in candidates:
-            try:
-                instance_id = self._get_collection_instance_id(release.id)
-                if instance_id is not None:
-                    log.debug(
-                        f"Found in collection (strategy 1): '{release.title}' "
-                        f"(release {release.id}, instance {instance_id})"
-                    )
-                    return self._build_result(release, instance_id=instance_id)
-            except Exception as e:
-                log.debug(f"Collection check failed for release {release.id}: {e}")
-                continue
+            instance_id = self._get_collection_instance_id(release.id)
+            if instance_id is not None:
+                log.debug(
+                    f"Found in collection (strategy 1): '{release.title}' "
+                    f"(release {release.id}, instance {instance_id})"
+                )
+                return self._build_result(release, instance_id=instance_id)
 
         # Strategy 2: walk the collection and fuzzy-match
         log.debug(
@@ -417,13 +419,16 @@ class DiscogsClient:
             return None
 
     def _database_search(self, artist: str, album: str, limit: int = 25) -> list:
-        """Search the Discogs database and return up to `limit` Release objects."""
-        try:
-            results = self._client.search(album, artist=artist, type="release")
-            return list(results.page(1)[:limit])
-        except Exception as e:
-            log.warning(f"Discogs database search failed for '{artist} / {album}': {e}")
-            return []
+        """Search the Discogs database and return up to `limit` Release objects.
+
+        A genuine "no matches" returns an empty list; a hard API error (network,
+        429, 5xx) is allowed to RAISE so the caller can treat it as "couldn't
+        determine" rather than "not found" (B-13).  Swallowing the error here
+        used to make every track fall through to the slow collection walk and
+        let an owned album be cached as a database/fallback downgrade.
+        """
+        results = self._client.search(album, artist=artist, type="release")
+        return list(results.page(1)[:limit])
 
     def _get_collection_instance_id(self, release_id: int) -> Optional[int]:
         """Check whether a release is in the user's collection.
@@ -465,8 +470,12 @@ class DiscogsClient:
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
+                # A page fetch failing is "couldn't determine," not "walked
+                # everything and found no match" — re-raise so the resolver
+                # doesn't cache an owned record as a downgrade (B-13).  A
+                # genuine no-match falls through to the `return None` below.
                 log.warning(f"Collection walk failed on page {page}: {e}")
-                return None
+                raise
 
             releases = data.get("releases", [])
             if not releases:
