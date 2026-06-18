@@ -136,7 +136,15 @@ class MetadataResolver:
             )
             if result:
                 log.debug(f"Resolved from Discogs database: {raw.artist} / {raw.album}")
-                self._cache_store(key, MetadataSource.DISCOGS_DATABASE, result)
+                # Only cache the database result if the collection tier above
+                # completed cleanly.  If the collection lookup ERRORED (a
+                # transient blip — "couldn't determine ownership"), caching this
+                # DATABASE downgrade would pin an album the user may actually own
+                # to no-Play-Count tracking for the rest of the session (B-4).
+                # Return it for this track, but leave it uncached so the next
+                # track retries the collection lookup.
+                if discogs_completed:
+                    self._cache_store(key, MetadataSource.DISCOGS_DATABASE, result)
                 return self._from_discogs(raw, result, MetadataSource.DISCOGS_DATABASE)
         except NotImplementedError:
             pass  # Not yet implemented — fall through
