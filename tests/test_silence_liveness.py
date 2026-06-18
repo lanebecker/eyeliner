@@ -103,6 +103,40 @@ def test_reset_music_state_reemits_music_started():
     assert AudioEvent.MUSIC_STARTED in events
 
 
+def test_reset_during_music_then_silence_still_fires_session_ended(monkeypatch):
+    """The bug a naive reset introduces: stream errors mid-music, the album ends
+    during the outage, and the stream recovers straight into silence.  Forcing
+    _is_music False means process() never sees the music→silence edge that arms
+    the timer — so reset_music_state() must arm it, or the completed album's
+    SESSION_ENDED is lost forever."""
+    t = [1000.0]
+    d, events = make_detector(session_end=45)
+    patch_clock(monkeypatch, t)
+
+    d.process(loud(), 1)             # music playing, _is_music True
+    d.reset_music_state()            # stream error mid-music → restart
+    events.clear()
+
+    t[0] = 1001.0
+    d.process(quiet(), 1)            # recovers into silence (album already ended)
+    t[0] = 1001.0 + 45
+    d.tick()
+    assert AudioEvent.SESSION_ENDED in events
+
+
+def test_reset_at_startup_does_not_arm_timer(monkeypatch):
+    """The first reset (startup, no music ever played) must NOT arm the timer —
+    otherwise SESSION_ENDED would fire spuriously after 45s of idle."""
+    t = [0.0]
+    d, events = make_detector(session_end=45)
+    patch_clock(monkeypatch, t)
+
+    d.reset_music_state()            # startup: was_music False
+    t[0] = 100.0
+    d.tick()
+    assert AudioEvent.SESSION_ENDED not in events
+
+
 def test_reset_music_state_preserves_silence_timer(monkeypatch):
     """The critical correctness property: resetting on a stream restart that
     happens DURING silence must not strand the end-of-session timer."""

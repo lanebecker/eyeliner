@@ -153,7 +153,14 @@ class AudioCapture:
         """
         while self._running:
             await asyncio.sleep(_SILENCE_TICK_SECONDS)
-            self.silence.tick()
+            try:
+                self.silence.tick()
+            except Exception as e:
+                # A listener raising must not kill the ticker — that would
+                # permanently disable the session-end safety net this task
+                # exists to provide.  (CancelledError is BaseException and is
+                # intentionally NOT caught, so shutdown still propagates.)
+                log.error(f"Silence ticker tick failed: {e}")
 
     async def run(self):
         """Main capture loop. Streams audio and dispatches overlapping chunks."""

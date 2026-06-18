@@ -95,22 +95,30 @@ class SilenceDetector:
         self._check_session_end(time.monotonic())
 
     def reset_music_state(self):
-        """Clear a stuck "music playing" flag on audio-stream (re)start (B-6).
+        """Reconcile detection state on audio-stream (re)start (B-6).
 
-        Without this, a >45s mid-music stall that tears down and rebuilds the
-        stream leaves _is_music=True, so when audio returns process() sees no
-        False→True transition and never emits MUSIC_STARTED (the now-playing
-        card would stay stuck on the pre-stall track).
+        Two failure modes are handled:
 
-        Deliberately resets ONLY the music flag — NOT _silence_since /
-        _session_ended.  If the stall happens during post-album silence, the
-        end-of-session timer must keep running (it's the tick()/process() path
-        that credits the album); clearing it here would re-create the very
-        lost-Play-Count bug B-6 fixes.  The music invariant guarantees this is
-        safe: _is_music is True only while _silence_since is None, so forcing
-        the flag False never strands an armed silence timer.
+        1. A >45s mid-music stall leaves _is_music=True, so when audio returns
+           process() sees no False→True transition and never emits
+           MUSIC_STARTED.  Forcing _is_music False fixes that.
+
+        2. BUT forcing _is_music False also means the normal music→silence
+           transition — the ONLY place process() arms _silence_since — won't be
+           observed if the album ended *during* the outage and the stream
+           recovers straight into silence.  Without arming the timer here, that
+           completed album's SESSION_ENDED would never fire and its Play Count
+           would be lost (the exact bug B-6 fixes, via a different door).
+
+        So: if music was interrupted, arm the end-of-session timer now (unless
+        it's already armed, or a session already ended).  If music actually
+        resumes instead, the next loud chunk's MUSIC_STARTED clears it.  A reset
+        during already-tracked silence leaves the existing timer untouched.
         """
+        was_music = self._is_music
         self._is_music = False
+        if was_music and self._silence_since is None and not self._session_ended:
+            self._silence_since = time.monotonic()
 
     @property
     def is_music_playing(self) -> bool:
