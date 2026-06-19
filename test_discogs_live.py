@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Live integration test for DiscogsClient.
+"""Live integration check for the Discogs reader/writer.
 
 Hits the real Discogs API using your config.yaml credentials.
-All tests are read-only by default.
+All checks are read-only by default.
 
 Usage:
     python test_discogs_live.py                # read-only
@@ -40,7 +40,7 @@ def info(msg): print(f"     {msg}")
 # Individual tests
 # ---------------------------------------------------------------------------
 
-def test_search_collection(client) -> Optional[dict]:
+def check_search_collection(client) -> Optional[dict]:
     sep(f"1 · search_collection  —  {TEST_ARTIST} / {TEST_ALBUM}")
     try:
         result = client.search_collection(TEST_ARTIST, TEST_ALBUM)
@@ -71,7 +71,7 @@ def test_search_collection(client) -> Optional[dict]:
     return result
 
 
-def test_search_database(client):
+def check_search_database(client):
     sep(f"2 · search_database  —  {TEST_ARTIST} / {TEST_ALBUM}")
     try:
         result = client.search_database(TEST_ARTIST, TEST_ALBUM)
@@ -89,7 +89,7 @@ def test_search_database(client):
     ok(f"Year:       {result.get('year') or '(unknown)'}")
 
 
-def test_get_tracklist(client, release_id: int):
+def check_get_tracklist(client, release_id: int):
     sep(f"3 · get_tracklist  —  release {release_id}")
     try:
         tracks = client.get_tracklist(release_id)
@@ -107,7 +107,7 @@ def test_get_tracklist(client, release_id: int):
         info(f"    {t.position:<4} {t.title}{dur}")
 
 
-def test_collection_fields(client):
+def check_collection_fields(client):
     sep("4 · collection fields")
     try:
         fields = client._get_collection_fields()
@@ -133,7 +133,7 @@ def test_collection_fields(client):
         )
 
 
-def test_increment_play_count(client, collection_result: Optional[dict]):
+def check_increment_play_count(client, collection_result: Optional[dict]):
     sep("5 · increment_play_count  —  WRITE TEST")
     if collection_result is None:
         fail("Skipping — requires a successful search_collection result first.")
@@ -204,16 +204,16 @@ def main():
         info("Mode:             read-only  (pass --test-write to also test the field update)")
 
     # Run tests
-    collection_result = test_search_collection(reader)
-    test_search_database(reader)
+    collection_result = check_search_collection(reader)
+    check_search_database(reader)
 
     if collection_result:
-        test_get_tracklist(reader, collection_result["release_id"])
+        check_get_tracklist(reader, collection_result["release_id"])
 
-    test_collection_fields(writer)
+    check_collection_fields(writer)
 
     if args.test_write:
-        test_increment_play_count(writer, collection_result)
+        check_increment_play_count(writer, collection_result)
     else:
         sep("5 · increment_play_count  —  skipped (read-only mode)")
         info("Run with --test-write to also test the Play Count increment.")

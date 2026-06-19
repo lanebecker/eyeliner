@@ -800,5 +800,6 @@ All source modules are complete. The only remaining work requires hardware:
   stripe placeholder; the richer layout (last-played art grid, clock, random
   collection suggestion) is planned for v1.5.0
 
-See `docs/testing-guide.md` for the full pre-hardware unit test suite (341 tests)
-and `docs/pi-setup-guide.md` for hardware bring-up instructions.
+See `docs/testing-guide.md` for the full pre-hardware unit test suite (run
+`pytest --collect-only -q | tail -1` for the current count) and
+`docs/pi-setup-guide.md` for hardware bring-up instructions.
