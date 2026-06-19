@@ -1,18 +1,23 @@
-"""Unit tests for cover-art download hardening (findings S-1, S-2).
+"""Unit tests for cover-art download hardening (findings S-1, S-2, S-7).
 
 S-1 — SSRF + unbounded download: cover URLs must be https, host-allow-listed,
       resolve to a public IP, follow only re-validated redirects, carry an
       image/* Content-Type, and abort past a byte cap.
 S-2 — downloaded bytes are image-verified (type + pixel bounds) before caching.
+S-7 — the host is resolved EXACTLY ONCE and the connection is pinned to that
+      vetted IP, so a second attacker-controlled DNS answer can't rebind the
+      socket to an internal host between check and fetch.  The whole hop is
+      rejected if ANY resolved address is non-public.
 
-No real network or DNS is used: requests.get and socket resolution are mocked.
-The module-level helpers are pure functions, so we test them directly without
-constructing a pygame-backed DisplayRenderer.
+No real network or DNS is used: socket resolution and the pinned-stream opener
+(_open_cover_stream) are mocked.  The module-level helpers are pure functions,
+so we test them directly without constructing a pygame-backed DisplayRenderer.
 """
 
 import io
 import os
 import types
+from urllib.parse import urlsplit
 
 import pytest
 from PIL import Image
@@ -32,25 +37,23 @@ def _png_bytes(width=64, height=64, color=(180, 90, 40)):
 
 
 class _FakeResp:
-    """Minimal stand-in for a streamed requests.Response."""
+    """Minimal stand-in for a streamed urllib3 HTTPResponse."""
 
-    def __init__(self, *, status_code=200, headers=None, body=b"", is_redirect=False):
-        self.status_code = status_code
+    def __init__(self, *, status=200, headers=None, body=b""):
+        self.status = status
         self.headers = headers or {}
         self._body = body
-        self.is_redirect = is_redirect
-        self.closed = False
+        self.released = False
 
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise r.requests.HTTPError(f"status {self.status_code}")
+    def stream(self, amt=65536, decode_content=False):
+        for i in range(0, len(self._body), amt):
+            yield self._body[i:i + amt]
 
-    def iter_content(self, chunk_size=65536):
-        for i in range(0, len(self._body), chunk_size):
-            yield self._body[i:i + chunk_size]
+    def release_conn(self):
+        self.released = True
 
     def close(self):
-        self.closed = True
+        pass
 
 
 def _renderer_stub(tmp_path):
@@ -88,52 +91,79 @@ def test_disallowed_hosts(host):
 
 
 # ---------------------------------------------------------------------------
-# _validate_cover_url
+# _validated_public_ip — resolve ONCE, return the IP to pin (S-7)
 # ---------------------------------------------------------------------------
 
-def test_validate_rejects_http_to_disallowed_host(monkeypatch):
-    # http is only upgraded for allow-listed hosts; an unknown host is rejected
-    # regardless of scheme.
-    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
-    with pytest.raises(ValueError):
-        r._validate_cover_url("http://evil.example/cover.jpg")
+def test_validated_public_ip_returns_global(monkeypatch):
+    monkeypatch.setattr(
+        r.socket, "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))],
+    )
+    assert r._validated_public_ip("i.discogs.com") == "93.184.216.34"
 
 
-def test_validate_rejects_disallowed_host(monkeypatch):
-    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
-    with pytest.raises(ValueError):
-        r._validate_cover_url("https://evil.example/cover.jpg")
+@pytest.mark.parametrize("ip", [
+    "192.168.1.10", "127.0.0.1", "10.0.0.5", "169.254.1.1",
+    # Non-private but still non-routable / dangerous space the classifier must
+    # reject: multicast (224/4 reports is_global=True!), unspecified, broadcast,
+    # and reserved (240/4).
+    "224.0.0.1", "0.0.0.0", "255.255.255.255", "240.0.0.1",
+])
+def test_validated_public_ip_rejects_private(monkeypatch, ip):
+    monkeypatch.setattr(
+        r.socket, "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", (ip, 0))],
+    )
+    assert r._validated_public_ip("i.discogs.com") is None
 
 
-def test_validate_rejects_private_ip(monkeypatch):
-    # Allow-listed host, but it resolves to a private address (rebinding/SSRF).
-    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: False)
-    with pytest.raises(ValueError):
-        r._validate_cover_url("https://i.discogs.com/cover.jpg")
+def test_validated_public_ip_rejects_mixed_set(monkeypatch):
+    # A rebinding answer mixing a public and an internal IP must reject the WHOLE
+    # hop — picking "the first public one" would let the attacker's private entry
+    # be the one requests connects to (S-7).
+    monkeypatch.setattr(
+        r.socket, "getaddrinfo",
+        lambda *a, **k: [
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+            (2, 1, 6, "", ("127.0.0.1", 0)),
+        ],
+    )
+    assert r._validated_public_ip("i.discogs.com") is None
 
 
-def test_validate_accepts_good_url(monkeypatch):
-    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
-    # Returns the URL to fetch (unchanged for an already-https URL).
-    assert r._validate_cover_url("https://i.discogs.com/cover.jpg") == \
-        "https://i.discogs.com/cover.jpg"
+def test_validated_public_ip_rejects_ipv4_mapped_loopback(monkeypatch):
+    # ::ffff:127.0.0.1 must not slip past the public/private check in v6 clothing.
+    monkeypatch.setattr(
+        r.socket, "getaddrinfo",
+        lambda *a, **k: [(10, 1, 6, "", ("::ffff:127.0.0.1", 0, 0, 0))],
+    )
+    assert r._validated_public_ip("i.discogs.com") is None
 
 
-def test_validate_upgrades_http_to_https_for_allowlisted_host(monkeypatch):
-    # Cover Art Archive sometimes returns http; we upgrade rather than reject.
-    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
-    out = r._validate_cover_url("http://coverartarchive.org/release/x/front")
-    assert out == "https://coverartarchive.org/release/x/front"
+def test_validated_public_ip_normalizes_ipv4_mapped_public(monkeypatch):
+    # A mapped PUBLIC address must be returned in its clean IPv4 form so the
+    # pinned connection dials a connectable address, not "::ffff:8.8.8.8".
+    monkeypatch.setattr(
+        r.socket, "getaddrinfo",
+        lambda *a, **k: [(10, 1, 6, "", ("::ffff:93.184.216.34", 0, 0, 0))],
+    )
+    assert r._validated_public_ip("i.discogs.com") == "93.184.216.34"
 
 
-def test_validate_rejects_non_http_scheme(monkeypatch):
-    monkeypatch.setattr(r, "_host_resolves_to_public_ip", lambda h: True)
-    with pytest.raises(ValueError):
-        r._validate_cover_url("file:///etc/passwd")
+def test_validated_public_ip_fails_closed_on_dns_error(monkeypatch):
+    def boom(*a, **k):
+        raise r.socket.gaierror("no such host")
+    monkeypatch.setattr(r.socket, "getaddrinfo", boom)
+    assert r._validated_public_ip("i.discogs.com") is None
+
+
+def test_validated_public_ip_fails_closed_on_empty(monkeypatch):
+    monkeypatch.setattr(r.socket, "getaddrinfo", lambda *a, **k: [])
+    assert r._validated_public_ip("i.discogs.com") is None
 
 
 # ---------------------------------------------------------------------------
-# _host_resolves_to_public_ip
+# _host_resolves_to_public_ip — thin yes/no predicate over the above
 # ---------------------------------------------------------------------------
 
 def test_public_ip_accepts_global(monkeypatch):
@@ -158,6 +188,96 @@ def test_public_ip_fails_closed_on_dns_error(monkeypatch):
         raise r.socket.gaierror("no such host")
     monkeypatch.setattr(r.socket, "getaddrinfo", boom)
     assert r._host_resolves_to_public_ip("i.discogs.com") is False
+
+
+# ---------------------------------------------------------------------------
+# _validate_cover_url — returns (fetch_url, host, pinned_ip)
+# ---------------------------------------------------------------------------
+
+def test_validate_rejects_http_to_disallowed_host(monkeypatch):
+    # http is only upgraded for allow-listed hosts; an unknown host is rejected
+    # regardless of scheme.
+    monkeypatch.setattr(r, "_validated_public_ip", lambda h: "1.2.3.4")
+    with pytest.raises(ValueError):
+        r._validate_cover_url("http://evil.example/cover.jpg")
+
+
+def test_validate_rejects_disallowed_host(monkeypatch):
+    monkeypatch.setattr(r, "_validated_public_ip", lambda h: "1.2.3.4")
+    with pytest.raises(ValueError):
+        r._validate_cover_url("https://evil.example/cover.jpg")
+
+
+def test_validate_rejects_private_ip(monkeypatch):
+    # Allow-listed host, but it resolves to a non-public address (rebinding/SSRF).
+    monkeypatch.setattr(r, "_validated_public_ip", lambda h: None)
+    with pytest.raises(ValueError):
+        r._validate_cover_url("https://i.discogs.com/cover.jpg")
+
+
+def test_validate_accepts_good_url(monkeypatch):
+    monkeypatch.setattr(r, "_validated_public_ip", lambda h: "93.184.216.34")
+    # Returns (fetch_url, host, pinned_ip); url unchanged for already-https.
+    assert r._validate_cover_url("https://i.discogs.com/cover.jpg") == (
+        "https://i.discogs.com/cover.jpg", "i.discogs.com", "93.184.216.34"
+    )
+
+
+def test_validate_upgrades_http_to_https_for_allowlisted_host(monkeypatch):
+    # Cover Art Archive sometimes returns http; we upgrade rather than reject.
+    monkeypatch.setattr(r, "_validated_public_ip", lambda h: "93.184.216.34")
+    out = r._validate_cover_url("http://coverartarchive.org/release/x/front")
+    assert out == (
+        "https://coverartarchive.org/release/x/front",
+        "coverartarchive.org",
+        "93.184.216.34",
+    )
+
+
+def test_validate_rejects_non_http_scheme(monkeypatch):
+    monkeypatch.setattr(r, "_validated_public_ip", lambda h: "1.2.3.4")
+    with pytest.raises(ValueError):
+        r._validate_cover_url("file:///etc/passwd")
+
+
+# ---------------------------------------------------------------------------
+# _open_cover_stream — the actual urllib3 wiring the S-7 pin turns on
+# ---------------------------------------------------------------------------
+
+def test_open_cover_stream_dials_ip_but_tls_for_hostname(monkeypatch):
+    """Lock the kwarg contract: the pool must DIAL the pinned IP while keeping
+    SNI + cert verification bound to the hostname.  Mocks urllib3 so no socket
+    is opened, but asserts the exact construction the pin depends on — without
+    this, a urllib3 upgrade that dropped server_hostname would leave every other
+    test green while silently breaking the fix.
+    """
+    captured = {}
+
+    class _FakePool:
+        def __init__(self, host, **kwargs):
+            captured["host"] = host
+            captured["kwargs"] = kwargs
+
+        def urlopen(self, method, path, **kwargs):
+            captured["method"] = method
+            captured["path"] = path
+            captured["urlopen_kwargs"] = kwargs
+            return "SENTINEL_RESPONSE"
+
+    monkeypatch.setattr(r.urllib3, "HTTPSConnectionPool", _FakePool)
+
+    out = r._open_cover_stream(
+        "https://i.discogs.com/a/b.png?x=1", "i.discogs.com", "93.184.216.34", 15
+    )
+
+    assert out == "SENTINEL_RESPONSE"
+    assert captured["host"] == "93.184.216.34"                      # dial the vetted IP
+    assert captured["kwargs"]["server_hostname"] == "i.discogs.com"  # SNI -> hostname
+    assert captured["kwargs"]["assert_hostname"] == "i.discogs.com"  # cert -> hostname
+    assert captured["kwargs"]["cert_reqs"] == "CERT_REQUIRED"
+    assert captured["path"] == "/a/b.png?x=1"                       # path + query preserved
+    assert captured["method"] == "GET"
+    assert captured["urlopen_kwargs"]["redirect"] is False          # we walk redirects ourselves
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +307,14 @@ def test_image_validation_rejects_oversized(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _download_cover_blocking — end-to-end with mocked HTTP (S-1 + S-2)
+# _download_cover_blocking — end-to-end with mocked pinned stream (S-1 + S-2 + S-7)
 # ---------------------------------------------------------------------------
 
 def test_download_happy_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(r, "_validate_cover_url", lambda u: "i.discogs.com")
+    monkeypatch.setattr(r, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "93.184.216.34"))
     resp = _FakeResp(headers={"Content-Type": "image/png"}, body=_png_bytes())
-    monkeypatch.setattr(r.requests, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(r, "_open_cover_stream", lambda *a, **k: resp)
 
     stub = _renderer_stub(tmp_path)
     dest = tmp_path / "cover.png"
@@ -201,14 +322,50 @@ def test_download_happy_path(tmp_path, monkeypatch):
 
     assert dest.exists()
     assert dest.stat().st_size > 0
+    assert resp.released  # connection handed back
     # No leftover .part tempfiles.
     assert not any(n.startswith(".cover-") for n in os.listdir(tmp_path))
 
 
+def test_download_pins_connection_to_validated_ip(tmp_path, monkeypatch):
+    # The CORE S-7 guarantee: the IP that _validate_cover_url vetted is the exact
+    # address the connection is opened against — no second, independent resolve.
+    seen = {}
+    monkeypatch.setattr(r, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "93.184.216.34"))
+
+    def fake_open(fetch_url, host, pinned_ip, timeout):
+        seen["host"] = host
+        seen["ip"] = pinned_ip
+        return _FakeResp(headers={"Content-Type": "image/png"}, body=_png_bytes())
+
+    monkeypatch.setattr(r, "_open_cover_stream", fake_open)
+
+    stub = _renderer_stub(tmp_path)
+    stub._download_cover_blocking("https://i.discogs.com/x.png", tmp_path / "c.png")
+
+    assert seen["ip"] == "93.184.216.34"
+    assert seen["host"] == "i.discogs.com"
+
+
 def test_download_rejects_non_image_content_type(tmp_path, monkeypatch):
-    monkeypatch.setattr(r, "_validate_cover_url", lambda u: "i.discogs.com")
+    monkeypatch.setattr(r, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
     resp = _FakeResp(headers={"Content-Type": "text/html"}, body=b"<html>")
-    monkeypatch.setattr(r.requests, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(r, "_open_cover_stream", lambda *a, **k: resp)
+
+    stub = _renderer_stub(tmp_path)
+    dest = tmp_path / "cover.png"
+    with pytest.raises(ValueError):
+        stub._download_cover_blocking("https://i.discogs.com/x", dest)
+    assert not dest.exists()
+
+
+def test_download_rejects_http_error_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(r, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
+    resp = _FakeResp(status=404, headers={"Content-Type": "image/png"}, body=b"")
+    monkeypatch.setattr(r, "_open_cover_stream", lambda *a, **k: resp)
 
     stub = _renderer_stub(tmp_path)
     dest = tmp_path / "cover.png"
@@ -218,11 +375,12 @@ def test_download_rejects_non_image_content_type(tmp_path, monkeypatch):
 
 
 def test_download_aborts_past_size_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(r, "_validate_cover_url", lambda u: "i.discogs.com")
+    monkeypatch.setattr(r, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
     monkeypatch.setattr(r, "_MAX_COVER_BYTES", 1024)
-    big = b"\x89PNG\r\n" + b"\x00" * 5000  # > 1 KB cap (header doesn't matter; cap trips first)
+    big = b"\x89PNG\r\n" + b"\x00" * 5000  # > 1 KB cap (cap trips first)
     resp = _FakeResp(headers={"Content-Type": "image/png"}, body=big)
-    monkeypatch.setattr(r.requests, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(r, "_open_cover_stream", lambda *a, **k: resp)
 
     stub = _renderer_stub(tmp_path)
     dest = tmp_path / "cover.png"
@@ -234,9 +392,10 @@ def test_download_aborts_past_size_cap(tmp_path, monkeypatch):
 
 def test_download_rejects_malicious_image_bytes(tmp_path, monkeypatch):
     # Passes the Content-Type gate but is not a decodable image → S-2 verify trips.
-    monkeypatch.setattr(r, "_validate_cover_url", lambda u: "i.discogs.com")
+    monkeypatch.setattr(r, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
     resp = _FakeResp(headers={"Content-Type": "image/png"}, body=b"GIF-not-really" * 10)
-    monkeypatch.setattr(r.requests, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(r, "_open_cover_stream", lambda *a, **k: resp)
 
     stub = _renderer_stub(tmp_path)
     dest = tmp_path / "cover.png"
@@ -245,28 +404,34 @@ def test_download_rejects_malicious_image_bytes(tmp_path, monkeypatch):
     assert not dest.exists()
 
 
-def test_download_follows_validated_redirect(tmp_path, monkeypatch):
+def test_download_follows_and_repins_validated_redirect(tmp_path, monkeypatch):
     seen = []
 
-    def fake_get(url, **kwargs):
-        seen.append(url)
-        if "coverartarchive.org" in url:
+    # Validate per hop, deriving the host from the URL; every hop is pinned.
+    monkeypatch.setattr(
+        r, "_validate_cover_url",
+        lambda u: (u, urlsplit(u).hostname, "93.184.216.34"),
+    )
+
+    def fake_open(fetch_url, host, pinned_ip, timeout):
+        seen.append((host, pinned_ip))
+        if "coverartarchive.org" in fetch_url:
             return _FakeResp(
-                status_code=307,
+                status=307,
                 headers={"Location": "https://ia800200.us.archive.org/cover.png"},
-                is_redirect=True,
             )
         return _FakeResp(headers={"Content-Type": "image/png"}, body=_png_bytes())
 
-    # _validate_cover_url returns the (normalized) URL to fetch; here it's a no-op.
-    monkeypatch.setattr(r, "_validate_cover_url", lambda u: u)
-    monkeypatch.setattr(r.requests, "get", fake_get)
+    monkeypatch.setattr(r, "_open_cover_stream", fake_open)
 
     stub = _renderer_stub(tmp_path)
     dest = tmp_path / "cover.png"
     stub._download_cover_blocking("https://coverartarchive.org/release/x/front", dest)
 
     assert dest.exists()
+    hosts = [h for h, _ in seen]
     # Both the original and the redirect target were validated + fetched.
-    assert any("coverartarchive.org" in u for u in seen)
-    assert any("archive.org" in u for u in seen)
+    assert any("coverartarchive.org" in h for h in hosts)
+    assert any("archive.org" in h for h in hosts)
+    # EVERY hop was pinned to a vetted IP (re-validation per hop, S-7).
+    assert all(ip == "93.184.216.34" for _, ip in seen)

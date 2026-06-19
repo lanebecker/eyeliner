@@ -8,7 +8,7 @@ shazamio>=0.6.0
 
 # Discogs
 python3-discogs-client>=2.6.0
-requests>=2.31.0  # Used directly in discogs_client.py + renderer.py (also transitive dep of discogs-client)
+requests>=2.31.0  # Used directly in the Discogs transport (also transitive dep of discogs-client)
 
 # Cover art fallback
 musicbrainzngs>=0.7.1
@@ -16,6 +16,12 @@ musicbrainzngs>=0.7.1
 # Display
 pygame>=2.5.0
 Pillow>=10.0.0
+# Cover-art fetch pins the connection to a vetted IP (S-7); these are imported
+# directly by src/display/renderer.py, not just transitively via requests.
+# urllib3>=2.0 is required: the IP-pinned HTTPSConnectionPool relies on the
+# server_hostname kwarg being forwarded to the connection (TLS SNI).
+urllib3>=2.0.0
+certifi>=2023.7.22
 
 # HTTP / async
 aiohttp>=3.9.0

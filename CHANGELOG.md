@@ -9,8 +9,23 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-_Nothing yet. Add notes here as features are built, then move them under a
-new version heading when VERSION is bumped._
+### Security
+
+- **Cover-art fetch pins the connection to a validated IP (S-7, #62).** The
+  download path previously resolved the host once to vet it, then let
+  `requests` resolve it again to connect — a check-then-use (TOCTOU) window an
+  attacker controlling DNS for an allow-listed host could exploit to rebind the
+  second lookup to an internal address. `_validate_cover_url` now resolves each
+  hop **exactly once** and returns the pinned IP; `_open_cover_stream` dials that
+  exact IP via a `urllib3.HTTPSConnectionPool` while keeping TLS SNI +
+  certificate verification bound to the original hostname (`server_hostname` /
+  `assert_hostname`). The whole hop is rejected if **any** resolved address is
+  non-public, IPv4-mapped IPv6 is normalized before classification, and
+  multicast/reserved/unspecified space is now rejected (plugging an
+  `is_global`-only gap where `224/4` slipped through). Redirects are
+  re-validated and re-pinned per hop. The renderer no longer imports `requests`;
+  `urllib3>=2.0` and `certifi` are now explicit direct dependencies.
+  Mutation-audited; suite grew to ~562.
 
 ---
 

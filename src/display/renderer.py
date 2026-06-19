@@ -93,9 +93,10 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, Tuple, TYPE_CHECKING
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
-import requests
+import certifi
+import urllib3
 
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
@@ -108,7 +109,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Cover-art download safety (findings S-1 / S-2)
+# Cover-art download safety (findings S-1 / S-2 / S-7)
 # ---------------------------------------------------------------------------
 # `cover_art_url` originates from untrusted external APIs (Discogs image `uri`,
 # the MusicBrainz Cover Art Archive).  A poisoned entry — or a MITM, since we do
@@ -117,9 +118,15 @@ log = logging.getLogger(__name__)
 # that exploits a stale decoder.  The download path therefore:
 #   * requires https,
 #   * restricts the host to an allow-list of known cover-art providers,
-#   * refuses any hop whose host resolves to a private / loopback / link-local IP
-#     (defends against DNS rebinding and redirect-to-internal),
-#   * follows redirects manually so every hop is re-validated,
+#   * resolves each hop's host EXACTLY ONCE, rejects the hop unless every
+#     resolved address is public, and then pins the connection to that one
+#     vetted IP — so the address we validate is the address we connect to.  This
+#     closes the validate-then-resolve-again DNS-rebinding TOCTOU (S-7): a second,
+#     attacker-controlled DNS answer can no longer steer the socket to an
+#     internal host between the check and the fetch.  TLS still verifies the
+#     certificate against the original hostname (SNI + assert_hostname), so
+#     pinning to an IP does not weaken authentication.
+#   * follows redirects manually so every hop is re-validated and re-pinned,
 #   * aborts after _MAX_COVER_BYTES,
 #   * requires an image/* Content-Type, and
 #   * verifies the decoded image (type + pixel bounds) before it is cached.
@@ -157,40 +164,75 @@ def _host_is_allowed(host: Optional[str]) -> bool:
     )
 
 
-def _host_resolves_to_public_ip(host: str) -> bool:
-    """True only if every DNS result for `host` is a global (public) address.
+def _validated_public_ip(host: str) -> Optional[str]:
+    """Resolve `host` ONCE and return a single public IP to pin to, else None.
 
-    Blocks an allow-listed name that resolves to a private / loopback /
-    link-local / reserved address — the DNS-rebinding and redirect-to-internal
-    SSRF vectors (S-1).  Fails closed: any resolution error returns False.
+    Returning the concrete address to connect to — rather than a yes/no — is what
+    lets the download pin the socket to the exact IP that was vetted, closing the
+    validate-then-resolve-again DNS-rebinding TOCTOU (S-7).  The whole hop is
+    rejected if ANY resolved address is non-public, which also defeats a single
+    rebinding answer that mixes a public and an internal IP.  Fails closed: any
+    resolution / parse error returns None.
     """
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        return False
+        return None
     if not infos:
-        return False
+        return None
+    pinned: Optional[str] = None
     for info in infos:
         ip_str = info[4][0]
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
-            return False
-        if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local:
-            return False
-    return True
+            return None
+        # Normalize an IPv4-mapped IPv6 address (e.g. ::ffff:127.0.0.1) to its
+        # IPv4 view so a private/loopback address can't be smuggled past the
+        # classification dressed up in v6 clothing.
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        # The classifier IS the security boundary, so be maximal: is_global alone
+        # lets multicast (224/4 reports is_global=True) through, and the rest are
+        # belt-and-suspenders for unspecified/reserved/loopback/link-local space.
+        if (
+            not ip.is_global
+            or ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return None
+        if pinned is None:
+            pinned = str(ip)
+    return pinned
 
 
-def _validate_cover_url(url: str) -> str:
-    """Validate and normalize a single cover-art URL hop; return the URL to fetch.
+def _host_resolves_to_public_ip(host: str) -> bool:
+    """True iff every DNS result for `host` is a global (public) address.
 
-    - The host must be allow-listed and resolve to a public address (S-1).
+    Thin predicate over :func:`_validated_public_ip`, kept for callers/tests that
+    only need the yes/no.  The download path uses the IP-returning function so it
+    can pin the connection to the vetted address (S-7).
+    """
+    return _validated_public_ip(host) is not None
+
+
+def _validate_cover_url(url: str) -> Tuple[str, str, str]:
+    """Validate one cover-art URL hop; return ``(fetch_url, host, pinned_ip)``.
+
+    - The host must be allow-listed (S-1).
+    - The host is resolved here EXACTLY ONCE and every resolved address must be
+      public; the returned ``pinned_ip`` is the address the caller MUST connect
+      to so the socket is pinned to precisely what was vetted (S-7).
     - http is upgraded to https for allow-listed hosts (the MusicBrainz Cover
       Art Archive sometimes returns http URLs; upgrading only ever makes the
       request more secure, and avoids silently dropping every fallback cover).
 
     Raises ValueError if the scheme is not http(s), the host is not allow-listed,
-    or the host resolves to a non-public address.
+    or the host does not resolve to a usable public address.
     """
     parts = urlsplit(url)
     host = parts.hostname
@@ -198,11 +240,49 @@ def _validate_cover_url(url: str) -> str:
         raise ValueError(f"cover URL scheme not allowed: {parts.scheme!r}")
     if not _host_is_allowed(host):
         raise ValueError(f"cover URL host not allow-listed: {host!r}")
-    if not _host_resolves_to_public_ip(host):
+    pinned_ip = _validated_public_ip(host)
+    if pinned_ip is None:
         raise ValueError(f"cover URL host resolves to a non-public address: {host!r}")
     if parts.scheme == "http":
         url = parts._replace(scheme="https").geturl()
-    return url
+    return url, host, pinned_ip
+
+
+def _open_cover_stream(fetch_url: str, host: str, pinned_ip: str, timeout: int):
+    """Open a streaming GET to `fetch_url`, dialing the pre-validated `pinned_ip`
+    but performing TLS for `host` (SNI + certificate hostname check).
+
+    This is the seam that makes the S-7 pin real: urllib3 connects to the exact
+    address vetted by :func:`_validate_cover_url`, while ``server_hostname`` /
+    ``assert_hostname`` keep certificate verification bound to the original
+    hostname — so pinning to an IP doesn't weaken authentication.  Redirects are
+    NOT followed here; :meth:`DisplayRenderer._download_cover_blocking` walks and
+    re-validates each hop.  Returns a urllib3 ``HTTPResponse`` opened with
+    ``preload_content=False`` for streaming.
+    """
+    parts = urlsplit(fetch_url)
+    port = parts.port or 443
+    path = parts.path or "/"
+    if parts.query:
+        path = f"{path}?{parts.query}"
+    pool = urllib3.HTTPSConnectionPool(
+        pinned_ip,
+        port=port,
+        server_hostname=host,   # TLS SNI presented to the server
+        assert_hostname=host,   # certificate must match the real hostname
+        cert_reqs="CERT_REQUIRED",
+        ca_certs=certifi.where(),
+        timeout=urllib3.Timeout(connect=timeout, read=timeout),
+    )
+    return pool.urlopen(
+        "GET",
+        path,
+        headers={"Host": host, "User-Agent": "vinyl-now-playing/1.0"},
+        redirect=False,
+        retries=False,
+        preload_content=False,
+        decode_content=False,
+    )
 
 
 # Suppress pygame audio (we're output-only) and point to the right display
@@ -1449,8 +1529,8 @@ class DisplayRenderer:
         display is marked dirty so the next frame picks up the fresh image.
 
         Implementation details:
-          - Uses requests.get with an explicit timeout so a hung CDN connection
-            can't tie up an executor thread indefinitely.
+          - Uses a urllib3 pool with an explicit connect/read timeout so a hung
+            CDN connection can't tie up an executor thread indefinitely.
           - Writes to a tempfile in the cache directory first, then atomically
             renames into place — partial downloads (network drop, process kill)
             never leave a half-written file that _load_cover would fail on.
@@ -1474,13 +1554,17 @@ class DisplayRenderer:
     def _download_cover_blocking(self, url: str, cache_path: Path):
         """Synchronous cover-art download — must run in an executor.
 
-        Hardened against SSRF, oversized responses, and malicious images
-        (findings S-1 / S-2):
+        Hardened against SSRF (incl. DNS rebinding), oversized responses, and
+        malicious images (findings S-1 / S-2 / S-7):
 
-          - Every URL hop is validated (https + allow-listed host + public IP)
-            via _validate_cover_url before any request is made.
-          - Redirects are followed manually (allow_redirects=False) so each hop
-            is re-validated; the chain is capped at _MAX_COVER_REDIRECTS.
+          - Every URL hop is validated AND resolved exactly once by
+            _validate_cover_url (https + allow-listed host + public IP); the
+            connection is then pinned to that exact IP via _open_cover_stream,
+            with TLS still verified against the hostname — so a second,
+            attacker-controlled DNS answer can't redirect the socket to an
+            internal address between check and fetch (S-7).
+          - Redirects are followed manually so each hop is re-validated and
+            re-pinned; the chain is capped at _MAX_COVER_REDIRECTS.
           - The final response must carry an image/* Content-Type.
           - The body is streamed with a running byte counter that aborts past
             _MAX_COVER_BYTES.
@@ -1488,28 +1572,25 @@ class DisplayRenderer:
             into the cache, so neither pygame nor Pillow ever decodes an
             unvalidated file.
 
-        The 15s timeout covers both connection setup and per-chunk reads.
+        The timeout covers both connection setup and per-chunk reads.
         """
-        # Walk the redirect chain ourselves, validating every hop.
+        # Walk the redirect chain ourselves, validating + pinning every hop.
         current_url = url
         resp = None
         try:
             for _ in range(_MAX_COVER_REDIRECTS + 1):
-                current_url = _validate_cover_url(current_url)
-                resp = requests.get(
-                    current_url,
-                    timeout=_COVER_CONNECT_READ_TIMEOUT,
-                    stream=True,
-                    allow_redirects=False,
+                fetch_url, host, pinned_ip = _validate_cover_url(current_url)
+                resp = _open_cover_stream(
+                    fetch_url, host, pinned_ip, _COVER_CONNECT_READ_TIMEOUT
                 )
-                if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                if resp.status in (301, 302, 303, 307, 308):
                     location = resp.headers.get("Location")
-                    resp.close()
+                    resp.release_conn()
+                    resp = None
                     if not location:
                         raise ValueError("redirect with no Location header")
-                    # Resolve relative redirects against the current URL.
-                    current_url = requests.compat.urljoin(current_url, location)
-                    resp = None
+                    # Resolve relative redirects against the current hostname URL.
+                    current_url = urljoin(fetch_url, location)
                     continue
                 break
             else:
@@ -1517,8 +1598,8 @@ class DisplayRenderer:
 
             if resp is None:
                 raise ValueError("no response fetching cover art")
-
-            resp.raise_for_status()
+            if resp.status >= 400:
+                raise ValueError(f"cover art fetch returned HTTP {resp.status}")
 
             content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if not content_type.startswith("image/"):
@@ -1534,7 +1615,7 @@ class DisplayRenderer:
             try:
                 total = 0
                 with tmp as f:
-                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    for chunk in resp.stream(64 * 1024):
                         if not chunk:
                             continue
                         total += len(chunk)
@@ -1555,7 +1636,7 @@ class DisplayRenderer:
                 raise
         finally:
             if resp is not None:
-                resp.close()
+                resp.release_conn()
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
         """Load and scale cover art from the local file cache.
