@@ -14,6 +14,8 @@ The backend is replaced with a MagicMock; we drive _handle_result() directly.
 """
 from unittest.mock import MagicMock, AsyncMock, patch
 
+import asyncio
+
 import numpy as np
 import pytest
 
@@ -316,3 +318,72 @@ async def test_enqueue_below_capacity_keeps_everything():
     await loop_obj.enqueue(np.full(4, 1.0, dtype=np.float32), 44100)
     await loop_obj.enqueue(np.full(4, 2.0, dtype=np.float32), 44100)
     assert loop_obj._audio_queue.qsize() == 2
+
+
+# ---------------------------------------------------------------------------
+# run() — the actual polling loop (T-2: previously never driven; tests only
+# ever called _handle_result directly)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_pulls_a_chunk_recognizes_it_and_emits(monkeypatch):
+    """A queued chunk is pulled, handed to the backend, and the recognized
+    result flows through _handle_result to on_confirmed — then a cancel unwinds
+    the infinite loop cleanly."""
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
+
+    raw = make_raw()
+    loop.backend.recognize = AsyncMock(return_value=raw)
+
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
+
+    task = asyncio.create_task(loop.run())
+    # Yield enough times for the loop to drain the queue, recognize, and commit.
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if on_confirmed.await_count:
+            break
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    loop.backend.recognize.assert_awaited_once()
+    on_confirmed.assert_awaited_once_with(raw)  # confirmation_required=1 → immediate
+
+
+@pytest.mark.asyncio
+async def test_run_swallows_a_backend_error_and_keeps_looping(monkeypatch):
+    """A backend exception is caught (logged + short sleep), not fatal: the loop
+    survives to process the next chunk."""
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
+
+    # First recognize raises, second succeeds — the loop must reach the second.
+    raw = make_raw()
+    loop.backend.recognize = AsyncMock(side_effect=[RuntimeError("shazam blip"), raw])
+
+    # Collapse the error-path back-off (asyncio.sleep(2)) to a real zero-yield so
+    # the test doesn't wait wall-clock seconds, while still ceding control to the
+    # loop (a plain mock wouldn't yield, and the run() task would never advance).
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_secs):
+        await real_sleep(0)
+
+    monkeypatch.setattr("src.audio.recognizer.asyncio.sleep", fast_sleep)
+
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
+    await loop.enqueue(np.ones(4, dtype=np.float32), 44100)
+
+    task = asyncio.create_task(loop.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if on_confirmed.await_count:
+            break
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert loop.backend.recognize.await_count == 2   # survived the first error
+    on_confirmed.assert_awaited_once_with(raw)
