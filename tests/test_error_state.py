@@ -79,6 +79,7 @@ def make_renderer():
     r._static_surface = None
     r._listening_since = None
     r._arc_segment = None
+    r._arc_rot_cache = _BoundedCache(64)   # P-10: cached boot-arc rotations
     return r
 
 

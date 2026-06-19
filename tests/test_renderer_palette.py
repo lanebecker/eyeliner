@@ -15,6 +15,10 @@ Verifies:
     30 fps transition lerping a palette to itself)
   ✓ A genuinely new palette mid-steady-state retargets and restarts the timer
 """
+import io
+
+from PIL import Image
+
 from src.display.renderer import (
     DisplayRenderer,
     _BoundedCache,
@@ -22,6 +26,15 @@ from src.display.renderer import (
 )
 from src.display.cover_cache import CoverArtCache
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
+
+
+def _write_cover(store, url, color=(180, 90, 40)):
+    """Write a real (decodable) cover image to the store's path for *url*."""
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), color).save(buf, format="PNG")
+    path = store.path_for(url)
+    path.write_bytes(buf.getvalue())
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +57,7 @@ def make_renderer(tmp_path, dynamic_theming=True):
     r._current_palette = FALLBACK_PALETTE
     r._target_palette = FALLBACK_PALETTE
     r._transition_start = 0.0
+    r._wanted_cover_url = None
     return r
 
 
@@ -123,3 +137,69 @@ def test_new_palette_after_steady_state_retargets(tmp_path, monkeypatch):
     assert r._target_palette == other
     assert r._transition_start == 200.0
     assert r._transition_start > first_start    # strict: the timer was restarted
+
+
+# ---------------------------------------------------------------------------
+# P-9 — palette extraction never decodes on the event loop
+# ---------------------------------------------------------------------------
+
+def test_queue_palette_does_not_decode_disk_cover(tmp_path):
+    """P-9: _queue_palette runs inside set_track's Signal callback on the event
+    loop, so it must NOT decode — even when the cover file is already on disk and
+    the palette isn't cached yet.  It targets FALLBACK; the async path extracts."""
+    r = make_renderer(tmp_path)
+    url = "https://i.discogs.com/c.jpg"
+    _write_cover(r._cover_store, url)          # file present, palette NOT cached
+    r._queue_palette(url)
+    assert r._target_palette == FALLBACK_PALETTE   # no inline extraction happened
+    assert r._palette_cache.get(url) is None
+
+
+async def test_extract_palette_async_extracts_off_loop_and_requeues(tmp_path):
+    """The off-loop path decodes (in an executor), caches, and re-queues the
+    transition to the real palette."""
+    r = make_renderer(tmp_path)
+    url = "https://i.discogs.com/c.jpg"
+    _write_cover(r._cover_store, url)
+    r._wanted_cover_url = url                   # this cover is the one on screen
+
+    await r._extract_palette_async(url)
+
+    cached = r._palette_cache.get(url)
+    assert cached is not None
+    assert cached != FALLBACK_PALETTE          # a real palette was extracted
+    assert r._target_palette == cached         # and re-queued as the target
+
+
+async def test_extract_palette_async_does_not_overwrite_newer_cover(tmp_path):
+    """Stale-decode guard: a slow extraction for a PREVIOUS track must cache its
+    palette but NOT retarget the live transition over the cover now on screen."""
+    r = make_renderer(tmp_path)
+    old_url = "https://i.discogs.com/a.jpg"
+    _write_cover(r._cover_store, old_url)
+    r._wanted_cover_url = "https://i.discogs.com/b.jpg"   # track B is now current
+
+    await r._extract_palette_async(old_url)               # A's late decode lands
+
+    assert r._palette_cache.get(old_url) is not None      # cached for later reuse
+    assert r._target_palette == FALLBACK_PALETTE          # but NOT painted over B
+
+
+async def test_extract_palette_async_noop_when_file_missing(tmp_path):
+    """No cover on disk yet → no extraction, no cache entry (the prefetch
+    download path will call back here once the file lands)."""
+    r = make_renderer(tmp_path)
+    url = "https://i.discogs.com/missing.jpg"
+    await r._extract_palette_async(url)
+    assert r._palette_cache.get(url) is None
+    assert r._target_palette == FALLBACK_PALETTE
+
+
+async def test_extract_palette_async_uses_cache_without_decoding(tmp_path):
+    """Already-cached palette → just re-queue it; no file or decode needed."""
+    r = make_renderer(tmp_path)
+    url = "https://i.discogs.com/c.jpg"
+    r._palette_cache.put(url, ALT_PALETTE)     # cached; deliberately no file on disk
+    r._wanted_cover_url = url
+    await r._extract_palette_async(url)
+    assert r._target_palette == ALT_PALETTE

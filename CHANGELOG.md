@@ -51,6 +51,27 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
   bytes, pruned on startup and after each download — and the prune never evicts
   the cover just written (guards an mtime-tie / coarse-SD-clock eviction race).
 
+### Changed (performance — long-run stability)
+
+- **Palette extraction moved off the event loop (P-9, #66).** `_queue_palette`
+  runs synchronously inside `PlayerState.set_track`'s observer callback on the
+  event loop, and used to decode the cover with Pillow inline (tens of ms on the
+  Pi) on a cache miss — violating the Signal "listeners must not block" contract.
+  It now never decodes: it targets the fallback palette on a miss, while a new
+  `_extract_palette_async` decodes in an executor and re-queues the real palette.
+  A "wanted cover" guard ensures a slow decode for a previous track can't paint
+  its palette over the track now on screen. _Minor visible trade:_ a cover whose
+  palette isn't yet in the in-memory cache (e.g. the first track after boot) now
+  lerps fallback→album over one executor hop instead of appearing fully themed on
+  the first frame — which is the same fallback→album transition the empty-state
+  screens already use; repeat albums within a session stay instant via the cache.
+- **Boot-arc rotation is cached by angle bucket (P-10, #67).** The identifying
+  spinner used to call `pygame.transform.rotate` every frame for the whole
+  (possibly minute-plus) wait; it now quantizes to 24 angle buckets and reuses a
+  cached rotated Surface per `(radius, accent, bucket)`, mirroring the status
+  dot's pulse buckets (P-3). Steady-state optimization; during the ≤1s palette
+  lerp it falls back to per-frame rotation (never worse than before).
+
 ---
 
 ## [1.5.0] — 2026-06-19

@@ -149,6 +149,15 @@ _PULSE_SECS = 1.6
 # Boot arc rotation period (seconds) — DESIGN.md: 1.4s linear infinite.
 _ARC_SECS = 1.4
 
+# Pre-rendered boot-arc rotation buckets (P-10).  The arc spins once per
+# _ARC_SECS, sampled at the boot cadence (~10 fps ≈ 14 frames/turn), so 24
+# evenly-spaced angles are smoother than the eye can resolve while letting the
+# rotated Surface be cached + reused instead of re-rotated every frame.
+_ARC_ROT_BUCKETS = 24
+# Cap on the rotated-arc cache: _ARC_ROT_BUCKETS per accent colour; the rest is
+# churn during the 1s palette lerp.  Bounded like every other cache (P-8 ethos).
+_ARC_ROT_CACHE_MAX = 64
+
 # Muted red for the error state (DESIGN.md §5: #c85050).
 _ERROR_RED = (200, 80, 80)
 
@@ -374,11 +383,18 @@ class DisplayRenderer:
         # Empty-state machinery (v1.4.1)
         self._listening_since: Optional[float] = None        # boot-label elapsed clock
         self._arc_segment = None                             # pre-rendered boot/error arc
+        self._arc_rot_cache = _BoundedCache(_ARC_ROT_CACHE_MAX)  # rotated boot arcs (P-10)
 
         # Strong references to fire-and-forget tasks (cover prefetches).
         # asyncio only keeps weak references to tasks, so without this a
         # running download could in principle be garbage-collected mid-flight.
         self._bg_tasks: set = set()
+
+        # The cover URL the display currently WANTS to show (set on every state
+        # change).  An off-loop palette extraction (P-9) re-queues its result
+        # only if this still matches — otherwise a slow decode for a previous
+        # track could retarget the palette over the track now on screen.
+        self._wanted_cover_url: Optional[str] = None
 
         self.state.on_change(self._on_state_change)
 
@@ -442,12 +458,14 @@ class DisplayRenderer:
         # When a new track arrives, queue a palette transition and prefetch cover art
         if state.status == PlayerStatus.PLAYING and state.current_track:
             url = state.current_track.cover_art_url
+            self._wanted_cover_url = url
             self._queue_palette(url)
             if url:
                 self._spawn(self._prefetch_cover(url))
         elif state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR, PlayerStatus.LISTENING):
             # Empty states always use the fallback palette (DESIGN.md §2);
             # lerp back smoothly rather than jump-cutting.
+            self._wanted_cover_url = None
             self._queue_palette(None)
 
     # -----------------------------------------------------------------------
@@ -1058,7 +1076,13 @@ class DisplayRenderer:
     def _draw_boot_arc(self, target, layout: NowPlayingLayout,
                        p: DisplayPalette, elapsed: float):
         """Rotate the accent arc segment over the boot empty cover
-        (1.4s linear infinite; static under reduced_motion)."""
+        (1.4s linear infinite; static under reduced_motion).
+
+        The rotated Surface is quantized to one of _ARC_ROT_BUCKETS angles and
+        cached per (radius, colour, bucket), so the boot screen reuses a handful
+        of pre-rotated arcs instead of calling pygame.transform.rotate on every
+        frame for the whole (possibly minute-plus) identification wait (P-10) —
+        the same bucketing the status dot uses (P-3)."""
         import pygame
 
         s = min(self.width / 1024, self.height / 600)
@@ -1067,10 +1091,17 @@ class DisplayRenderer:
         cx = ca.x + ca.w // 2
         cy = ca.y + ca.h // 2 - int(24 * s)
 
-        arc = self._get_arc_segment(arc_r, p.accent)
-        if not self.reduced_motion:
-            angle = -(elapsed % _ARC_SECS) / _ARC_SECS * 360.0
-            arc = pygame.transform.rotate(arc, angle)
+        base = self._get_arc_segment(arc_r, p.accent)
+        if self.reduced_motion:
+            arc = base
+        else:
+            bucket = int((elapsed % _ARC_SECS) / _ARC_SECS * _ARC_ROT_BUCKETS) % _ARC_ROT_BUCKETS
+            key = (arc_r, p.accent, bucket)
+            arc = self._arc_rot_cache.get(key)
+            if arc is None:
+                angle = -(bucket / _ARC_ROT_BUCKETS) * 360.0
+                arc = pygame.transform.rotate(base, angle)
+                self._arc_rot_cache.put(key, arc)
         target.blit(arc, arc.get_rect(center=(cx, cy)))
 
     # -----------------------------------------------------------------------
@@ -1300,14 +1331,12 @@ class DisplayRenderer:
         elif (cached := self._palette_cache.get(cover_url)) is not None:
             target = cached  # get() already refreshed its eviction position
         else:
-            # Extraction happens synchronously here; cover art is already cached
-            # on disk from _prefetch_cover(), so no network I/O.
-            cache_path = self._cover_store.path_for(cover_url)
-            if cache_path.exists():
-                target = extract_palette(cache_path)
-                self._palette_cache.put(cover_url, target)  # put() handles eviction
-            else:
-                target = FALLBACK_PALETTE
+            # P-9: _queue_palette must NEVER decode — it runs synchronously inside
+            # set_track's Signal callback on the event loop, and Pillow decode +
+            # quantize is tens of ms on the Pi.  When the palette isn't cached yet
+            # we target FALLBACK for now; _extract_palette_async (in an executor)
+            # extracts off-loop and re-queues with the real palette a frame later.
+            target = FALLBACK_PALETTE
 
         # Skip the retarget entirely when nothing changed (v1.3.5): every
         # track commit notifies the renderer, and tracks from the same album
@@ -1341,28 +1370,59 @@ class DisplayRenderer:
     # -----------------------------------------------------------------------
 
     async def _prefetch_cover(self, url: str):
-        """Download cover art to the local cache without blocking the render loop.
+        """Ensure the cover for *url* is on disk and its palette extracted, all
+        off the event loop.
 
         Scheduled via asyncio.create_task() from _on_state_change() so the
-        download runs in a thread-pool executor and never stalls the event loop.
-        The SSRF-hardened fetch + atomic write + disk bounding live in
-        CoverArtCache (A-15); once the file is on disk, palette extraction is
-        (re-)queued and the display is marked dirty so the next frame picks up
-        the fresh image.
+        download (SSRF-hardened fetch + atomic write + disk bounding in
+        CoverArtCache, A-15) and the palette extraction both run in a thread-pool
+        executor and never stall the event loop.  Note the palette step runs even
+        when the cover is ALREADY on disk (e.g. cached from a previous session) —
+        that warm-cache case is exactly what used to decode inline on the loop
+        (P-9).
         """
-        if self._cover_store.exists(url):
-            return  # Already cached — nothing to do
+        if not self._cover_store.exists(url):
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._cover_store.download, url)
+                log.debug(f"Cover art cached: {self._cover_store.path_for(url).name}")
+            except Exception as e:
+                log.warning(f"Failed to download cover art from {url}: {e}")
+                return
 
+        await self._extract_palette_async(url)
+        self._dirty = True
+
+    async def _extract_palette_async(self, url: str):
+        """Extract a cover's palette in an executor, cache it, and re-queue the
+        transition — keeping Pillow decode + quantize off the event loop (P-9).
+
+        A no-op if dynamic theming is off, the palette is already cached (just
+        re-queue, no decode), or the cover file isn't on disk yet (the prefetch
+        download path will call back here once it lands).
+        """
+        if not self.dynamic_theming:
+            return
+        if self._palette_cache.get(url) is not None:
+            if url == self._wanted_cover_url:
+                self._queue_palette(url)  # cache hit → real palette, no decode
+            return
+        cache_path = self._cover_store.path_for(url)
+        if not cache_path.exists():
+            return
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._cover_store.download, url)
-            log.debug(f"Cover art cached: {self._cover_store.path_for(url).name}")
-            # File is now on disk — extract palette and trigger a redraw
-            if self.dynamic_theming:
-                self._queue_palette(url)
-            self._dirty = True
+            palette = await loop.run_in_executor(None, extract_palette, cache_path)
         except Exception as e:
-            log.warning(f"Failed to download cover art from {url}: {e}")
+            log.warning(f"Palette extraction failed for {url}: {e}")
+            return
+        # Always cache (the palette is valid for this URL regardless of timing)...
+        self._palette_cache.put(url, palette)
+        # ...but only retarget the live transition if this cover is still the one
+        # the display wants — a slow decode for a previous track must not paint
+        # its palette over whatever is on screen now.
+        if url == self._wanted_cover_url:
+            self._queue_palette(url)
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
         """Load and scale cover art from the local file cache.

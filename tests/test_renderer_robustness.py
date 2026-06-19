@@ -146,3 +146,73 @@ async def test_missing_cover_does_not_refetch(tmp_path):
 
     assert result is None
     assert refetched == []
+
+
+# ---------------------------------------------------------------------------
+# P-10 — boot-arc rotation is cached by angle bucket (not re-rotated per frame)
+# ---------------------------------------------------------------------------
+
+def test_boot_arc_rotation_is_bucketed(monkeypatch):
+    """The boot arc spins for the whole identification wait; rotating it every
+    frame is wasteful.  Frames landing in the same angle bucket must reuse a
+    cached rotated Surface (one rotate), and only a new bucket triggers another."""
+    from src.display.renderer import (
+        _BoundedCache as _BC,
+        _ARC_ROT_BUCKETS,
+        _ARC_ROT_CACHE_MAX,
+        _ARC_SECS,
+    )
+
+    r = DisplayRenderer.__new__(DisplayRenderer)
+    r.width, r.height = 1024, 600
+    r.reduced_motion = False
+    r._arc_segment = None
+    r._arc_rot_cache = _BC(_ARC_ROT_CACHE_MAX)
+
+    layout = get_now_playing_layout(1024, 600)
+    target = pygame.Surface((1024, 600))
+
+    calls = []
+    real_rotate = pygame.transform.rotate
+    monkeypatch.setattr(
+        pygame.transform, "rotate",
+        lambda surf, angle: calls.append(angle) or real_rotate(surf, angle),
+    )
+
+    bucket_dt = _ARC_SECS / _ARC_ROT_BUCKETS
+    # Two frames inside bucket 0 → exactly one rotate (second is a cache hit).
+    r._draw_boot_arc(target, layout, FALLBACK_PALETTE, 0.0)
+    r._draw_boot_arc(target, layout, FALLBACK_PALETTE, bucket_dt * 0.4)
+    assert len(calls) == 1
+
+    # A frame in bucket 1 → one additional rotate.
+    r._draw_boot_arc(target, layout, FALLBACK_PALETTE, bucket_dt * 1.5)
+    assert len(calls) == 2
+
+
+def test_boot_arc_reduced_motion_never_rotates(monkeypatch):
+    """With reduced_motion the arc is static — no rotation at all (and no cache
+    churn), matching the design's prefers-reduced-motion translation."""
+    from src.display.renderer import _BoundedCache as _BC, _ARC_ROT_CACHE_MAX
+
+    r = DisplayRenderer.__new__(DisplayRenderer)
+    r.width, r.height = 1024, 600
+    r.reduced_motion = True
+    r._arc_segment = None
+    r._arc_rot_cache = _BC(_ARC_ROT_CACHE_MAX)
+
+    layout = get_now_playing_layout(1024, 600)
+    target = pygame.Surface((1024, 600))
+
+    calls = []
+    real_rotate = pygame.transform.rotate
+    monkeypatch.setattr(
+        pygame.transform, "rotate",
+        lambda surf, angle: calls.append(angle) or real_rotate(surf, angle),
+    )
+
+    r._draw_boot_arc(target, layout, FALLBACK_PALETTE, 0.0)
+    r._draw_boot_arc(target, layout, FALLBACK_PALETTE, 9.9)
+
+    assert calls == []                 # never rotated
+    assert len(r._arc_rot_cache) == 0  # and never cached
