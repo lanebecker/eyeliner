@@ -112,6 +112,25 @@ class AudioCapture:
             f"Available input devices: {available}"
         )
 
+    def _enqueue_block(self, blocks: asyncio.Queue, block: np.ndarray):
+        """Put an audio block on the queue, dropping the OLDEST first when it's
+        full so recent audio wins — the drop-oldest overflow policy the module
+        docstring sells as a correctness feature.
+
+        Runs on the event-loop thread (scheduled by the callback via
+        call_soon_threadsafe), never on the PortAudio audio thread.
+        """
+        if blocks.full():
+            try:
+                blocks.get_nowait()  # Drop the OLDEST block — recent audio wins
+                log.warning(
+                    "Audio block queue full; dropped the oldest block. "
+                    "The event loop appears to be stalling."
+                )
+            except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
+                pass
+        blocks.put_nowait(block)
+
     def _make_callback(self, loop: asyncio.AbstractEventLoop, blocks: asyncio.Queue):
         """Build the InputStream callback (runs on the PortAudio audio thread).
 
@@ -119,25 +138,12 @@ class AudioCapture:
         each block onto the event loop with call_soon_threadsafe, where
         _enqueue_block applies the drop-oldest overflow policy.
         """
-        def _enqueue_block(block: np.ndarray):
-            # Runs on the event loop thread.
-            if blocks.full():
-                try:
-                    blocks.get_nowait()  # Drop the OLDEST block — recent audio wins
-                    log.warning(
-                        "Audio block queue full; dropped the oldest block. "
-                        "The event loop appears to be stalling."
-                    )
-                except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
-                    pass
-            blocks.put_nowait(block)
-
         def callback(indata, frames, time_info, status):
             if status:
                 log.warning(f"Audio input status: {status}")
             # Copy: PortAudio reuses the indata buffer after the callback returns.
             block = indata[:, 0].copy()
-            loop.call_soon_threadsafe(_enqueue_block, block)
+            loop.call_soon_threadsafe(self._enqueue_block, blocks, block)
 
         return callback
 

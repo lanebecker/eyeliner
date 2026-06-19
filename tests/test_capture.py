@@ -15,15 +15,20 @@ What this covers (pure logic):
     ValueError listing available devices
   ✓ The overlap >= chunk startup guard (warns, disables overlap)
   ✓ Constructor config plumbing and defaults
+  ✓ _enqueue_block drop-oldest overflow policy (T-3)
+  ✓ _make_callback marshaling: channel-0 copy scheduled on the loop (T-3)
+  ✓ stop(): not-running flag + the None wake sentinel, edge cases (T-3)
 
 What this deliberately does NOT cover (genuinely hardware-bound):
   - The live sd.InputStream integration (callback timing, PortAudio
     behavior) — that still needs the Pi + UCA222; the windowing logic it
     drives is covered hardware-free by tests/test_chunking.py.
 """
+import asyncio
 import sys
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 # Make capture importable without PortAudio: only installs the stub when the
@@ -156,3 +161,104 @@ def test_find_device_not_found_raises_with_available_list():
     assert "Nonexistent Interface" in msg
     assert "Built-in Microphone" in msg
     assert "HDMI Output" not in msg
+
+
+# ---------------------------------------------------------------------------
+# _enqueue_block — drop-oldest overflow policy (T-3)
+#
+# Mirrors test_enqueue_drops_oldest_when_full for the recognizer: when the
+# block queue fills (the event loop stalled), the OLDEST block is evicted and
+# the newest admitted, so recognition always sees the freshest audio.
+# ---------------------------------------------------------------------------
+
+def test_enqueue_block_appends_when_not_full():
+    cap = make_capture()
+    q = asyncio.Queue(maxsize=4)
+    cap._enqueue_block(q, np.full(4, 1.0, dtype=np.float32))
+    cap._enqueue_block(q, np.full(4, 2.0, dtype=np.float32))
+    assert q.qsize() == 2
+
+
+def test_enqueue_block_drops_oldest_when_full():
+    cap = make_capture()
+    q = asyncio.Queue(maxsize=2)
+    cap._enqueue_block(q, np.full(4, 1.0, dtype=np.float32))   # oldest
+    cap._enqueue_block(q, np.full(4, 2.0, dtype=np.float32))   # queue now full
+    cap._enqueue_block(q, np.full(4, 3.0, dtype=np.float32))   # evict 1.0, admit 3.0
+
+    assert q.qsize() == 2
+    first = q.get_nowait()
+    second = q.get_nowait()
+    assert first[0] == 2.0    # the oldest (1.0) was dropped
+    assert second[0] == 3.0   # the newest was admitted
+
+
+# ---------------------------------------------------------------------------
+# _make_callback — marshals each block onto the event loop (T-3)
+# ---------------------------------------------------------------------------
+
+def test_callback_schedules_channel0_copy_on_the_loop():
+    cap = make_capture()
+    loop = MagicMock()
+    q = asyncio.Queue(maxsize=4)
+    callback = cap._make_callback(loop, q)
+
+    indata = np.array([[1.0], [2.0], [3.0]], dtype=np.float32)  # (frames, 1 channel)
+    callback(indata, 3, None, None)
+
+    loop.call_soon_threadsafe.assert_called_once()
+    fn, blocks_arg, block_arg = loop.call_soon_threadsafe.call_args[0]
+    assert fn == cap._enqueue_block          # marshalled to the enqueue, not run inline
+    assert blocks_arg is q
+    np.testing.assert_array_equal(block_arg, np.array([1.0, 2.0, 3.0], dtype=np.float32))
+
+
+def test_callback_copies_block_so_portaudio_buffer_reuse_is_safe():
+    """PortAudio reuses the indata buffer after the callback returns, so the
+    scheduled block must be an independent copy."""
+    cap = make_capture()
+    loop = MagicMock()
+    callback = cap._make_callback(loop, asyncio.Queue(maxsize=4))
+
+    indata = np.array([[1.0], [2.0]], dtype=np.float32)
+    callback(indata, 2, None, None)
+    block_arg = loop.call_soon_threadsafe.call_args[0][2]
+
+    indata[0, 0] = 99.0  # simulate PortAudio overwriting its buffer
+    assert block_arg[0] == 1.0  # the scheduled block is unaffected
+
+
+# ---------------------------------------------------------------------------
+# stop() — flips _running and wakes a parked run() with the None sentinel (T-3)
+# ---------------------------------------------------------------------------
+
+def test_stop_clears_running_and_enqueues_wake_sentinel():
+    cap = make_capture()
+    cap._blocks = asyncio.Queue(maxsize=4)
+    cap._running = True
+
+    cap.stop()
+
+    assert cap._running is False
+    assert cap._blocks.get_nowait() is None  # the sentinel that wakes blocks.get()
+
+
+def test_stop_is_safe_before_run_creates_a_queue():
+    cap = make_capture()
+    cap._blocks = None  # run() never started
+
+    cap.stop()  # must not raise
+
+    assert cap._running is False
+
+
+def test_stop_tolerates_a_full_block_queue():
+    cap = make_capture()
+    q = asyncio.Queue(maxsize=1)
+    q.put_nowait(np.zeros(4, dtype=np.float32))  # already full
+    cap._blocks = q
+    cap._running = True
+
+    cap.stop()  # QueueFull is swallowed — run() already has something to wake for
+
+    assert cap._running is False
