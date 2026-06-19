@@ -181,7 +181,7 @@ def main():
     # Make sure src/ imports resolve when running from the project root
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from src.config import load_config, ConfigError
-    from src.metadata.discogs_client import DiscogsClient
+    from src.metadata.discogs import DiscogsHttp, DiscogsReader, DiscogsCollectionWriter
 
     try:
         config = load_config()
@@ -189,11 +189,14 @@ def main():
         print(f"\n  ✗  {e}\n")
         sys.exit(1)
 
-    client = DiscogsClient(config.discogs)
+    # A-4: one shared transport; read tests use the reader, write tests the writer.
+    http = DiscogsHttp(config.discogs.user_token)
+    reader = DiscogsReader(http, config.discogs)
+    writer = DiscogsCollectionWriter(http, config.discogs)
 
     print()
-    info(f"User:             {client.username}")
-    info(f"Play Count field: '{client.play_count_field_name}'")
+    info(f"User:             {reader.username}")
+    info(f"Play Count field: '{writer.play_count_field_name}'")
     info(f"Test album:       {TEST_ARTIST} / {TEST_ALBUM}")
     if args.test_write:
         info("Mode:             READ + WRITE (--test-write)")
@@ -201,16 +204,16 @@ def main():
         info("Mode:             read-only  (pass --test-write to also test the field update)")
 
     # Run tests
-    collection_result = test_search_collection(client)
-    test_search_database(client)
+    collection_result = test_search_collection(reader)
+    test_search_database(reader)
 
     if collection_result:
-        test_get_tracklist(client, collection_result["release_id"])
+        test_get_tracklist(reader, collection_result["release_id"])
 
-    test_collection_fields(client)
+    test_collection_fields(writer)
 
     if args.test_write:
-        test_increment_play_count(client, collection_result)
+        test_increment_play_count(writer, collection_result)
     else:
         sep("5 · increment_play_count  —  skipped (read-only mode)")
         info("Run with --test-write to also test the Play Count increment.")

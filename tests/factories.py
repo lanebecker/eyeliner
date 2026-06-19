@@ -11,12 +11,19 @@ Each factory omits the dataclass's own optional fields from its defaults, so a
 no-argument call exercises the real dataclass default (e.g. overlap_seconds=5).
 """
 
+from unittest.mock import patch
+
 from src.config import (
     AudioConfig,
     DiscogsConfig,
     DisplayConfig,
     LastFmConfig,
     RecognitionConfig,
+)
+from src.metadata.discogs import (
+    DiscogsHttp,
+    DiscogsReader,
+    DiscogsCollectionWriter,
 )
 
 
@@ -56,3 +63,28 @@ def make_display_config(**overrides) -> DisplayConfig:
     base = dict(width=1024, height=600)
     base.update(overrides)
     return DisplayConfig(**base)
+
+
+# ---------------------------------------------------------------------------
+# Discogs (A-4 split): transport / reader / writer
+#
+# All three share the single HTTP seam — DiscogsHttp.session — so a test mocks
+# transport by assigning ``http.session.get`` / ``.post`` (exactly as the old
+# DiscogsClient tests assigned ``client._session.get``).  The reader also holds
+# the python3-discogs-client library Client, which is patched out at build time.
+# ---------------------------------------------------------------------------
+
+def make_discogs_http(token: str = "fake-token") -> DiscogsHttp:
+    return DiscogsHttp(token)
+
+
+def make_discogs_reader(http=None, config=None) -> DiscogsReader:
+    http = http if http is not None else make_discogs_http()
+    with patch("src.metadata.discogs.reader.discogs_client.Client"):
+        reader = DiscogsReader(http, config or make_discogs_config())
+    return reader
+
+
+def make_discogs_writer(http=None, config=None) -> DiscogsCollectionWriter:
+    http = http if http is not None else make_discogs_http()
+    return DiscogsCollectionWriter(http, config or make_discogs_config())

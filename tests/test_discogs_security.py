@@ -10,7 +10,7 @@ All HTTP interaction is mocked; nothing here touches the real Discogs API.
 
 import pytest
 
-from src.metadata.discogs_client import _as_id, _redact_url
+from src.metadata.discogs.transport import _as_id, _redact_url
 
 
 # ---------------------------------------------------------------------------

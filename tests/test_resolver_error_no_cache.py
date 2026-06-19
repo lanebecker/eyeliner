@@ -21,7 +21,7 @@ def make_raw():
 
 def make_resolver():
     r = MetadataResolver.__new__(MetadataResolver)  # bypass real client construction
-    r.discogs = MagicMock()
+    r.reader = MagicMock()
     r.coverart = MagicMock()
     r.coverart.get_cover_art_url.return_value = "https://coverartarchive.org/x/front"
     r._album_cache = {}
@@ -31,8 +31,8 @@ def make_resolver():
 @pytest.mark.asyncio
 async def test_transient_collection_error_is_not_cached():
     r = make_resolver()
-    r.discogs.search_collection.side_effect = ConnectionError("boom")  # couldn't determine
-    r.discogs.search_database.return_value = None                      # genuine no-match
+    r.reader.search_collection.side_effect = ConnectionError("boom")  # couldn't determine
+    r.reader.search_database.return_value = None                      # genuine no-match
 
     result = await r.resolve(make_raw())
 
@@ -48,8 +48,8 @@ async def test_collection_error_then_database_hit_is_not_cached():
     but must NOT be cached — otherwise an album the user may own is pinned to
     no-Play-Count tracking for the whole session (B-4)."""
     r = make_resolver()
-    r.discogs.search_collection.side_effect = ConnectionError("blip")  # couldn't determine
-    r.discogs.search_database.return_value = {
+    r.reader.search_collection.side_effect = ConnectionError("blip")  # couldn't determine
+    r.reader.search_database.return_value = {
         "release_id": 100, "instance_id": None, "album": "X",
     }
 
@@ -64,8 +64,8 @@ async def test_clean_collection_miss_then_database_hit_is_cached():
     """Control: a CLEAN collection miss (not an error) followed by a database
     hit still caches the database result — the existing, desired behaviour."""
     r = make_resolver()
-    r.discogs.search_collection.return_value = None  # clean "not owned"
-    r.discogs.search_database.return_value = {
+    r.reader.search_collection.return_value = None  # clean "not owned"
+    r.reader.search_database.return_value = {
         "release_id": 100, "instance_id": None, "album": "X",
     }
 
@@ -84,8 +84,8 @@ async def test_transient_vs_unexpected_collection_errors_log_differently(caplog)
 
     # Transient → info, "transient" in the message.
     r1 = make_resolver()
-    r1.discogs.search_collection.side_effect = ConnectionError("blip")
-    r1.discogs.search_database.return_value = None
+    r1.reader.search_collection.side_effect = ConnectionError("blip")
+    r1.reader.search_database.return_value = None
     with caplog.at_level(logging.INFO):
         await r1.resolve(make_raw())
     transient_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
@@ -96,8 +96,8 @@ async def test_transient_vs_unexpected_collection_errors_log_differently(caplog)
 
     # Unexpected (a real bug) → warning, "Unexpected" in the message.
     r2 = make_resolver()
-    r2.discogs.search_collection.side_effect = ValueError("a real bug")
-    r2.discogs.search_database.return_value = None
+    r2.reader.search_collection.side_effect = ValueError("a real bug")
+    r2.reader.search_database.return_value = None
     with caplog.at_level(logging.INFO):
         await r2.resolve(make_raw())
     warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -108,8 +108,8 @@ async def test_transient_vs_unexpected_collection_errors_log_differently(caplog)
 @pytest.mark.asyncio
 async def test_clean_miss_is_cached():
     r = make_resolver()
-    r.discogs.search_collection.return_value = None  # clean "not owned"
-    r.discogs.search_database.return_value = None    # clean "no match"
+    r.reader.search_collection.return_value = None  # clean "not owned"
+    r.reader.search_database.return_value = None    # clean "no match"
 
     await r.resolve(make_raw())
 

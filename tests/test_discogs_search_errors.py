@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
-from tests.test_discogs_client import make_client
+from tests.factories import make_discogs_reader
 
 
 # ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ from tests.test_discogs_client import make_client
 # ---------------------------------------------------------------------------
 
 def test_database_search_raises_on_hard_error():
-    client = make_client()
+    client = make_discogs_reader()
     client._client = MagicMock()
     client._client.search.side_effect = requests.exceptions.ConnectionError("boom")
     with pytest.raises(requests.exceptions.ConnectionError):
@@ -27,7 +27,7 @@ def test_database_search_raises_on_hard_error():
 
 
 def test_database_search_returns_empty_on_genuine_no_match():
-    client = make_client()
+    client = make_discogs_reader()
     client._client = MagicMock()
     page = MagicMock()
     page.page.return_value = []          # no matches (not an error)
@@ -43,9 +43,9 @@ def test_database_search_returns_empty_on_genuine_no_match():
 # ---------------------------------------------------------------------------
 
 def test_collection_index_build_error_propagates():
-    client = make_client()
+    client = make_discogs_reader()
     client._collection_index = None
-    client._request = MagicMock(side_effect=requests.exceptions.Timeout("slow"))
+    client._http.request = MagicMock(side_effect=requests.exceptions.Timeout("slow"))
     with pytest.raises(requests.exceptions.Timeout):
         client.search_collection("artist", "album")
 
@@ -66,7 +66,7 @@ def _index(release_id=111, instance_id=42, title="Sister", artists=("Sonic Youth
 
 
 def test_owned_candidate_returns_built_result():
-    client = make_client()
+    client = make_discogs_reader()
     client._collection_index = _index(111, 42)        # pre-built index (no HTTP)
     client._database_search = MagicMock(return_value=[_candidate(111)])
     client._build_result = MagicMock(return_value={"release_id": 111, "instance_id": 42})
@@ -77,7 +77,7 @@ def test_owned_candidate_returns_built_result():
 
 
 def test_candidate_not_in_index_is_not_owned():
-    client = make_client()
+    client = make_discogs_reader()
     client._collection_index = _index(999, 7)         # owns a DIFFERENT release
     client._database_search = MagicMock(return_value=[_candidate(111)])  # candidate not owned
 
@@ -88,7 +88,7 @@ def test_candidate_not_in_index_is_not_owned():
 def test_strategy_2_fuzzy_matches_index_without_extra_http():
     """A candidate whose release_id isn't owned still resolves if the index has
     a fuzzy artist+album match — matched locally, no per-release GET."""
-    client = make_client()
+    client = make_discogs_reader()
     client._collection_index = _index(111, 42, title="Sister", artists=("Sonic Youth",))
     client._database_search = MagicMock(return_value=[])  # strategy 1 finds nothing
     client._client = MagicMock()
@@ -103,7 +103,7 @@ def test_strategy_2_fuzzy_matches_index_without_extra_http():
 def test_strategy_2_release_fetch_error_propagates():
     """A transient error fetching the matched release in strategy 2 must
     propagate (couldn't-determine), not be swallowed as 'not owned' (B-4)."""
-    client = make_client()
+    client = make_discogs_reader()
     client._collection_index = _index(111, 42, title="Sister", artists=("Sonic Youth",))
     client._database_search = MagicMock(return_value=[])
     client._client = MagicMock()

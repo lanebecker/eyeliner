@@ -4,8 +4,8 @@ Logic:
   - Maintains a PlaySession from first track identification until SESSION_ENDED.
   - When the last track on the album is identified, sets potential_last_track = True.
   - On SESSION_ENDED (sustained silence), if potential_last_track is set:
-      1. Calls DiscogsClient.increment_play_count for the release.
-      2. Calls DiscogsClient.update_last_played if last_played_field_name is configured.
+      1. Calls DiscogsCollectionWriter.increment_play_count for the release.
+      2. Calls DiscogsCollectionWriter.update_last_played if last_played_field_name is configured.
       3. Calls LastFmClient.love on the last track if love_on_completion is enabled.
   - Conservative by design: if the last track was never identified (e.g. only
     Side A was played), none of the above updates are triggered.
@@ -38,7 +38,7 @@ from src.metadata.models import PlaySession, TrackMetadata
 from src.audio.silence import AudioEvent
 
 if TYPE_CHECKING:
-    from src.metadata.discogs_client import DiscogsClient
+    from src.metadata.discogs.writer import DiscogsCollectionWriter
     from src.tracking.lastfm_client import LastFmClient
 
 log = logging.getLogger(__name__)
@@ -53,13 +53,14 @@ class ListenTracker:
 
     def __init__(
         self,
-        discogs: "DiscogsClient",
+        writer: "DiscogsCollectionWriter",
         lastfm: Optional["LastFmClient"] = None,
     ):
-        # A-3: depend on a DiscogsClient by explicit composition, injected in
-        # main.py — not dug out of the resolver's internals (`resolver.discogs`),
-        # which coupled the tracker to the resolver's attribute layout.
-        self.discogs = discogs
+        # A-4: depend only on the Discogs WRITE half (Play Count / Last Played),
+        # injected at the composition root (main.py).  A-3 had already moved this
+        # off the resolver's internals; A-4 narrows it from the whole God client
+        # to just the collection writer.
+        self.writer = writer
         self.lastfm = lastfm
         self._session: Optional[PlaySession] = None
         # Strong references to in-flight _end_session tasks.  asyncio only
@@ -154,7 +155,7 @@ class ListenTracker:
             )
             success = await asyncio.get_running_loop().run_in_executor(
                 None,
-                self.discogs.increment_play_count,
+                self.writer.increment_play_count,
                 session.album_release_id,
                 session.album_instance_id,
             )
@@ -163,10 +164,10 @@ class ListenTracker:
             else:
                 log.warning("⚠ Failed to increment Discogs Play Count.")
 
-            if self.discogs.last_played_field_name:
+            if self.writer.last_played_field_name:
                 last_played_success = await asyncio.get_running_loop().run_in_executor(
                     None,
-                    self.discogs.update_last_played,
+                    self.writer.update_last_played,
                     session.album_release_id,
                     session.album_instance_id,
                 )

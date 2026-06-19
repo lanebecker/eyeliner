@@ -39,13 +39,12 @@ import logging
 from typing import TYPE_CHECKING
 
 from src.metadata.models import TrackMetadata, MetadataSource
-from src.metadata.discogs_client import DiscogsClient
 from src.metadata.coverart import CoverArtFallback
 from src.metadata.errors import is_transient
 
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
-    from src.config import DiscogsConfig
+    from src.metadata.discogs.reader import DiscogsReader
 
 log = logging.getLogger(__name__)
 
@@ -58,8 +57,11 @@ _ALBUM_CACHE_MAX = 64
 class MetadataResolver:
     """Resolves a RawRecognitionResult into a full TrackMetadata."""
 
-    def __init__(self, config: "DiscogsConfig"):
-        self.discogs = DiscogsClient(config)
+    def __init__(self, reader: "DiscogsReader"):
+        # A-4: the resolver depends only on the read half of Discogs, injected
+        # at the composition root (main.py) — it no longer owns a God client the
+        # tracker has to reach into (the old A-3 `resolver.discogs` back-channel).
+        self.reader = reader
         self.coverart = CoverArtFallback()
         # (artist_lower, album_lower) → (MetadataSource, payload)
         #   payload is the Discogs result dict for Discogs tiers,
@@ -122,7 +124,7 @@ class MetadataResolver:
         # and is logged loudly so it isn't mistaken for a routine miss.
         try:
             result = await loop.run_in_executor(
-                None, self.discogs.search_collection, raw.artist, raw.album
+                None, self.reader.search_collection, raw.artist, raw.album
             )
             if result:
                 log.debug(f"Resolved from Discogs collection: {raw.artist} / {raw.album}")
@@ -138,7 +140,7 @@ class MetadataResolver:
         # Step 2: Discogs database
         try:
             result = await loop.run_in_executor(
-                None, self.discogs.search_database, raw.artist, raw.album
+                None, self.reader.search_database, raw.artist, raw.album
             )
             if result:
                 log.debug(f"Resolved from Discogs database: {raw.artist} / {raw.album}")

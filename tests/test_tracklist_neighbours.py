@@ -121,7 +121,7 @@ def test_tracklist_entry_is_frozen():
 
 def _resolver():
     r = MetadataResolver.__new__(MetadataResolver)
-    r.discogs = MagicMock()
+    r.reader = MagicMock()
     r.coverart = MagicMock()
     r._album_cache = {}
     return r
@@ -135,7 +135,7 @@ def _raw(title):
 async def test_each_track_gets_its_own_tracklist_list():
     r = _resolver()
     shared = [TracklistEntry("A1", "One"), TracklistEntry("A2", "Two")]
-    r.discogs.search_collection.return_value = {
+    r.reader.search_collection.return_value = {
         "album": "X", "release_id": 1, "instance_id": 2, "tracklist": shared,
     }
 
@@ -150,7 +150,7 @@ async def test_each_track_gets_its_own_tracklist_list():
 @pytest.mark.asyncio
 async def test_none_tracklist_normalized_to_empty_list():
     r = _resolver()
-    r.discogs.search_collection.return_value = {
+    r.reader.search_collection.return_value = {
         "album": "X", "release_id": 1, "instance_id": 2, "tracklist": None,
     }
     t = await r.resolve(_raw("One"))

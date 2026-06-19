@@ -33,12 +33,16 @@ Covered scenarios — update_last_played:
 from datetime import date
 from unittest.mock import MagicMock, patch
 
-from src.metadata.discogs_client import DiscogsClient
-from tests.factories import make_discogs_config
+from tests.factories import make_discogs_config, make_discogs_writer, make_discogs_reader
 
 
 # ---------------------------------------------------------------------------
 # Helpers
+#
+# A-4: these are write-side tests, so "client" is a DiscogsCollectionWriter.
+# The HTTP seam moved to the shared transport, so tests mock
+# ``client._http.session.get`` / ``.post`` (was ``client._session.*``) and the
+# rate-limit retry lives on ``client._http.request`` (was ``client._request``).
 # ---------------------------------------------------------------------------
 
 _BASE_CONFIG = make_discogs_config()
@@ -51,25 +55,28 @@ _LAST_PLAYED_FIELD_ID = 7
 
 
 def make_client():
-    """Build a DiscogsClient with all HTTP interactions mocked out."""
-    with patch("src.metadata.discogs_client.discogs_client.Client"):
-        client = DiscogsClient(_BASE_CONFIG)
+    """A DiscogsCollectionWriter with the fields cache pre-populated."""
+    writer = make_discogs_writer(config=_BASE_CONFIG)
     # Pre-populate the fields cache so tests don't need to stub the fields GET
-    client._collection_fields = {"Play Count": _FIELD_ID}
-    return client
+    writer._collection_fields = {"Play Count": _FIELD_ID}
+    return writer
+
+
+def make_reader():
+    """A DiscogsReader (read-side methods: search / year / build)."""
+    return make_discogs_reader(config=_BASE_CONFIG)
 
 
 def make_client_with_last_played():
-    """Build a DiscogsClient configured with last_played_field_name."""
+    """A DiscogsCollectionWriter configured with last_played_field_name."""
     config = make_discogs_config(last_played_field_name="Last Played")
-    with patch("src.metadata.discogs_client.discogs_client.Client"):
-        client = DiscogsClient(config)
+    writer = make_discogs_writer(config=config)
     # Pre-populate both fields in the cache
-    client._collection_fields = {
+    writer._collection_fields = {
         "Play Count": _FIELD_ID,
         "Last Played": _LAST_PLAYED_FIELD_ID,
     }
-    return client
+    return writer
 
 
 def make_get_response(status_code: int, json_body: dict):
@@ -110,14 +117,14 @@ def test_blank_field_sets_one():
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, ""))
     post_resp = make_post_response(204)
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is True
-    client._session.post.assert_called_once()
-    _, kwargs = client._session.post.call_args
+    client._http.session.post.assert_called_once()
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"]["value"] == "1"
 
 
@@ -126,13 +133,13 @@ def test_existing_count_five_becomes_six():
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "5"))
     post_resp = make_post_response(204)
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is True
-    _, kwargs = client._session.post.call_args
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"]["value"] == "6"
 
 
@@ -141,13 +148,13 @@ def test_existing_count_one_becomes_two():
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "1"))
     post_resp = make_post_response(204)
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is True
-    _, kwargs = client._session.post.call_args
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"]["value"] == "2"
 
 
@@ -161,13 +168,13 @@ def test_garbage_string_value_treated_as_zero():
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "not-a-number"))
     post_resp = make_post_response(204)
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is True
-    _, kwargs = client._session.post.call_args
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"]["value"] == "1"
 
 
@@ -177,13 +184,13 @@ def test_whitespace_only_value_treated_as_zero():
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "   "))
     post_resp = make_post_response(204)
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is True
-    _, kwargs = client._session.post.call_args
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"]["value"] == "1"
 
 
@@ -196,12 +203,12 @@ def test_field_not_found_returns_false_no_post():
     client = make_client()
     client._collection_fields = {}  # Override: no fields at all
 
-    client._session.post = MagicMock()
+    client._http.session.post = MagicMock()
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is False
-    client._session.post.assert_not_called()
+    client._http.session.post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +221,13 @@ def test_get_current_value_non200_falls_back_to_zero_and_still_writes():
 
     get_resp = make_get_response(500, {})
     post_resp = make_post_response(204)
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is True
-    _, kwargs = client._session.post.call_args
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"]["value"] == "1"
 
 
@@ -234,8 +241,8 @@ def test_post_non204_returns_false():
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "3"))
     post_resp = make_post_response(400, "Bad Request")
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
@@ -248,8 +255,8 @@ def test_post_401_returns_false():
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "2"))
     post_resp = make_post_response(401, "Unauthorized")
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
@@ -261,8 +268,8 @@ def test_exception_during_post_returns_false_no_crash():
     client = make_client()
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "1"))
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(side_effect=ConnectionError("network gone"))
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(side_effect=ConnectionError("network gone"))
 
     result = client.increment_play_count(release_id=111, instance_id=42)
 
@@ -278,7 +285,7 @@ def test_get_field_value_returns_correct_value_for_matching_instance():
     client = make_client()
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "7"))
-    client._session.get = MagicMock(return_value=get_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
 
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
@@ -291,7 +298,7 @@ def test_get_field_value_wrong_instance_id_returns_none():
 
     # Response has instance_id=99, but we're looking for instance_id=42
     get_resp = make_get_response(200, instance_response(99, _FIELD_ID, "3"))
-    client._session.get = MagicMock(return_value=get_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
 
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
@@ -303,7 +310,7 @@ def test_get_field_value_non200_returns_none():
     client = make_client()
 
     get_resp = make_get_response(404, {})
-    client._session.get = MagicMock(return_value=get_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
 
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
@@ -325,7 +332,7 @@ def test_get_field_value_field_not_in_notes_returns_none():
         ]
     }
     get_resp = make_get_response(200, response)
-    client._session.get = MagicMock(return_value=get_resp)
+    client._http.session.get = MagicMock(return_value=get_resp)
 
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
@@ -340,14 +347,14 @@ def test_update_last_played_not_configured_returns_true_no_api_calls():
     """When last_played_field_name is not set, update_last_played is a no-op."""
     client = make_client()  # last_played_field_name is None (not in config)
 
-    client._session.post = MagicMock()
-    client._session.get = MagicMock()
+    client._http.session.post = MagicMock()
+    client._http.session.get = MagicMock()
 
     result = client.update_last_played(release_id=111, instance_id=42)
 
     assert result is True
-    client._session.post.assert_not_called()
-    client._session.get.assert_not_called()
+    client._http.session.post.assert_not_called()
+    client._http.session.get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -359,16 +366,16 @@ def test_update_last_played_posts_todays_iso_date():
     client = make_client_with_last_played()
 
     post_resp = make_post_response(204)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     fake_today = date(2026, 5, 24)
-    with patch("src.metadata.discogs_client.date") as mock_date:
+    with patch("src.metadata.discogs.writer.date") as mock_date:
         mock_date.today.return_value = fake_today
         result = client.update_last_played(release_id=111, instance_id=42)
 
     assert result is True
-    client._session.post.assert_called_once()
-    _, kwargs = client._session.post.call_args
+    client._http.session.post.assert_called_once()
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"]["value"] == "2026-05-24"
 
 
@@ -377,12 +384,12 @@ def test_update_last_played_date_is_iso_format():
     client = make_client_with_last_played()
 
     post_resp = make_post_response(204)
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.update_last_played(release_id=111, instance_id=42)
 
     assert result is True
-    _, kwargs = client._session.post.call_args
+    _, kwargs = client._http.session.post.call_args
     posted_value = kwargs["json"]["value"]
     # Verify format by parsing — raises ValueError if not valid ISO date
     parsed = date.fromisoformat(posted_value)
@@ -398,12 +405,12 @@ def test_update_last_played_field_not_found_returns_false():
     client = make_client_with_last_played()
     client._collection_fields = {"Play Count": _FIELD_ID}  # Override: no Last Played field
 
-    client._session.post = MagicMock()
+    client._http.session.post = MagicMock()
 
     result = client.update_last_played(release_id=111, instance_id=42)
 
     assert result is False
-    client._session.post.assert_not_called()
+    client._http.session.post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +422,7 @@ def test_update_last_played_post_non204_returns_false():
     client = make_client_with_last_played()
 
     post_resp = make_post_response(400, "Bad Request")
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.update_last_played(release_id=111, instance_id=42)
 
@@ -427,7 +434,7 @@ def test_update_last_played_post_401_returns_false():
     client = make_client_with_last_played()
 
     post_resp = make_post_response(401, "Unauthorized")
-    client._session.post = MagicMock(return_value=post_resp)
+    client._http.session.post = MagicMock(return_value=post_resp)
 
     result = client.update_last_played(release_id=111, instance_id=42)
 
@@ -438,7 +445,7 @@ def test_update_last_played_exception_returns_false_no_crash():
     """An exception raised during update_last_played POST is caught, returns False."""
     client = make_client_with_last_played()
 
-    client._session.post = MagicMock(side_effect=ConnectionError("network gone"))
+    client._http.session.post = MagicMock(side_effect=ConnectionError("network gone"))
 
     result = client.update_last_played(release_id=111, instance_id=42)
 
@@ -464,90 +471,90 @@ def make_429_response(retry_after=None):
 def test_request_retries_once_on_429_honoring_retry_after():
     client = make_client()
     ok = make_get_response(200, {})
-    client._session.get = MagicMock(side_effect=[make_429_response("3"), ok])
+    client._http.session.get = MagicMock(side_effect=[make_429_response("3"), ok])
 
-    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
-        resp = client._request("GET", "https://api.discogs.com/anything")
+    with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        resp = client._http.request("GET", "https://api.discogs.com/anything")
 
     assert resp is ok
-    assert client._session.get.call_count == 2
+    assert client._http.session.get.call_count == 2
     mock_sleep.assert_called_once_with(3)
 
 
 def test_request_429_uses_default_wait_when_header_missing():
-    from src.metadata.discogs_client import _RATE_LIMIT_DEFAULT_WAIT
+    from src.metadata.discogs.transport import _RATE_LIMIT_DEFAULT_WAIT
     client = make_client()
-    client._session.get = MagicMock(
+    client._http.session.get = MagicMock(
         side_effect=[make_429_response(), make_get_response(200, {})]
     )
 
-    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
-        client._request("GET", "https://api.discogs.com/anything")
+    with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        client._http.request("GET", "https://api.discogs.com/anything")
 
     mock_sleep.assert_called_once_with(_RATE_LIMIT_DEFAULT_WAIT)
 
 
 def test_request_429_uses_default_wait_when_header_unparseable():
-    from src.metadata.discogs_client import _RATE_LIMIT_DEFAULT_WAIT
+    from src.metadata.discogs.transport import _RATE_LIMIT_DEFAULT_WAIT
     client = make_client()
-    client._session.get = MagicMock(
+    client._http.session.get = MagicMock(
         side_effect=[make_429_response("soon-ish"), make_get_response(200, {})]
     )
 
-    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
-        client._request("GET", "https://api.discogs.com/anything")
+    with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        client._http.request("GET", "https://api.discogs.com/anything")
 
     mock_sleep.assert_called_once_with(_RATE_LIMIT_DEFAULT_WAIT)
 
 
 def test_request_429_wait_is_capped():
-    from src.metadata.discogs_client import _RATE_LIMIT_MAX_WAIT
+    from src.metadata.discogs.transport import _RATE_LIMIT_MAX_WAIT
     client = make_client()
-    client._session.get = MagicMock(
+    client._http.session.get = MagicMock(
         side_effect=[make_429_response("9999"), make_get_response(200, {})]
     )
 
-    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
-        client._request("GET", "https://api.discogs.com/anything")
+    with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        client._http.request("GET", "https://api.discogs.com/anything")
 
     mock_sleep.assert_called_once_with(_RATE_LIMIT_MAX_WAIT)
 
 
 def test_request_does_not_retry_on_success():
     client = make_client()
-    client._session.get = MagicMock(return_value=make_get_response(200, {}))
+    client._http.session.get = MagicMock(return_value=make_get_response(200, {}))
 
-    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
-        client._request("GET", "https://api.discogs.com/anything")
+    with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        client._http.request("GET", "https://api.discogs.com/anything")
 
-    assert client._session.get.call_count == 1
+    assert client._http.session.get.call_count == 1
     mock_sleep.assert_not_called()
 
 
 def test_request_gives_up_after_second_429():
     """No infinite retry loops: a second consecutive 429 is returned as-is."""
     client = make_client()
-    client._session.get = MagicMock(
+    client._http.session.get = MagicMock(
         side_effect=[make_429_response("1"), make_429_response("1")]
     )
 
-    with patch("src.metadata.discogs_client.time.sleep") as mock_sleep:
-        resp = client._request("GET", "https://api.discogs.com/anything")
+    with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        resp = client._http.request("GET", "https://api.discogs.com/anything")
 
     assert resp.status_code == 429
-    assert client._session.get.call_count == 2
+    assert client._http.session.get.call_count == 2
     mock_sleep.assert_called_once()  # Slept for the first retry only
 
 
 def test_request_routes_post_through_session_post():
     client = make_client()
-    client._session.post = MagicMock(return_value=make_post_response(204))
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
 
-    resp = client._request("POST", "https://api.discogs.com/anything", json={"value": "1"})
+    resp = client._http.request("POST", "https://api.discogs.com/anything", json={"value": "1"})
 
     assert resp.status_code == 204
-    client._session.post.assert_called_once()
-    _, kwargs = client._session.post.call_args
+    client._http.session.post.assert_called_once()
+    _, kwargs = client._http.session.post.call_args
     assert kwargs["json"] == {"value": "1"}
     assert "timeout" in kwargs  # _HTTP_TIMEOUT applied by default
 
@@ -556,15 +563,15 @@ def test_increment_play_count_survives_one_rate_limit_on_post():
     """End-to-end: a 429 on the field-update POST still results in success."""
     client = make_client()
     get_resp = make_get_response(200, {"releases": []})  # No prior value → 0
-    client._session.get = MagicMock(return_value=get_resp)
-    client._session.post = MagicMock(
+    client._http.session.get = MagicMock(return_value=get_resp)
+    client._http.session.post = MagicMock(
         side_effect=[make_429_response("1"), make_post_response(204)]
     )
 
-    with patch("src.metadata.discogs_client.time.sleep"):
+    with patch("src.metadata.discogs.transport.time.sleep"):
         assert client.increment_play_count(111, 222) is True
 
-    assert client._session.post.call_count == 2
+    assert client._http.session.post.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -596,35 +603,35 @@ def _mock_master_response(year):
 
 
 def test_original_year_prefers_master_year():
-    client = make_client()
-    client._session.get = MagicMock(return_value=_mock_master_response(2005))
+    client = make_reader()
+    client._http.session.get = MagicMock(return_value=_mock_master_response(2005))
     assert client.get_original_year(_make_release()) == "2005"
-    assert "masters/151481" in client._session.get.call_args[0][0]
+    assert "masters/151481" in client._http.session.get.call_args[0][0]
 
 
 def test_original_year_none_when_no_master():
-    client = make_client()
-    client._session.get = MagicMock()
+    client = make_reader()
+    client._http.session.get = MagicMock()
     assert client.get_original_year(_make_release(master_id=None)) is None
-    client._session.get.assert_not_called()
+    client._http.session.get.assert_not_called()
 
 
 def test_original_year_none_when_master_year_is_zero():
     """Discogs uses 0 for unknown years — must not display '0'."""
-    client = make_client()
-    client._session.get = MagicMock(return_value=_mock_master_response(0))
+    client = make_reader()
+    client._http.session.get = MagicMock(return_value=_mock_master_response(0))
     assert client.get_original_year(_make_release()) is None
 
 
 def test_original_year_none_when_fetch_raises():
-    client = make_client()
-    client._session.get = MagicMock(side_effect=ConnectionError("network down"))
+    client = make_reader()
+    client._http.session.get = MagicMock(side_effect=ConnectionError("network down"))
     assert client.get_original_year(_make_release()) is None
 
 
 def test_original_year_none_when_master_attr_raises():
     """The lazy .master property can raise on a failed lib fetch."""
-    client = make_client()
+    client = make_reader()
     release = MagicMock()
     type(release).master = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
     assert client.get_original_year(release) is None
@@ -643,7 +650,7 @@ def _make_full_release(pressing_year=2026):
 
 
 def test_build_result_uses_original_year_over_pressing_year():
-    client = make_client()
+    client = make_reader()
     client.get_tracklist = MagicMock(return_value=[])
     client.get_original_year = MagicMock(return_value="2005")
     result = client._build_result(_make_full_release(pressing_year=2026), instance_id=None)
@@ -651,7 +658,7 @@ def test_build_result_uses_original_year_over_pressing_year():
 
 
 def test_build_result_falls_back_to_pressing_year():
-    client = make_client()
+    client = make_reader()
     client.get_tracklist = MagicMock(return_value=[])
     client.get_original_year = MagicMock(return_value=None)
     result = client._build_result(_make_full_release(pressing_year=2026), instance_id=None)

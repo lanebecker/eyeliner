@@ -25,6 +25,7 @@ from pathlib import Path
 
 from src.config import load_config, ConfigError
 from src.app.track_commit_service import TrackCommitService
+from src.metadata.discogs import DiscogsHttp, DiscogsReader, DiscogsCollectionWriter
 from src.audio.capture import AudioCapture
 from src.audio.silence import SilenceDetector, AudioEvent
 from src.audio.recognizer import RecognitionLoop
@@ -119,11 +120,13 @@ async def main():
         sys.exit(1)
 
     state = PlayerState()
-    resolver = MetadataResolver(config.discogs)
+    # A-4: one shared Discogs transport; the read half goes to the resolver, the
+    # write half to the tracker — each depends only on the slice it uses (no more
+    # God client, no resolver.discogs back-channel).
+    discogs_http = DiscogsHttp(config.discogs.user_token)
+    resolver = MetadataResolver(DiscogsReader(discogs_http, config.discogs))
     lastfm = LastFmClient(config.lastfm)
-    # A-3: the resolver and tracker share one DiscogsClient by explicit
-    # composition — the tracker is injected with it directly.
-    tracker = ListenTracker(resolver.discogs, lastfm)
+    tracker = ListenTracker(DiscogsCollectionWriter(discogs_http, config.discogs), lastfm)
     # A-9: the application-layer commit service owns resolve → state → track →
     # scrobble; the recognition loop just confirms a result and hands it off.
     commit_service = TrackCommitService(state, resolver, tracker, lastfm)

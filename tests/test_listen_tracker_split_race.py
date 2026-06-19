@@ -19,7 +19,7 @@ from tests.test_listen_tracker import make_tracker, make_track, make_tracklist
 
 @pytest.mark.asyncio
 async def test_stale_session_ended_does_not_end_new_session_after_split():
-    tracker, resolver = make_tracker()
+    tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
 
     # Record A plays through its closer → creditable, latched to release 111.
@@ -34,7 +34,7 @@ async def test_stale_session_ended_does_not_end_new_session_after_split():
     )
     session_b = tracker._session
     assert session_b is not session_a
-    resolver.discogs.increment_play_count.assert_called_once_with(111, 222)
+    writer.increment_play_count.assert_called_once_with(111, 222)
 
     # The SESSION_ENDED that fired for A's silence now finally runs, bound to A.
     await tracker._end_session(expected=session_a)
@@ -42,14 +42,14 @@ async def test_stale_session_ended_does_not_end_new_session_after_split():
     # It must NOT end B…
     assert tracker._session is session_b
     # …and must NOT have credited anything further.
-    resolver.discogs.increment_play_count.assert_called_once_with(111, 222)
+    writer.increment_play_count.assert_called_once_with(111, 222)
 
 
 @pytest.mark.asyncio
 async def test_session_ended_for_current_session_still_ends_it():
     """The guard only suppresses *stale* ends; an end bound to the live session
     still works."""
-    tracker, resolver = make_tracker()
+    tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik"))
     live = tracker._session
@@ -57,7 +57,7 @@ async def test_session_ended_for_current_session_still_ends_it():
     await tracker._end_session(expected=live)
 
     assert tracker._session is None
-    resolver.discogs.increment_play_count.assert_called_once()
+    writer.increment_play_count.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -66,7 +66,7 @@ async def test_scheduled_session_ended_after_split_is_a_noop():
     split before it runs, then let the loop drain — the new session survives."""
     import asyncio
 
-    tracker, resolver = make_tracker()
+    tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(
         make_track("Master-Dik", release_id=111, instance_id=222)
@@ -88,7 +88,7 @@ async def test_scheduled_session_ended_after_split_is_a_noop():
 
     assert not tracker._bg_tasks
     assert tracker._session is session_b           # B was NOT ended
-    resolver.discogs.increment_play_count.assert_called_once_with(111, 222)
+    writer.increment_play_count.assert_called_once_with(111, 222)
 
 
 @pytest.mark.asyncio
@@ -97,7 +97,7 @@ async def test_real_session_ended_for_current_session_credits_once():
     live session exactly once."""
     import asyncio
 
-    tracker, resolver = make_tracker()
+    tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(
         make_track("Master-Dik", release_id=111, instance_id=222)
@@ -108,4 +108,4 @@ async def test_real_session_ended_for_current_session_credits_once():
         await asyncio.sleep(0)
 
     assert tracker._session is None
-    resolver.discogs.increment_play_count.assert_called_once_with(111, 222)
+    writer.increment_play_count.assert_called_once_with(111, 222)

@@ -67,7 +67,7 @@ def resolver(mock_discogs, mock_coverart):
     # Import here to avoid triggering real client instantiation at module load
     from src.metadata.resolver import MetadataResolver
     r = MetadataResolver.__new__(MetadataResolver)
-    r.discogs = mock_discogs
+    r.reader = mock_discogs
     r.coverart = mock_coverart
     r._album_cache = {}  # Normally created in __init__ (bypassed via __new__)
     return r

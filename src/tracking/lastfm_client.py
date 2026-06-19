@@ -1,8 +1,8 @@
 """LastFmClient — Last.fm scrobbling and track-loving via pylast.
 
 All public methods are synchronous (pylast is synchronous). Callers in async
-contexts should wrap them in run_in_executor, matching the pattern used by
-DiscogsClient throughout the codebase.
+contexts should wrap them in run_in_executor, matching the pattern used by the
+Discogs reader/writer throughout the codebase.
 
 The client is a graceful no-op when:
   - the ``lastfm`` section is absent from config
