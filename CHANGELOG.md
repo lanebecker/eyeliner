@@ -110,6 +110,32 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
   scheduling, breaking the synchronous-session contract and adding a
   SESSION_ENDED ordering hazard for no real safety gain).
 
+### Documented / tests (aspirational debt)
+
+- **Hue-Diversity Rule deliberately deferred, docs reconciled (D-1, #73).** The
+  ≥60° OKLCH cross-album accent separation was a prototype-only design
+  exploration the docs still framed as "aspirational / not yet implemented"
+  (implying pending). It is now recorded as **deliberately deferred — not a
+  production feature**: the production `accent` stays the authentic
+  most-saturated cover color, in isolation. Implementing it would make the accent
+  a synthetic color not in the artwork and the palette order-dependent (breaking
+  the pure `url → palette` cache); revisit only if same-hue runs prove
+  distracting on hardware. CLAUDE.md and DESIGN.md updated to match the shipped
+  code; no code change.
+- **Resolution-independence of the static layout backed by a test matrix
+  (D-2, #74).** CLAUDE.md claims the renderer is resolution-independent
+  (`s = min(w/1024, h/600)`, no breakpoints), but `get_now_playing_layout` was
+  only ever exercised near 1024×600. A new parametrized matrix — 480×320 → 4K
+  **plus non-16:9 cases (square, portrait, ultra-wide, 5:4)** that exercise the
+  `sx ≠ sy` / min-dimension cover branch — asserts no negative/zero/off-screen
+  rects, a square cover bound by the smaller dimension and clear of the text
+  column, correct vertical flow with the title block clear of the bottom
+  meta/prev-next, and font floors + hierarchy at every size. The static layout
+  held across the whole matrix. _Scope:_ this covers the deterministic layout
+  geometry; the renderer's runtime text-fit composition (`_compose_now_playing`'s
+  dynamic title push-down/clip) is content-dependent and remains unexercised by
+  these pure-geometry tests.
+
 ---
 
 ## [1.5.0] — 2026-06-19

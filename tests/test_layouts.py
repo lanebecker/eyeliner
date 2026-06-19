@@ -301,3 +301,91 @@ def test_font_sizes_larger_at_higher_resolution():
     small = get_now_playing_layout(640, 480)
     large = get_now_playing_layout(1280, 720)
     assert large.font_size_track > small.font_size_track
+
+
+# ---------------------------------------------------------------------------
+# D-2 (#74) — resolution-independence matrix
+#
+# Backs CLAUDE.md's "resolution-independent (A-10)" claim with coverage across
+# tiny → 4K.  The renderer reads width/height from config and scales every
+# constant by s = min(width/1024, height/600); there are no hard breakpoints,
+# so the layout must stay sane at any size — not just the 1024x600 target.
+# ---------------------------------------------------------------------------
+
+RESOLUTION_MATRIX = [
+    (480, 320),     # tiny — stresses the max() font/element floors
+    (640, 480),
+    (800, 480),     # common 5" HDMI
+    (1024, 600),    # primary target (Waveshare 7")
+    (1280, 720),
+    (1920, 1080),   # FHD
+    (3840, 2160),   # 4K
+    # Non-16:9 / extreme aspect ratios — these are the whole reason the cover uses
+    # min(sx, sy) and the layout splits sx (horizontal) from sy (vertical); a
+    # landscape-only matrix never exercises the sx != sy branch.
+    (1024, 1024),   # square
+    (600, 1024),    # portrait
+    (2560, 600),    # ultra-wide
+    (1280, 1024),   # 5:4
+]
+
+
+@pytest.mark.parametrize("width,height", RESOLUTION_MATRIX)
+def test_matrix_rects_positive_and_in_bounds(width, height):
+    """No rect is negative, zero-sized, or off-screen at any resolution."""
+    layout = get_now_playing_layout(width, height)
+    for name, rect in all_rects(layout).items():
+        assert rect.w > 0 and rect.h > 0, f"{name} non-positive at {width}x{height}: {rect}"
+        assert rect.x >= 0 and rect.y >= 0, f"{name} negative coord at {width}x{height}: {rect}"
+        assert rect.x + rect.w <= width, f"{name} right edge off-screen at {width}x{height}"
+        assert rect.y + rect.h <= height, f"{name} bottom edge off-screen at {width}x{height}"
+
+
+@pytest.mark.parametrize("width,height", RESOLUTION_MATRIX)
+def test_matrix_cover_square_and_text_clear_of_cover(width, height):
+    layout = get_now_playing_layout(width, height)
+    assert layout.cover_art.w == layout.cover_art.h, f"cover not square at {width}x{height}"
+    # The square side must be bound by the SMALLER scaled dimension (440px ref),
+    # which is what keeps it from clipping at non-16:9 ratios — the property the
+    # portrait/ultra-wide/square rows exist to exercise.
+    expected_side = min(int(440 * width / 1024), int(440 * height / 600))
+    assert layout.cover_art.w == expected_side, (
+        f"cover side {layout.cover_art.w} != min-dimension {expected_side} at {width}x{height}"
+    )
+    cover_right = layout.cover_art.x + layout.cover_art.w
+    for name in TEXT_PANEL_NAMES:
+        assert getattr(layout, name).x >= cover_right, (
+            f"{name} overlaps the cover horizontally at {width}x{height}"
+        )
+
+
+@pytest.mark.parametrize("width,height", RESOLUTION_MATRIX)
+def test_matrix_vertical_flow_and_title_clears_bottom_block(width, height):
+    """The top-flowing text block stays ordered, the bottom-anchored block stays
+    ordered, and the title region never collides with the bottom meta/prev-next."""
+    layout = get_now_playing_layout(width, height)
+    # Top-down flow (each computed from the previous one).
+    flow = ["track_text", "divider", "artist_text", "album_text", "genre_chips"]
+    for upper, lower in zip(flow, flow[1:]):
+        assert getattr(layout, upper).y < getattr(layout, lower).y, (
+            f"{upper} not above {lower} at {width}x{height}"
+        )
+    # Bottom-anchored pair.
+    assert layout.meta_text.y < layout.prev_next.y, f"meta below prev_next at {width}x{height}"
+    # The title block must clear the bottom-anchored meta region (no overlap).
+    title_bottom = layout.track_text.y + layout.track_text.h
+    assert title_bottom <= layout.meta_text.y, (
+        f"title block (bottom {title_bottom}) overlaps meta (top {layout.meta_text.y}) "
+        f"at {width}x{height}"
+    )
+
+
+@pytest.mark.parametrize("width,height", RESOLUTION_MATRIX)
+def test_matrix_font_floors_and_hierarchy(width, height):
+    """Font floors hold and the size hierarchy is preserved at every resolution."""
+    layout = get_now_playing_layout(width, height)
+    assert layout.font_size_track >= 24
+    assert layout.font_size_artist >= 18
+    assert layout.font_size_album >= 14
+    assert layout.font_size_header >= 9
+    assert layout.font_size_track >= layout.font_size_artist >= layout.font_size_album
