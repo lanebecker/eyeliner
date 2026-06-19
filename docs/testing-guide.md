@@ -623,3 +623,9 @@ These components need the actual Pi + USB audio interface + display to test:
 Once the hardware arrives, a `test_integration.py` covering the full needle-drop →
 track-identified → display-updated → session-ended → Discogs-updated path would be
 the natural next addition.
+
+For the manual verification + tuning to run the first time the assembled unit
+powers on — audio-device match, `silence_threshold_rms` tuning, the live cover
+fetch / S-7 IP-pinned-TLS smoke test, the recognition churn breadcrumb, the
+runtime title push-down, and full-pipeline + autostart checks — see
+**`docs/first-boot-checklist.md`**.
