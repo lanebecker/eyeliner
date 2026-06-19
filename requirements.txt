@@ -17,7 +17,7 @@ musicbrainzngs>=0.7.1
 pygame>=2.5.0
 Pillow>=10.0.0
 # Cover-art fetch pins the connection to a vetted IP (S-7); these are imported
-# directly by src/display/renderer.py, not just transitively via requests.
+# directly by src/display/cover_cache.py, not just transitively via requests.
 # urllib3>=2.0 is required: the IP-pinned HTTPSConnectionPool relies on the
 # server_hostname kwarg being forwarded to the connection (TLS SNI).
 urllib3>=2.0.0

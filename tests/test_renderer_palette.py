@@ -20,6 +20,7 @@ from src.display.renderer import (
     _BoundedCache,
     _PALETTE_CACHE_MAX,
 )
+from src.display.cover_cache import CoverArtCache
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
 
 
@@ -37,7 +38,8 @@ def make_renderer(tmp_path, dynamic_theming=True):
     """Build a renderer skeleton with only what _queue_palette touches."""
     r = DisplayRenderer.__new__(DisplayRenderer)
     r.dynamic_theming = dynamic_theming
-    r.cache_dir = tmp_path                      # Empty dir → no cover files on disk
+    # Empty dir → no cover files on disk; _queue_palette reads paths via the store.
+    r._cover_store = CoverArtCache(tmp_path)
     r._palette_cache = _BoundedCache(_PALETTE_CACHE_MAX)
     r._current_palette = FALLBACK_PALETTE
     r._target_palette = FALLBACK_PALETTE

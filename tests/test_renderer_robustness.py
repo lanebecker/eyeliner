@@ -19,6 +19,7 @@ import pygame  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from src.display.renderer import DisplayRenderer, _BoundedCache  # noqa: E402
+from src.display.cover_cache import CoverArtCache  # noqa: E402
 from src.display.palette import extract_palette  # noqa: E402
 from src.display.layouts import get_now_playing_layout, Rect  # noqa: E402
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE  # noqa: E402
@@ -107,12 +108,12 @@ def test_genre_no_overflow_chip_when_all_fit():
 @pytest.mark.asyncio
 async def test_corrupt_cached_cover_triggers_refetch(tmp_path):
     r = make_renderer()
-    r.cache_dir = tmp_path
+    r._cover_store = CoverArtCache(tmp_path)
     r._cover_cache = _BoundedCache(8)
     r._bg_tasks = set()
 
     url = "https://i.discogs.com/cover.jpg"
-    cache_path = tmp_path / r._url_to_cache_key(url)
+    cache_path = r._cover_store.path_for(url)
     cache_path.write_bytes(b"this is not a valid image")  # corrupt cover
 
     refetched = []
@@ -135,7 +136,7 @@ async def test_missing_cover_does_not_refetch(tmp_path):
     """A simply-absent cover (not yet downloaded) must NOT spawn a re-fetch from
     _load_cover — that path is owned by the state-change prefetch."""
     r = make_renderer()
-    r.cache_dir = tmp_path
+    r._cover_store = CoverArtCache(tmp_path)
     r._cover_cache = _BoundedCache(8)
     r._bg_tasks = set()
     refetched = []

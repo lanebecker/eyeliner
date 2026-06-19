@@ -27,6 +27,30 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
   `urllib3>=2.0` and `certifi` are now explicit direct dependencies.
   Mutation-audited; suite grew to ~562.
 
+### Changed (architecture)
+
+- **Cover-art fetch + disk cache extracted into `CoverArtCache` (A-15, #63).**
+  The SSRF-hardened download, URL→disk caching, and the new disk-hygiene logic
+  moved out of the 1,600-line `renderer.py` into a new, pygame-free
+  `src/display/cover_cache.py` — the same God-object split A-4 did to the Discogs
+  client, so the security-sensitive network boundary is now isolated and
+  independently testable. The renderer holds a `CoverArtCache` and only asks it
+  for paths / triggers downloads; it no longer imports `socket`, `ipaddress`,
+  `urllib3`, `certifi`, or `tempfile`. It keeps the scaled-Surface cache and the
+  palette transition (render-loop concerns). No behavioral change. Cover-fetch
+  tests moved to `tests/test_cover_cache.py`.
+
+### Fixed (resource hygiene)
+
+- **Stale `.cover-*.part` tempfiles are swept on startup (R-1, #64).** A SIGKILL
+  between a cover's tempfile write and its atomic rename used to strand a partial
+  that nothing ever cleaned up; `CoverArtCache` now sweeps them on construction.
+- **The on-disk cover cache is now bounded (R-2, #65).** Every in-memory cache
+  was already bounded, but the cover directory grew without limit for the life of
+  the collection. It's now an mtime-LRU cache capped by file count and total
+  bytes, pruned on startup and after each download — and the prune never evicts
+  the cover just written (guards an mtime-tie / coarse-SD-clock eviction race).
+
 ---
 
 ## [1.5.0] — 2026-06-19

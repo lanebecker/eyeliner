@@ -83,207 +83,30 @@ one blit plus the dot.  The layout is likewise computed once at startup
 """
 
 import asyncio
-import ipaddress
 import logging
 import os
-import socket
-import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, Tuple, TYPE_CHECKING
-from urllib.parse import urljoin, urlsplit
-
-import certifi
-import urllib3
 
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
-from src.display.palette import extract_palette, ensure_contrast, validate_image_file
+from src.display.palette import extract_palette, ensure_contrast
+from src.display.cover_cache import CoverArtCache
 
 if TYPE_CHECKING:
     from src.config import DisplayConfig
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Cover-art download safety (findings S-1 / S-2 / S-7)
-# ---------------------------------------------------------------------------
-# `cover_art_url` originates from untrusted external APIs (Discogs image `uri`,
-# the MusicBrainz Cover Art Archive).  A poisoned entry — or a MITM, since we do
-# not pin certificates — could otherwise point the fetch at an internal LAN host
-# (SSRF), a multi-gigabyte response that fills the SD card, or a malicious image
-# that exploits a stale decoder.  The download path therefore:
-#   * requires https,
-#   * restricts the host to an allow-list of known cover-art providers,
-#   * resolves each hop's host EXACTLY ONCE, rejects the hop unless every
-#     resolved address is public, and then pins the connection to that one
-#     vetted IP — so the address we validate is the address we connect to.  This
-#     closes the validate-then-resolve-again DNS-rebinding TOCTOU (S-7): a second,
-#     attacker-controlled DNS answer can no longer steer the socket to an
-#     internal host between the check and the fetch.  TLS still verifies the
-#     certificate against the original hostname (SNI + assert_hostname), so
-#     pinning to an IP does not weaken authentication.
-#   * follows redirects manually so every hop is re-validated and re-pinned,
-#   * aborts after _MAX_COVER_BYTES,
-#   * requires an image/* Content-Type, and
-#   * verifies the decoded image (type + pixel bounds) before it is cached.
-
-# Apex domains we trust to serve cover art.  A host matches if it IS one of
-# these or is a dotted subdomain of one — never merely a string that ends with
-# one (so "evilcoverartarchive.org" is rejected, not allowed).  Cover Art
-# Archive 307-redirects to the Internet Archive (archive.org), so that apex is
-# included for the redirect hop.
-_ALLOWED_COVER_APEX_DOMAINS = (
-    "discogs.com",
-    "coverartarchive.org",
-    "archive.org",
-    "mzstatic.com",
-)
-
-_MAX_COVER_BYTES = 10 * 1024 * 1024   # 10 MB ceiling on a downloaded cover
-_MAX_COVER_REDIRECTS = 5              # cap redirect chains
-_COVER_CONNECT_READ_TIMEOUT = 15     # seconds, per HTTP request
-
-
-def _host_is_allowed(host: Optional[str]) -> bool:
-    """True if `host` is an allow-listed apex domain or a dotted subdomain of one.
-
-    Matching is exact-or-dot-boundary (`host == apex` or `host.endswith("." +
-    apex)`), never a bare suffix test — otherwise "evilcoverartarchive.org"
-    would be accepted as if it were "coverartarchive.org".
-    """
-    if not host:
-        return False
-    host = host.lower().rstrip(".")
-    return any(
-        host == apex or host.endswith("." + apex)
-        for apex in _ALLOWED_COVER_APEX_DOMAINS
-    )
-
-
-def _validated_public_ip(host: str) -> Optional[str]:
-    """Resolve `host` ONCE and return a single public IP to pin to, else None.
-
-    Returning the concrete address to connect to — rather than a yes/no — is what
-    lets the download pin the socket to the exact IP that was vetted, closing the
-    validate-then-resolve-again DNS-rebinding TOCTOU (S-7).  The whole hop is
-    rejected if ANY resolved address is non-public, which also defeats a single
-    rebinding answer that mixes a public and an internal IP.  Fails closed: any
-    resolution / parse error returns None.
-    """
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        return None
-    if not infos:
-        return None
-    pinned: Optional[str] = None
-    for info in infos:
-        ip_str = info[4][0]
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return None
-        # Normalize an IPv4-mapped IPv6 address (e.g. ::ffff:127.0.0.1) to its
-        # IPv4 view so a private/loopback address can't be smuggled past the
-        # classification dressed up in v6 clothing.
-        if ip.version == 6 and ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
-        # The classifier IS the security boundary, so be maximal: is_global alone
-        # lets multicast (224/4 reports is_global=True) through, and the rest are
-        # belt-and-suspenders for unspecified/reserved/loopback/link-local space.
-        if (
-            not ip.is_global
-            or ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            return None
-        if pinned is None:
-            pinned = str(ip)
-    return pinned
-
-
-def _host_resolves_to_public_ip(host: str) -> bool:
-    """True iff every DNS result for `host` is a global (public) address.
-
-    Thin predicate over :func:`_validated_public_ip`, kept for callers/tests that
-    only need the yes/no.  The download path uses the IP-returning function so it
-    can pin the connection to the vetted address (S-7).
-    """
-    return _validated_public_ip(host) is not None
-
-
-def _validate_cover_url(url: str) -> Tuple[str, str, str]:
-    """Validate one cover-art URL hop; return ``(fetch_url, host, pinned_ip)``.
-
-    - The host must be allow-listed (S-1).
-    - The host is resolved here EXACTLY ONCE and every resolved address must be
-      public; the returned ``pinned_ip`` is the address the caller MUST connect
-      to so the socket is pinned to precisely what was vetted (S-7).
-    - http is upgraded to https for allow-listed hosts (the MusicBrainz Cover
-      Art Archive sometimes returns http URLs; upgrading only ever makes the
-      request more secure, and avoids silently dropping every fallback cover).
-
-    Raises ValueError if the scheme is not http(s), the host is not allow-listed,
-    or the host does not resolve to a usable public address.
-    """
-    parts = urlsplit(url)
-    host = parts.hostname
-    if parts.scheme not in ("http", "https"):
-        raise ValueError(f"cover URL scheme not allowed: {parts.scheme!r}")
-    if not _host_is_allowed(host):
-        raise ValueError(f"cover URL host not allow-listed: {host!r}")
-    pinned_ip = _validated_public_ip(host)
-    if pinned_ip is None:
-        raise ValueError(f"cover URL host resolves to a non-public address: {host!r}")
-    if parts.scheme == "http":
-        url = parts._replace(scheme="https").geturl()
-    return url, host, pinned_ip
-
-
-def _open_cover_stream(fetch_url: str, host: str, pinned_ip: str, timeout: int):
-    """Open a streaming GET to `fetch_url`, dialing the pre-validated `pinned_ip`
-    but performing TLS for `host` (SNI + certificate hostname check).
-
-    This is the seam that makes the S-7 pin real: urllib3 connects to the exact
-    address vetted by :func:`_validate_cover_url`, while ``server_hostname`` /
-    ``assert_hostname`` keep certificate verification bound to the original
-    hostname — so pinning to an IP doesn't weaken authentication.  Redirects are
-    NOT followed here; :meth:`DisplayRenderer._download_cover_blocking` walks and
-    re-validates each hop.  Returns a urllib3 ``HTTPResponse`` opened with
-    ``preload_content=False`` for streaming.
-    """
-    parts = urlsplit(fetch_url)
-    port = parts.port or 443
-    path = parts.path or "/"
-    if parts.query:
-        path = f"{path}?{parts.query}"
-    pool = urllib3.HTTPSConnectionPool(
-        pinned_ip,
-        port=port,
-        server_hostname=host,   # TLS SNI presented to the server
-        assert_hostname=host,   # certificate must match the real hostname
-        cert_reqs="CERT_REQUIRED",
-        ca_certs=certifi.where(),
-        timeout=urllib3.Timeout(connect=timeout, read=timeout),
-    )
-    return pool.urlopen(
-        "GET",
-        path,
-        headers={"Host": host, "User-Agent": "vinyl-now-playing/1.0"},
-        redirect=False,
-        retries=False,
-        preload_content=False,
-        decode_content=False,
-    )
-
+# Cover-art fetching, the SSRF-hardened download (S-1/S-2/S-7), and the bounded,
+# self-cleaning on-disk cache (R-1/R-2) live in src/display/cover_cache.py
+# (A-15).  The renderer holds a CoverArtCache and only asks it for paths /
+# triggers downloads; it keeps the scaled-Surface cache and palette transition,
+# which are render-loop concerns.
 
 # Suppress pygame audio (we're output-only) and point to the right display
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -515,8 +338,10 @@ class DisplayRenderer:
         # pygame has no OS media query, so it's a config flag.  When set,
         # the status dot renders static (no pulse, no glow animation).
         self.reduced_motion: bool = config.reduced_motion
-        self.cache_dir = Path(config.cover_art_cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # The on-disk cover cache + SSRF-hardened fetch live in CoverArtCache
+        # (A-15); it mkdir's the dir, sweeps stale .part files (R-1), bounds the
+        # cache (R-2), and is the only thing that knows cover paths now.
+        self._cover_store = CoverArtCache(config.cover_art_cache_dir)
 
         self._screen = None
         self._font_cache = _BoundedCache(_FONT_CACHE_MAX)  # (role, size) → Font (P-8)
@@ -1477,8 +1302,7 @@ class DisplayRenderer:
         else:
             # Extraction happens synchronously here; cover art is already cached
             # on disk from _prefetch_cover(), so no network I/O.
-            cache_key = self._url_to_cache_key(cover_url)
-            cache_path = self.cache_dir / cache_key
+            cache_path = self._cover_store.path_for(cover_url)
             if cache_path.exists():
                 target = extract_palette(cache_path)
                 self._palette_cache.put(cover_url, target)  # put() handles eviction
@@ -1513,130 +1337,32 @@ class DisplayRenderer:
         )
 
     # -----------------------------------------------------------------------
-    # Cover art — async fetch + sync load from cache
+    # Cover art — async fetch (via CoverArtCache) + sync load from cache
     # -----------------------------------------------------------------------
-
-    def _url_to_cache_key(self, url: str) -> str:
-        import hashlib
-        return hashlib.md5(url.encode()).hexdigest() + ".jpg"
 
     async def _prefetch_cover(self, url: str):
         """Download cover art to the local cache without blocking the render loop.
 
         Scheduled via asyncio.create_task() from _on_state_change() so the
         download runs in a thread-pool executor and never stalls the event loop.
-        Once the file is written, palette extraction is (re-)queued and the
-        display is marked dirty so the next frame picks up the fresh image.
-
-        Implementation details:
-          - Uses a urllib3 pool with an explicit connect/read timeout so a hung
-            CDN connection can't tie up an executor thread indefinitely.
-          - Writes to a tempfile in the cache directory first, then atomically
-            renames into place — partial downloads (network drop, process kill)
-            never leave a half-written file that _load_cover would fail on.
+        The SSRF-hardened fetch + atomic write + disk bounding live in
+        CoverArtCache (A-15); once the file is on disk, palette extraction is
+        (re-)queued and the display is marked dirty so the next frame picks up
+        the fresh image.
         """
-        cache_key = self._url_to_cache_key(url)
-        cache_path = self.cache_dir / cache_key
-        if cache_path.exists():
+        if self._cover_store.exists(url):
             return  # Already cached — nothing to do
 
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._download_cover_blocking, url, cache_path)
-            log.debug(f"Cover art cached: {cache_path.name}")
+            await loop.run_in_executor(None, self._cover_store.download, url)
+            log.debug(f"Cover art cached: {self._cover_store.path_for(url).name}")
             # File is now on disk — extract palette and trigger a redraw
             if self.dynamic_theming:
                 self._queue_palette(url)
             self._dirty = True
         except Exception as e:
             log.warning(f"Failed to download cover art from {url}: {e}")
-
-    def _download_cover_blocking(self, url: str, cache_path: Path):
-        """Synchronous cover-art download — must run in an executor.
-
-        Hardened against SSRF (incl. DNS rebinding), oversized responses, and
-        malicious images (findings S-1 / S-2 / S-7):
-
-          - Every URL hop is validated AND resolved exactly once by
-            _validate_cover_url (https + allow-listed host + public IP); the
-            connection is then pinned to that exact IP via _open_cover_stream,
-            with TLS still verified against the hostname — so a second,
-            attacker-controlled DNS answer can't redirect the socket to an
-            internal address between check and fetch (S-7).
-          - Redirects are followed manually so each hop is re-validated and
-            re-pinned; the chain is capped at _MAX_COVER_REDIRECTS.
-          - The final response must carry an image/* Content-Type.
-          - The body is streamed with a running byte counter that aborts past
-            _MAX_COVER_BYTES.
-          - The written file is image-verified before it is atomically renamed
-            into the cache, so neither pygame nor Pillow ever decodes an
-            unvalidated file.
-
-        The timeout covers both connection setup and per-chunk reads.
-        """
-        # Walk the redirect chain ourselves, validating + pinning every hop.
-        current_url = url
-        resp = None
-        try:
-            for _ in range(_MAX_COVER_REDIRECTS + 1):
-                fetch_url, host, pinned_ip = _validate_cover_url(current_url)
-                resp = _open_cover_stream(
-                    fetch_url, host, pinned_ip, _COVER_CONNECT_READ_TIMEOUT
-                )
-                if resp.status in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("Location")
-                    resp.release_conn()
-                    resp = None
-                    if not location:
-                        raise ValueError("redirect with no Location header")
-                    # Resolve relative redirects against the current hostname URL.
-                    current_url = urljoin(fetch_url, location)
-                    continue
-                break
-            else:
-                raise ValueError("too many redirects fetching cover art")
-
-            if resp is None:
-                raise ValueError("no response fetching cover art")
-            if resp.status >= 400:
-                raise ValueError(f"cover art fetch returned HTTP {resp.status}")
-
-            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if not content_type.startswith("image/"):
-                raise ValueError(f"unexpected Content-Type for cover art: {content_type!r}")
-
-            # delete=False so we can rename after closing; we clean up manually on error
-            tmp = tempfile.NamedTemporaryFile(
-                dir=str(self.cache_dir),
-                prefix=".cover-",
-                suffix=".part",
-                delete=False,
-            )
-            try:
-                total = 0
-                with tmp as f:
-                    for chunk in resp.stream(64 * 1024):
-                        if not chunk:
-                            continue
-                        total += len(chunk)
-                        if total > _MAX_COVER_BYTES:
-                            raise ValueError(
-                                f"cover art exceeds {_MAX_COVER_BYTES} byte cap"
-                            )
-                        f.write(chunk)
-                # Validate the decoded image before exposing it to the cache (S-2).
-                validate_image_file(tmp.name)
-                os.replace(tmp.name, str(cache_path))  # atomic on POSIX
-            except Exception:
-                # Clean up partial / rejected file before re-raising
-                try:
-                    os.unlink(tmp.name)
-                except OSError:
-                    pass
-                raise
-        finally:
-            if resp is not None:
-                resp.release_conn()
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
         """Load and scale cover art from the local file cache.
@@ -1659,8 +1385,7 @@ class DisplayRenderer:
         if cached is not None:
             return cached
 
-        cache_key = self._url_to_cache_key(url)
-        cache_path = self.cache_dir / cache_key
+        cache_path = self._cover_store.path_for(url)
         if not cache_path.exists():
             return None
 
