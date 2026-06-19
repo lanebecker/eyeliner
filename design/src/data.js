@@ -7,6 +7,15 @@
 //   accent  — bright extracted color (track name, badges)
 //   text    — primary text color (near-white, tinted)
 //   muted   — secondary text color
+//
+// NOTE (PR-4): these accents were HAND-CORRECTED for ≥60° OKLCH separation
+// across albums, and a few muted values nudged to clear 4.5:1 vs bg (see the
+// inline comments below).  They are REFERENCE TARGETS for the look, not an
+// implementation.  The guarantees must come from production code, not this
+// hand-tuned data: muted-contrast is enforced by `src/display/palette.py`
+// (extract_palette / ensure_contrast); cross-album Hue-Diversity is the
+// ASPIRATIONAL A-1 (no cross-album OKLCH registry exists in code yet — see
+// CLAUDE.md / DESIGN.md §2).
 
 const ALBUMS = [
   {

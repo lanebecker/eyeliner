@@ -109,6 +109,10 @@ function useTweaks(defaults) {
     const edits = typeof keyOrEdits === 'object' && keyOrEdits !== null
       ? keyOrEdits : { [keyOrEdits]: val };
     setValues((prev) => ({ ...prev, ...edits }));
+    // The '*' target origin here (and on the other __edit_mode_* messages in
+    // this file) is intentional: these are the impeccable live-edit host bridge,
+    // and the canvas runs same-origin / sandboxed.  Pin a concrete origin only
+    // if this canvas is ever embedded cross-origin (PR-5).
     window.parent.postMessage({ type: '__edit_mode_set_keys', edits }, '*');
     window.dispatchEvent(new CustomEvent('tweakchange', { detail: edits }));
   }, []);

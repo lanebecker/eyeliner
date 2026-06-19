@@ -1,6 +1,24 @@
 // Direction A — "Museum Card" + variants.
-// prefers-reduced-motion: checked once at module load; inline styles reference this.
-const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// prefers-reduced-motion as a live React hook (PR-3).  The old version read
+// `matchMedia(...).matches` ONCE at module load — stale if the OS setting
+// changes, and a hard throw on any non-browser/SSR import.  This subscribes to
+// the query's `change` event and guards `matchMedia` so the module stays
+// import-safe.  Every component that animates calls this and gates its
+// `animation` on the result.
+function useReducedMotion() {
+  const QUERY = '(prefers-reduced-motion: reduce)';
+  const supported = typeof window !== 'undefined' && typeof window.matchMedia === 'function';
+  const [reduced, setReduced] = React.useState(() => supported && window.matchMedia(QUERY).matches);
+  React.useEffect(() => {
+    if (!supported) return;
+    const mql = window.matchMedia(QUERY);
+    const onChange = e => setReduced(e.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, [supported]);
+  return reduced;
+}
 // All variants share the same type hierarchy and palette logic — the
 // changes are layout (cover position, sleeve frame, accent block,
 // chrome density). Pass `variant` to switch.
@@ -16,8 +34,14 @@ function DirectionA({
   album, state = 'playing', showAdjacent = false, themed = true,
   variant = 'default',
 }) {
+  const prefersReducedMotion = useReducedMotion();
   const p = themed ? album.palette : window.FALLBACK_PALETTE;
   const isEmpty = state === 'idle' || state === 'boot' || state === 'error';
+  // HANDOFF NOTE (PR-2): in empty states (idle/boot/error) this prototype still
+  // renders the META column — artist, album, genre chips, catalog footer — only
+  // swapping the cover and hero text.  PRODUCTION MUST NOT: DESIGN.md §5 mandates
+  // suppressing ALL album metadata in empty states (which renderer._compose_empty
+  // does).  Port empty-state behaviour from DESIGN.md §5, never from this file.
   const mirror = variant === 'right';
   const showTopStrip = variant !== 'compact';
   const hasBlock = variant === 'block';
@@ -272,6 +296,7 @@ function DirectionA({
 }
 
 function DirAStatus({ state, accent, muted }) {
+  const prefersReducedMotion = useReducedMotion();
   const dot = {
     playing: accent, between: '#e0a040', paused: muted, idle: muted, boot: accent, error: '#c85050',
   }[state];
@@ -302,6 +327,7 @@ function useBootElapsed(state) {
 }
 
 function DirAEmptyCover({ state, p }) {
+  const prefersReducedMotion = useReducedMotion();
   const elapsed = useBootElapsed(state);
   // Label transitions: first 20s → "WARMING UP", 20-59s → "STILL LISTENING…", 60s+ → "IDENTIFYING… 1:mm"
   const bootLabel = React.useMemo(() => {
@@ -323,9 +349,7 @@ function DirAEmptyCover({ state, p }) {
         <svg width="72" height="72" viewBox="0 0 72 72">
           <circle cx="36" cy="36" r="32" stroke={p.muted} strokeOpacity="0.4" strokeWidth="1" fill="none" />
           <circle cx="36" cy="36" r="32" stroke="#c85050" strokeWidth="1.5" fill="none"
-            strokeDasharray="50 200" strokeLinecap="round" style={{
-              transformOrigin: '36px 36px',
-            }} />
+            strokeDasharray="50 200" strokeLinecap="round" />
         </svg>
         <div style={{
           fontFamily: '"JetBrains Mono", monospace',

@@ -202,6 +202,10 @@ function DCViewport({ children, minScale = 0.1, maxScale = 8, style = {} }) {
     el.style.setProperty('--dc-inv-zoom', String(1 / scale));
     if (lastPostedScale.current !== scale) {
       lastPostedScale.current = scale;
+      // The '*' target origin (here and on the other __dc_* messages in this
+      // file) is intentional: the impeccable canvas host bridge, run same-origin
+      // / sandboxed.  Pin a concrete origin only if ever embedded cross-origin
+      // (PR-5).
       window.parent.postMessage({ type: '__dc_zoom', scale }, '*');
     }
     clearTimeout(saveT.current);

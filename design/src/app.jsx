@@ -3,8 +3,7 @@
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "themed": true,
-  "showAdjacent": true,
-  "primaryAlbumId": "sister"
+  "showAdjacent": true
 }/*EDITMODE-END*/;
 
 function App() {
@@ -25,7 +24,7 @@ function App() {
             <DCArtboard key={a.id} id={`rec-${a.id}`}
               label={`${a.artist} — ${a.album.split(' or')[0]}`}
               width={1024} height={600}>
-              <DirectionA album={a} state="playing" themed={t.themed} showAdjacent={true} />
+              <DirectionA album={a} state="playing" themed={t.themed} showAdjacent={t.showAdjacent} />
             </DCArtboard>
           ))}
         </DCSection>
