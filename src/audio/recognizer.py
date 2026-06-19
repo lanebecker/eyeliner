@@ -20,6 +20,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# How many consecutive unconfirmable results to tolerate before logging a churn
+# warning (B-21).  At ~10-12s/chunk this is ~a minute of "seeing tracks but
+# never the same one twice" — enough to distinguish genuine churn from a normal
+# track change, cheap enough to leave a journal breadcrumb when it happens.
+_CHURN_LOG_EVERY = 5
+
 
 @dataclass
 class RawRecognitionResult:
@@ -166,6 +172,11 @@ class RecognitionLoop:
         self._pending_result: Optional[RawRecognitionResult] = None
         self._pending_count: int = 0
         self._miss_count: int = 0
+        # Consecutive unconfirmable non-None results (alternating matches that
+        # never reach confirmation_required).  Purely diagnostic — it leaves a
+        # breadcrumb when the display "stops updating" because recognition is
+        # churning rather than failing outright (B-21).
+        self._churn_count: int = 0
         self.backend: RecognizerBackend = self._init_backend()
 
     def _init_backend(self) -> RecognizerBackend:
@@ -240,6 +251,7 @@ class RecognitionLoop:
 
         if self._same_track(result, self.state.current_raw):
             self._miss_count = 0  # same track still playing — recognition works (B-7)
+            self._churn_count = 0  # …and not churning (B-21)
             return  # Same track still playing
 
         if self._same_track(result, self._pending_result):
@@ -251,6 +263,7 @@ class RecognitionLoop:
         if self._pending_count >= self.confirmation_required:
             log.info(f"Track confirmed: {result.artist} — {result.title}")
             self._miss_count = 0  # a real commit — recognition works (B-7)
+            self._churn_count = 0  # …and not churning (B-21)
             # Hand the confirmed result to the commit service (A-9).  We await
             # it so the next chunk isn't processed until current_raw has been
             # advanced (the dedup at the top depends on that ordering).
@@ -264,6 +277,17 @@ class RecognitionLoop:
             # the boot/IDENTIFYING screen forever.  Previously _miss_count was
             # reset on EVERY non-None result, so neither churn nor interspersed
             # None-misses could ever accumulate to surface ERROR (B-7).
+            self._churn_count += 1
+            if self._churn_count % _CHURN_LOG_EVERY == 0:
+                # Diagnostic breadcrumb (B-21): the display looks "stuck" not
+                # because recognition failed but because it keeps seeing
+                # different tracks that never confirm.  Conservative by design —
+                # we still don't guess — but now the journal says why.
+                log.warning(
+                    "Recognition churning: %d consecutive unconfirmable results "
+                    "(latest: %s — %s); display not updated.",
+                    self._churn_count, result.artist, result.title,
+                )
             self._register_miss()
 
     def _register_miss(self):

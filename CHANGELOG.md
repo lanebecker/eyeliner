@@ -72,6 +72,44 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
   dot's pulse buckets (P-3). Steady-state optimization; during the ≤1s palette
   lerp it falls back to per-frame rotation (never worse than before).
 
+### Fixed (pipeline correctness)
+
+- **Scrobble re-checks the session epoch before firing (B-19, #68).** Scrobbling
+  still happens on confirmation (a confirmed vinyl track is genuinely playing),
+  but `TrackCommitService.commit` now re-checks `session_epoch` before the
+  scrobble — `on_track_identified` can yield (its album-split path awaits a
+  Discogs write), and a needle-lift during that window must not scrobble a track
+  whose session has already ended. The display commit, which has no intervening
+  await, is unaffected.
+- **Recognition-churn telemetry (B-21, #70).** When recognition keeps returning
+  different one-off matches that never reach confirmation (two records bleeding,
+  a noisy room), the display correctly doesn't guess — but it used to do so
+  silently. A churn counter now logs a warning every few unconfirmable results so
+  a "stopped updating" report has a journal breadcrumb. No change to the
+  conservative consecutive-confirmation behavior.
+- **Static-frame cache key no longer keys on `id(cover)` (B-22, #71).** Python
+  object ids are recycled after GC, so a freshly-loaded cover Surface could
+  reuse a collected one's id and falsely match a stale composed frame. The key
+  now includes a monotonic `_cover_version` bumped whenever a cover lands, so a
+  newly-downloaded cover reliably forces a recompose.
+- **Last.fm love can't double-fire (B-23, #72).** `PlaySession` gains a `loved`
+  flag (latched before the love await), mirroring the `credited` guard. Needed
+  because a fallback album (no release_id) never latches `credited`, so the
+  existing guard didn't cover the love path; a re-entrant finalize could
+  otherwise love the closer twice.
+
+### Documented (no behavior change)
+
+- **Lock-free session start proven race-free (B-20, #69).** Analysis showed the
+  synchronous `_start_session` called from `on_silence_event(MUSIC_STARTED)` is
+  not a reproducible race on the single-threaded event loop (create-only,
+  idempotent, no await; the session-destroy site has no await before the null;
+  the one lock-held-across-await path adopts rather than clobbers). The invariant
+  is now documented in `_start_session` and locked down by a regression test,
+  rather than restructured (routing the sync start through the lock would need
+  scheduling, breaking the synchronous-session contract and adding a
+  SESSION_ENDED ordering hazard for no real safety gain).
+
 ---
 
 ## [1.5.0] — 2026-06-19

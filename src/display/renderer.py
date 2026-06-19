@@ -369,6 +369,11 @@ class DisplayRenderer:
 
         # Render hot-path caches (v1.3.3)
         self._cover_cache = _BoundedCache(_COVER_CACHE_MAX)  # (url, w, h) → scaled Surface
+        # Monotonic token bumped whenever a cover lands on disk (B-22).  The
+        # static-frame key includes it so a freshly-downloaded cover forces a
+        # recompose — a stable replacement for the old id(cover), whose ids could
+        # be recycled after GC and falsely match a stale frame.
+        self._cover_version: int = 0
         self._gradient_key: Optional[tuple] = None           # (bg, surface, w, h)
         self._gradient_surface = None                        # pygame.Surface
 
@@ -542,7 +547,7 @@ class DisplayRenderer:
             track.year, track.label, track.catalog_number,
             self._side_string(track),
             track.prev_track_title, track.next_track_title,
-            id(cover),  # changes when the async cover download lands
+            self._cover_version,  # bumps when a cover lands (stable; no id() reuse — B-22)
             p.bg, p.surface, p.accent, p.text, p.muted,
         )
         if self._static_key != key or self._static_surface is None:
@@ -1391,6 +1396,9 @@ class DisplayRenderer:
                 return
 
         await self._extract_palette_async(url)
+        # A cover for `url` is now on disk — bump the version so the next render
+        # recomposes the static frame and picks it up (B-22).
+        self._cover_version += 1
         self._dirty = True
 
     async def _extract_palette_async(self, url: str):

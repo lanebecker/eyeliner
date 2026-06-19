@@ -90,7 +90,13 @@ class TrackCommitService:
             f"{metadata.title} [{metadata.source.name}]"
         )
 
-        if self.lastfm:
+        # Re-check the epoch before scrobbling (B-19).  set_track/set_raw above run
+        # with no intervening await, so the display commit is consistent with the
+        # post-resolve epoch check — but on_track_identified CAN yield (its
+        # album-split path awaits a Discogs write), and a SESSION_ENDED during that
+        # window means the needle lifted.  Don't scrobble a track whose session has
+        # already ended.
+        if self.lastfm and self.state.session_epoch == commit_epoch:
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     None, self.lastfm.scrobble, metadata, timestamp

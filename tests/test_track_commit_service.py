@@ -176,6 +176,29 @@ async def test_scrobble_failure_does_not_break_commit():
 
 
 @pytest.mark.asyncio
+async def test_scrobble_skipped_when_session_ends_during_tracker_tail():
+    """B-19: on_track_identified can yield (its album-split path awaits a Discogs
+    write).  If the needle lifts during that window, the scrobble for the now-
+    ended track must be skipped — even though the display commit already ran."""
+    lastfm = MagicMock()
+    lastfm.scrobble = MagicMock()
+    service, state, resolver, tracker = make_service(lastfm=lastfm)
+    state.set_status(PlayerStatus.LISTENING)
+    meta = MagicMock()
+    resolver.resolve = AsyncMock(return_value=meta)
+
+    async def end_during_tail(metadata):
+        state.clear()  # SESSION_ENDED lands during the tracker tail → epoch bumps
+
+    tracker.on_track_identified = AsyncMock(side_effect=end_during_tail)
+
+    await service.commit(make_raw())
+
+    tracker.on_track_identified.assert_awaited_once()  # the tail did run...
+    lastfm.scrobble.assert_not_called()                # ...but the scrobble was skipped
+
+
+@pytest.mark.asyncio
 async def test_stale_commit_does_not_scrobble():
     """When the session ends mid-resolve, nothing is scrobbled."""
     lastfm = MagicMock()

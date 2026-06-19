@@ -216,3 +216,68 @@ def test_boot_arc_reduced_motion_never_rotates(monkeypatch):
 
     assert calls == []                 # never rotated
     assert len(r._arc_rot_cache) == 0  # and never cached
+
+
+def test_static_frame_recomposes_when_cover_version_bumps(tmp_path):
+    """B-22: a freshly-landed cover must force the now-playing static frame to
+    recompose.  The static-frame key includes the monotonic _cover_version, so a
+    bump changes the key even when the on-screen `cover` object is identical
+    (the old id(cover) token could be GC-recycled and falsely match a stale
+    frame).  Renders with no cover file on disk (cover=None both times), so ONLY
+    the version token can distinguish the two keys."""
+    from src.display.cover_cache import CoverArtCache
+    from src.display.renderer import (
+        _BoundedCache as _BC, _PALETTE_CACHE_MAX, _COVER_CACHE_MAX,
+        _LABEL_CACHE_MAX, _DOT_CACHE_MAX, _FONT_CACHE_MAX,
+    )
+    from src.state.player_state import PlayerState, PlayerStatus
+    from src.metadata.models import TrackMetadata, MetadataSource
+
+    r = DisplayRenderer.__new__(DisplayRenderer)
+    r.width, r.height = 1024, 600
+    r.reduced_motion = True
+    r.dynamic_theming = False
+    r._layout = get_now_playing_layout(1024, 600)
+    r._screen = pygame.Surface((1024, 600))
+    r._font_cache = _BC(_FONT_CACHE_MAX)
+    r._label_cache = _BC(_LABEL_CACHE_MAX)
+    r._dot_cache = _BC(_DOT_CACHE_MAX)
+    r._cover_cache = _BC(_COVER_CACHE_MAX)
+    r._palette_cache = _BC(_PALETTE_CACHE_MAX)
+    r._cover_store = CoverArtCache(tmp_path)
+    r._gradient_key = None
+    r._gradient_surface = None
+    # Pre-seed the cover-shadow cache so _cover_shadow returns early instead of
+    # calling convert_alpha (which needs an initialized display); this test only
+    # cares about the static-frame KEY, not the shadow pixels.
+    _ca = r._layout.cover_art
+    r._shadow_key = (_ca.w, _ca.h)
+    r._shadow_surface = pygame.Surface((_ca.w + 200, _ca.h + 200), pygame.SRCALPHA)
+    r._static_key = None
+    r._static_surface = None
+    r._arc_segment = None
+    r._current_palette = FALLBACK_PALETTE
+    r._target_palette = FALLBACK_PALETTE
+    r._transition_start = 0.0
+    r._cover_version = 0
+    r._dirty = False
+
+    state = PlayerState()
+    state.current_track = TrackMetadata(
+        title="So What", artist="Miles Davis", album="Kind of Blue",
+        source=MetadataSource.FALLBACK,
+        cover_art_url="https://i.discogs.com/x.jpg",  # never written to disk → cover=None
+        tracklist=[],
+    )
+    state.status = PlayerStatus.PLAYING
+    r.state = state
+
+    r._render_now_playing()
+    key_before = r._static_key
+    assert key_before is not None
+
+    r._cover_version += 1          # a cover for this track just landed
+    r._render_now_playing()
+    key_after = r._static_key
+
+    assert key_before != key_after  # the static frame recomposed (B-22)

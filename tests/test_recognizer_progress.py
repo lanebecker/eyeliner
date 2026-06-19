@@ -85,3 +85,61 @@ async def test_commit_resets_progress_counter():
 
 # B-11 (current_raw advanced only after a successful set_track) moved with the
 # commit sequence to tests/test_track_commit_service.py.
+
+
+# ---------------------------------------------------------------------------
+# B-21 — churn telemetry (diagnostic only; no confirmation-behavior change)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_churn_logs_a_warning_after_threshold(caplog):
+    """Alternating distinct one-off matches never confirm; after the threshold a
+    warning is logged so a 'stuck' display has a breadcrumb (B-21)."""
+    import logging
+    from src.audio.recognizer import _CHURN_LOG_EVERY
+
+    # High error_after_misses so ERROR doesn't fire before we reach the churn log.
+    loop, state = make_loop(confirmation_required=2, error_after_misses=100)
+    state.set_status(PlayerStatus.LISTENING)
+
+    with caplog.at_level(logging.WARNING, logger="src.audio.recognizer"):
+        # One short of the threshold → still silent (pins the trigger point so a
+        # drifted modulo, e.g. == 1, is caught — not just a disabled log).
+        for i in range(_CHURN_LOG_EVERY - 1):
+            await loop._handle_result(raw(f"Track {i}"))  # all distinct → churn
+        assert not any("churning" in r.message.lower() for r in caplog.records)
+
+        await loop._handle_result(raw("Track last"))      # the Nth churn → warn
+
+    assert loop._churn_count == _CHURN_LOG_EVERY
+    assert any("churning" in r.message.lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_churn_counter_resets_on_confirm():
+    """A real confirmation clears the churn counter — churn measures only the
+    consecutive unconfirmable run."""
+    loop, state = make_loop(confirmation_required=2, error_after_misses=100)
+    state.set_status(PlayerStatus.LISTENING)
+
+    await loop._handle_result(raw("A"))   # churn 1
+    await loop._handle_result(raw("B"))   # churn 2
+    assert loop._churn_count == 2
+    await loop._handle_result(raw("B"))   # B confirms (count reaches 2) → reset
+
+    assert loop._churn_count == 0
+
+
+@pytest.mark.asyncio
+async def test_churn_counter_resets_when_current_track_seen_again():
+    """Seeing the track that's already playing means recognition works — not
+    churn — so the counter resets."""
+    loop, state = make_loop(confirmation_required=2, error_after_misses=100)
+    state.set_status(PlayerStatus.LISTENING)
+
+    await loop._handle_result(raw("A"))   # churn 1
+    await loop._handle_result(raw("B"))   # churn 2
+    state.current_raw = raw("A")          # pretend A is now the playing track
+    await loop._handle_result(raw("A"))   # same as current → not churn
+
+    assert loop._churn_count == 0

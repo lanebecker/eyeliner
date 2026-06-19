@@ -605,6 +605,36 @@ async def test_db_record_then_collection_record_splits():
 
 
 @pytest.mark.asyncio
+async def test_love_not_repeated_on_double_finalize_fallback_album():
+    """B-23: a fallback album (no release_id) never latches `credited`, so the
+    B-8 credited-guard doesn't cover the love path.  The separate `loved` flag
+    must still prevent a double-love on a re-entrant finalize."""
+    writer = make_writer_mock()
+    lastfm = MagicMock()
+    lastfm.love_on_completion = True
+    lastfm.love = MagicMock(return_value=True)
+    tracker = ListenTracker(writer, lastfm)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    fallback_last = TrackMetadata(
+        title="Master-Dik", artist="Sonic Youth", album="Sister",
+        source=MetadataSource.FALLBACK,
+        discogs_release_id=None, discogs_instance_id=None,
+        tracklist=make_tracklist(),
+    )
+    await tracker.on_track_identified(fallback_last)
+    session = tracker._session
+    assert session.potential_last_track is True
+    assert session.album_release_id is None   # so `credited` will never latch
+
+    await tracker._finalize_session(session)
+    await tracker._finalize_session(session)   # re-entrant / double finalize
+
+    lastfm.love.assert_called_once()           # the `loved` flag held the line
+    assert session.loved is True
+
+
+@pytest.mark.asyncio
 async def test_collection_then_db_record_still_splits():
     """The original v1.3.4 direction (collection → DB) keeps working under
     last_release_id comparison."""

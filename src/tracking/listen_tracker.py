@@ -88,6 +88,32 @@ class ListenTracker:
             task.add_done_callback(self._bg_tasks.discard)
 
     def _start_session(self):
+        """Create a session if none is active.  Idempotent and create-only.
+
+        Invariant (B-20): this is intentionally called WITHOUT the lifecycle
+        lock from the synchronous ``on_silence_event(MUSIC_STARTED)`` path, and
+        that is race-free on the single-threaded event loop because:
+
+          1. It is *create-only and idempotent* — it never nulls or replaces an
+             existing session, only assigns one when ``_session is None``.
+          2. It has no ``await``, so it runs atomically; nothing interleaves
+             inside it.
+          3. The one place a session is *destroyed* (``_session = None`` in
+             ``_end_session_locked``) has no ``await`` between acquiring the lock
+             and the null, so a synchronous ``_start_session`` cannot slip in
+             between them and have its new session immediately nulled.
+          4. The only critical section that holds the lock across an ``await``
+             (``on_track_identified``'s album split + ``_finalize_session``)
+             operates on a *local* session reference after nulling
+             ``self._session``, and re-checks ``self._session is None`` under the
+             lock — so a session created by a concurrent MUSIC_STARTED is adopted,
+             not corrupted.
+
+        Routing this through the lock would require scheduling (``on_silence_event``
+        is sync), which would break the synchronous "session exists immediately
+        after MUSIC_STARTED" contract and add a SESSION_ENDED ordering hazard for
+        no real safety gain.  See test_listen_tracker_split_race.py.
+        """
         if self._session is None:
             self._session = PlaySession()
             log.info("Play session started.")
@@ -189,9 +215,20 @@ class ListenTracker:
 
         # Last.fm: love the last track if the full side completed and love is enabled.
         # Runs independently of Discogs — a Discogs failure doesn't prevent this.
-        if session.potential_last_track and self.lastfm and self.lastfm.love_on_completion:
+        # Gated on (and latching) session.loved so a re-entrant/double finalize
+        # can't love the same track twice (B-23) — the love-side analogue of the
+        # B-8 `credited` guard above.
+        if (
+            session.potential_last_track
+            and not session.loved
+            and self.lastfm
+            and self.lastfm.love_on_completion
+        ):
             last_track = session.identified_tracks[-1] if session.identified_tracks else None
             if last_track:
+                # Latch before the await so a re-entrant finalize bails instead of
+                # issuing a second love for the same track.
+                session.loved = True
                 love_success = await asyncio.get_running_loop().run_in_executor(
                     None, self.lastfm.love, last_track
                 )

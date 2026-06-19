@@ -203,3 +203,24 @@ async def test_extract_palette_async_uses_cache_without_decoding(tmp_path):
     r._wanted_cover_url = url
     await r._extract_palette_async(url)
     assert r._target_palette == ALT_PALETTE
+
+
+# ---------------------------------------------------------------------------
+# B-22 — the static-frame key uses a stable cover-version token, not id(cover)
+# ---------------------------------------------------------------------------
+
+async def test_prefetch_cover_bumps_cover_version(tmp_path):
+    """When a cover lands on disk, _prefetch_cover bumps a monotonic version
+    counter (and marks dirty), so the static-frame cache key changes and the
+    frame recomposes — a stable signal, unlike the old id(cover) which could be
+    recycled after GC (B-22)."""
+    r = make_renderer(tmp_path)
+    r._cover_version = 0
+    r._dirty = False
+    url = "https://i.discogs.com/c.jpg"
+    _write_cover(r._cover_store, url)          # warm cache: file already on disk
+
+    await r._prefetch_cover(url)
+
+    assert r._cover_version == 1               # version advanced → forces recompose
+    assert r._dirty is True

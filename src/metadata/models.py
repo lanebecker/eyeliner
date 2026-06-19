@@ -289,6 +289,11 @@ class PlaySession:
     # end (the B-2 race, or a split misfire that finalizes the same session
     # twice) cannot double-increment the same release (B-8).
     credited: bool = False
+    # Set True once this session's last track has been Loved on Last.fm, so the
+    # same re-entrant/double-finalize paths can't double-love it (B-23).  Tracked
+    # separately from `credited` because loving runs independently of the Discogs
+    # credit (a Discogs failure doesn't gate it).
+    loved: bool = False
 
     def log_track(self, track: TrackMetadata):
         """Record a newly identified track in this session."""

@@ -13,8 +13,7 @@ becomes a no-op.  These tests drive the interleaving deterministically.
 import pytest
 
 from src.audio.silence import AudioEvent
-from src.metadata.models import MetadataSource, TrackMetadata
-from tests.test_listen_tracker import make_tracker, make_track, make_tracklist
+from tests.test_listen_tracker import make_tracker, make_track
 
 
 @pytest.mark.asyncio
@@ -89,6 +88,38 @@ async def test_scheduled_session_ended_after_split_is_a_noop():
     assert not tracker._bg_tasks
     assert tracker._session is session_b           # B was NOT ended
     writer.increment_play_count.assert_called_once_with(111, 222)
+
+
+@pytest.mark.asyncio
+async def test_lock_free_music_started_during_end_does_not_corrupt(tmp_path=None):
+    """B-20: the lock-free MUSIC_STARTED → _start_session path is race-free.
+
+    Reproduces the one interleaving that matters — a MUSIC_STARTED landing after
+    an end has nulled `_session` but before its finalize completes — and shows
+    no corruption: `_start_session` creates a FRESH session (never resurrects the
+    ended one), and the detached old session still credits the correct release.
+    """
+    tracker, writer = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(
+        make_track("Master-Dik", release_id=111, instance_id=222)
+    )  # record A, played through its closer → creditable
+    session_a = tracker._session
+
+    # An end nulls `_session` (as _end_session_locked does) BEFORE finalizing...
+    tracker._session = None
+    # ...and a MUSIC_STARTED fires in that window (the lock-free create path).
+    tracker._start_session()
+    session_b = tracker._session
+
+    assert session_b is not session_a       # a fresh session, A not resurrected
+    assert session_b.album_release_id is None  # B starts clean (no inherited latch)
+
+    # The detached A is finalized (operating on the local ref, as the end does).
+    await tracker._finalize_session(session_a)
+
+    writer.increment_play_count.assert_called_once_with(111, 222)  # A credited
+    assert tracker._session is session_b     # B untouched and still current
 
 
 @pytest.mark.asyncio
