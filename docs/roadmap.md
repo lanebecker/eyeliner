@@ -329,7 +329,7 @@ reads the master's year (one rate-limited GET per album, amortized by the
 album cache) with the pressing year as fallback. DESIGN.md §7 already
 specified this; the code now complies. 341-test unit suite (+7).
 
-### v1.5.0 — Code-review hardening ✅ (current)
+### v1.5.0 — Code-review hardening ✅
 
 **No new user-facing features.** A full Principal-Engineer review
 (`CODE_REVIEW_2026-06-17.md`) produced 59 findings across six milestones —
@@ -343,6 +343,21 @@ empty states, and a log-and-continue `Signal` observer — plus the performance,
 correctness, security, test-coverage, and design-prototype findings. See
 `CHANGELOG.md` for the full breakdown. **Upgrade note:** config validation is
 now stricter (a hand-edited `config.yaml` with loose types may need fixing).
+
+### v1.5.1 — Code-review hardening, round 2 ✅ (current)
+
+**No new user-facing features.** A second-pass review (`CODE_REVIEW_2026-06-18.md`)
+produced 13 issues (#62–#74) across five milestones, all fixed here under the same
+discipline. Headlines: closed the residual cover-fetch **DNS-rebinding SSRF**
+(#62, IP-pinned HTTPS); extracted the cover fetch/disk cache out of the renderer
+into a pure **`CoverArtCache`** module with `.part` sweep + bounded disk cache
+(#63–#65); moved **palette extraction off the event loop** and bucket-cached the
+boot-arc rotation (#66–#67); pipeline-correctness fixes — epoch-gated scrobble,
+churn telemetry, a stable static-frame cache key, Last.fm love idempotency, and a
+documented lock-free-session-start invariant (#68–#72); and reconciled two
+doc-vs-code gaps — Hue-Diversity formally deferred and resolution-independence
+backed by a layout matrix (#73–#74). Test suite grew 545 → 632. The one deferred
+follow-up is #61 (dedicated Discogs executor), gated on real rate-limit evidence.
 
 ---
 

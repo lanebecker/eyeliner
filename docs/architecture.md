@@ -483,9 +483,11 @@ boot animates (arc + dot + ticking label).
   with accent glow (1.6s eased opacity/scale pulse per DESIGN.md §5) +
   letter-spaced `NOW PLAYING` label (left), `SIDE A · 02 OF 03` position
   indicator (right), both JetBrains Mono
-- Left panel: square album art (~440px), downloaded from URL, MD5-keyed disk
-  cache at `display.cover_art_cache_dir`; "Cover Lift" drop shadow beneath
-  (Pillow gaussian blur, cached per size) and a hairline ring above
+- Left panel: square album art (~440px). The download + MD5-keyed disk cache at
+  `display.cover_art_cache_dir` live in `CoverArtCache` (A-15, see below); the
+  renderer only loads the cached file and smoothscales it (`_load_cover`,
+  in-memory `_cover_cache`). "Cover Lift" drop shadow beneath (Pillow gaussian
+  blur, cached per size) and a hairline ring above
 - Right panel: hero track title (Inter Tight SemiBold 72px, word-wrapped) is
   the unconstrained primary element — it claims as much vertical space as it
   naturally needs.  The accent divider line, artist name (Inter Tight Medium
@@ -502,11 +504,15 @@ boot animates (arc + dot + ticking label).
   in exactly one place by design: the PREV/NEXT adjacent track names.
 
 **Dynamic color theming:**
-- On each new track, `_queue_palette()` calls `palette.extract_palette()`
-  (`src/display/palette.py`, A-8) on the cached cover JPEG — 8-colour quantize →
-  dominant tint → `bg`/`surface`, most vibrant → `accent`, near-white →
-  `text`/`muted`, with `muted` contrast-clamped to ≥ 4.5:1 vs `bg`. The renderer
-  consumes the result; it no longer owns the colour maths.
+- Palette extraction (`palette.extract_palette()`, `src/display/palette.py`, A-8:
+  8-colour quantize → dominant tint → `bg`/`surface`, most vibrant → `accent`,
+  near-white → `text`/`muted`, `muted` contrast-clamped to ≥ 4.5:1 vs `bg`) runs
+  **off the event loop** (P-9). `_queue_palette()` — called synchronously inside
+  `set_track`'s listener — only *consumes* a cached palette (targets
+  `FALLBACK_PALETTE` on a miss, never decodes); `_prefetch_cover` dispatches
+  `_extract_palette_async`, which decodes in an executor, caches the result, and
+  re-queues. A `_wanted_cover_url` guard drops a late decode that finished after
+  the displayed track already changed, so it can't repaint the current cover.
 - Palettes cached per `cover_art_url` with an LRU-style cap
   (`_PALETTE_CACHE_MAX = 200`); extraction only runs once per album
 - `_animated_palette()` lerps `_current_palette` → `_target_palette` over
@@ -550,8 +556,14 @@ size-capped; unit-tested in `tests/test_renderer_caches.py`):
 | `_cover_cache` | (url, w, h) | 16 | JPEG decode + smoothscale per compose |
 | gradient surface | (bg, surface, w, h) | 1 | 24 full-screen circle fills per compose |
 | `_label_cache` | (text, size, color, tracking) | 128 | per-character tracked-label rendering |
+| `_dot_cache` | (color, glow, r, pulse-bucket) | 64 | status-dot Surface per pulse phase (P-3) |
+| `_arc_rot_cache` | (radius, accent, angle-bucket) | 64 | `transform.rotate` of the boot arc per frame (P-10) |
 | shadow surface | (w, h) | 1 | Pillow gaussian blur of the Cover Lift shadow |
-| `_static_surface` | (track content, palette) | 1 | **the entire frame** at steady state |
+| `_static_surface` | (track content, **`_cover_version`**, palette) | 1 | **the entire frame** at steady state |
+
+The static-frame key carries a monotonic `_cover_version` (bumped when a cover
+lands on disk) rather than `id(cover)` — object ids are recycled after GC, so the
+old key could falsely match a stale frame (B-22).
 
 The `_dirty` flag prevents redraws when nothing changed;
 `DisplayRenderer._on_state_change()` is registered as a `PlayerState`
@@ -565,6 +577,42 @@ fully quiet at steady state.  Cover-art prefetch tasks are held in a
 - `DISPLAY=:0` — default X display (needed when launched via SSH or systemd)
 
 Escape key exits the app cleanly.
+
+---
+
+### `src/display/cover_cache.py` — CoverArtCache
+
+The cover-art **fetch + disk cache**, extracted from the renderer (A-15) so the
+security-sensitive network boundary lives in one small, pygame-free, independently
+testable place — the same split A-4 did to the Discogs God client. The renderer
+holds one `CoverArtCache` and asks it for paths (`path_for` / `exists`) or
+triggers a fetch (`download`, run in an executor); image decode, scaling, and
+palette extraction stay in the renderer (render-loop concerns).
+
+- **SSRF-hardened, IP-pinned download (S-1 / S-2 / S-7).** `cover_art_url` comes
+  from untrusted external APIs (Discogs image `uri`, MusicBrainz Cover Art
+  Archive). `download()` requires https (http upgraded for allow-listed hosts),
+  restricts the host to an apex allow-list (`discogs.com`, `coverartarchive.org`,
+  `archive.org`, `mzstatic.com`, exact-or-dot-boundary), and **resolves each hop's
+  host exactly once**, rejecting the hop unless *every* resolved address is public
+  (private/loopback/link-local/multicast/reserved/unspecified all rejected;
+  IPv4-mapped IPv6 normalized first). It then **pins the connection to that one
+  vetted IP** via a `urllib3.HTTPSConnectionPool` while keeping TLS SNI +
+  certificate verification bound to the original hostname (`server_hostname` /
+  `assert_hostname`) — closing the validate-then-resolve-again DNS-rebinding TOCTOU
+  (a second, attacker-controlled DNS answer can't steer the socket to an internal
+  host). Redirects are walked manually so every hop is re-validated and re-pinned;
+  the body is byte-capped (10 MB) mid-stream, requires an `image/*` Content-Type,
+  and is image-verified (`palette.validate_image_file`) before an atomic
+  `os.replace` into the cache.
+- **Disk hygiene (R-1 / R-2).** On construction it sweeps stale `.cover-*.part`
+  tempfiles (orphaned by a SIGKILL between write and rename), and prunes the cache
+  to a mtime-LRU bound (`max_files` / `max_bytes`) on init and after every
+  successful download — the prune never evicts the file just written (guards an
+  mtime-tie/coarse-SD-clock eviction race).
+- **Pure:** no pygame, no palette dependency — fully unit-tested in
+  `tests/test_cover_cache.py` with a mocked socket layer and a fake streamed
+  response, no display required.
 
 ---
 
@@ -806,8 +854,9 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `src/state/player_state.py` | Central state, status transitions, change listeners (via `Signal`) |
 | `src/util/signal.py` | `Signal[T]` — log-and-continue observer used by PlayerState + SilenceDetector |
 | `src/display/layouts.py` | Pixel geometry and font sizes (restyle here) |
-| `src/display/palette.py` | Cover-art palette extraction + WCAG colour science (`extract_palette`, `ensure_contrast`) |
-| `src/display/renderer.py` | pygame window, cover art cache, screen rendering, `EmptyState` table |
+| `src/display/palette.py` | Cover-art palette extraction + WCAG colour science (`extract_palette`, `ensure_contrast`, `validate_image_file`) |
+| `src/display/cover_cache.py` | `CoverArtCache` (A-15) — SSRF-hardened IP-pinned cover download (S-1/S-2/S-7), URL→disk cache, `.part` sweep + mtime-LRU prune (R-1/R-2); pygame-free |
+| `src/display/renderer.py` | pygame window, screen rendering, palette transition, in-memory scaled-cover cache, `EmptyState` table (consumes `CoverArtCache`) |
 | `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs write trigger (via `DiscogsCollectionWriter`), Last.fm love call |
 | `src/tracking/lastfm_client.py` | Last.fm scrobble and love — wraps pylast; graceful no-op when unconfigured |
 | `get_lastfm_session_key.py` | One-time desktop auth helper — generates a Last.fm session key to paste into config.yaml |

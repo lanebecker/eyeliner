@@ -78,7 +78,8 @@ The table groups related files; for the live, authoritative file list run
 | `test_listen_tracker.py`, `_idempotency.py`, `_split_race.py` | Last-track detection, Discogs writes, idempotency, album-change split |
 | `test_lastfm_client.py` | LastFmClient scrobble & love logic |
 | `test_layouts.py` | Display layout geometry |
-| `test_renderer_palette.py`, `_caches.py`, `_typography.py`, `_perf.py`, `_robustness.py`, `_cover_security.py` | Palette transitions, bounded caches, typography, hot-loop perf, degenerate covers, cover-download SSRF guards |
+| `test_renderer_palette.py`, `_caches.py`, `_typography.py`, `_perf.py`, `_robustness.py` | Palette transitions incl. off-loop extraction + `_cover_version` recompose (P-9/B-22), bounded caches, typography, hot-loop perf, degenerate covers, boot-arc bucket cache (P-10) |
+| `test_cover_cache.py` | `CoverArtCache` — SSRF IP-pinning + DNS-rebinding/mixed-IP rejection (S-1/S-2/S-7), `.part` sweep + mtime-LRU disk prune (R-1/R-2) |
 | `test_error_state.py` | `EmptyState` rendering, miss counting, boot label |
 | `test_main_wiring.py` | `main.py` pipeline wiring + shutdown semantics |
 | `test_session_log_track_dedup.py` | PlaySession track-dedup logging |

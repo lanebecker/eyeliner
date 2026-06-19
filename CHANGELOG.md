@@ -9,6 +9,23 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [1.5.1] — 2026-06-19
+
+**Code-review hardening, round 2 — no new user-facing features.** A second-pass
+Principal-Engineer review (`CODE_REVIEW_2026-06-18.md`) produced 13 issues
+(#62–#74) across five milestones, all fixed here through the same implement →
+test → mutation-check → cold-review discipline. Highlights: the residual
+cover-fetch DNS-rebinding SSRF is closed with an IP-pinned HTTPS fetch; the
+cover fetch/disk cache is extracted into a pure `CoverArtCache` module with disk
+hygiene; palette extraction and boot-arc rotation moved off / cached on the hot
+path; five pipeline-correctness fixes; and two doc-vs-code gaps reconciled. The
+test suite grew 545 → 632. No behavioral regressions; the one deferred follow-up
+is #61 (dedicated Discogs executor), gated on real-world rate-limit evidence.
+
 ### Security
 
 - **Cover-art fetch pins the connection to a validated IP (S-7, #62).** The
