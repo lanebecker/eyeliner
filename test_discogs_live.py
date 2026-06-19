@@ -49,7 +49,7 @@ def check_search_collection(client) -> Optional[dict]:
         return None
 
     if result is None:
-        fail(f"Not found in your collection.")
+        fail("Not found in your collection.")
         info(f"Is '{TEST_ALBUM}' by {TEST_ARTIST} in your Discogs?")
         info("If so, try adjusting the artist/album strings at the top of this script.")
         return None
