@@ -14,6 +14,130 @@ new version heading when VERSION is bumped._
 
 ---
 
+## [1.5.0] — 2026-06-19
+
+**Code-review hardening release — no new user-facing features.** A full
+Principal-Engineer review of the codebase (`CODE_REVIEW_2026-06-17.md`) produced
+59 findings across six milestones — architecture, performance, correctness,
+security, tests, and the design prototype — all fixed here. Every fix shipped
+through the same discipline: implement → tests → mutation checks → independent
+cold review. No behavioral regressions; the test suite grew to ~545 and is
+mutation-audited.
+
+> **Upgrade note:** `config.yaml` is now parsed into a typed, validated config
+> at startup (see _Changed_ below). Validation is **stricter** than the old
+> untyped load — a hand-edited config with loose types (e.g. `fullscreen: 1`,
+> `sample_rate: 44100.0`, or a quoted number like `width: "1024"`) that used to
+> run will now fail fast with one aggregated, human-readable `ConfigError`.
+> The shipped `config.example.yaml` uses correct types; check yours if it was
+> edited by hand.
+
+### Changed (architecture)
+
+- **Typed configuration boundary (A-2).** New `src/config.py`: `load_config()`
+  parses + validates `config.yaml` **once** into a frozen `AppConfig` tree of
+  section dataclasses (`AudioConfig`, `DiscogsConfig`, `DisplayConfig`,
+  `LastFmConfig`, `RecognitionConfig`). Every component now takes its own typed
+  slice instead of reaching into an untyped dict, and a missing/misspelled key
+  is one friendly `ConfigError` at startup rather than a deep `KeyError`.
+- **`DiscogsClient` God object split into a package (A-4).** `src/metadata/discogs/`
+  now holds three single-purpose collaborators: `DiscogsHttp` (`transport.py` —
+  the shared authenticated session + rate-limit-aware `request()`), `DiscogsReader`
+  (`reader.py` — collection/database search, tracklist, original-year,
+  result assembly), and `DiscogsCollectionWriter` (`writer.py` — Play Count and
+  Last Played writes). `main.py` is the composition root: one shared transport,
+  reader → resolver, writer → tracker — each depends only on the half it uses.
+  The old `src/metadata/discogs_client.py` is removed.
+- **Application-layer commit coordinator (A-9).** The resolve → state → track →
+  scrobble sequence moved out of the audio layer into
+  `src/app/track_commit_service.py` (`TrackCommitService.commit`). `RecognitionLoop`
+  now simply confirms a `RawRecognitionResult` and hands it to an injected
+  `on_confirmed` callback; it no longer knows about the resolver, tracker, or
+  Last.fm. The B-1 epoch guard and B-11 ordering are preserved exactly.
+- **Thin `TrackMetadata` + `SideIndex` value object (A-5).** All positional facts
+  (track number, side letter/position/total, prev/next, is-last-track) are now
+  computed once by `SideIndex.from_tracklist(...)` and cached, instead of each
+  property re-scanning the tracklist by title on every access.
+- **Palette extraction relocated (A-8).** Cover-art palette extraction and the
+  WCAG colour science (`extract_palette`, `ensure_contrast`, `contrast_ratio`,
+  `relative_luminance`, `validate_image_file`) moved from the pygame renderer to
+  `src/display/palette.py`; the renderer now consumes already-valid palettes.
+  `extract_palette` guarantees the Full-Opacity Rule (muted ≥ 4.5:1) by
+  construction.
+- **Enum-driven empty states (A-7).** Boot/idle/error rendering is now an
+  `EmptyState` enum + a single `_EMPTY_STATES` descriptor table, replacing the
+  stringly-typed `kind` argument and three parallel dicts.
+- **Observer hardening (A-11/A-12).** New `src/util/signal.py` `Signal[T]` with
+  log-and-continue delivery (a throwing listener can't kill delivery to the
+  rest); `PlayerState` and `SilenceDetector` use it. `PlayerState` is documented
+  as event-loop-thread-only.
+- **Error taxonomy (A-6).** New `src/metadata/errors.py` distinguishes transient
+  vs. permanent external failures (`is_transient`); the resolve boundary treats a
+  transient miss as "couldn't determine" (leave the album uncached/retryable)
+  rather than a false "not owned".
+- **Recognition backend split (A-13).** `RecognitionLoop` recognition is split
+  into `_encode_wav` (executor) / `_call_shazam` (transport, lazy import) / a
+  pure `_parse_shazam` for testability.
+- **Decoupling (A-3).** The tracker is injected with its Discogs dependency
+  directly at the composition root rather than reaching into the resolver's
+  internals (later narrowed to the write half by A-4).
+
+### Performance
+
+- **Session collection index (P-1).** Discogs collection search builds an
+  in-memory index once per session and matches locally, replacing up to 25
+  per-candidate membership GETs and a full re-walk.
+- **Rate-limit back-off cap lowered 30s → 10s (P-2).** Bounds how long a 429
+  back-off can park a shared executor worker. (Full isolation via a dedicated
+  Discogs thread pool is deferred — tracked in #61.)
+- **Renderer hot-loop caching (P-3…P-8).** Pre-rendered status-dot phases,
+  quantized in-flight lerp palettes for stable per-frame cache keys, a bounded
+  font cache, numpy-based palette frequency counting (also retiring the
+  deprecated `Image.getdata()`), and other per-frame allocation removals.
+
+### Fixed (correctness)
+
+- **Play-count integrity (B-1, B-2).** A track can no longer resurrect itself
+  after the needle lifts (session-epoch guard around the resolve await), and a
+  fast side/record swap no longer credits the wrong album.
+- **Tracklist / neighbour correctness (B-5, B-10).** Reprise titles repeated
+  across sides resolve to the correct neighbour, and numbered tracklists (no
+  side letter) now get prev/next.
+- **Discogs robustness (B-15, B-16).** A 429 on a POST no longer blindly retries
+  unless the body is an idempotent absolute-set; a numeric Play Count value is
+  coerced instead of silently skipped.
+- **Renderer robustness (B-12, B-17, B-18).** Degenerate covers don't crash
+  palette extraction, the genre "+N" overflow reflects what actually fit, and a
+  corrupt cached cover is re-fetched within the track.
+- Plus the remaining correctness findings (B-7, B-9, B-11, B-14, etc.).
+
+### Security
+
+- Cover-art download SSRF hardening, decompression-bomb guards, write-URL ID
+  coercion (S-5), and request-URL redaction in logs (S-4) (S-1…S-5).
+
+### Tests & docs
+
+- New suites for the new structure: `test_config.py`, `test_track_commit_service.py`,
+  the Discogs `reader`/`writer`/`transport`/`security`/`split` tests, plus run-loop,
+  capture drop-oldest/stop, and tracker public-path coverage. The Last.fm scrobble
+  branch and `RecognitionLoop.run()` are now exercised (T-2). Async tests are
+  marker-consistent and a flaky palette-retarget assertion is deterministic.
+- Hardcoded test counts in docs are de-hardcoded (T-8) — run
+  `pytest --collect-only -q | tail -1` for the live number.
+- The manual `test_discogs_live.py` script is gated out of pytest collection (T-7).
+
+### Design prototype
+
+- Wired the "Show prev/next" tweak toggle and removed dead `primaryAlbumId`
+  (PR-1); replaced the module-load `matchMedia` read with a live
+  `useReducedMotion()` hook (PR-3); dropped a dead `transformOrigin` and
+  annotated the sanctioned wildcard `postMessage` bridge (PR-5); added handoff
+  notes that empty-state metadata suppression and palette guarantees come from
+  `DESIGN.md` / production code, not the hand-tuned prototype (PR-2, PR-4).
+
+---
+
 ## [1.4.2] — 2026-06-11
 
 **Behavior-refinement release — original year over pressing year.** The
@@ -71,7 +195,7 @@ and bare gradient. Test count: 314 → 334.
 - **Idle screen** (replaces the bare gradient) — 135° diagonal-stripe
   empty cover (12px surface/bg bands) with "NO RECORD ON PLATTER", hero
   "Waiting for a record". Still the minimal DESIGN.md placeholder; the
-  rich idle redesign remains v1.5.0.
+  rich idle redesign remains planned (now v1.6.0).
 - New `recognition.error_after_misses` config key (default 6).
 
 ### Changed
@@ -110,8 +234,10 @@ spec (typography, elevation, components) defined in `DESIGN.md` and
 297 → 314.
 
 > **Versioning note:** the roadmap previously reserved v1.4.0 for the idle
-> screen redesign; planned features shift up one minor version (idle screen
-> → v1.5.0, side awareness → v1.6.0, web dashboard → v1.7.0).
+> screen redesign; planned features then shifted up one minor version. (Further
+> superseded by the v1.5.0 code-review hardening release — current plan is idle
+> screen → v1.6.0, side awareness → v1.7.0, web dashboard → v1.8.0; see
+> `docs/roadmap.md`.)
 
 ### Added
 

@@ -52,24 +52,37 @@ cp config.example.yaml config.yaml
 
 ## Test inventory
 
-| File | What it tests | Needs hardware? | Needs Discogs? |
-|------|--------------|-----------------|----------------|
-| `tests/test_models.py` | Data models (TrackMetadata, PlaySession, etc.) | No | No |
-| `tests/test_silence.py` | Silence detector state machine | No | No |
-| `tests/test_chunking.py` | ChunkAssembler overlapping-window logic | No | No |
-| `tests/test_capture.py` | AudioCapture device matching & config guards (stubbed sounddevice) | No | No |
-| `tests/test_player_state.py` | PlayerState transitions & change notifications | No | No |
-| `tests/test_listen_tracker.py` | Last-track detection & Discogs update logic | No | No |
-| `tests/test_discogs_client.py` | DiscogsClient Play Count, Last Played, rate-limit & original-year logic | No | No |
-| `tests/test_lastfm_client.py` | LastFmClient scrobble & love logic | No | No |
-| `tests/test_resolver.py` | 3-step metadata fallback chain + album cache | No | No |
-| `tests/test_recognizer.py` | Recognition loop confirmation logic | No | No |
-| `tests/test_layouts.py` | Display layout geometry | No | No |
-| `tests/test_renderer_caches.py` | Renderer bounded caches & palette color math | No | No |
-| `tests/test_renderer_palette.py` | _queue_palette transition decisions (headless) | No | No |
-| `tests/test_renderer_typography.py` | Typography/fidelity helpers + compose smoke test (headless) | No | No |
-| `tests/test_error_state.py` | ERROR state, miss counting, boot label, empty-state composes | No | No |
-| `test_discogs_live.py` | Live Discogs API integration | No | **Yes** |
+All suites under `tests/` are hardware-free and Discogs-free (HTTP is mocked).
+The table groups related files; for the live, authoritative file list run
+`ls tests/test_*.py`.
+
+| File(s) | What it tests |
+|---------|---------------|
+| `test_config.py` | Typed config parsing/validation — `AppConfig`, aggregating `ConfigError`, coercion |
+| `test_models.py`, `test_tracklist_neighbours.py` | TrackMetadata + `SideIndex` (prev/next, reprise B-5, numbered B-10), PlaySession |
+| `test_silence.py`, `test_silence_liveness.py` | Silence detector state machine + the B-6 liveness tick |
+| `test_signal.py` | `Signal[T]` log-and-continue observer |
+| `test_chunking.py` | ChunkAssembler overlapping-window logic |
+| `test_capture.py` | AudioCapture device match, config guards, drop-oldest `_enqueue_block`, `stop()` (stubbed sounddevice) |
+| `test_player_state.py` | PlayerState transitions & change notifications |
+| `test_recognizer.py`, `_encode.py`, `_parse.py`, `_epoch.py`, `_progress.py` | Confirmation gate, `run()` loop, the encode/`_call_shazam`/`_parse` split, B-1 epoch + B-7 progress |
+| `test_track_commit_service.py` | `TrackCommitService.commit` — B-1 epoch guard, B-11 ordering, Last.fm scrobble branch (T-2) |
+| `test_resolver.py`, `test_resolver_error_no_cache.py` | 3-step fallback + album cache + transient-vs-permanent handling |
+| `test_metadata_errors.py` | Transient/permanent error taxonomy (`is_transient`) |
+| `test_discogs_reader.py` | Reader read surface — `get_tracklist` heading/positionless filter, fail-soft |
+| `test_discogs_search_errors.py` | `search_collection` strategy-1→2 fallthrough + B-4/B-13 error semantics |
+| `test_discogs_collection_index.py` | P-1 session collection index |
+| `test_discogs_client.py`, `_robustness.py` | `DiscogsCollectionWriter` Play Count / Last Played + 429 retry (B-15) + numeric coercion (B-16) |
+| `test_discogs_security.py` | Write-URL ID coercion (S-5) + URL redaction (S-4) |
+| `test_discogs_split.py` | A-4 concern boundary (reader/writer share one transport) |
+| `test_listen_tracker.py`, `_idempotency.py`, `_split_race.py` | Last-track detection, Discogs writes, idempotency, album-change split |
+| `test_lastfm_client.py` | LastFmClient scrobble & love logic |
+| `test_layouts.py` | Display layout geometry |
+| `test_renderer_palette.py`, `_caches.py`, `_typography.py`, `_perf.py`, `_robustness.py`, `_cover_security.py` | Palette transitions, bounded caches, typography, hot-loop perf, degenerate covers, cover-download SSRF guards |
+| `test_error_state.py` | `EmptyState` rendering, miss counting, boot label |
+| `test_main_wiring.py` | `main.py` pipeline wiring + shutdown semantics |
+| `test_session_log_track_dedup.py` | PlaySession track-dedup logging |
+| `test_discogs_live.py` (repo root, `check_*` fns) | **Live** Discogs API — manual only, **needs Discogs creds**, excluded from pytest collection (see [T-7] / `conftest.py`) |
 
 ---
 
@@ -82,40 +95,18 @@ pytest
 ```
 
 pytest.ini points `testpaths = tests`, so this automatically picks up everything
-in the `tests/` directory. Expected output:
+in the `tests/` directory and runs it in well under a second (no I/O, no
+hardware). The whole suite should report `… passed` with no failures.
 
-```
-============================= test session starts ==============================
-platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0
-collected 341 items
+The exact test count is **deliberately not pinned in docs** — it drifts every
+time a suite is added (T-8). For the current number, run:
 
-tests/test_capture.py ..........                                         [  3%]
-tests/test_chunking.py ................                                  [  8%]
-tests/test_discogs_client.py .............................               [ 16%]
-tests/test_error_state.py ....................                           [ 22%]
-tests/test_lastfm_client.py ...............                              [ 27%]
-tests/test_layouts.py .....................................              [ 34%]
-tests/test_listen_tracker.py .............................               [ 43%]
-tests/test_models.py ................................................... [ 59%]
-............                                                             [ 63%]
-tests/test_player_state.py .........                                     [ 66%]
-tests/test_recognizer.py ...................                             [ 72%]
-tests/test_renderer_caches.py .............                              [ 76%]
-tests/test_renderer_palette.py ......                                    [ 78%]
-tests/test_renderer_typography.py .................                      [ 84%]
-tests/test_resolver.py .............................                     [ 93%]
-tests/test_silence.py ......................                             [100%]
-
-=============================== warnings summary ===============================
-venv/lib/python3.9/site-packages/urllib3/__init__.py:35
-  NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the
-  'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/
-  urllib3/urllib3/issues/3020
-
-============================== 341 passed in 0.38s ==============================
+```bash
+pytest --collect-only -q | tail -1
 ```
 
-The `NotOpenSSLWarning` is harmless — see [Common failure modes](#common-failure-modes) below.
+You may see a harmless `NotOpenSSLWarning` from urllib3 on macOS/LibreSSL — see
+[Common failure modes](#common-failure-modes) below.
 
 ### One suite at a time
 
@@ -262,8 +253,9 @@ Key cases:
 
 ### `test_listen_tracker.py` — Last-track detection (most important)
 
-Mocks `DiscogsClient` and drives `ListenTracker` directly. Tests every edge case
-from the architecture doc.
+Mocks a `DiscogsCollectionWriter` and drives `ListenTracker` directly (including
+the public `on_silence_event(SESSION_ENDED)` → `create_task` path, T-5). Tests
+every edge case from the architecture doc.
 
 Key cases — Play Count:
 - **Happy path:** last track identified + session ends → `increment_play_count` called with correct `release_id` and `instance_id`
@@ -295,9 +287,11 @@ since v1.3.5):
 
 ### `test_discogs_client.py` — Play Count & Last Played logic
 
-Mocks all HTTP calls and tests `DiscogsClient.increment_play_count()`,
-`update_last_played()`, and the `_get_field_value()` helper in isolation.
-No real Discogs account required.
+Mocks the shared HTTP seam (`DiscogsHttp.session.get`/`.post`) and tests the
+`DiscogsCollectionWriter` writes — `increment_play_count()`,
+`update_last_played()`, and the `_get_field_value()` helper — in isolation
+(rate-limit and B-16 numeric-coercion cases live in
+`test_discogs_client_robustness.py`). No real Discogs account required.
 
 Key cases — increment_play_count:
 - **Blank field:** Play Count field is empty → posts `"1"`
@@ -324,11 +318,11 @@ Key cases — _get_field_value:
 - **Non-200 GET:** returns `None`
 - **Field not in notes:** returns `None`
 
-Key cases — _request rate-limit handling (new in v1.3.3; `time.sleep` is
-patched, so none of these actually wait):
+Key cases — `DiscogsHttp.request` rate-limit handling (`time.sleep` is patched,
+so none of these actually wait):
 - **429 then success:** retried once, sleeping for the `Retry-After` value
 - **Missing/unparseable `Retry-After`:** falls back to the 2s default
-- **Oversized `Retry-After`:** clamped to the 30s cap
+- **Oversized `Retry-After`:** clamped to the 10s cap (lowered from 30s in P-2)
 - **Success:** no retry, no sleep
 - **Two consecutive 429s:** second response returned as-is (no infinite retry)
 - **POST routing:** dispatches via `session.post` with default timeout applied
@@ -336,7 +330,7 @@ patched, so none of these actually wait):
 
 Key cases — get_original_year / year preference (new in v1.4.2):
 - **Master year preferred:** a 2026 reissue with master year 2005 → `"2005"`,
-  fetched from `/masters/{id}` via the rate-limited `_request` helper
+  fetched from `/masters/{id}` via the rate-limited `DiscogsHttp.request` helper
 - **No master:** returns `None`, no HTTP call made
 - **Master year 0:** Discogs's "unknown" sentinel → `None` (never displays "0")
 - **Network failure / lazy `.master` raising:** caught, returns `None`
@@ -364,7 +358,7 @@ Key cases:
 
 ### `test_resolver.py` — Metadata fallback chain
 
-Injects mock `DiscogsClient` and `CoverArtFallback` into `MetadataResolver`.
+Injects a mock `DiscogsReader` and `CoverArtFallback` into `MetadataResolver`.
 
 Key cases:
 - Collection hit → `DISCOGS_COLLECTION` source; database step never called

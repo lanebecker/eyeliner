@@ -34,7 +34,7 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
                current_track)           │                  2. Discogs database
                     │            SESSION_ENDED              3. MusicBrainz fallback
                     │                   │                             │
-                    │                   ├─► DiscogsClient             ▼
+                    │                   ├─► DiscogsCollectionWriter   ▼
                     │                   │   .increment_play_count   TrackMetadata
                     │                   │   .update_last_played        │
                     │                   │                       ┌──────┴──────────┐
@@ -55,10 +55,16 @@ Turntable (RCA) → Behringer UCA222 (USB) → Raspberry Pi 4
 ### `main.py` — Entry point
 
 Instantiates all components, wires up event listeners, and runs the async
-event loop. Key wiring:
+event loop. It is the **composition root**: `load_config()` returns a typed
+`AppConfig`, and `main.py` builds one shared `DiscogsHttp`, injects a
+`DiscogsReader` into `MetadataResolver(reader)` and a `DiscogsCollectionWriter`
+into `ListenTracker(writer, lastfm)`, and constructs
+`TrackCommitService(state, resolver, tracker, lastfm)` — passing
+`commit_service.commit` to `RecognitionLoop` as its `on_confirmed` callback.
+Key wiring:
 
 - `SilenceDetector.on_event` → `ListenTracker.on_silence_event` + `PlayerState.set_status`
-- `RecognitionLoop._commit_track` → `MetadataResolver.resolve` → `PlayerState.set_track` + `ListenTracker.on_track_identified`
+- `RecognitionLoop` confirms a track → `on_confirmed` (= `TrackCommitService.commit`) → `MetadataResolver.resolve` → `PlayerState.set_track` + `ListenTracker.on_track_identified` + Last.fm scrobble
 - `PlayerState.on_change` → `DisplayRenderer._on_state_change` (sets dirty flag)
 
 **Graceful shutdown (v1.3.5):** the three pipeline coroutines run as named
@@ -195,19 +201,27 @@ block-queue policy.
 1. If the result matches the currently playing track → skip (no re-commit)
 2. If the result matches `_pending_result` → increment `_pending_count`
 3. Otherwise → reset: `_pending_result = result`, `_pending_count = 1`
-4. If `_pending_count >= confirmation_required` → call `_commit_track()`, reset pending state
+4. If `_pending_count >= confirmation_required` → `await on_confirmed(result)`, reset pending state
 
-`_commit_track()` calls:
-- `state.set_raw(raw)` — stores the raw result
-- Records a Unix timestamp (`int(time.time())`) before the blocking resolve
+After A-9 the loop holds only `state` (for dedup + miss-counting → ERROR); it no
+longer knows about the resolver, tracker, or Last.fm. The confirmed result is
+handed to an injected `on_confirmed` callback — wired in `main.py` to
+**`TrackCommitService.commit`** (`src/app/track_commit_service.py`), which owns
+the commit sequence:
+- Records a Unix timestamp (`int(time.time())`) and captures the session epoch
+  before the blocking resolve (B-1 guard)
 - `await resolver.resolve(raw)` — full metadata lookup
-- `state.set_track(metadata)` — updates display state
-- `await tracker.on_track_identified(metadata)` — logs to play session
-- `lastfm.scrobble(metadata, timestamp)` — fires in an executor (non-blocking); failure is caught and logged, never interrupts the main loop
+- If a SESSION_ENDED bumped the epoch during the resolve await → discard the
+  commit (the needle lifted; don't resurrect a dead track)
+- `state.set_track(metadata)` **then** `state.set_raw(raw)` — set_track before
+  set_raw so `current_raw` never leads a failed commit (B-11)
+- `await tracker.on_track_identified(metadata)` — logs to the play session
+- `lastfm.scrobble(metadata, timestamp)` — fires in an executor (non-blocking); failure is caught and logged, never interrupts the loop
 
 **Config keys:** `recognition.backend` (default `"shazamio"`),
 `recognition.confirmation_required` (default 2),
-`recognition.poll_interval_seconds` (default 30)
+`recognition.error_after_misses` (default 6),
+`recognition.poll_interval_seconds` (required)
 
 ---
 
@@ -224,8 +238,12 @@ Orchestrates the three-step metadata lookup chain. Always returns a
 | 2 | Discogs database | `DISCOGS_DATABASE` | Generic release metadata, no instance_id |
 | 3 | Shazam raw + MusicBrainz cover art | `FALLBACK` | Minimal metadata |
 
-Each step runs via `asyncio.run_in_executor` (blocking API calls). Exceptions
-at any step are caught and logged; execution falls through to the next step.
+Each step runs via `asyncio.run_in_executor` (blocking API calls). The resolve
+boundary uses the transient-vs-permanent error taxonomy in
+`src/metadata/errors.py` (`is_transient`): a transient/network failure is logged
+at info as "couldn't determine" and leaves the album uncached/retryable, while
+an unexpected error is logged loudly — so a transient blip never pins an owned
+album to a fallback downgrade for the session.
 
 **Album-level result cache (v1.3.3):** a full Discogs resolve can cost 30+
 HTTP requests, and every track on an album shares the same (artist, album)
@@ -238,66 +256,59 @@ LRU-style eviction.  Cuts per-LP Discogs traffic by roughly 90%.
 
 ---
 
-### `src/metadata/discogs_client.py` — DiscogsClient
+### `src/metadata/discogs/` — Discogs access (transport / reader / writer)
 
-Wraps the Discogs API for collection search and field updates.
+The former `DiscogsClient` God object was split (A-4) into three single-purpose
+collaborators that share one HTTP transport. The resolver depends only on the
+reader; the tracker depends only on the writer; `main.py` builds one transport
+and injects each half.
 
-**Libraries:**
-- `python3-discogs-client` — high-level search and release fetching
-- `requests.Session` — collection membership checks and custom field updates
-  (endpoints the library doesn't expose cleanly)
+**`transport.py` — `DiscogsHttp`** — the shared authenticated `requests.Session`
+plus a rate-limit-aware `request()`. All direct REST calls route through it; it
+retries exactly once on HTTP 429, sleeping for the server-suggested
+`Retry-After` (clamped to **10s** — lowered from 30s in P-2 so a long back-off
+can't park a shared executor worker; 2s default when the header is missing or
+unparseable). The sleep runs on an executor thread, never the event loop. Calls
+the high-level `python3-discogs-client` library makes internally
+(search/release/master) are NOT routed through here — 429s there surface as
+exceptions and fall through the resolver's fallback chain. Also home to `_as_id`
+(write-URL ID coercion, S-5) and `_redact_url` (username masking in logs, S-4).
 
-**Rate-limit handling (v1.3.3):** all direct REST calls route through
-`_request()`, which retries exactly once on HTTP 429, sleeping for the
-server-suggested `Retry-After` (clamped to 30s; 2s default when the header is
-missing or unparseable).  The sleep runs on an executor thread, never the
-event loop.  Calls made internally by `python3-discogs-client` are not
-covered — 429s there surface as exceptions and fall through the resolver's
-existing fallback chain.
+**`reader.py` — `DiscogsReader`** (the resolver's half) — owns the high-level
+`python3-discogs-client` `Client` and the session collection index.
 
-**`search_collection(artist, album)` — two-strategy approach:**
+- **`search_collection(artist, album)` — two strategies, both matched locally
+  against a session-cached collection index (P-1)**, so neither pays a
+  per-candidate HTTP cost:
+  - Strategy 1: search the Discogs database for up to 25 candidates and look
+    each up in the local index by `release_id`; return the first owned hit.
+  - Strategy 2: if strategy 1 misses, fuzzy-match the index entries on
+    artist + album title locally. Catches rare/obscurely-ranked pressings.
 
-Strategy 1 (fast): Search the Discogs database for up to 25 candidate
-releases, then call the collection membership endpoint
-(`/users/{username}/collection/releases/{release_id}`) for each. Returns the
-first with a matching `instance_id`. Covers most common cases.
+  The index (`_get_collection_index`, built once via paginated GETs) replaced
+  the old per-candidate membership GET and full re-walk.
+- **`search_database`, `get_tracklist`, `get_original_year`, `_build_result`** —
+  database search, tracklist (filtering Discogs "heading" pseudo-tracks),
+  original-release-year from the master, and the standardised result dict.
 
-Strategy 2 (slow fallback): If strategy 1 finds nothing, page through the
-user's entire collection 100 items at a time, fuzzy-matching on artist/album
-title substring. Catches rare or obscurely-ranked pressings.
+**`writer.py` — `DiscogsCollectionWriter`** (the tracker's half) — the two writes:
 
-**`increment_play_count(release_id, instance_id)`:**
-
-Reads the current value of the Play Count custom field, increments it by 1,
-and writes it back:
-
-```
-GET  /users/{username}/collection/releases/{release_id}
-     → parse current "Play Count" value (default 0 if blank or unreadable)
-
-POST /users/{username}/collection/folders/0/releases/{release_id}
-     /instances/{instance_id}/fields/{field_id}
-{"value": "<current + 1>"}
-```
-
-Returns `True` on HTTP 204, `False` otherwise. The `field_id` is lazily fetched
-and cached from `/users/{username}/collection/fields`. Falls back to 0 if the
-GET fails or the field is blank.
-
-**`update_last_played(release_id, instance_id)`:**
-
-Writes today's date (ISO 8601, `YYYY-MM-DD`) to the Last Played custom field:
-
-```
-POST /users/{username}/collection/folders/0/releases/{release_id}
-     /instances/{instance_id}/fields/{field_id}
-{"value": "YYYY-MM-DD"}
-```
-
-Returns `True` on HTTP 204 or if `last_played_field_name` is not configured
-(graceful no-op). Returns `False` on any failure. The field name is read from
-`discogs.last_played_field_name` in `config.yaml`; if that key is absent, no
-API calls are made.
+- **`increment_play_count(release_id, instance_id)`** — reads the current Play
+  Count, increments by 1, writes it back:
+  ```
+  GET  /users/{username}/collection/releases/{release_id}
+       → parse current "Play Count" (default 0 if blank/unreadable; a numeric
+         value is coerced, not silently skipped — B-16)
+  POST /users/{username}/collection/folders/0/releases/{release_id}
+       /instances/{instance_id}/fields/{field_id}
+  {"value": "<current + 1>"}
+  ```
+  Returns `True` on HTTP 204. The POST opts into the single 429 retry because
+  it's an idempotent absolute-set (B-15). The `field_id` is lazily fetched and
+  cached from `/users/{username}/collection/fields`.
+- **`update_last_played(release_id, instance_id)`** — POSTs today's date
+  (ISO 8601 `YYYY-MM-DD`) to the Last Played field, or a graceful no-op
+  returning `True` when `discogs.last_played_field_name` isn't configured.
 
 ---
 
@@ -320,9 +331,11 @@ front cover thumbnail found. Returns `None` if nothing is available.
 position strings like `"A1"` or `"B12"` into `(side_letter, track_number)`.
 
 **`DisplayPalette`** — five-field dataclass carrying the current color theme:
-`bg`, `surface`, `accent`, `text`, `muted` (all `(R, G, B)` tuples).
-Extracted from album art via Pillow color quantization; falls back to
-`FALLBACK_PALETTE` when no cover art is available.
+`bg`, `surface`, `accent`, `text`, `muted` (all `(R, G, B)` tuples). It is a
+passive value object; extraction lives in `src/display/palette.py`
+(`extract_palette`, A-8), which quantizes the cover and **guarantees** the
+muted role passes the Full-Opacity Rule (≥ 4.5:1 vs bg) by construction. Falls
+back to `FALLBACK_PALETTE` when no cover art is available.
 
 **`TracklistEntry`**: `position` (e.g. `"A1"`), `title`, `duration` (optional, e.g. `"4:37"`)
 
@@ -333,13 +346,19 @@ Key fields: `title`, `artist`, `album`, `source`, `year`, `label`,
 `cover_art_url`, `tracklist`, `genres`
 
 `year` is the album's ORIGINAL release year, not the pressing year
-(v1.4.2): `DiscogsClient._build_result` prefers
+(v1.4.2): `DiscogsReader._build_result` prefers
 `get_original_year()` — one rate-limited GET to `/masters/{id}`, run once
 per album thanks to the resolver's album cache — and falls back to
 `release.year` (the pressing year) when the release has no master or the
 lookup fails.  A 2026 reissue of a 2005 album displays 2005.
 
-Key properties:
+The positional facts below are NOT recomputed per access. They are derived once
+by a `SideIndex` value object (`SideIndex.from_tracklist(tracklist, title)`,
+A-5) and cached on a `cached_property`; `TrackMetadata`'s properties are thin
+delegations to it. (Previously each property re-scanned the tracklist by title
+on every read, which the renderer hit several times per frame.)
+
+Key properties (all delegating to `side_index`):
 - `is_last_track` — True if the current entry's POSITION matches the final
   tracklist entry's position (v1.3.4; the entry itself is located by
   normalized title).  Position matching prevents duplicate-title albums
@@ -445,7 +464,7 @@ animation, easier on the Pi's CPU).
 
 | State | Screen |
 |-------|--------|
-| `IDLE` | DirectionA empty frame: 135° diagonal-stripe cover + "NO RECORD ON PLATTER", hero "Waiting for a record" (v1.4.1; richer idle redesign still planned for v1.5.0) |
+| `IDLE` | DirectionA empty frame: 135° diagonal-stripe cover + "NO RECORD ON PLATTER", hero "Waiting for a record" (v1.4.1; richer idle redesign still planned for v1.6.0) |
 | `LISTENING` | DirectionA empty frame: ghost ring + rotating accent arc (1.4s linear), time-progressive cover label (WARMING UP → STILL LISTENING… → IDENTIFYING… M:SS), hero "Listening…" — fresh sessions only; side flips keep the card up (v1.3.4) |
 | `ERROR` | DirectionA empty frame: static muted-red arc, "NO MATCH FOUND" + "REPOSITION NEEDLE TO RETRY", hero "Couldn't identify" — the stillness is the signal (boot spins; error sits) |
 | `PLAYING` | Full "Museum Card" now-playing layout |
@@ -483,9 +502,11 @@ boot animates (arc + dot + ticking label).
   in exactly one place by design: the PREV/NEXT adjacent track names.
 
 **Dynamic color theming:**
-- On each new track, `_queue_palette()` runs PIL color quantization on the
-  cached cover art JPEG — 8 colors → dominant tint → `bg`/`surface`, most
-  vibrant → `accent`, near-white → `text`/`muted`
+- On each new track, `_queue_palette()` calls `palette.extract_palette()`
+  (`src/display/palette.py`, A-8) on the cached cover JPEG — 8-colour quantize →
+  dominant tint → `bg`/`surface`, most vibrant → `accent`, near-white →
+  `text`/`muted`, with `muted` contrast-clamped to ≥ 4.5:1 vs `bg`. The renderer
+  consumes the result; it no longer owns the colour maths.
 - Palettes cached per `cover_art_url` with an LRU-style cap
   (`_PALETTE_CACHE_MAX = 200`); extraction only runs once per album
 - `_animated_palette()` lerps `_current_palette` → `_target_palette` over
@@ -607,13 +628,14 @@ completion.
    (v1.3.3 — asyncio only weak-references tasks, and this one performs the
    Discogs play-count write)
 
-**`_end_session()` update logic:**
+**Update logic** (`_end_session()` → `_end_session_locked()` → `_finalize_session()`;
+the writes use the injected `DiscogsCollectionWriter`):
 
 ```
 potential_last_track == True
 AND album_release_id is not None
-    → discogs.increment_play_count(release_id, instance_id)
-    → discogs.update_last_played(release_id, instance_id)  [if configured]
+    → writer.increment_play_count(release_id, instance_id)
+    → writer.update_last_played(release_id, instance_id)   [if configured]
     → lastfm.love(last_identified_track)                   [if love_on_completion=true]
 
 potential_last_track == True
@@ -638,7 +660,7 @@ played through to completion.
 
 Wraps `pylast` to scrobble tracks and mark tracks as Loved on Last.fm.
 Synchronous (pylast is synchronous); async callers use `run_in_executor`,
-matching the `DiscogsClient` pattern.
+matching the Discogs reader/writer pattern.
 
 **Design principles:**
 - Graceful no-op when not configured, when credentials are incomplete, or when
@@ -652,7 +674,7 @@ initialised (i.e. all credentials present and `pylast.LastFMNetwork(...)` did
 not raise).
 
 **`scrobble(track, timestamp)`:**
-Called from `RecognitionLoop._commit_track()` for every confirmed track.
+Called from `TrackCommitService.commit` for every confirmed track.
 
 ```python
 self._network.scrobble(
@@ -667,8 +689,8 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 (no-op) if `enabled` is `False`.
 
 **`love(track)`:**
-Called from `ListenTracker._end_session()` when `potential_last_track` is `True`
-and `love_on_completion` is enabled in config.
+Called from `ListenTracker._finalize_session()` when `potential_last_track` is
+`True` and `love_on_completion` is enabled in config.
 
 ```python
 self._network.get_track(track.artist, track.title).love()
@@ -695,7 +717,7 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 4. RecognitionLoop.run()     dequeues chunk → ShazamIOBackend.recognize()
                              → RawRecognitionResult (or None)
 5. _handle_result()          confirmation_required=2: need 2 matches
-                             second match → _commit_track()
+                             second match → on_confirmed (= TrackCommitService.commit)
                              (None while LISTENING: _register_miss();
                              error_after_misses straight misses → ERROR)
 6. MetadataResolver.resolve()  album cache miss → step 1: Discogs collection
@@ -712,17 +734,17 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 ### Side plays through → Discogs + Last.fm updated
 
 ```
-1. RecognitionLoop           last track identified, committed
+1. TrackCommitService.commit last track confirmed + committed
                              → LastFmClient.scrobble(track, timestamp) [in executor]
 2. ListenTracker             session.log_track() → potential_last_track=True
                              album_release_id latched from first Discogs track
 3. Needle lifts              silence begins
 4. SilenceDetector           after 45s → SESSION_ENDED
-5. ListenTracker._end_session()  potential_last_track + release_id present
-                                 → DiscogsClient.increment_play_count()
-                                 → DiscogsClient.update_last_played()  [if configured]
+5. ListenTracker._finalize_session()  potential_last_track + release_id present
+                                 → writer.increment_play_count()
+                                 → writer.update_last_played()          [if configured]
                                  → LastFmClient.love(last_track)        [if love_on_completion=true]
-6. DiscogsClient             Play Count: GET current value, increment, POST new value
+6. DiscogsCollectionWriter   Play Count: GET current value, increment, POST new value
                              Last Played: POST today's ISO date
                              → HTTP 204 → return True
 7. LastFmClient              get_track(artist, title).love()
@@ -758,7 +780,8 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `display.cover_art_cache_dir` | `"src/display/assets/cache"` | MD5-keyed JPEG cache |
 | `recognition.backend` | `"shazamio"` | `"shazamio"` \| `"acrcloud"` \| `"audd"` |
 | `recognition.confirmation_required` | `2` | Consecutive matching results before committing |
-| `recognition.poll_interval_seconds` | `30` | Timeout if recognition queue is empty |
+| `recognition.error_after_misses` | `6` | Consecutive misses while LISTENING before the ERROR screen |
+| `recognition.poll_interval_seconds` | — _(required)_ | Timeout if recognition queue is empty |
 
 ---
 
@@ -766,19 +789,26 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 
 | File | Responsibility |
 |------|---------------|
-| `main.py` | Entry point — wires components, runs async event loop |
-| `src/audio/capture.py` | Continuous USB audio streaming (InputStream), chunk dispatch |
+| `main.py` | Entry point / composition root — wires components, runs async event loop |
+| `src/config.py` | Typed config boundary — `load_config()` → `AppConfig` (frozen section dataclasses), aggregating `ConfigError` |
+| `src/audio/capture.py` | Continuous USB audio streaming (InputStream), chunk dispatch, drop-oldest `_enqueue_block` |
 | `src/audio/chunking.py` | Pure-numpy overlapping-window ChunkAssembler |
-| `src/audio/silence.py` | RMS silence detection, AudioEvent emission |
-| `src/audio/recognizer.py` | ShazamIO recognition loop, confirmation logic |
-| `src/metadata/models.py` | TrackMetadata, PlaySession, TracklistEntry, MetadataSource, DisplayPalette, FALLBACK_PALETTE, _SIDE_RE |
-| `src/metadata/resolver.py` | 3-step metadata lookup chain |
-| `src/metadata/discogs_client.py` | Discogs collection/DB search, genres/styles extraction, Play Count increment, Last Played update |
+| `src/audio/silence.py` | RMS silence detection, AudioEvent emission (via `Signal`) |
+| `src/audio/recognizer.py` | ShazamIO recognition loop + confirmation gate; emits a confirmed result via `on_confirmed` |
+| `src/app/track_commit_service.py` | `TrackCommitService` — resolve → state → track → scrobble commit (B-1/B-11) |
+| `src/metadata/models.py` | TrackMetadata (+ `SideIndex`), PlaySession, TracklistEntry, MetadataSource, DisplayPalette, FALLBACK_PALETTE, _SIDE_RE |
+| `src/metadata/resolver.py` | 3-step metadata lookup chain (depends on `DiscogsReader`) |
+| `src/metadata/errors.py` | Transient-vs-permanent external-error taxonomy (`is_transient`) |
+| `src/metadata/discogs/transport.py` | `DiscogsHttp` — shared session + rate-limit-aware `request()`, `_as_id`/`_redact_url` |
+| `src/metadata/discogs/reader.py` | `DiscogsReader` — collection/DB search, tracklist, original-year, result assembly |
+| `src/metadata/discogs/writer.py` | `DiscogsCollectionWriter` — Play Count increment, Last Played update |
 | `src/metadata/coverart.py` | MusicBrainz Cover Art Archive fallback |
-| `src/state/player_state.py` | Central state, status transitions, change listeners |
+| `src/state/player_state.py` | Central state, status transitions, change listeners (via `Signal`) |
+| `src/util/signal.py` | `Signal[T]` — log-and-continue observer used by PlayerState + SilenceDetector |
 | `src/display/layouts.py` | Pixel geometry and font sizes (restyle here) |
-| `src/display/renderer.py` | pygame window, cover art cache, screen rendering |
-| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs field update trigger, Last.fm love call |
+| `src/display/palette.py` | Cover-art palette extraction + WCAG colour science (`extract_palette`, `ensure_contrast`) |
+| `src/display/renderer.py` | pygame window, cover art cache, screen rendering, `EmptyState` table |
+| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs write trigger (via `DiscogsCollectionWriter`), Last.fm love call |
 | `src/tracking/lastfm_client.py` | Last.fm scrobble and love — wraps pylast; graceful no-op when unconfigured |
 | `get_lastfm_session_key.py` | One-time desktop auth helper — generates a Last.fm session key to paste into config.yaml |
 
@@ -798,7 +828,7 @@ All source modules are complete. The only remaining work requires hardware:
 - **End-to-end integration** — full needle-drop → Discogs-updated flow on hardware
 - **Idle screen richness** — the v1.4.1 idle frame is the deliberate DESIGN.md
   stripe placeholder; the richer layout (last-played art grid, clock, random
-  collection suggestion) is planned for v1.5.0
+  collection suggestion) is planned for v1.6.0
 
 See `docs/testing-guide.md` for the full pre-hardware unit test suite (run
 `pytest --collect-only -q | tail -1` for the current count) and

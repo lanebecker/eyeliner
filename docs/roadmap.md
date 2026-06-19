@@ -44,9 +44,9 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 ## v1.2.0 — Display Redesign & Dynamic Theming ✅
 
 A comprehensive visual overhaul based on the "Museum Card" layout from Claude
-Design mockups. Absorbed the color theming work originally planned for v1.5.0
-and laid the tracklist-parsing groundwork that makes v1.5.0's Side A/B behavioral
-logic significantly lighter to implement.
+Design mockups. Absorbed the color theming work originally planned for a later
+release, and laid the tracklist-parsing groundwork that makes the planned
+v1.7.0 Side A/B behavioral logic significantly lighter to implement.
 
 **192-test unit suite** (+44 tests covering side-awareness properties, new layout
 geometry, and genres passthrough).
@@ -65,7 +65,7 @@ geometry, and genres passthrough).
 - Two-column footer showing `← PREV` / previous track name and
   `NEXT →` / next track name
 
-*Dynamic color theming (absorbed from planned v1.5.0):*
+*Dynamic color theming (absorbed from a later planned release):*
 - Dominant color extracted from the cached album art JPEG using Pillow's color
   quantization
 - Background color subtly tinted per album, giving each record a distinct visual
@@ -75,7 +75,7 @@ geometry, and genres passthrough).
 - Smooth color transition when the track changes (lerp over ~1 second)
 - New `display.dynamic_theming` config boolean (default `true`)
 
-*Tracklist parsing (foundation for v1.5.0 side awareness):*
+*Tracklist parsing (foundation for the planned v1.7.0 side awareness):*
 - Full tracklist fetched from the existing Discogs release response — no new API
   calls; the data is already returned, just not previously extracted
 - Track positions parsed to determine current side (`A`, `B`, etc.), position
@@ -281,7 +281,7 @@ auditing the previous two sweeps' own work; see `CHANGELOG.md` for detail.
 (`DESIGN.md`, `design/DirectionA.jsx`) that the production renderer only
 partially implemented. This release closes the visual gap and pays the
 render-loop tax down at the same time. (This slot was previously reserved
-for the idle screen, which shifts to v1.5.0 — see the CHANGELOG versioning
+for the idle screen, which shifts to v1.6.0 — see the CHANGELOG versioning
 note.)
 
 **What shipped:**
@@ -311,7 +311,7 @@ per DESIGN.md §5; see `CHANGELOG.md` for full detail.
   label (WARMING UP → STILL LISTENING… → IDENTIFYING… M:SS), hero
   "Listening…" at 48px
 - Idle: 135° diagonal-stripe cover + "NO RECORD ON PLATTER", hero "Waiting
-  for a record" (still the minimal placeholder; rich redesign is v1.5.0)
+  for a record" (still the minimal placeholder; rich redesign is v1.6.0)
 - All empty states: fallback palette (smoothly lerped to), metadata fully
   suppressed, state-mapped dot, Cover Lift shadow retained; idle and error
   are fully static so the render loop goes quiet
@@ -320,7 +320,7 @@ per DESIGN.md §5; see `CHANGELOG.md` for full detail.
 The between-tracks/paused states from DESIGN.md need audio-silence
 heuristics and remain deferred to their own effort.
 
-### v1.4.2 — Original Year over Pressing Year ✅ (current)
+### v1.4.2 — Original Year over Pressing Year ✅
 
 **Behavior-refinement release.** The catalog footer now shows the album's
 original release year, not the pressing's — a 2026 reissue of *Apologies to
@@ -329,11 +329,26 @@ reads the master's year (one rate-limited GET per album, amortized by the
 album cache) with the pressing year as fallback. DESIGN.md §7 already
 specified this; the code now complies. 341-test unit suite (+7).
 
+### v1.5.0 — Code-review hardening ✅ (current)
+
+**No new user-facing features.** A full Principal-Engineer review
+(`CODE_REVIEW_2026-06-17.md`) produced 59 findings across six milestones —
+all fixed here through a disciplined implement → test → mutation-check →
+cold-review loop. Headline structural changes: a typed config boundary
+(`src/config.py`), the `DiscogsClient` God object split into a
+reader/writer/transport package (`src/metadata/discogs/`), an application-layer
+`TrackCommitService`, a thin `TrackMetadata` backed by a `SideIndex` value
+object, palette/WCAG science relocated to `src/display/palette.py`, enum-driven
+empty states, and a log-and-continue `Signal` observer — plus the performance,
+correctness, security, test-coverage, and design-prototype findings. See
+`CHANGELOG.md` for the full breakdown. **Upgrade note:** config validation is
+now stricter (a hand-edited `config.yaml` with loose types may need fixing).
+
 ---
 
-## v1.5.0 — Idle Screen & Recent Plays
+## v1.6.0 — Idle Screen & Recent Plays
 
-**Why fifth:** the idle screen is currently a blank dark background. This is
+**Why next:** the idle screen is currently a blank dark background. This is
 the most visible gap in the daily experience — the Pi is on all the time,
 and "nothing" is what you see most. (DESIGN.md likewise flags the current
 stripe placeholder as a design gap; any redesign must use the fallback
@@ -344,15 +359,15 @@ palette and stay in the room-monitor vocabulary.)
   local log) on the idle screen
 - Optional clock / date display
 - "What to play tonight?" — a random record from your Discogs collection
-  displayed during extended idle periods (calls `DiscogsClient` to pull a
+  displayed during extended idle periods (via the `DiscogsReader` to pull a
   random collection item)
 - New `display.idle_mode` config option: `"recent"` | `"random"` | `"clock"` | `"blank"`
 
 ---
 
-## v1.6.0 — Side A / Side B Awareness
+## v1.7.0 — Side A / Side B Awareness
 
-**Why sixth:** makes the listening completion logic meaningfully more accurate.
+**Why after that:** makes the listening completion logic meaningfully more accurate.
 Right now the tracker treats every needle-drop-to-lift session the same way,
 so playing only Side A of a two-sided album can still trigger a Play Count
 increment if Side A happens to end on the last listed track. Side awareness closes
@@ -371,9 +386,9 @@ groundwork required.
 
 ---
 
-## v1.7.0 — Local Web Dashboard
+## v1.8.0 — Local Web Dashboard
 
-**Why seventh:** optional quality-of-life for multi-room or phone-checking use
+**Why last:** optional quality-of-life for multi-room or phone-checking use
 cases. Runs alongside the main app as a lightweight HTTP server.
 
 **What it adds:**
