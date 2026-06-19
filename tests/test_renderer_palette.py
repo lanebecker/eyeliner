@@ -224,3 +224,22 @@ async def test_prefetch_cover_bumps_cover_version(tmp_path):
 
     assert r._cover_version == 1               # version advanced → forces recompose
     assert r._dirty is True
+
+
+async def test_prefetch_cover_warm_cache_themes_without_download(tmp_path):
+    """Warm-cache path: a cover already on disk (no download) must still be
+    extracted + themed by _prefetch_cover — the download block is skipped, but
+    palette extraction is NOT (P-9 warm-cache promise; guards against a refactor
+    that moves the extract behind the download)."""
+    r = make_renderer(tmp_path)
+    r._cover_version = 0
+    r._dirty = False
+    url = "https://i.discogs.com/c.jpg"
+    r._wanted_cover_url = url                  # this cover is the one on screen
+    _write_cover(r._cover_store, url)          # already on disk → no download leg
+
+    await r._prefetch_cover(url)
+
+    themed = r._palette_cache.get(url)
+    assert themed is not None and themed != FALLBACK_PALETTE  # extracted off-loop
+    assert r._target_palette == themed                        # and queued as target
