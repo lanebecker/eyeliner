@@ -98,19 +98,26 @@ def test_same_target_skip_does_not_restart_transition(tmp_path):
     assert r._transition_start == first_start  # Timer NOT restarted
 
 
-def test_new_palette_after_steady_state_retargets(tmp_path):
+def test_new_palette_after_steady_state_retargets(tmp_path, monkeypatch):
     r = make_renderer(tmp_path)
     r._palette_cache.put("http://x/a.jpg", ALT_PALETTE)
+
+    # Deterministic clock so "retarget restarts the timer" is provable with a
+    # strict >, instead of the old flaky `!= first_start or == 0.0` escape that
+    # silently passed when both calls landed in the same monotonic tick (T-6).
+    monkeypatch.setattr("src.display.renderer.time.monotonic", lambda: 100.0)
     r._queue_palette("http://x/a.jpg")
     first_start = r._transition_start
+    assert first_start == 100.0
 
     other = DisplayPalette(
         bg=(10, 10, 20), surface=(22, 22, 44), accent=(80, 80, 220),
         text=(230, 230, 240), muted=(130, 130, 150),
     )
     r._palette_cache.put("http://x/b.jpg", other)
+    monkeypatch.setattr("src.display.renderer.time.monotonic", lambda: 200.0)
     r._queue_palette("http://x/b.jpg")         # Different album → new transition
 
     assert r._target_palette == other
-    assert r._transition_start >= first_start
-    assert r._transition_start != first_start or first_start == 0.0
+    assert r._transition_start == 200.0
+    assert r._transition_start > first_start    # strict: the timer was restarted

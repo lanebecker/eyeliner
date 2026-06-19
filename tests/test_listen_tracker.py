@@ -405,6 +405,7 @@ async def test_update_last_played_returning_false_does_not_raise():
 # completes.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_session_ended_task_is_referenced_until_done():
     tracker = ListenTracker(make_writer_mock())
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
@@ -418,6 +419,41 @@ async def test_session_ended_task_is_referenced_until_done():
 
     assert tracker._session is None      # Session was ended
     assert len(tracker._bg_tasks) == 0   # Reference released on completion
+
+
+@pytest.mark.asyncio
+async def test_full_album_increments_via_public_session_ended_path():
+    """T-5: drive the production wiring — on_silence_event(SESSION_ENDED) →
+    create_task → _end_session — end to end, so the path that actually fires the
+    Discogs write (and where B-2's race lives) is covered, not just a direct
+    _end_session() await."""
+    tracker, writer = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))  # the album closer
+
+    tracker.on_silence_event(AudioEvent.SESSION_ENDED)
+    for _ in range(5):                  # let the scheduled task run to completion
+        await asyncio.sleep(0)
+
+    writer.increment_play_count.assert_called_once_with(12345, 67890)
+    assert tracker._session is None
+    assert len(tracker._bg_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_album_via_public_session_ended_path_does_not_increment():
+    """T-5: only Side A played → the public SESSION_ENDED path ends the session
+    without a Discogs write."""
+    tracker, writer = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Catholic Block"))  # not the closer
+
+    tracker.on_silence_event(AudioEvent.SESSION_ENDED)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    writer.increment_play_count.assert_not_called()
+    assert tracker._session is None
 
 
 # ---------------------------------------------------------------------------

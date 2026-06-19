@@ -123,8 +123,12 @@ def test_blank_field_sets_one():
     result = client.increment_play_count(release_id=111, instance_id=42)
 
     assert result is True
+    # Assert the OUTGOING REQUEST shape (URL + body), not merely that a
+    # particular session method fired (T-Quality): a future transport refactor
+    # must still POST the incremented value to the right collection-field path.
     client._http.session.post.assert_called_once()
-    _, kwargs = client._http.session.post.call_args
+    args, kwargs = client._http.session.post.call_args
+    assert args[0].endswith("/collection/folders/0/releases/111/instances/42/fields/6")
     assert kwargs["json"]["value"] == "1"
 
 
@@ -374,8 +378,11 @@ def test_update_last_played_posts_todays_iso_date():
         result = client.update_last_played(release_id=111, instance_id=42)
 
     assert result is True
+    # Outgoing request shape (URL + body), not just the seam (T-Quality):
+    # today's date must POST to the Last Played field's collection path.
     client._http.session.post.assert_called_once()
-    _, kwargs = client._http.session.post.call_args
+    args, kwargs = client._http.session.post.call_args
+    assert args[0].endswith("/collection/folders/0/releases/111/instances/42/fields/7")
     assert kwargs["json"]["value"] == "2026-05-24"
 
 

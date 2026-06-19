@@ -233,10 +233,7 @@ def test_render_empty_caches_until_boot_label_ticks(_display):
     r = make_renderer()
     r._screen = pygame.display.get_surface()
 
-    class _State:  # minimal stand-in; _render_empty reads no state fields
-        pass
-
-    r.state = _State()
+    r.state = MagicMock()  # _render_empty reads no state fields
     r.dynamic_theming = False
     r._current_palette = FALLBACK_PALETTE
     r._target_palette = FALLBACK_PALETTE
@@ -290,10 +287,7 @@ def test_render_empty_sets_dirty_only_for_animated_states(_display, state, expec
     r = make_renderer()
     r._screen = pygame.display.get_surface()
 
-    class _State:
-        pass
-
-    r.state = _State()
+    r.state = MagicMock()  # _render_empty reads no state fields
     r._current_palette = FALLBACK_PALETTE
     r._target_palette = FALLBACK_PALETTE
     r._transition_start = 0.0

@@ -292,6 +292,7 @@ async def test_no_double_commit_after_success():
 # and stale audio kept being processed first.)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_enqueue_drops_oldest_when_full():
     loop_obj, _, _ = make_loop()
     maxsize = loop_obj._audio_queue.maxsize
@@ -313,6 +314,7 @@ async def test_enqueue_drops_oldest_when_full():
     assert remaining[-1] == 99.0   # the newest chunk was admitted
 
 
+@pytest.mark.asyncio
 async def test_enqueue_below_capacity_keeps_everything():
     loop_obj, _, _ = make_loop()
     await loop_obj.enqueue(np.full(4, 1.0, dtype=np.float32), 44100)
