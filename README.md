@@ -18,7 +18,7 @@ When the last track of an album finishes, it automatically increments the Play C
 - 🎨 Dynamic color theming — palette extracted from each album's cover art; background, accent, and text colors shift per record with a smooth 1-second transition
 - ✅ Automatically increments Play Count in Discogs when the last track plays
 - 📅 Optionally records Last Played date (ISO 8601) in a Discogs custom field
-- 🎧 Last.fm scrobbling — every identified track posted to your listening history automatically
+- 🎧 Last.fm scrobbling (opt-in) — when enabled, every identified track is posted to your listening history automatically
 - ❤️ Optional Last.fm "Loved" mark when a full album side completes (configurable, off by default)
 - 🔄 Graceful fallback: Discogs collection → Discogs database → MusicBrainz
 - 🔧 Swappable recognition backend (ShazamIO, ACRCloud, AudD)

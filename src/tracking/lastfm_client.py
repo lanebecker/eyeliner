@@ -26,8 +26,8 @@ log = logging.getLogger(__name__)
 class LastFmClient:
     """Wraps pylast to scrobble tracks and optionally mark them as Loved.
 
-    Construct once at startup (via main.py) and inject into RecognitionLoop
-    and ListenTracker. pylast is imported lazily so that the module can be
+    Construct once at startup (via main.py) and inject into TrackCommitService
+    (scrobble) and ListenTracker (love). pylast is imported lazily so that the module can be
     imported even when pylast is not installed — the client simply disables
     itself in that case.
     """

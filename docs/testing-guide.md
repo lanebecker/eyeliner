@@ -482,8 +482,7 @@ Key cases:
 
 ### `test_layouts.py` — Display geometry
 
-Tests `get_now_playing_layout()` at multiple resolutions (1024×600, 800×480, 1280×720, 640×480).
-No pygame window is opened.
+Tests `get_now_playing_layout()` across resolutions. No pygame window is opened.
 
 Key cases:
 - All 9 rects (`header_strip`, `cover_art`, `track_text`, `divider`, `artist_text`, `album_text`, `genre_chips`, `meta_text`, `prev_next`) have positive dimensions and non-negative coordinates
@@ -495,6 +494,37 @@ Key cases:
 - Font size hierarchy: track ≥ artist ≥ album ≥ meta/chips/header
 - Chip and divider geometry is positive/non-negative
 - Layout scales proportionally: larger resolution → larger cover art, wider text panels, larger fonts
+- **Resolution-independence matrix (D-2, #74):** a parametrized 480×320 → 4K run
+  **plus non-16:9 cases (square, portrait, ultra-wide, 5:4)** that exercise the
+  `min(sx, sy)` cover branch — asserting no negative/off-screen rects, a square
+  cover bound by the smaller dimension and clear of the text column, the title
+  block clear of the bottom meta/prev-next, and font floors + hierarchy at every
+  size. (Backs CLAUDE.md's "resolution-independent" claim for the static layout;
+  the renderer's runtime title push-down is content-dependent and remains a
+  hardware/visual check — see `docs/first-boot-checklist.md` §5.)
+
+### `test_cover_cache.py` — Cover fetch + disk cache (new in v1.5.1)
+
+Tests `CoverArtCache` (`src/display/cover_cache.py`, A-15) — the SSRF-hardened
+cover download and disk hygiene, extracted from the renderer. Pygame-free; DNS
+resolution and the pinned HTTPS opener are mocked, so no real network is used.
+
+Key cases:
+- **Host allow-list (S-1):** apex match is exact-or-dot-boundary —
+  `i.discogs.com` allowed, `evilcoverartarchive.org` / `discogs.com.attacker.net`
+  rejected
+- **IP validation + DNS-rebinding (S-7):** resolves once; rejects the hop if ANY
+  address is non-public (private/loopback/link-local/multicast/reserved/
+  unspecified, and IPv4-mapped IPv6), rejects mixed public+private answer sets,
+  normalizes a mapped public address, fails closed on resolution error
+- **Pinned stream contract:** `_open_cover_stream` dials the vetted IP but sets
+  `server_hostname`/`assert_hostname` to the hostname (SNI + cert), `redirect=False`
+- **Download path (S-1/S-2):** rejects non-`image/*` Content-Type and HTTP ≥400,
+  aborts past the byte cap mid-stream, rejects undecodable bytes, follows and
+  re-pins validated redirects, and pins to the vetted IP per hop
+- **Disk hygiene (R-1/R-2):** `.part` tempfiles swept on init; mtime-LRU prune by
+  file count and byte budget, the just-written cover protected from eviction even
+  on an mtime tie, non-`.jpg` files left untouched
 
 ---
 

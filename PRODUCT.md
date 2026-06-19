@@ -12,7 +12,7 @@ Primarily the owner: a vinyl listener who wants a companion display running whil
 
 A passive now-playing display for a vinyl turntable. The turntable's audio feeds a Raspberry Pi running ShazamIO (an async Python audio-fingerprinting library — no API key required), which identifies the currently playing track. Track metadata resolves through a three-tier chain: your Discogs collection first (fastest and richest — returns your specific pressing's label, catalog number, and side-aware tracklist), then the broader Discogs database, then MusicBrainz as a final fallback. The display then shows the track name, album cover, artist, album title, side position, label and catalog details, and adjacent tracks. The primary goal is to convey the track name to the room. Artist and album are secondary. All remaining metadata is tertiary.
 
-When the last track of an album plays, the app automatically increments a Play Count custom field in your Discogs collection and optionally records a Last Played date. Every identified track is scrobbled to Last.fm.
+When the last track of an album plays, the app automatically increments a Play Count custom field in your Discogs collection and optionally records a Last Played date. When Last.fm scrobbling is enabled (opt-in), every identified track is scrobbled.
 
 The display is static — it shows what's playing now, not a timeline of when it will end. No progress bars, scrubbers, or elapsed time. Success is a display that makes the listening experience feel more considered: not a music app, not a widget, but something that belongs in the room alongside the turntable.
 
