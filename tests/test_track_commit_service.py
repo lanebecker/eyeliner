@@ -95,6 +95,77 @@ async def test_current_raw_not_advanced_when_resolve_fails():
 
 
 # ---------------------------------------------------------------------------
+# Tracker failure must not strand the track (LB-1, #84)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tracker_failure_does_not_advance_current_raw():
+    """LB-1: if on_track_identified raises (its album-split path awaits a Discogs
+    write), current_raw must NOT advance.  The old order advanced it BEFORE the
+    tracker await, so on failure the recognition loop's dedup treated the
+    never-recorded track as 'already playing' and never re-attempted it —
+    displayed, but never tracked, never scrobbled, never retried.  Now the
+    exception propagates before set_raw, so the loop re-commits on the next
+    chunk; set_track still ran (the display already showed it), only the dedup
+    key is left clean."""
+    service, state, resolver, tracker = make_service()
+    state.set_status(PlayerStatus.LISTENING)
+    meta = MagicMock()
+    resolver.resolve = AsyncMock(return_value=meta)
+    tracker.on_track_identified = AsyncMock(side_effect=RuntimeError("discogs write blew up"))
+
+    with pytest.raises(RuntimeError):
+        await service.commit(make_raw(), state.session_epoch)
+
+    assert state.current_raw is None       # un-advanced → the loop re-attempts
+    assert state.current_track is meta      # display already updated (set_track ran)
+
+
+@pytest.mark.asyncio
+async def test_tracker_failure_defers_the_scrobble_to_the_retry():
+    """LB-1: a tracker failure must not scrobble on the doomed commit — the
+    scrobble sits after set_raw, so it is deferred to the successful retry rather
+    than double-firing (the retry re-runs the whole commit)."""
+    lastfm = MagicMock()
+    lastfm.scrobble = MagicMock()
+    service, state, resolver, tracker = make_service(lastfm=lastfm)
+    state.set_status(PlayerStatus.LISTENING)
+    resolver.resolve = AsyncMock(return_value=MagicMock())
+    tracker.on_track_identified = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError):
+        await service.commit(make_raw(), state.session_epoch)
+
+    lastfm.scrobble.assert_not_called()
+    assert state.current_raw is None
+
+
+@pytest.mark.asyncio
+async def test_needle_lift_during_tracker_does_not_advance_current_raw():
+    """B-19/LB-1: moving set_raw after the tracker await (per LB-1) means a needle
+    lift DURING on_track_identified (SESSION_ENDED → clear() bumps the epoch and
+    nulls current_raw) must not let set_raw resurrect the dead session's dedup
+    key.  The epoch guard on set_raw skips the advance, so current_raw stays null
+    and a re-drop of the same record can commit again.  (The end-state null holds
+    under the old order too — clear() nulled it after set_raw ran — so this test
+    pins the GUARD specifically: with the guard removed, set_raw runs
+    unconditionally and resurrects the key, which the mutation check confirms.)"""
+    service, state, resolver, tracker = make_service()
+    state.set_status(PlayerStatus.LISTENING)
+    resolver.resolve = AsyncMock(return_value=MagicMock())
+
+    async def end_during_tail(metadata):
+        state.clear()   # needle lifts mid-tracker → epoch bumps, current_raw nulled
+
+    tracker.on_track_identified = AsyncMock(side_effect=end_during_tail)
+
+    await service.commit(make_raw(), state.session_epoch)
+
+    assert state.current_raw is None        # set_raw skipped; not resurrected
+    assert state.status == PlayerStatus.IDLE
+
+
+# ---------------------------------------------------------------------------
 # Epoch guard (B-1)
 # ---------------------------------------------------------------------------
 
