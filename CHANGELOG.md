@@ -48,6 +48,17 @@ same implement → RED test → mutation-check → cold-review discipline.
   intentional substring fuzz (which catches reissues like "The Wall" vs "The Wall
   (Remastered)") is preserved, and legitimately short titles ("4", "Q") still
   match — only empty/whitespace terms are rejected.
+- **A titleless Shazam response no longer confirms as a real track (REC-3, #81 —
+  HIGH).** `_parse_shazam` built a `RawRecognitionResult` even when the `track`
+  object had an empty, missing, or `null` title, so two such junk responses
+  matched each other, reached `confirmation_required`, and were committed
+  (resolved, displayed, and — before SEC-1 — a wrong-collection-write risk). The
+  title is the track's identity, so `_parse_shazam` now returns `None` when it is
+  empty/whitespace/missing/null, and the recognition loop counts it as a miss.
+  A title-only track (no artist) is still a valid partial match. As a side
+  effect this also resolves the `title: null` half of REC-2 (a null title no
+  longer reaches — and crashes — the dedup comparison); the null-*artist* half
+  remains tracked separately under REC-2.
 
 ---
 

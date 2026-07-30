@@ -51,3 +51,31 @@ def test_parse_partial_track_defaults_safely():
     # A track with only a title must not raise; missing fields default.
     r = ShazamIOBackend._parse_shazam({"track": {"title": "Only Title"}})
     assert r == RawRecognitionResult("Only Title", "", "", None)
+
+
+# ---------------------------------------------------------------------------
+# REC-3 — a track object with no USABLE TITLE is a no-match, not a recognition.
+# The title is the track's identity; without it, two such junk responses would
+# "confirm" as a real track and get committed. Parse must return None so the
+# loop counts them as misses. (A missing/null title also previously crashed the
+# dedup comparison in _same_track — the null-title half of REC-2.)
+# ---------------------------------------------------------------------------
+
+def test_parse_missing_title_is_none():
+    # Track exists (so it's not the falsy-track path) but has no title key.
+    assert ShazamIOBackend._parse_shazam({"track": {"subtitle": "Miles Davis"}}) is None
+
+
+def test_parse_empty_title_is_none():
+    assert ShazamIOBackend._parse_shazam({"track": {"title": "", "subtitle": "A"}}) is None
+
+
+def test_parse_whitespace_title_is_none():
+    assert ShazamIOBackend._parse_shazam({"track": {"title": "   ", "subtitle": "A"}}) is None
+
+
+def test_parse_null_title_is_none():
+    # JSON null (title present but null) — the .get default does NOT apply, so
+    # the value is None; parse must treat it as a no-match, not build a result
+    # with title=None that later crashes _same_track (null-title half of REC-2).
+    assert ShazamIOBackend._parse_shazam({"track": {"title": None, "subtitle": "A"}}) is None
