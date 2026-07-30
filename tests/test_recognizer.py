@@ -19,7 +19,7 @@ import asyncio
 import numpy as np
 import pytest
 
-from src.audio.recognizer import RawRecognitionResult, RecognitionLoop
+from src.audio.recognizer import RawRecognitionResult, RecognitionLoop, ShazamIOBackend
 from tests.factories import make_recognition_config
 
 
@@ -80,6 +80,28 @@ async def test_single_result_increments_pending_count_to_one():
 # ---------------------------------------------------------------------------
 # Two matching results commit
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_titleless_shazam_responses_never_confirm():
+    """REC-3 end-to-end: repeated Shazam responses that carry a track object but
+    no usable title must never confirm a track. _parse_shazam rejects them as a
+    no-match, so the loop counts misses and never emits a titleless result to the
+    commit service (which, pre-fix, would resolve it and — before SEC-1 — write to
+    an arbitrary owned record)."""
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
+    state.current_raw = None
+    state.status = None  # not LISTENING; we only care that nothing confirms
+
+    # track exists (not the falsy-track None path) but has no title.
+    titleless = {"track": {"subtitle": "Miles Davis", "sections": []}}
+    for _ in range(3):
+        parsed = ShazamIOBackend._parse_shazam(titleless)
+        await loop._handle_result(parsed)
+
+    on_confirmed.assert_not_awaited()
+    assert loop._pending_result is None
+    assert loop._pending_count == 0
+
 
 @pytest.mark.asyncio
 async def test_two_matching_results_emit_confirmed_track():

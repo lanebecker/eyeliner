@@ -108,6 +108,18 @@ class ShazamIOBackend(RecognizerBackend):
         if not track:
             return None
 
+        # The title is the track's IDENTITY: a track object with an empty,
+        # missing, or null title is a no-match, not a recognition (REC-3).
+        # Without this guard, two such junk responses match each other and
+        # "confirm" as a real track that then gets committed — and a null title
+        # would later crash the dedup comparison in _same_track (the null-title
+        # half of REC-2).  `or ""` coerces a JSON-null title to a string so the
+        # emptiness check is None-safe.  Returning None makes the loop count it
+        # as a miss instead of a candidate.
+        title = track.get("title") or ""
+        if not title.strip():
+            return None
+
         # Pull album from the metadata section if present.  Break BOTH loops as
         # soon as the album is found — without the outer break the inner break
         # only exits the metadata loop and a later section could overwrite it.
@@ -121,7 +133,7 @@ class ShazamIOBackend(RecognizerBackend):
                 break
 
         return RawRecognitionResult(
-            title=track.get("title", ""),
+            title=title,
             artist=track.get("subtitle", ""),
             album=album,
             isrc=track.get("isrc"),
