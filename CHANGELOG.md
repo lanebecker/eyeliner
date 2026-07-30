@@ -59,6 +59,19 @@ same implement → RED test → mutation-check → cold-review discipline.
   effect this also resolves the `title: null` half of REC-2 (a null title no
   longer reaches — and crashes — the dedup comparison); the null-*artist* half
   remains tracked separately under REC-2.
+- **A duplicated Discogs position string no longer credits a phantom play
+  (META-4, #78 — HIGH).** `SideIndex.is_last_track` — the sole gate on the
+  end-of-side Play Count / Last Played write — compared the current track's
+  position string to the last entry's. Discogs positions are community-edited
+  free text and not guaranteed unique, so a mid-album track that merely *shared*
+  the closer's position string ("B2") was flagged the last track and credited a
+  play for a side that never finished. `is_last_track` is now derived from the
+  already-computed, position-AND-title-disambiguated `global_index`, so only the
+  genuine final entry credits. The deliberately conservative reprise behavior (a
+  closer whose title is duplicated earlier resolves to the first occurrence and
+  is *not* credited — a missed play rather than a phantom one) is preserved; a
+  20,000-tracklist differential fuzz confirmed the change only ever removes
+  phantoms, never flips a correct result.
 
 ---
 
