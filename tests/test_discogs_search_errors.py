@@ -111,3 +111,95 @@ def test_strategy_2_release_fetch_error_propagates():
 
     with pytest.raises(requests.exceptions.Timeout):
         client.search_collection("sonic youth", "sister")
+
+
+# ---------------------------------------------------------------------------
+# SEC-1 — an incomplete recognition (empty / whitespace artist OR album) must
+# NOT select an arbitrary owned record as the Play Count / Last Played write
+# target. The strategy-2 substring test degenerates on an empty term
+# (`"" in title` is always True) — and even a single space is a substring of
+# most titles ("kind of blue" contains spaces) — so it would hand back the
+# most-recently-added owned release with its instance_id. That instance_id is
+# what the collection writer POSTs to, so a junk Shazam match becomes a wrong
+# write to real collection data. search_collection must return None instead, so
+# the track falls through to the database/fallback tiers (no instance_id, no
+# write) rather than crediting a play to the wrong record.
+# ---------------------------------------------------------------------------
+
+def _wrong_target_reader():
+    """A reader whose collection would be wrongly selected by a degenerate match:
+    strategy 1 finds nothing, and any strategy-2 hit would build a write target."""
+    client = make_discogs_reader()
+    client._collection_index = _index(111, 42, title="Kind of Blue", artists=("Miles Davis",))
+    client._database_search = MagicMock(return_value=[])   # strategy 1 finds nothing
+    client._client = MagicMock()
+    client._client.release.return_value = MagicMock()
+    client._build_result = MagicMock(return_value={"release_id": 111, "instance_id": 42})
+    return client
+
+
+def test_empty_album_does_not_select_a_write_target():
+    client = _wrong_target_reader()
+
+    result = client.search_collection("Miles Davis", "")
+
+    assert result is None
+    client._build_result.assert_not_called()   # never chose a write target
+    client._client.release.assert_not_called()
+
+
+def test_empty_artist_does_not_select_a_write_target():
+    client = _wrong_target_reader()
+
+    result = client.search_collection("", "Kind of Blue")
+
+    assert result is None
+    client._build_result.assert_not_called()
+
+
+def test_single_space_album_does_not_select_a_write_target():
+    """A single space IS a substring of most titles ('kind of blue' contains
+    spaces), so an un-stripped guard would still degenerate — this pins the
+    .strip() on the album term and reproduces the bug on the pre-fix code."""
+    client = _wrong_target_reader()
+
+    result = client.search_collection("Miles Davis", " ")
+
+    assert result is None
+    client._build_result.assert_not_called()
+
+
+def test_single_space_artist_does_not_select_a_write_target():
+    """Pins the .strip() on the artist term (a single space is a substring of
+    'miles davis')."""
+    client = _wrong_target_reader()
+
+    result = client.search_collection(" ", "Kind of Blue")
+
+    assert result is None
+    client._build_result.assert_not_called()
+
+
+def test_both_terms_empty_does_not_select_a_write_target():
+    client = _wrong_target_reader()
+
+    result = client.search_collection("", "")
+
+    assert result is None
+    client._build_result.assert_not_called()
+
+
+def test_legitimately_short_album_still_matches():
+    """The guard rejects EMPTY/whitespace only — a real, short album title must
+    still match (no arbitrary minimum-length rejection that would false-negative
+    titles like '4' or 'Q')."""
+    client = make_discogs_reader()
+    client._collection_index = _index(111, 42, title="4", artists=("Beyoncé",))
+    client._database_search = MagicMock(return_value=[])
+    client._client = MagicMock()
+    client._client.release.return_value = MagicMock()
+    client._build_result = MagicMock(return_value={"release_id": 111, "instance_id": 42})
+
+    result = client.search_collection("Beyoncé", "4")
+
+    assert result == {"release_id": 111, "instance_id": 42}

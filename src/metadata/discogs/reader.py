@@ -73,6 +73,25 @@ class DiscogsReader:
         "couldn't determine" (leaves the album uncached, retries next track)
         rather than a false "not owned" (B-4/B-13).
         """
+        # SEC-1: an incomplete recognition (empty / whitespace artist OR album)
+        # cannot identify a SPECIFIC owned pressing.  The strategy-2 substring
+        # test degenerates on an empty term — ``"" in title`` and ``"" in
+        # artist`` are always True, and even a single space is a substring of
+        # most titles ("Kind of Blue" contains spaces) — so it would return an
+        # arbitrary owned release, whose ``instance_id`` becomes the Play Count /
+        # Last Played write target.  Refuse to guess: return None so the track
+        # resolves via the database / fallback tiers (no instance_id, no write)
+        # instead of crediting a play to the wrong record.  This does NOT reject
+        # legitimately short titles ("4", "Q") — only empty/whitespace terms.
+        if not artist.strip() or not album.strip():
+            log.info(
+                "Skipping collection match for an incomplete recognition "
+                "(artist=%r, album=%r): cannot identify a specific owned pressing "
+                "without both fields, so not selecting a write target.",
+                artist, album,
+            )
+            return None
+
         index = self._get_collection_index()
 
         # Strategy 1: database candidates, matched locally against the index.
