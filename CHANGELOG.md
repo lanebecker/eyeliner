@@ -35,6 +35,18 @@ same implement → RED test → mutation-check → cold-review discipline.
   B-16 JSON-number coercion (`5` → `6`) is preserved.
 - Both aborts log at ERROR with a distinct message, and the two guards are pinned
   independently by log-message assertions so neither can be removed unnoticed.
+
+### Tests
+
+- **Pinned `_get_collection_fields` — the field-name → field-ID map that selects
+  which Discogs column a write lands in (MUT-1, #79).** Every writer test
+  previously pre-seeded `writer._collection_fields`, so the fetch/build path had
+  zero test executions and a mutation could silently reverse the name→id mapping
+  (writing to the wrong column) with the suite still green. Added tests
+  exercising the real fetch: the endpoint URL, the name→id direction, caching,
+  HTTP-error propagation, and an end-to-end check that the resolved field-ID is
+  the one that lands in the write URL. `writer.py` is now at 100% line coverage,
+  and the five previously-surviving mutants there are killed.
 - **An incomplete recognition no longer writes to an arbitrary owned record
   (SEC-1, #76 — HIGH).** `search_collection`'s strategy-2 fuzzy match used a bare
   substring test (`album_lower in title and any(artist_lower in a …)`). An empty

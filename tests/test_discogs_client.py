@@ -38,6 +38,9 @@ from unittest.mock import MagicMock, patch
 
 import logging
 
+import pytest
+import requests
+
 from src.metadata.discogs.writer import _READ_FAILED
 from tests.factories import make_discogs_config, make_discogs_writer, make_discogs_reader
 
@@ -407,6 +410,100 @@ def test_get_field_value_field_unset_returns_none_confirmed_blank():
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _get_collection_fields — the field-NAME → field-ID map that decides WHICH
+# Discogs custom column a write lands in.  Previously EVERY writer test
+# pre-seeded ``writer._collection_fields``, so this fetch/build path never
+# executed under test at all (MUT-1): the map selecting the write column was
+# entirely unpinned.  These exercise it directly.
+# ---------------------------------------------------------------------------
+
+def _fields_response(fields):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"fields": fields}
+    return resp
+
+
+def make_unseeded_writer():
+    """A writer whose collection-fields cache is NOT pre-populated, so
+    _get_collection_fields actually fetches."""
+    writer = make_discogs_writer(config=_BASE_CONFIG)
+    assert writer._collection_fields is None  # guard: the fetch path is live
+    return writer
+
+
+def test_get_collection_fields_fetches_and_maps_name_to_id():
+    """The fetch builds {field_name: field_id} from the collection-fields
+    endpoint — the mapping that later selects the write column."""
+    writer = make_unseeded_writer()
+    writer._http.request = MagicMock(return_value=_fields_response(
+        [{"name": "Play Count", "id": 3}, {"name": "Last Played", "id": 4}]
+    ))
+
+    fields = writer._get_collection_fields()
+
+    # name -> id (NOT id -> name): the value is what gets interpolated into the
+    # write URL, so the direction matters.
+    assert fields == {"Play Count": 3, "Last Played": 4}
+    method, url = writer._http.request.call_args[0][:2]
+    assert method == "GET"
+    assert url.endswith("/users/testuser/collection/fields")
+
+
+def test_get_collection_fields_is_cached_after_first_fetch():
+    """Second call returns the same cached dict with no further HTTP (the
+    _collection_fields-is-not-None guard)."""
+    writer = make_unseeded_writer()
+    writer._http.request = MagicMock(return_value=_fields_response(
+        [{"name": "Play Count", "id": 3}]
+    ))
+
+    first = writer._get_collection_fields()
+    second = writer._get_collection_fields()
+
+    assert first == {"Play Count": 3}
+    assert second is first
+    assert writer._http.request.call_count == 1
+
+
+def test_get_collection_fields_propagates_http_error_and_does_not_cache():
+    """A failed fetch raises (couldn't determine the fields) and leaves the
+    cache unset so a later call can retry."""
+    writer = make_unseeded_writer()
+    bad = MagicMock()
+    bad.raise_for_status.side_effect = requests.exceptions.HTTPError("500")
+    writer._http.request = MagicMock(return_value=bad)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        writer._get_collection_fields()
+    assert writer._collection_fields is None
+
+
+def test_increment_uses_the_fetched_field_id_as_the_write_column():
+    """End-to-end with NO pre-seeded cache: the id the map resolves for
+    'Play Count' is the field the POST targets — so a wrong name→id mapping
+    would write to the wrong Discogs column, not just fail a lookup."""
+    writer = make_unseeded_writer()
+
+    def fake_request(method, url, **kwargs):
+        if url.endswith("/collection/fields"):
+            return _fields_response(
+                [{"name": "Other", "id": 9}, {"name": "Play Count", "id": 3}]
+            )
+        if method == "GET":  # the current-value read
+            return make_get_response(200, instance_response(42, 3, "5"))
+        return make_post_response(204)  # the write
+
+    writer._http.request = MagicMock(side_effect=fake_request)
+
+    assert writer.increment_play_count(release_id=111, instance_id=42) is True
+    post_urls = [c.args[1] for c in writer._http.request.call_args_list if c.args[0] == "POST"]
+    assert post_urls, "no POST issued"
+    assert post_urls[0].endswith("/fields/3")  # Play Count = 3, not Other = 9
 
 
 def test_get_field_value_field_not_in_notes_returns_none():
