@@ -35,6 +35,19 @@ same implement → RED test → mutation-check → cold-review discipline.
   B-16 JSON-number coercion (`5` → `6`) is preserved.
 - Both aborts log at ERROR with a distinct message, and the two guards are pinned
   independently by log-message assertions so neither can be removed unnoticed.
+- **An incomplete recognition no longer writes to an arbitrary owned record
+  (SEC-1, #76 — HIGH).** `search_collection`'s strategy-2 fuzzy match used a bare
+  substring test (`album_lower in title and any(artist_lower in a …)`). An empty
+  Shazam album or artist — or even a single space, which is a substring of most
+  titles — made that test vacuously true, so it returned the most-recently-added
+  owned release, whose `instance_id` then became the Play Count / Last Played
+  write target: a junk match became a wrong write to real collection data.
+  `search_collection` now returns `None` when the artist or album is empty or
+  whitespace-only, so the track resolves via the database/fallback tiers (no
+  `instance_id`, no write) instead of crediting a play to the wrong record. The
+  intentional substring fuzz (which catches reissues like "The Wall" vs "The Wall
+  (Remastered)") is preserved, and legitimately short titles ("4", "Q") still
+  match — only empty/whitespace terms are rejected.
 
 ---
 
