@@ -47,6 +47,12 @@ log = logging.getLogger(__name__)
 # as opposed to "end only if the current session is this specific one".
 _CURRENT_SESSION = object()
 
+# Bounded window (seconds) that shutdown waits for an in-flight end-of-session
+# Discogs credit to finish before the event loop tears it down (CONC-1). Long
+# enough for the normal write pair to complete many times over, short enough to
+# stay well within systemd's default 90s stop timeout even on a stuck network.
+_SHUTDOWN_DRAIN_SECONDS = 10.0
+
 
 class ListenTracker:
     """Manages play sessions and triggers Discogs field updates on album completion."""
@@ -86,6 +92,38 @@ class ListenTracker:
             task = asyncio.create_task(self._end_session(expected=target))
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
+
+    async def drain(self, timeout: float = _SHUTDOWN_DRAIN_SECONDS) -> None:
+        """Wait (bounded) for any in-flight end-of-session credit tasks to finish.
+
+        Called from the composition root's shutdown path (``run_pipeline``) so a
+        SESSION_ENDED credit that is mid-write — ``increment_play_count`` done but
+        ``update_last_played`` / the Last.fm love still pending — is not torn in
+        half by the event loop closing (CONC-1). The credit runs as a
+        fire-and-forget task in ``_bg_tasks``; it is NOT one of the pipeline
+        legs, so without this nothing awaits it and ``asyncio.run`` cancels it
+        mid-write, leaving the collection permanently half-updated (Play Count
+        incremented, Last Played stale) with ``credited`` latched so nothing
+        retries.
+
+        Bounded by ``timeout`` so a stuck write cannot hang shutdown past
+        systemd's stop timeout; a task still running afterwards is left for loop
+        teardown to cancel, with a warning. Never raises — shutdown must proceed.
+        """
+        pending = [t for t in self._bg_tasks if not t.done()]
+        if not pending:
+            return
+        log.info(
+            "Draining %d in-flight session-credit task(s) before shutdown…",
+            len(pending),
+        )
+        _, still_pending = await asyncio.wait(pending, timeout=timeout)
+        if still_pending:
+            log.warning(
+                "%d session-credit task(s) still running after a %.0fs drain "
+                "timeout; the Discogs update may be incomplete.",
+                len(still_pending), timeout,
+            )
 
     def _start_session(self):
         """Create a session if none is active.  Idempotent and create-only.

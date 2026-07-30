@@ -71,6 +71,18 @@ same implement → RED test → mutation-check → cold-review discipline.
   effect this also resolves the `title: null` half of REC-2 (a null title no
   longer reaches — and crashes — the dedup comparison); the null-*artist* half
   remains tracked separately under REC-2.
+- **Shutdown no longer tears an in-flight end-of-session credit in half
+  (CONC-1, #76 — HIGH).** The end-of-session Play Count / Last Played write runs
+  as a fire-and-forget task in the tracker's `_bg_tasks`; it is not one of the
+  three pipeline legs, so nothing awaited it. A SIGTERM or ESC a second or two
+  after a needle-lift let `asyncio.run` cancel it mid-write — `increment_play_count`
+  had run but `update_last_played` and the Last.fm love had not, and because
+  `_finalize_session` latches `credited` before the first await, nothing retried
+  it: the collection was left permanently half-updated, silently. `ListenTracker`
+  gained a bounded `drain()` that `run_pipeline` now awaits in its `finally`
+  (before stopping capture/display, and even when a leg faulted), so an in-flight
+  credit finishes. Bounded by `_SHUTDOWN_DRAIN_SECONDS` (10s) so a stuck write
+  can't hang shutdown past systemd's stop timeout.
 - **A duplicated Discogs position string no longer credits a phantom play
   (META-4, #78 — HIGH).** `SideIndex.is_last_track` — the sole gate on the
   end-of-side Play Count / Last Played write — compared the current track's
