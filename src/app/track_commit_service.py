@@ -12,11 +12,17 @@ The audio layer now only *confirms* a :class:`RawRecognitionResult` and hands it
 off; this service owns resolve → state → track → scrobble.  The two correctness
 invariants that lived in the old ``_commit_track`` are preserved exactly:
 
-  * **B-1 (epoch guard).** ``resolve()`` yields the event loop; a SESSION_ENDED
-    (needle lift) during it runs ``state.clear()`` and bumps the session epoch.
-    The epoch captured *before* resolving is re-checked *after*; a commit for
-    audio that already stopped is discarded rather than resurrecting a dead
-    track onto the screen or corrupting a fresh session.
+  * **B-1 / PCONC-1 (epoch guard).** Every chunk carries the session epoch it
+    was captured under (bound at enqueue in the recognition loop, and passed to
+    :meth:`commit` as ``audio_epoch``).  A SESSION_ENDED (needle lift) bumps the
+    session epoch via ``state.clear()`` — whether it lands *during* the resolve
+    await OR *before* this confirmed commit ran at all, while the chunk lagged in
+    the recognition queue.  The commit compares the live epoch against the
+    AUDIO's epoch; a commit for audio whose session already ended is discarded
+    rather than resurrecting a dead track onto the screen or corrupting a fresh
+    session.  Sampling the epoch at commit *entry* (the pre-PCONC-1 design) could
+    not see the queue-lag case: the entry sample already read the post-lift epoch
+    and then found it "stable" across the resolve.
   * **B-11 (ordering).** ``set_raw`` is advanced only *after* ``set_track``
     succeeds — otherwise ``current_raw`` would lead ``current_track`` and the
     loop's dedup would treat the new track as "already playing" and never
@@ -59,21 +65,35 @@ class TrackCommitService:
         self.tracker = tracker
         self.lastfm = lastfm
 
-    async def commit(self, raw: "RawRecognitionResult") -> bool:
+    async def commit(self, raw: "RawRecognitionResult", audio_epoch: int) -> bool:
         """Resolve full metadata for *raw* and commit it everywhere.
 
+        ``audio_epoch`` is the session epoch this audio was captured under, bound
+        at enqueue time by the recognition loop (PCONC-1) and threaded through
+        confirmation to here.  It is **required** — the guard is only sound if
+        the caller supplies the audio's own epoch; there is deliberately no
+        default that would silently fall back to re-sampling at commit time (the
+        exact defect PCONC-1 fixes).
+
         Returns ``True`` when the track was committed, ``False`` when the commit
-        was discarded because the session ended mid-resolve (B-1).  Resolver
-        exceptions are NOT swallowed — they propagate to the recognition loop's
-        ``run()`` handler, exactly as the old ``_commit_track`` did, so a
-        transient resolve failure leaves ``current_raw`` un-advanced (B-11) and
-        the track is re-attempted on the next chunk.
+        was discarded because the session that produced this audio has ended —
+        whether the needle lifted mid-resolve (B-1) or before the queue-lagged
+        commit ran at all (PCONC-1).  Resolver exceptions are NOT swallowed —
+        they propagate to the recognition loop's ``run()`` handler, exactly as
+        the old ``_commit_track`` did, so a transient resolve failure leaves
+        ``current_raw`` un-advanced (B-11) and the track is re-attempted on the
+        next chunk.
         """
         timestamp = int(time.time())
-        # Capture the session token before the resolve await (B-1).
-        commit_epoch = self.state.session_epoch
+        # The epoch is bound to the AUDIO at capture/enqueue time (PCONC-1) and
+        # passed in — NOT re-sampled here.  A commit-entry sample missed the
+        # queue-lag race: a chunk captured before the needle lifted could be
+        # dequeued and confirmed AFTER a new session began, and the entry sample
+        # would read the new (stable-across-resolve) epoch and commit the dead
+        # track into the fresh session.  Validating against the audio's own epoch
+        # closes that window as well as the mid-resolve one (B-1).
         metadata = await self.resolver.resolve(raw)
-        if self.state.session_epoch != commit_epoch:
+        if self.state.session_epoch != audio_epoch:
             log.info(
                 "Discarding stale commit for %s — %s: the session ended while "
                 "metadata was resolving.",
@@ -96,7 +116,7 @@ class TrackCommitService:
         # album-split path awaits a Discogs write), and a SESSION_ENDED during that
         # window means the needle lifted.  Don't scrobble a track whose session has
         # already ended.
-        if self.lastfm and self.state.session_epoch == commit_epoch:
+        if self.lastfm and self.state.session_epoch == audio_epoch:
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     None, self.lastfm.scrobble, metadata, timestamp

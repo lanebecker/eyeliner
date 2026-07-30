@@ -96,6 +96,23 @@ same implement → RED test → mutation-check → cold-review discipline.
   is *not* credited — a missed play rather than a phantom one) is preserved; a
   20,000-tracklist differential fuzz confirmed the change only ever removes
   phantoms, never flips a correct result.
+- **A queue-lagged audio chunk no longer commits a dead track into a fresh
+  session (PCONC-1, #80 — HIGH).** The epoch guard sampled the session token at
+  `TrackCommitService.commit` *entry* — after the audio was captured, queued, and
+  confirmed. A chunk captured while a record played can sit in the recognition
+  queue (maxsize 5) past a needle-lift (`clear()` bumps the epoch); once a new
+  session begins it is dequeued, confirmed, and committed — and the entry-time
+  sample reads the *new* epoch, finds it stable across the resolve, and writes the
+  previous record's track onto the screen and, downstream, into the Discogs
+  collection. The epoch is now bound to the audio at `enqueue` (≈ capture) time,
+  travels with the chunk through recognition, and is passed to `commit` as a
+  required `audio_epoch`; a commit whose audio predates the live session is
+  discarded. This closes the queue-lag window the mid-resolve guard (B-1) never
+  covered, while preserving the mid-resolve (B-1) and tracker-tail (B-19) checks
+  exactly — all three now validate against the audio's own epoch rather than a
+  commit-time re-sample. Reproduced RED at the commit boundary; the epoch
+  threading is mutation-verified (a dequeue-time re-read, a dropped epoch, a
+  constant-epoch enqueue, and a re-sample-at-entry mutant are all killed).
 
 ---
 
