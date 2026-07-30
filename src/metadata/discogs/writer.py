@@ -12,7 +12,7 @@ It has no knowledge of the read side (search/tracklist/year) — that lives in
 
 import logging
 from datetime import date
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, Union, TYPE_CHECKING
 
 from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _as_id
 
@@ -20,6 +20,27 @@ if TYPE_CHECKING:
     from src.config import DiscogsConfig
 
 log = logging.getLogger(__name__)
+
+
+class _ReadFailed:
+    """Sentinel type for :meth:`DiscogsCollectionWriter._get_field_value`.
+
+    Means "the current field value could not be read" (an HTTP error, a network
+    exception, or a 200 whose body does not contain the instance) and therefore
+    must NOT be treated as ``0``. It is deliberately DISTINCT from ``None``,
+    which means a *confirmed-blank* field and is safe to treat as ``0``.
+
+    Conflating the two — every read failure collapsing to ``None`` and then to
+    ``0`` — let a single failed read reset an accumulated Play Count to ``1``
+    with a success log (finding META-1). A read-modify-write that ends in an
+    absolute set must abort when the read cannot be trusted.
+    """
+
+    __slots__ = ()
+
+
+#: Singleton "current value is unknown" marker (see :class:`_ReadFailed`).
+_READ_FAILED = _ReadFailed()
 
 
 class DiscogsCollectionWriter:
@@ -59,21 +80,39 @@ class DiscogsCollectionWriter:
                 )
                 return False
 
-            # Read current value; fall back to 0 if blank, missing, or GET fails.
-            # Coerce via str() before .strip(): the value is normally a string,
-            # but if Discogs ever returns it as a JSON number, calling .strip()
-            # on an int would raise AttributeError and silently skip the
-            # increment (B-16).
+            # Read the current value. This is a read-modify-write ending in an
+            # ABSOLUTE set, so an untrusted read must never become a write:
+            # treating an unreadable value as 0 would reset the owner's
+            # accumulated Play Count to 1 (META-1). Only a CONFIRMED-blank field
+            # (None) is a safe 0; _READ_FAILED means "unknown — abort".
             raw_value = self._get_field_value(release_id, instance_id, field_id)
-            text = str(raw_value).strip() if raw_value is not None else ""
-            try:
-                current_count = int(text) if text else 0
-            except (ValueError, TypeError):
-                log.warning(
-                    f"Play Count field for release {release_id} / instance {instance_id} "
-                    f"contains non-integer value {raw_value!r}; treating as 0."
+            if raw_value is _READ_FAILED:
+                log.error(
+                    f"Aborting Play Count increment for release {release_id} / instance "
+                    f"{instance_id}: could not read the current value, so refusing to "
+                    f"overwrite it (leaving the existing count intact)."
                 )
-                current_count = 0
+                return False
+
+            # Coerce via str() before .strip(): a confirmed value is normally a
+            # string, but Discogs can return it as a JSON number, and calling
+            # .strip() on an int would raise (B-16). None / "" is a blank field.
+            text = str(raw_value).strip() if raw_value is not None else ""
+            if not text:
+                current_count = 0  # confirmed-blank field == zero plays
+            else:
+                try:
+                    current_count = int(text)
+                except (ValueError, TypeError):
+                    # A present but non-integer value is real data we cannot
+                    # safely increment; overwriting it with an absolute 1 would
+                    # destroy it (META-2). Abort rather than clobber.
+                    log.error(
+                        f"Aborting Play Count increment for release {release_id} / instance "
+                        f"{instance_id}: existing value {raw_value!r} is not an integer, so "
+                        f"refusing to overwrite it with 1."
+                    )
+                    return False
 
             new_count = current_count + 1
 
@@ -183,14 +222,21 @@ class DiscogsCollectionWriter:
 
     def _get_field_value(
         self, release_id: int, instance_id: int, field_id: int
-    ) -> Optional[str]:
+    ) -> Union[str, None, _ReadFailed]:
         """Read the current value of a custom field for a specific collection instance.
 
-        GETs /users/{username}/collection/releases/{release_id} and finds the
-        matching instance_id, then returns the note value for field_id.
+        GETs /users/{username}/collection/releases/{release_id}, finds the
+        matching instance_id, and returns the note value for field_id.
 
-        Returns None if the GET fails, the instance isn't found, or the field
-        has no value set.
+        Three-state result, because the caller performs an absolute write and a
+        failed read must NOT be treated as 0 (META-1):
+
+          * ``str`` (possibly a JSON number the caller coerces) — the value is set.
+          * ``None`` — the instance was found but this field is unset: a
+            CONFIRMED-blank field, safe to treat as 0.
+          * :data:`_READ_FAILED` — the value is UNKNOWN and the caller must
+            abort: the GET failed, an exception was raised, or the instance was
+            not present in the 200 body (absent / paged / edited — ambiguous).
         """
         try:
             resp = self._http.request(
@@ -201,22 +247,26 @@ class DiscogsCollectionWriter:
             if resp.status_code != 200:
                 log.debug(
                     f"_get_field_value: GET returned {resp.status_code} "
-                    f"for release {release_id}; defaulting to 0."
+                    f"for release {release_id}; current value UNKNOWN (not writing)."
                 )
-                return None
+                return _READ_FAILED
             instances = resp.json().get("releases", [])
             for inst in instances:
                 if inst.get("instance_id") == instance_id:
                     for note in inst.get("notes", []):
                         if note.get("field_id") == field_id:
                             return note.get("value")
-                    # Instance found but field not set — return None (treat as 0)
+                    # Instance found but this field is unset — a CONFIRMED blank,
+                    # safe to treat as 0.
                     return None
+            # The instance is not in the response at all: ambiguous (genuinely
+            # absent, a paged response, or an edited collection), so the current
+            # value is UNKNOWN — not blank.
             log.debug(
                 f"_get_field_value: instance {instance_id} not found in "
-                f"release {release_id} response; defaulting to 0."
+                f"release {release_id} response; current value UNKNOWN (not writing)."
             )
-            return None
+            return _READ_FAILED
         except Exception as e:
             log.debug(f"_get_field_value failed for release {release_id}: {e}")
-            return None
+            return _READ_FAILED
