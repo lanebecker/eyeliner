@@ -102,20 +102,37 @@ class TrackCommitService:
             return False
 
         self.state.set_track(metadata)
-        # Advance current_raw only AFTER the resolved track is displayed (B-11).
-        self.state.set_raw(raw)
         await self.tracker.on_track_identified(metadata)
+        # Advance the dedup key (current_raw) only AFTER the tracker has accepted
+        # the track, and only while the session is still the one this audio came
+        # from (LB-1 + B-19).  Two failures are handled here that the old order
+        # (set_raw *before* this await) silently mishandled:
+        #   • on_track_identified RAISES — its album-split path awaits a Discogs
+        #     write.  The exception propagates before this line, so current_raw is
+        #     left un-advanced and the recognition loop re-attempts the track,
+        #     instead of the old behavior where an already-advanced current_raw
+        #     made the dedup treat a never-recorded track as "already playing" —
+        #     displayed but never tracked, never scrobbled, never retried (LB-1).
+        #   • the needle lifts DURING on_track_identified (SESSION_ENDED → clear()
+        #     bumps the epoch and nulls current_raw).  Skipping the advance leaves
+        #     current_raw null, so a re-drop of the same record can commit again
+        #     rather than being suppressed by a resurrected dead-session dedup key.
+        # Still satisfies B-11: set_track ran first, so current_raw never leads
+        # current_track.
+        if self.state.session_epoch == audio_epoch:
+            self.state.set_raw(raw)
         log.info(
             f"Now playing: {metadata.artist} / {metadata.album} / "
             f"{metadata.title} [{metadata.source.name}]"
         )
 
-        # Re-check the epoch before scrobbling (B-19).  set_track/set_raw above run
-        # with no intervening await, so the display commit is consistent with the
-        # post-resolve epoch check — but on_track_identified CAN yield (its
+        # Re-check the epoch before scrobbling (B-19).  set_track ran with no
+        # intervening await since the post-resolve epoch check, so the display
+        # commit is consistent with it — but on_track_identified CAN yield (its
         # album-split path awaits a Discogs write), and a SESSION_ENDED during that
-        # window means the needle lifted.  Don't scrobble a track whose session has
-        # already ended.
+        # window means the needle lifted.  The set_raw above already shares this
+        # guard; apply it to the scrobble too so a track whose session has already
+        # ended is neither re-committed nor scrobbled.
         if self.lastfm and self.state.session_epoch == audio_epoch:
             try:
                 await asyncio.get_running_loop().run_in_executor(

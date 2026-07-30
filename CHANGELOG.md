@@ -128,6 +128,23 @@ same implement → RED test → mutation-check → cold-review discipline.
   via raspi-config (covers VNEW-1). This is the deployment-side root-cause fix;
   the defensive writer-side clock gate (STAB-2, #86) is complementary and tracked
   separately.
+- **A tracker exception no longer strands a confirmed track (LB-1, #84 —
+  MEDIUM).** `TrackCommitService.commit` advanced the dedup key (`set_raw`)
+  *before* awaiting `tracker.on_track_identified`. The B-11 ordering invariant
+  guarded against a *resolver* failure but not a *tracker* one: if
+  `on_track_identified` raised — its album-split path awaits a Discogs write —
+  the exception propagated to `run()` while `current_raw` had already advanced,
+  so the recognition loop's dedup treated the never-recorded track as "already
+  playing" and never re-attempted it. The track was displayed but never tracked,
+  never scrobbled, and never retried. `set_raw` now runs *after*
+  `on_track_identified` succeeds, so a tracker exception leaves `current_raw`
+  un-advanced and the loop re-commits on the next chunk (a transient failure
+  self-heals — the track is then both tracked and scrobbled; no double-scrobble,
+  since the scrobble sits after `set_raw`). Moving `set_raw` past the tracker
+  await also opened a needle-lift window, so the advance now shares the same
+  epoch guard as the scrobble (B-19): a SESSION_ENDED *during* the tracker call
+  can't resurrect a dead session's dedup key. Reproduced RED; the reorder and the
+  guard are both mutation-verified. B-11 still holds (set_track runs first).
 
 ---
 
