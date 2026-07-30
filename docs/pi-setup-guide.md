@@ -339,7 +339,8 @@ Paste this (adjust the username if you're not using `pi`):
 ```ini
 [Unit]
 Description=vinyl-now-playing
-After=network.target graphical.target
+Wants=network-online.target
+After=network-online.target time-sync.target graphical.target
 
 [Service]
 Type=simple
@@ -354,6 +355,46 @@ RestartSec=10
 [Install]
 WantedBy=graphical.target
 ```
+
+**Why the `[Unit]` ordering matters — read this before enabling.** The Raspberry
+Pi has no battery-backed real-time clock, so at boot its clock is whatever
+`fake-hwclock` last saved — stale, sometimes by hours or days — until
+`systemd-timesyncd` reaches an NTP server *over the network*. If the app starts
+before that happens, every **Last Played** date it stamps into your Discogs
+collection is wrong, and the error is silent and irreversible. The ordering above
+holds the service until the network is actually up (`network-online.target`,
+which must be pulled in by the matching `Wants=` — ordering after it alone does
+nothing) and the clock has been synchronized (`time-sync.target`).
+
+One catch: `After=time-sync.target` only has teeth if the unit that *waits* for
+the clock is enabled. With plain `systemd-timesyncd`, `time-sync.target` can be
+reached **before** the clock is actually set. Enable the waiter once:
+
+```bash
+sudo systemctl enable systemd-time-wait-sync.service
+```
+
+Also set the Pi's timezone, so Last Played is stamped in your local time rather
+than the default zone:
+
+```bash
+sudo raspi-config
+```
+
+Choose **Localisation Options → Timezone**. (Non-interactive equivalent, using
+your own zone: `sudo timedatectl set-timezone America/Los_Angeles`.)
+
+Confirm both took effect with `timedatectl` — it should report
+`System clock synchronized: yes` and your chosen `Time zone`.
+
+Two things to know about this gate. Enabling `systemd-time-wait-sync.service` is
+system-wide — it delays *every* unit ordered after `time-sync.target`; on this
+dedicated Pi that is exactly what you want. And if the Pi ever boots **offline**,
+the app will not appear until the network is up and the clock syncs — a blank
+screen then is the service correctly *waiting*, not a crash (`systemctl status
+systemd-time-wait-sync.service` shows it still starting, blocking on the clock,
+and `journalctl -u vinyl-now-playing` stays quiet rather than logging an error).
+It needs the network for recognition anyway, so this costs nothing in practice.
 
 Enable and start:
 

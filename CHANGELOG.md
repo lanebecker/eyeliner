@@ -113,6 +113,21 @@ same implement → RED test → mutation-check → cold-review discipline.
   commit-time re-sample. Reproduced RED at the commit boundary; the epoch
   threading is mutation-verified (a dequeue-time re-read, a dropped epoch, a
   constant-epoch enqueue, and a re-sample-at-entry mutant are all killed).
+- **The systemd unit now waits for a synced clock and an up network before
+  starting (CRIT-4, #83 — the root cause behind the unset-clock date
+  corruption).** The documented `vinyl-now-playing.service` ordered only on
+  `network.target` (the network stack is *configured*, not up) with nothing
+  waiting on the clock. The Pi has no battery-backed RTC, so the app could start
+  with a stale `fake-hwclock` time and stamp wrong **Last Played** dates into the
+  Discogs collection before `systemd-timesyncd` synced over the network. The unit
+  now orders `After=network-online.target time-sync.target graphical.target` with
+  `Wants=network-online.target`, and `docs/pi-setup-guide.md` adds the two steps
+  that give that ordering teeth: enabling `systemd-time-wait-sync.service`
+  (without it, `time-sync.target` can be reached *before* the clock is set — a
+  documented systemd behavior with plain `timesyncd`) and setting the timezone
+  via raspi-config (covers VNEW-1). This is the deployment-side root-cause fix;
+  the defensive writer-side clock gate (STAB-2, #86) is complementary and tracked
+  separately.
 
 ---
 
