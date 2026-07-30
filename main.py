@@ -71,7 +71,7 @@ def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenT
         state.clear()
 
 
-async def run_pipeline(tasks, capture, display):
+async def run_pipeline(tasks, capture, display, tracker):
     """Run the pipeline legs until the first one finishes, then shut down.
 
     Extracted from main() (T-1) so the shutdown semantics are testable without
@@ -79,7 +79,10 @@ async def run_pipeline(tasks, capture, display):
       - the moment ANY leg exits, cancel the rest (FIRST_COMPLETED) — this is
         the v1.3.5 "ESC zombie" fix;
       - re-raise a faulted leg's exception after cleanup;
-      - always stop capture and display in the finally.
+      - drain the tracker's in-flight end-of-session credit tasks (CONC-1) —
+        they are fire-and-forget, not pipeline legs, so nothing else awaits them
+        and ``asyncio.run`` would otherwise cancel a mid-write credit — then
+        always stop capture and display in the finally.
     """
     try:
         done, pending = await asyncio.wait(
@@ -104,6 +107,11 @@ async def run_pipeline(tasks, capture, display):
             raise first_exc
         log.info("Pipeline stopped.")
     finally:
+        # Let an in-flight end-of-session Discogs credit finish before the loop
+        # tears it down (CONC-1); bounded so a stuck write can't hang shutdown.
+        # Runs even when a leg faulted — a crash must not abandon a half-written
+        # collection update.
+        await tracker.drain()
         capture.stop()
         display.stop()
 
@@ -162,8 +170,9 @@ async def main():
         loop.add_signal_handler(sig, _cancel_all)
 
     # FIRST_COMPLETED shutdown + cleanup live in run_pipeline (extracted for
-    # testability — T-1).
-    await run_pipeline(tasks, capture, display)
+    # testability — T-1).  The tracker is passed so shutdown can drain its
+    # in-flight end-of-session credit before the loop closes (CONC-1).
+    await run_pipeline(tasks, capture, display, tracker)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ Covers the two pieces extracted from main() for testability:
 """
 import asyncio
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
@@ -64,6 +64,14 @@ def test_session_ended_clears_and_bumps_epoch():
 # run_pipeline
 # ---------------------------------------------------------------------------
 
+def _drainable_tracker():
+    """A tracker stub whose drain() is an awaitable no-op — run_pipeline awaits
+    it on shutdown so an in-flight end-of-session credit isn't torn (CONC-1)."""
+    t = MagicMock()
+    t.drain = AsyncMock()
+    return t
+
+
 @pytest.mark.asyncio
 async def test_run_pipeline_cancels_pending_and_stops():
     capture, display = MagicMock(), MagicMock()
@@ -77,9 +85,48 @@ async def test_run_pipeline_cancels_pending_and_stops():
     done_leg = asyncio.create_task(quick())
     pending_leg = asyncio.create_task(forever())
 
-    await run_pipeline([done_leg, pending_leg], capture, display)
+    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker())
 
     assert pending_leg.cancelled()
+    capture.stop.assert_called_once()
+    display.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_drains_tracker_before_stopping_subsystems():
+    """CONC-1: shutdown must await the tracker's in-flight credit tasks (drain)
+    in the finally, and do so BEFORE tearing down capture/display."""
+    capture, display = MagicMock(), MagicMock()
+    tracker = _drainable_tracker()
+    order = []
+    tracker.drain.side_effect = lambda *a, **k: order.append("drain")
+    capture.stop.side_effect = lambda: order.append("capture.stop")
+    display.stop.side_effect = lambda: order.append("display.stop")
+
+    async def quick():
+        return
+
+    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker)
+
+    tracker.drain.assert_awaited_once()
+    assert order[0] == "drain"                 # credit finishes before subsystems stop
+    assert "capture.stop" in order and "display.stop" in order
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_still_drains_when_a_leg_faults():
+    """A faulted leg must not abandon an in-flight credit — drain still runs in
+    the finally before the exception propagates."""
+    capture, display = MagicMock(), MagicMock()
+    tracker = _drainable_tracker()
+
+    async def boom():
+        raise RuntimeError("leg died")
+
+    with pytest.raises(RuntimeError, match="leg died"):
+        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker)
+
+    tracker.drain.assert_awaited_once()
     capture.stop.assert_called_once()
     display.stop.assert_called_once()
 
@@ -98,7 +145,7 @@ async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
     pending_leg = asyncio.create_task(forever())
 
     with pytest.raises(RuntimeError, match="leg died"):
-        await run_pipeline([boom_leg, pending_leg], capture, display)
+        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker())
 
     # finally ran despite the re-raise…
     capture.stop.assert_called_once()
@@ -128,7 +175,7 @@ async def test_run_pipeline_logs_every_faulted_leg(caplog):
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises((RuntimeError, ValueError)):
-            await run_pipeline([leg_a, leg_b], capture, display)
+            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker())
 
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "leg A died" in logged

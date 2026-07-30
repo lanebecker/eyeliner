@@ -653,3 +653,92 @@ async def test_collection_then_db_record_still_splits():
     # Record 1 was collection-owned and finished → credited by the split.
     writer.increment_play_count.assert_called_once_with(111, 222)
     assert tracker._session.last_release_id == 555
+
+
+# ---------------------------------------------------------------------------
+# CONC-1 — drain(): shutdown must wait for an in-flight end-of-session credit
+# so it is not torn in half (Play Count incremented, Last Played never written,
+# credited latched, no retry). These pin drain()'s three behaviours plus a
+# reproduction of the mid-write tear window.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_drain_with_no_in_flight_tasks_is_a_noop():
+    tracker = ListenTracker(make_writer_mock(), None)
+    # No bg tasks; must return promptly without error.
+    await asyncio.wait_for(tracker.drain(timeout=5), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_an_in_flight_credit_to_finish():
+    tracker = ListenTracker(make_writer_mock(), None)
+    finished = []
+    gate = asyncio.Event()
+
+    async def credit():
+        await gate.wait()
+        finished.append("done")
+
+    t = asyncio.create_task(credit())
+    tracker._bg_tasks.add(t)
+    t.add_done_callback(tracker._bg_tasks.discard)
+
+    drainer = asyncio.create_task(tracker.drain(timeout=5))
+    await asyncio.sleep(0)
+    assert not drainer.done()          # drain is still waiting on the credit
+    assert finished == []
+
+    gate.set()
+    await drainer
+    assert finished == ["done"]        # the credit completed before drain returned
+
+
+@pytest.mark.asyncio
+async def test_drain_lets_a_two_phase_credit_complete_not_torn():
+    """The exact CONC-1 shape: a credit that has done its FIRST write and is
+    awaiting its SECOND. Without draining, shutdown cancels it here and the
+    second write is lost. drain() must let it finish both."""
+    tracker = ListenTracker(make_writer_mock(), None)
+    writes = []
+    between_writes = asyncio.Event()
+
+    async def credit():
+        writes.append("play_count")        # first Discogs write lands
+        await between_writes.wait()         # <-- the tear window
+        writes.append("last_played")        # second write
+
+    t = asyncio.create_task(credit())
+    tracker._bg_tasks.add(t)
+    t.add_done_callback(tracker._bg_tasks.discard)
+
+    await asyncio.sleep(0)
+    assert writes == ["play_count"]         # mid-write: this is where the old code tore it
+
+    drainer = asyncio.create_task(tracker.drain(timeout=5))
+    await asyncio.sleep(0)
+    assert not drainer.done()               # drain holds shutdown open for the credit
+    between_writes.set()
+    await drainer
+    assert writes == ["play_count", "last_played"]   # both writes landed
+
+
+@pytest.mark.asyncio
+async def test_drain_is_bounded_by_timeout_and_does_not_hang():
+    """A stuck credit must not hang shutdown forever — drain returns after the
+    timeout (the task is left for loop teardown to cancel)."""
+    tracker = ListenTracker(make_writer_mock(), None)
+    never = asyncio.Event()
+
+    async def stuck():
+        await never.wait()
+
+    t = asyncio.create_task(stuck())
+    tracker._bg_tasks.add(t)
+    t.add_done_callback(tracker._bg_tasks.discard)
+
+    # If drain ignored its timeout this would hang; wait_for bounds the test.
+    await asyncio.wait_for(tracker.drain(timeout=0.05), timeout=2.0)
+
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
