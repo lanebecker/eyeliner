@@ -30,7 +30,7 @@ def make_loop(confirmation_required=2, error_after_misses=3):
     )
     state = PlayerState()
 
-    async def commit(r):
+    async def commit(r, audio_epoch=0):
         state.set_track(MagicMock())
         state.set_raw(r)
         return True

@@ -112,7 +112,8 @@ async def test_two_matching_results_emit_confirmed_track():
     await loop._handle_result(raw)
     await loop._handle_result(raw)
 
-    on_confirmed.assert_awaited_once_with(raw)
+    # epoch defaults to 0 when _handle_result is driven directly (PCONC-1).
+    on_confirmed.assert_awaited_once_with(raw, 0)
 
 
 @pytest.mark.asyncio
@@ -239,7 +240,7 @@ async def test_new_track_after_current_triggers_confirmation():
     await loop._handle_result(new_raw)
     await loop._handle_result(new_raw)
 
-    on_confirmed.assert_awaited_once_with(new_raw)
+    on_confirmed.assert_awaited_once_with(new_raw, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -327,11 +328,11 @@ async def test_enqueue_drops_oldest_when_full():
     await loop_obj.enqueue(np.full(4, 99.0, dtype=np.float32), 44100)
 
     assert loop_obj._audio_queue.qsize() == maxsize
-    first_audio, _ = loop_obj._audio_queue.get_nowait()
+    first_audio, *_ = loop_obj._audio_queue.get_nowait()  # (audio, sr, epoch)
     assert first_audio[0] == 1.0   # marker 0.0 was evicted
     remaining = []
     while not loop_obj._audio_queue.empty():
-        audio, _ = loop_obj._audio_queue.get_nowait()
+        audio, *_ = loop_obj._audio_queue.get_nowait()
         remaining.append(audio[0])
     assert remaining[-1] == 99.0   # the newest chunk was admitted
 
@@ -373,7 +374,8 @@ async def test_run_pulls_a_chunk_recognizes_it_and_emits(monkeypatch):
         await task
 
     loop.backend.recognize.assert_awaited_once()
-    on_confirmed.assert_awaited_once_with(raw)  # confirmation_required=1 → immediate
+    # run() threads the epoch bound at enqueue through to on_confirmed (PCONC-1).
+    on_confirmed.assert_awaited_once_with(raw, state.session_epoch)  # confirmation_required=1 → immediate
 
 
 @pytest.mark.asyncio
@@ -410,4 +412,80 @@ async def test_run_swallows_a_backend_error_and_keeps_looping(monkeypatch):
         await task
 
     assert loop.backend.recognize.await_count == 2   # survived the first error
-    on_confirmed.assert_awaited_once_with(raw)
+    on_confirmed.assert_awaited_once_with(raw, state.session_epoch)
+
+
+# ---------------------------------------------------------------------------
+# PCONC-1 (#80) — the session epoch is bound to the AUDIO at enqueue (capture)
+# time and threaded through recognition → confirmation → commit, so a chunk that
+# lagged in the queue past a needle-lift is committed against the session it came
+# from, not whichever one is live when the delayed commit runs.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_enqueue_binds_the_current_epoch_to_the_chunk():
+    """The chunk carries the session epoch that was live when it was enqueued."""
+    loop, state, _ = make_loop()
+    state.session_epoch = 7
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
+
+    _audio, _sr, epoch = loop._audio_queue.get_nowait()
+    assert epoch == 7
+
+
+@pytest.mark.asyncio
+async def test_queued_epoch_is_frozen_at_enqueue_not_read_later():
+    """A chunk that sat in the queue while the needle lifted must still carry its
+    ORIGINAL (pre-lift) epoch — the epoch is sampled at enqueue, never re-read at
+    dequeue (dequeue-time would already be the post-lift epoch and defeat the
+    guard)."""
+    loop, state, _ = make_loop()
+    state.session_epoch = 3
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
+
+    state.session_epoch = 4          # needle lifts AFTER the chunk is queued
+
+    _audio, _sr, epoch = loop._audio_queue.get_nowait()
+    assert epoch == 3                # frozen at enqueue, not re-read as 4
+
+
+@pytest.mark.asyncio
+async def test_handle_result_forwards_the_audio_epoch_to_on_confirmed():
+    """On confirmation the loop hands the AUDIO's epoch to on_confirmed so the
+    commit is validated against the session the audio came from (PCONC-1)."""
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
+    state.current_raw = None
+
+    raw = make_raw()
+    await loop._handle_result(raw, epoch=5)
+    await loop._handle_result(raw, epoch=5)
+
+    on_confirmed.assert_awaited_once_with(raw, 5)
+
+
+@pytest.mark.asyncio
+async def test_run_threads_the_enqueued_epoch_through_to_on_confirmed():
+    """End-to-end: a chunk enqueued under epoch 9 confirms and commits with
+    epoch 9 — even after the session moves on to 10 while the stale chunk waits
+    in the queue.  This is the PCONC-1 queue-lag race the commit-time epoch
+    sample could not see."""
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
+    state.session_epoch = 9
+
+    raw = make_raw()
+    loop.backend.recognize = AsyncMock(return_value=raw)
+
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
+    state.session_epoch = 10   # needle lifts / new session AFTER capture
+
+    task = asyncio.create_task(loop.run())
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if on_confirmed.await_count:
+            break
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    on_confirmed.assert_awaited_once_with(raw, 9)   # the PRE-lift epoch, not 10

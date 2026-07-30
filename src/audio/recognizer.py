@@ -165,7 +165,7 @@ class RecognitionLoop:
         self,
         config: "RecognitionConfig",
         state: "PlayerState",
-        on_confirmed: Callable[["RawRecognitionResult"], Awaitable[object]],
+        on_confirmed: Callable[["RawRecognitionResult", int], Awaitable[object]],
     ):
         self.state = state
         # Called with a confirmed RawRecognitionResult; owns resolve → state →
@@ -208,7 +208,18 @@ class RecognitionLoop:
         kept grinding through stale audio and delayed track-change
         detection.)  Drops are logged at debug level so a "stopped
         identifying" complaint has a breadcrumb in the journal.
+
+        The current session epoch is captured HERE, at enqueue (≈ capture) time,
+        and travels with the chunk (PCONC-1).  A chunk can sit in this queue
+        while the needle lifts and a new session begins; binding the epoch at
+        enqueue — not when the chunk is later dequeued, recognized, or committed
+        — is what lets the commit service recognise audio that predates the live
+        session and discard it instead of committing a dead track into a fresh
+        one.  (Dequeue-time would already read the post-lift epoch and defeat the
+        guard.)
         """
+        # Bind the session epoch to the audio at capture time (PCONC-1).
+        epoch = self.state.session_epoch
         if self._audio_queue.full():
             try:
                 self._audio_queue.get_nowait()  # Drop the OLDEST — recent audio wins
@@ -219,18 +230,18 @@ class RecognitionLoop:
                 )
             except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
                 pass
-        await self._audio_queue.put((audio, sample_rate))
+        await self._audio_queue.put((audio, sample_rate, epoch))
 
     async def run(self):
         """Main recognition loop."""
         log.info("Recognition loop started.")
         while True:
             try:
-                audio, sample_rate = await asyncio.wait_for(
+                audio, sample_rate, epoch = await asyncio.wait_for(
                     self._audio_queue.get(), timeout=self.poll_interval
                 )
                 result = await self.backend.recognize(audio, sample_rate)
-                await self._handle_result(result)
+                await self._handle_result(result, epoch)
             except asyncio.TimeoutError:
                 pass  # No audio queued — fine
             except Exception as e:
@@ -253,8 +264,24 @@ class RecognitionLoop:
             and a.artist.strip().lower() == b.artist.strip().lower()
         )
 
-    async def _handle_result(self, result: Optional[RawRecognitionResult]):
-        """Apply confirmation logic, then resolve metadata and update state."""
+    async def _handle_result(self, result: Optional[RawRecognitionResult], epoch: int = 0):
+        """Apply confirmation logic, then resolve metadata and update state.
+
+        ``epoch`` is the session epoch bound to *this* chunk's audio at enqueue
+        time (PCONC-1).  On a real confirmation it is forwarded to
+        ``on_confirmed`` so the commit is validated against the session the
+        audio came from — not whichever session happens to be live when the
+        (possibly queue-delayed) commit finally runs.
+
+        The ``epoch=0`` default is a TEST-ONLY affordance: the many
+        confirmation-logic tests that drive ``_handle_result`` directly do not
+        care about epochs, and 0 is the initial epoch so they behave identically.
+        ⚠️  Any NEW production caller MUST pass the real bound epoch — ``run()``
+        is currently the only one, and it does.  A wrong/stale epoch here cannot
+        cause a phantom write: the commit boundary takes an explicit REQUIRED
+        ``audio_epoch`` and fails safe, so the worst case is the guard discarding
+        live commits (loud missed identifications), never a silent bad write.
+        """
         if result is None:
             self._pending_result = None
             self._pending_count = 0
@@ -276,10 +303,11 @@ class RecognitionLoop:
             log.info(f"Track confirmed: {result.artist} — {result.title}")
             self._miss_count = 0  # a real commit — recognition works (B-7)
             self._churn_count = 0  # …and not churning (B-21)
-            # Hand the confirmed result to the commit service (A-9).  We await
-            # it so the next chunk isn't processed until current_raw has been
-            # advanced (the dedup at the top depends on that ordering).
-            await self.on_confirmed(result)
+            # Hand the confirmed result to the commit service (A-9), along with
+            # the epoch this audio was captured under (PCONC-1).  We await it so
+            # the next chunk isn't processed until current_raw has been advanced
+            # (the dedup at the top depends on that ordering).
+            await self.on_confirmed(result, epoch)
             self._pending_result = None
             self._pending_count = 0
         else:

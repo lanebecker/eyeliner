@@ -5,6 +5,9 @@ RecognitionLoop._commit_track into an application-layer service.  These tests
 own the invariants that used to live in the recognizer tests:
 
   * B-1 — a commit whose session ends mid-resolve is discarded (epoch guard).
+  * PCONC-1 — a commit for audio captured in an already-ended session is
+    discarded, because the epoch is bound to the audio (passed as audio_epoch),
+    not re-sampled at commit entry.
   * B-11 — current_raw is advanced only after set_track succeeds.
 
 …plus the scrobble branch that was previously never exercised because the
@@ -49,7 +52,7 @@ async def test_commit_sets_track_then_raw_and_notifies_tracker():
     resolver.resolve = AsyncMock(return_value=meta)
 
     r = make_raw()
-    committed = await service.commit(r)
+    committed = await service.commit(r, state.session_epoch)
 
     assert committed is True
     assert state.current_track is meta
@@ -70,7 +73,7 @@ async def test_current_raw_advanced_only_after_set_track():
     state.set_track = lambda m: (order.append("track"), real_set_track(m))[1]
     state.set_raw = lambda r: (order.append("raw"), real_set_raw(r))[1]
 
-    await service.commit(make_raw())
+    await service.commit(make_raw(), state.session_epoch)
 
     assert order == ["track", "raw"]
 
@@ -84,7 +87,7 @@ async def test_current_raw_not_advanced_when_resolve_fails():
     state.set_status(PlayerStatus.LISTENING)
 
     with pytest.raises(RuntimeError):
-        await service.commit(make_raw())
+        await service.commit(make_raw(), state.session_epoch)
 
     assert state.current_raw is None
     assert state.current_track is None
@@ -107,7 +110,7 @@ async def test_commit_discarded_when_session_ends_during_resolve():
 
     resolver.resolve = AsyncMock(side_effect=resolve_then_needle_lifts)
 
-    committed = await service.commit(make_raw())
+    committed = await service.commit(make_raw(), state.session_epoch)
 
     assert committed is False
     # The dead track must NOT be resurrected onto the screen…
@@ -124,12 +127,38 @@ async def test_commit_proceeds_when_session_stable():
     meta = MagicMock()
     resolver.resolve = AsyncMock(return_value=meta)
 
-    committed = await service.commit(make_raw())
+    committed = await service.commit(make_raw(), state.session_epoch)
 
     assert committed is True
     assert state.current_track is meta
     assert state.status == PlayerStatus.PLAYING
     tracker.on_track_identified.assert_awaited_once_with(meta)
+
+
+@pytest.mark.asyncio
+async def test_commit_discarded_when_audio_predates_the_current_session():
+    """PCONC-1 (#80): audio captured in an EARLIER session must be discarded when
+    the live session has already moved on — even though the epoch stays 'stable'
+    across the resolve.  This is the queue-lag stale-commit the commit-time epoch
+    sample (pre-fix) could NOT see: the needle lifted and a new session began
+    BEFORE this confirmed commit ran, so an entry-time sample would read the new
+    epoch, find it stable across the resolve, and commit the dead track into the
+    fresh session (polluting the display and, downstream, the Discogs write)."""
+    service, state, resolver, tracker = make_service()
+    state.set_status(PlayerStatus.LISTENING)
+    audio_epoch = state.session_epoch          # audio captured now (epoch 0)
+
+    state.clear()                              # needle lifts: session ends (epoch 1)
+    state.set_status(PlayerStatus.LISTENING)   # a NEW record starts a new session
+
+    meta = MagicMock()
+    resolver.resolve = AsyncMock(return_value=meta)   # epoch stays 1 across resolve
+
+    committed = await service.commit(make_raw(), audio_epoch)
+
+    assert committed is False                  # stale audio discarded, not committed
+    assert state.current_track is None         # the fresh session is NOT polluted
+    tracker.on_track_identified.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +173,7 @@ async def test_scrobble_called_with_metadata_and_timestamp():
     meta = MagicMock()
     resolver.resolve = AsyncMock(return_value=meta)
 
-    await service.commit(make_raw())
+    await service.commit(make_raw(), state.session_epoch)
 
     lastfm.scrobble.assert_called_once()
     args = lastfm.scrobble.call_args[0]
@@ -156,7 +185,7 @@ async def test_scrobble_called_with_metadata_and_timestamp():
 async def test_no_scrobble_when_lastfm_absent():
     service, state, resolver, tracker = make_service(lastfm=None)
     # Must not raise despite no Last.fm client.
-    committed = await service.commit(make_raw())
+    committed = await service.commit(make_raw(), state.session_epoch)
     assert committed is True
 
 
@@ -169,7 +198,7 @@ async def test_scrobble_failure_does_not_break_commit():
     meta = MagicMock()
     resolver.resolve = AsyncMock(return_value=meta)
 
-    committed = await service.commit(make_raw())
+    committed = await service.commit(make_raw(), state.session_epoch)
 
     assert committed is True
     assert state.current_track is meta  # commit completed despite scrobble error
@@ -192,7 +221,7 @@ async def test_scrobble_skipped_when_session_ends_during_tracker_tail():
 
     tracker.on_track_identified = AsyncMock(side_effect=end_during_tail)
 
-    await service.commit(make_raw())
+    await service.commit(make_raw(), state.session_epoch)
 
     tracker.on_track_identified.assert_awaited_once()  # the tail did run...
     lastfm.scrobble.assert_not_called()                # ...but the scrobble was skipped
@@ -212,6 +241,6 @@ async def test_stale_commit_does_not_scrobble():
 
     resolver.resolve = AsyncMock(side_effect=resolve_then_needle_lifts)
 
-    await service.commit(make_raw())
+    await service.commit(make_raw(), state.session_epoch)
 
     lastfm.scrobble.assert_not_called()

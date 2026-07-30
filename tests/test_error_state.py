@@ -51,7 +51,7 @@ def make_loop(error_after_misses=3):
     )
     state = PlayerState()
 
-    async def commit(r):
+    async def commit(r, audio_epoch=0):
         # Stand in for TrackCommitService.commit: a confirmed track lands as
         # PLAYING so any miss-streak-reset-on-commit assertions hold.
         state.set_track(MagicMock())
