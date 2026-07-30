@@ -95,6 +95,46 @@ def test_is_last_track_false_when_not_in_tracklist():
 
 
 # ---------------------------------------------------------------------------
+# META-4 — is_last_track must not be fooled by DUPLICATE position strings.
+# Discogs positions are community-edited free text and are NOT guaranteed
+# unique. is_last_track gates the collection Play Count write, so an early
+# track that merely shares the closer's position string must not be flagged
+# the last track — that would credit a phantom play for a side that never
+# finished. The fix derives is_last_track from the disambiguated global_index
+# (position AND title) rather than a naive last-position comparison.
+# ---------------------------------------------------------------------------
+
+def _dup_position_tracklist():
+    """A tracklist where a MID-album track shares the closer's position 'B2'."""
+    return [
+        TracklistEntry("A1", "One"),
+        TracklistEntry("B2", "Mid-Album Track"),   # duplicate position, NOT the closer
+        TracklistEntry("B1", "Three"),
+        TracklistEntry("B2", "Closer"),            # the genuine last track
+    ]
+
+
+def test_is_last_track_false_for_mid_track_sharing_closer_position():
+    """A mid-album track that only SHARES the closer's position string must be
+    is_last_track False — otherwise identifying it credits a phantom play."""
+    tl = _dup_position_tracklist()
+    assert make_track("Mid-Album Track", tracklist=tl).is_last_track is False
+
+
+def test_is_last_track_true_for_real_closer_despite_duplicate_position():
+    """The genuine last track still credits, even when an earlier track shares
+    its position string — no regression from the duplicate-position fix."""
+    tl = _dup_position_tracklist()
+    assert make_track("Closer", tracklist=tl).is_last_track is True
+
+
+def test_is_last_track_true_for_single_track_release():
+    """A one-track release: the only track is the last track."""
+    tl = [TracklistEntry("A", "Only")]
+    assert make_track("Only", tracklist=tl).is_last_track is True
+
+
+# ---------------------------------------------------------------------------
 # TrackMetadata.track_display
 # ---------------------------------------------------------------------------
 

@@ -107,13 +107,16 @@ class SideIndex:
             the side filter is empty; the logic falls back to the title match
             and still yields correct adjacency.
 
-        ``is_last_track`` is matched by POSITION (not title): it is the sole
-        gate on Discogs play-count updates, and pure title matching let an
-        earlier track sharing the closer's title (reprises, live sets) latch a
-        phantom "last track".  The deliberately conservative failure mode
-        remains: when a GENUINE closer duplicates an earlier title, the current
-        entry resolves to the first occurrence and ``is_last_track`` is False —
-        a missed play count rather than a phantom one.
+        ``is_last_track`` is derived from the disambiguated ``global_index``
+        (matched by position AND title), NOT from a bare position-string
+        comparison: it is the sole gate on Discogs play-count updates, and both
+        a duplicated TITLE (reprises, live sets) and a duplicated POSITION string
+        (Discogs positions are community-edited free text and not guaranteed
+        unique, META-4) would otherwise let an earlier track latch a phantom
+        "last track".  The deliberately conservative failure mode remains: when a
+        GENUINE closer duplicates an earlier title, the current entry resolves to
+        the first occurrence and ``is_last_track`` is False — a missed play count
+        rather than a phantom one.
         """
         if not tracklist:
             return cls.empty()
@@ -174,7 +177,13 @@ class SideIndex:
             if global_index is None:
                 global_index = fallback
 
-        is_last_track = bool(current and current.position == tracklist[-1].position)
+        # is_last_track gates the collection Play Count write, so a wrong True
+        # is a data-integrity bug. Derive it from the disambiguated global_index
+        # (matched by position AND title, above) rather than a naive comparison
+        # of position strings: Discogs positions are community-edited free text
+        # and NOT guaranteed unique, so a mid-album track that merely SHARES the
+        # closer's position string must not be flagged the last track (META-4).
+        is_last_track = global_index is not None and global_index == len(tracklist) - 1
 
         prev_title = None
         next_title = None
