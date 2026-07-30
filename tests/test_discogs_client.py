@@ -7,19 +7,22 @@ Covered scenarios — increment_play_count:
   ✓ Blank Play Count field → sets "1"
   ✓ Existing count "5" → sets "6"
   ✓ Existing count "1" → sets "2"
-  ✓ Garbage string value → treats as 0, sets "1"
-  ✓ Whitespace-only value → treats as 0, sets "1"
+  ✓ Whitespace-only value → confirmed blank, treats as 0, sets "1"
+  ✓ Present but non-integer value → ABORTS, no POST (META-2: never clobber to 1)
   ✓ Field not found in collection fields → returns False, no POST
-  ✓ GET for current value returns non-200 → falls back to 0, still writes "1"
+  ✓ GET for current value returns 5xx → ABORTS, no POST (META-1: never clobber)
+  ✓ ConnectionError on the value read → ABORTS, no POST (META-1)
+  ✓ 200 but our instance missing from body → ABORTS, no POST (META-1: ambiguous)
   ✓ POST returns non-204 → returns False
   ✓ POST returns 401 → returns False
   ✓ Exception raised during POST → returns False, no crash
 
-Covered scenarios — _get_field_value:
+Covered scenarios — _get_field_value (three-state: value / confirmed-blank / unknown):
   ✓ Correct instance_id → returns value string
-  ✓ instance_id not in response → returns None
-  ✓ Non-200 GET → returns None
-  ✓ Instance found but field_id not in notes → returns None
+  ✓ instance_id not in response → returns _READ_FAILED (unknown, not blank)
+  ✓ Non-200 GET → returns _READ_FAILED
+  ✓ Exception during read → returns _READ_FAILED
+  ✓ Instance found but field_id not in notes → returns None (confirmed blank)
 
 Covered scenarios — update_last_played:
   ✓ last_played_field_name not configured → returns True, no API calls
@@ -33,6 +36,9 @@ Covered scenarios — update_last_played:
 from datetime import date
 from unittest.mock import MagicMock, patch
 
+import logging
+
+from src.metadata.discogs.writer import _READ_FAILED
 from tests.factories import make_discogs_config, make_discogs_writer, make_discogs_reader
 
 
@@ -166,20 +172,29 @@ def test_existing_count_one_becomes_two():
 # increment_play_count — garbage / edge-case field values
 # ---------------------------------------------------------------------------
 
-def test_garbage_string_value_treated_as_zero():
-    """Non-integer value → log warning, treat as 0, post '1'."""
+def test_nonempty_garbage_value_aborts_without_writing(caplog):
+    """A present but non-integer Play Count must NOT be reset to 1 (META-2).
+
+    A successful read that returns prose (e.g. a hand-typed note) is a value we
+    cannot safely increment, but it is REAL DATA — overwriting it with an
+    absolute '1' destroys whatever the field held. The safe behaviour is to
+    abort the write and return False, leaving the field untouched for the owner
+    to inspect. The old behaviour (treat as 0, post '1') is the bug.
+    """
     client = make_client()
 
     get_resp = make_get_response(200, instance_response(42, _FIELD_ID, "not-a-number"))
-    post_resp = make_post_response(204)
     client._http.session.get = MagicMock(return_value=get_resp)
-    client._http.session.post = MagicMock(return_value=post_resp)
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
 
-    result = client.increment_play_count(release_id=111, instance_id=42)
+    with caplog.at_level(logging.ERROR):
+        result = client.increment_play_count(release_id=111, instance_id=42)
 
-    assert result is True
-    _, kwargs = client._http.session.post.call_args
-    assert kwargs["json"]["value"] == "1"
+    assert result is False
+    client._http.session.post.assert_not_called()
+    # Pin the META-2 path specifically (a present, non-integer value), so this
+    # abort is not confused with the read-failure abort (META-1).
+    assert "not an integer" in caplog.text
 
 
 def test_whitespace_only_value_treated_as_zero():
@@ -216,23 +231,68 @@ def test_field_not_found_returns_false_no_post():
 
 
 # ---------------------------------------------------------------------------
-# increment_play_count — GET failure fallback
+# increment_play_count — UNTRUSTED READ must abort, never clobber (META-1)
+#
+# The increment is a read-modify-write ending in an ABSOLUTE set. If the read
+# of the current value cannot be trusted, treating it as 0 resets the owner's
+# accumulated Play Count to 1 — silently, with a success log. The only safe
+# behaviour is to abort the write. These tests pin that for every read-failure
+# mode: a 5xx, a connection error, and a 200 whose body does not contain the
+# instance (a partial/paged/edited response we cannot interpret as "blank").
 # ---------------------------------------------------------------------------
 
-def test_get_current_value_non200_falls_back_to_zero_and_still_writes():
-    """If GET for current value returns non-200, fall back to 0 and still POST '1'."""
+def test_get_current_value_5xx_aborts_without_writing(caplog):
+    """A 5xx on the value read must abort the increment, not fall back to 0."""
     client = make_client()
 
-    get_resp = make_get_response(500, {})
-    post_resp = make_post_response(204)
+    client._http.session.get = MagicMock(return_value=make_get_response(500, {}))
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    with caplog.at_level(logging.ERROR):
+        result = client.increment_play_count(release_id=111, instance_id=42)
+
+    assert result is False
+    client._http.session.post.assert_not_called()
+    # Pin the READ-failure abort path (META-1) specifically, so it is not
+    # satisfied by the non-integer abort (META-2) accidentally catching the
+    # sentinel's string form.
+    assert "could not read the current value" in caplog.text
+
+
+def test_get_current_value_connection_error_aborts_without_writing(caplog):
+    """A ConnectionError on the value read must abort, not clobber to 1."""
+    client = make_client()
+
+    client._http.session.get = MagicMock(side_effect=ConnectionError("network gone"))
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    with caplog.at_level(logging.ERROR):
+        result = client.increment_play_count(release_id=111, instance_id=42)
+
+    assert result is False
+    client._http.session.post.assert_not_called()
+    assert "could not read the current value" in caplog.text
+
+
+def test_get_current_value_instance_missing_aborts_without_writing(caplog):
+    """A 200 whose body lacks our instance is ambiguous, not 'blank' — abort.
+
+    The instance genuinely being absent, a paged response, or an edited
+    collection all land here; none of them justify resetting the count to 1.
+    """
+    client = make_client()
+
+    # 200, but the only instance in the body is a different one (99 != 42).
+    get_resp = make_get_response(200, instance_response(99, _FIELD_ID, "12"))
     client._http.session.get = MagicMock(return_value=get_resp)
-    client._http.session.post = MagicMock(return_value=post_resp)
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
 
-    result = client.increment_play_count(release_id=111, instance_id=42)
+    with caplog.at_level(logging.ERROR):
+        result = client.increment_play_count(release_id=111, instance_id=42)
 
-    assert result is True
-    _, kwargs = client._http.session.post.call_args
-    assert kwargs["json"]["value"] == "1"
+    assert result is False
+    client._http.session.post.assert_not_called()
+    assert "could not read the current value" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +356,12 @@ def test_get_field_value_returns_correct_value_for_matching_instance():
     assert result == "7"
 
 
-def test_get_field_value_wrong_instance_id_returns_none():
-    """_get_field_value returns None when the response has a different instance_id."""
+def test_get_field_value_wrong_instance_id_returns_read_failed():
+    """A 200 body that lacks our instance is UNKNOWN, not blank → _READ_FAILED.
+
+    This is the value that keeps a partial/paged/edited response from being read
+    as 0 and clobbering the count (META-1).
+    """
     client = make_client()
 
     # Response has instance_id=99, but we're looking for instance_id=42
@@ -306,15 +370,39 @@ def test_get_field_value_wrong_instance_id_returns_none():
 
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
-    assert result is None
+    assert result is _READ_FAILED
 
 
-def test_get_field_value_non200_returns_none():
-    """_get_field_value returns None on a non-200 GET response."""
+def test_get_field_value_non200_returns_read_failed():
+    """_get_field_value returns _READ_FAILED (not None) on a non-200 GET (META-1)."""
     client = make_client()
 
     get_resp = make_get_response(404, {})
     client._http.session.get = MagicMock(return_value=get_resp)
+
+    result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
+
+    assert result is _READ_FAILED
+
+
+def test_get_field_value_exception_returns_read_failed():
+    """A network exception during the read is UNKNOWN, not blank → _READ_FAILED."""
+    client = make_client()
+
+    client._http.session.get = MagicMock(side_effect=ConnectionError("boom"))
+
+    result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
+
+    assert result is _READ_FAILED
+
+
+def test_get_field_value_field_unset_returns_none_confirmed_blank():
+    """Instance found but this field unset is a CONFIRMED blank → None (safe 0)."""
+    client = make_client()
+
+    # Instance 42 present, but its only note is for a different field_id.
+    body = {"releases": [{"instance_id": 42, "notes": [{"field_id": 999, "value": "x"}]}]}
+    client._http.session.get = MagicMock(return_value=make_get_response(200, body))
 
     result = client._get_field_value(release_id=111, instance_id=42, field_id=_FIELD_ID)
 
@@ -567,12 +655,18 @@ def test_request_routes_post_through_session_post():
 
 
 def test_increment_play_count_survives_one_rate_limit_on_post():
-    """End-to-end: a 429 on the field-update POST still results in success."""
+    """End-to-end: a 429 on the field-update POST still results in success.
+
+    The read must return a TRUSTED value so the increment reaches the POST —
+    this test exercises the POST 429-retry, not the read. (Previously it stubbed
+    an empty ``releases`` body, which now correctly aborts as an unknown read —
+    META-1 — so it no longer reached the POST it was written to test.)
+    """
     client = make_client()
-    get_resp = make_get_response(200, {"releases": []})  # No prior value → 0
+    get_resp = make_get_response(200, instance_response(222, _FIELD_ID, "5"))
     client._http.session.get = MagicMock(return_value=get_resp)
     client._http.session.post = MagicMock(
-        side_effect=[make_429_response("1"), make_post_response(204)]
+        side_effect=[make_429_response("6"), make_post_response(204)]
     )
 
     with patch("src.metadata.discogs.transport.time.sleep"):

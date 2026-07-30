@@ -9,7 +9,32 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-_Nothing yet._
+**Code-review hardening, round 3 (Wave 1 — collection data integrity).** A third
+adversarial cold audit (`CODE_REVIEW_2026-07-30.md`) filed 88 issues across five
+milestones; this section tracks the Wave 1 fixes as they land, each through the
+same implement → RED test → mutation-check → cold-review discipline.
+
+### Fixed
+
+- **A failed or untrusted read no longer resets the Play Count to 1 (META-1,
+  #75 — CRITICAL).** `increment_play_count` is a read-modify-write ending in an
+  absolute set. `_get_field_value` previously returned `None` for *every* read
+  failure — a non-200, a network exception, or a 200 whose body did not contain
+  the instance — which the caller could not tell apart from a genuinely blank
+  field, so it treated the value as `0` and POSTed an absolute `1`, silently
+  overwriting an accumulated count and logging success. `_get_field_value` now
+  returns a three-state result — the value, `None` for a *confirmed-blank* field
+  (safe `0`), or the `_READ_FAILED` sentinel for an *untrusted* read — and
+  `increment_play_count` aborts (no POST, returns `False`) whenever the current
+  value cannot be trusted.
+- **A present, non-integer Play Count is no longer overwritten with 1 (META-2,
+  #77 — HIGH).** A successful read that returns a non-integer value is real data
+  that cannot be safely incremented; the increment now aborts and leaves the
+  field untouched rather than clobbering it with an absolute `1`. Whitespace-only
+  and empty values are still treated as a blank `0` (first play → `1`); the
+  B-16 JSON-number coercion (`5` → `6`) is preserved.
+- Both aborts log at ERROR with a distinct message, and the two guards are pinned
+  independently by log-message assertions so neither can be removed unnoticed.
 
 ---
 
