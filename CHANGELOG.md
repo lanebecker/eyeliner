@@ -145,6 +145,21 @@ same implement → RED test → mutation-check → cold-review discipline.
   epoch guard as the scrobble (B-19): a SESSION_ENDED *during* the tracker call
   can't resurrect a dead session's dedup key. Reproduced RED; the reorder and the
   guard are both mutation-verified. B-11 still holds (set_track runs first).
+- **Removed an unreachable duplicate-position fallback in
+  `SideIndex.from_tracklist` (MUT-15, #85 — test effectiveness).** The finding
+  flagged surviving mutants on the `global_index` fallback ("if two rows share a
+  position string and neither matches the title, use the first position match").
+  Measured rather than assumed: that branch is *provably unreachable* —
+  `target_position` is always derived from a title-bearing entry, so a row
+  matching BOTH the position and the title always exists and the loop never falls
+  through (a differential fuzz of ~1.9M cases plus 1M reachability probes found 0
+  fall-throughs and 0 behavior differences vs. the old code). The three surviving
+  mutants were therefore *equivalent* — they only mutated a variable nothing
+  consumed — and unkillable by any test. So instead of testing an impossible
+  state (the finding's literal suggestion), the dead fallback was removed,
+  eliminating those mutants at the source, and the *reachable* duplicate-position
+  behavior (resolve by position AND title, not the first row at that position) is
+  now pinned by a real test. Behavior-preserving; no production behavior change.
 
 ---
 

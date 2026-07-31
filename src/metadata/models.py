@@ -164,18 +164,26 @@ class SideIndex:
 
         global_index = None
         if target_position is not None:
-            # Prefer an entry matching BOTH position and title (robust if two
-            # rows ever share a position string); else the first position match.
-            fallback = None
+            # Resolve the exact occurrence by matching BOTH position AND title.
+            # This is what correctly handles a DUPLICATE position string (two
+            # rows both at "B2" — Discogs positions are community-edited free
+            # text and not guaranteed unique): the position+title pair pins the
+            # right row rather than the first row at that position.
+            #
+            # target_position is ALWAYS derived from a title-bearing entry (the
+            # side-disambiguated match above, or `current`'s own position), so a
+            # row matching both this position and the title always exists — the
+            # loop never falls through. A prior "else use the first position-only
+            # match" fallback was removed as provably-unreachable dead code
+            # (MUT-15): because target_position can never point at a position
+            # with no title match, that branch never executed — an 816k-case
+            # fuzz over duplicate-position tracklists confirmed 0 hits, and its
+            # three surviving mutants were equivalent (they only mutated a
+            # variable nothing consumed).
             for i, e in enumerate(tracklist):
-                if e.position == target_position:
-                    if e.title.lower().strip() == title_key:
-                        global_index = i
-                        break
-                    if fallback is None:
-                        fallback = i
-            if global_index is None:
-                global_index = fallback
+                if e.position == target_position and e.title.lower().strip() == title_key:
+                    global_index = i
+                    break
 
         # is_last_track gates the collection Play Count write, so a wrong True
         # is a data-integrity bug. Derive it from the disambiguated global_index

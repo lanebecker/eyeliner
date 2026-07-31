@@ -663,6 +663,33 @@ def test_side_index_numbered_tracklist_has_neighbours_without_sides():
     assert si.next_track_title == "Three"
 
 
+def test_side_index_duplicate_position_resolves_by_title_not_first_row():
+    """MUT-15: two rows share the position string 'B2' (Discogs positions are
+    community-edited free text and not guaranteed unique).  from_tracklist must
+    resolve the current track to the row matching BOTH position AND title — the
+    exact occurrence — not merely the first row at that position.  Pins the
+    reachable duplicate-position path directly at the SideIndex level (the
+    unreachable 'first position-only match' fallback was removed)."""
+    tl = [
+        TracklistEntry("A1", "Opener"),
+        TracklistEntry("B2", "Decoy"),     # SAME position as the closer, different title
+        TracklistEntry("B1", "Filler"),
+        TracklistEntry("B2", "Closer"),    # the genuine last track
+    ]
+    closer = SideIndex.from_tracklist(tl, "Closer")
+    assert closer.global_index == 3        # the position+title match, NOT the decoy at index 1
+    assert closer.is_last_track is True
+    assert closer.prev_track_title == "Filler"
+    assert closer.next_track_title is None
+
+    # The decoy resolves to ITS OWN row, not the closer's — proving the match is
+    # by position AND title, and would fail if the title check were dropped.
+    decoy = SideIndex.from_tracklist(tl, "Decoy")
+    assert decoy.global_index == 1
+    assert decoy.is_last_track is False
+    assert decoy.next_track_title == "Filler"
+
+
 def test_side_index_is_frozen():
     """The value object is immutable — its facts are settled at resolve time."""
     si = SideIndex.from_tracklist([TracklistEntry("A1", "Only")], "Only")
