@@ -17,7 +17,7 @@ Covers update_last_played integration:
 No audio hardware, display, or Discogs account required. DiscogsClient is mocked.
 """
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import pytest
 
 from src.audio.silence import AudioEvent
@@ -394,6 +394,45 @@ async def test_update_last_played_returning_false_does_not_raise():
     # Should complete without raising
     await tracker._end_session()
     writer.update_last_played.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_clock_skip_is_not_logged_as_a_failure(caplog):
+    """STAB-2: when update_last_played skips the write because the clock is
+    untrustworthy (pre-NTP), the finalize path must NOT ALSO report it as a
+    failure — a deliberate skip is not a failure (the writer already WARNed)."""
+    import logging
+    tracker, writer = make_tracker(
+        last_played_field_name="Last Played",
+        update_last_played_return=False,   # the writer's gate skipped → returns False
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=False):
+        await tracker._end_session()
+    assert not any(
+        "Failed to update Discogs Last Played" in r.message for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_last_played_failure_is_still_logged(caplog):
+    """The STAB-2 skip suppression must NOT mask a genuine failure: update_last_played
+    returning False with a TRUSTWORTHY clock is a real error and is still logged."""
+    import logging
+    tracker, writer = make_tracker(
+        last_played_field_name="Last Played",
+        update_last_played_return=False,
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
+        await tracker._end_session()
+    assert any(
+        "Failed to update Discogs Last Played" in r.message for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
