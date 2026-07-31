@@ -15,6 +15,7 @@ from datetime import date
 from typing import Optional, Union, TYPE_CHECKING
 
 from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _as_id
+from src.util.clock import clock_is_trustworthy
 
 if TYPE_CHECKING:
     from src.config import DiscogsConfig
@@ -158,6 +159,22 @@ class DiscogsCollectionWriter:
         """
         if not self.last_played_field_name:
             return True  # Not configured — graceful no-op
+
+        # Clock-sanity gate (STAB-2): the Pi has no RTC, so a pre-NTP boot makes
+        # date.today() read the Unix epoch or a stale fake-hwclock date. Writing
+        # that as an absolute set would stamp a wrong date over the correct Last
+        # Played value in the real collection. Skip the write (with one WARNING)
+        # rather than corrupt it; the next play re-attempts once the clock syncs.
+        # Play Count is deliberately NOT gated — it writes a count, not a date.
+        if not clock_is_trustworthy():
+            log.warning(
+                "Skipping Last Played update for release %s / instance %s: the system "
+                "clock is not yet trustworthy (pre-NTP boot?) — refusing to overwrite the "
+                "real value with a wrong date. It will update on the next play once the "
+                "clock has synchronized.",
+                release_id, instance_id,
+            )
+            return False
 
         try:
             fields = self._get_collection_fields()

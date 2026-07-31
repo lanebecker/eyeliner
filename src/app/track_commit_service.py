@@ -34,6 +34,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
+from src.util.clock import clock_is_trustworthy
+
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
     from src.metadata.resolver import MetadataResolver
@@ -134,11 +136,25 @@ class TrackCommitService:
         # guard; apply it to the scrobble too so a track whose session has already
         # ended is neither re-committed nor scrobbled.
         if self.lastfm and self.state.session_epoch == audio_epoch:
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, self.lastfm.scrobble, metadata, timestamp
+            # Clock-sanity gate (STAB-2): validate the EXACT timestamp captured at
+            # the top of commit().  A pre-NTP boot (the Pi has no RTC) stamps an
+            # epoch/stale time; Last.fm silently drops a scrobble that is too old
+            # or in the future — or lands it at the wrong point in listening
+            # history — while reporting success either way.  Skip with one WARNING
+            # rather than submit a wrong time.
+            if not clock_is_trustworthy(timestamp):
+                log.warning(
+                    "Skipping Last.fm scrobble for %s — %s: the system clock is not yet "
+                    "trustworthy (pre-NTP boot?); a wrong timestamp would be dropped or land "
+                    "at the wrong point in listening history.",
+                    metadata.artist, metadata.title,
                 )
-            except Exception as e:
-                log.warning(f"Last.fm scrobble error: {e}")
+            else:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, self.lastfm.scrobble, metadata, timestamp
+                    )
+                except Exception as e:
+                    log.warning(f"Last.fm scrobble error: {e}")
 
         return True

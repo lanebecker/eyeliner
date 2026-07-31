@@ -160,6 +160,27 @@ same implement → RED test → mutation-check → cold-review discipline.
   eliminating those mutants at the source, and the *reachable* duplicate-position
   behavior (resolve by position AND title, not the first row at that position) is
   now pinned by a real test. Behavior-preserving; no production behavior change.
+- **A pre-NTP clock no longer stamps a wrong Last Played date or scrobble
+  timestamp over real data (STAB-2, #86 — MEDIUM).** The Pi has no RTC; a boot
+  before NTP settles reads the Unix epoch or a stale `fake-hwclock` date.
+  `update_last_played` wrote `date.today().isoformat()` as an absolute set with no
+  clock check, so a pre-NTP side-completion POSTed e.g. `1970-01-01` over the
+  correct Last Played value in the real collection (and logged success), and the
+  scrobble submitted an epoch/stale timestamp that Last.fm silently drops or
+  mis-places. A new `src/util/clock.py` gate (`clock_is_trustworthy`, a
+  compiled-in 2026-01-01 floor) now guards both date-dependent writes: a pre-NTP
+  boot skips the Last Played write and the scrobble with a WARNING rather than
+  writing a wrong value, and re-attempts on the next play once the clock syncs.
+  Play Count is deliberately NOT gated — it writes a count, not a date, so a wrong
+  clock can't corrupt it. This is the code-level complement to the
+  deployment-level CRIT-4 (#83): the systemd unit already waits for
+  `time-sync.target`, so a correctly-deployed appliance never runs before sync;
+  this gate is defense-in-depth for the manual-run / mis-deployed case and the
+  catastrophic epoch reading. (The floor is a lower bound — a stale-but-post-floor
+  clock is a documented residual the deployment sync covers.) A deliberate
+  clock-skip is not mislabeled as a failure by the tracker's finalize log.
+  RED-reproduced (a 1970 POST over the real field); the gate and both call-site
+  guards are mutation-verified; cold review + a narrow second pass both PASS.
 
 ---
 

@@ -36,6 +36,7 @@ from typing import Optional, TYPE_CHECKING
 
 from src.metadata.models import PlaySession, TrackMetadata
 from src.audio.silence import AudioEvent
+from src.util.clock import clock_is_trustworthy
 
 if TYPE_CHECKING:
     from src.metadata.discogs.writer import DiscogsCollectionWriter
@@ -237,6 +238,14 @@ class ListenTracker:
                 )
                 if last_played_success:
                     log.info("✅ Discogs Last Played updated successfully.")
+                elif not clock_is_trustworthy():
+                    # A pre-NTP clock made update_last_played skip the write (it
+                    # already logged its own WARNING).  A deliberate skip is NOT a
+                    # failure, so don't ALSO report it as one (STAB-2).  A False
+                    # return with an untrustworthy clock is always the skip path —
+                    # the writer's gate short-circuits before the POST — never a
+                    # real write failure, so this can't mask a genuine error.
+                    pass
                 else:
                     log.warning("⚠ Failed to update Discogs Last Played.")
 

@@ -589,6 +589,74 @@ def test_update_last_played_date_is_iso_format():
 
 
 # ---------------------------------------------------------------------------
+# update_last_played — clock-sanity gate (STAB-2)
+#
+# The Pi has no RTC; a pre-NTP boot makes date.today() read the epoch or a stale
+# fake-hwclock date. Writing that would stamp a wrong date over the real Last
+# Played value. The write is gated on clock_is_trustworthy(); Play Count is NOT
+# gated (it writes a count, not a date).
+# ---------------------------------------------------------------------------
+
+def test_update_last_played_skips_when_clock_untrustworthy():
+    """A pre-NTP clock must NOT overwrite Last Played — skip the POST, return False."""
+    client = make_client_with_last_played()
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    with patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=False):
+        result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is False
+    client._http.session.post.assert_not_called()  # no wrong date written
+
+
+def test_update_last_played_writes_when_clock_trustworthy():
+    """The gate lets a good clock through — today's date still POSTs."""
+    client = make_client_with_last_played()
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    with patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=True):
+        result = client.update_last_played(release_id=111, instance_id=42)
+
+    assert result is True
+    client._http.session.post.assert_called_once()
+
+
+def test_update_last_played_skip_logs_a_warning(caplog):
+    """The skip leaves a WARNING breadcrumb so a missed update is explained."""
+    import logging
+    client = make_client_with_last_played()
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    with caplog.at_level(logging.WARNING), \
+         patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=False):
+        client.update_last_played(release_id=111, instance_id=42)
+
+    assert any("clock is not yet trustworthy" in r.message for r in caplog.records)
+
+
+def test_increment_play_count_is_not_gated_by_the_clock():
+    """Play Count writes a count, not a date, so a wrong clock can't corrupt it —
+    it is deliberately NOT gated and still increments even when the clock is
+    untrustworthy (STAB-2 scope)."""
+    writer = make_unseeded_writer()
+
+    def fake_request(method, url, **kwargs):
+        if url.endswith("/collection/fields"):
+            return _fields_response([{"name": "Play Count", "id": 3}])
+        if method == "GET":
+            return make_get_response(200, instance_response(42, 3, "5"))
+        return make_post_response(204)
+
+    writer._http.request = MagicMock(side_effect=fake_request)
+
+    with patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=False):
+        assert writer.increment_play_count(release_id=111, instance_id=42) is True
+
+    post_urls = [c.args[1] for c in writer._http.request.call_args_list if c.args[0] == "POST"]
+    assert post_urls, "Play Count POST was suppressed by the clock gate — it must not be"
+
+
+# ---------------------------------------------------------------------------
 # update_last_played — field not found
 # ---------------------------------------------------------------------------
 

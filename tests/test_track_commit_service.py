@@ -16,7 +16,7 @@ recognizer tests never passed a Last.fm client (T-2).
 A real PlayerState is used so the epoch logic is live; resolver / tracker /
 lastfm are mocks.
 """
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -315,3 +315,23 @@ async def test_stale_commit_does_not_scrobble():
     await service.commit(make_raw(), state.session_epoch)
 
     lastfm.scrobble.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scrobble_skipped_when_clock_untrustworthy():
+    """STAB-2: a pre-NTP clock captured an epoch/stale timestamp at the top of
+    commit(); the scrobble is skipped rather than submitting a wrong time that
+    Last.fm would silently drop or mis-place. The rest of the commit still runs."""
+    lastfm = MagicMock()
+    lastfm.scrobble = MagicMock()
+    service, state, resolver, tracker = make_service(lastfm=lastfm)
+    state.set_status(PlayerStatus.LISTENING)
+    meta = MagicMock()
+    resolver.resolve = AsyncMock(return_value=meta)
+
+    with patch("src.app.track_commit_service.clock_is_trustworthy", return_value=False):
+        committed = await service.commit(make_raw(), state.session_epoch)
+
+    assert committed is True              # commit still succeeds (display + tracker)
+    assert state.current_track is meta
+    lastfm.scrobble.assert_not_called()   # only the scrobble is skipped
