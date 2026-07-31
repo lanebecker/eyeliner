@@ -16,7 +16,7 @@ recognizer tests never passed a Last.fm client (T-2).
 A real PlayerState is used so the epoch logic is live; resolver / tracker /
 lastfm are mocks.
 """
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -58,7 +58,7 @@ async def test_commit_sets_track_then_raw_and_notifies_tracker():
     assert state.current_track is meta
     assert state.current_raw is r
     assert state.status == PlayerStatus.PLAYING
-    tracker.on_track_identified.assert_awaited_once_with(meta)
+    tracker.on_track_identified.assert_awaited_once_with(meta, is_stale=ANY)
 
 
 @pytest.mark.asyncio
@@ -154,7 +154,7 @@ async def test_needle_lift_during_tracker_does_not_advance_current_raw():
     state.set_status(PlayerStatus.LISTENING)
     resolver.resolve = AsyncMock(return_value=MagicMock())
 
-    async def end_during_tail(metadata):
+    async def end_during_tail(metadata, is_stale=None):
         state.clear()   # needle lifts mid-tracker → epoch bumps, current_raw nulled
 
     tracker.on_track_identified = AsyncMock(side_effect=end_during_tail)
@@ -203,7 +203,7 @@ async def test_commit_proceeds_when_session_stable():
     assert committed is True
     assert state.current_track is meta
     assert state.status == PlayerStatus.PLAYING
-    tracker.on_track_identified.assert_awaited_once_with(meta)
+    tracker.on_track_identified.assert_awaited_once_with(meta, is_stale=ANY)
 
 
 @pytest.mark.asyncio
@@ -287,7 +287,7 @@ async def test_scrobble_skipped_when_session_ends_during_tracker_tail():
     meta = MagicMock()
     resolver.resolve = AsyncMock(return_value=meta)
 
-    async def end_during_tail(metadata):
+    async def end_during_tail(metadata, is_stale=None):
         state.clear()  # SESSION_ENDED lands during the tracker tail → epoch bumps
 
     tracker.on_track_identified = AsyncMock(side_effect=end_during_tail)
@@ -315,6 +315,30 @@ async def test_stale_commit_does_not_scrobble():
     await service.commit(make_raw(), state.session_epoch)
 
     lastfm.scrobble.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_hands_tracker_an_epoch_staleness_predicate():
+    """CONC-6: commit passes on_track_identified an is_stale() predicate that
+    reports False while the audio's session is live and True once it ends (the
+    epoch bumps) — so the tracker can drop a stale track after acquiring the
+    lifecycle lock instead of starting a phantom session."""
+    service, state, resolver, tracker = make_service()
+    state.set_status(PlayerStatus.LISTENING)
+    resolver.resolve = AsyncMock(return_value=MagicMock())
+    seen = {}
+
+    async def capture(metadata, is_stale=None):
+        seen["while_live"] = is_stale()   # epoch unchanged → not stale
+        state.clear()                      # needle lifts → epoch bumps
+        seen["after_end"] = is_stale()     # epoch changed → stale
+
+    tracker.on_track_identified = AsyncMock(side_effect=capture)
+
+    await service.commit(make_raw(), state.session_epoch)
+
+    assert seen["while_live"] is False
+    assert seen["after_end"] is True
 
 
 @pytest.mark.asyncio

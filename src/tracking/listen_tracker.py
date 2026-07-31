@@ -32,7 +32,7 @@ split.
 
 import asyncio
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from src.metadata.models import PlaySession, TrackMetadata
 from src.audio.silence import AudioEvent
@@ -284,8 +284,10 @@ class ListenTracker:
                 else:
                     log.warning("⚠ Failed to love track on Last.fm.")
 
-    async def on_track_identified(self, track: TrackMetadata):
-        """Called by RecognitionLoop when a new track is confirmed.
+    async def on_track_identified(
+        self, track: TrackMetadata, is_stale: Optional[Callable[[], bool]] = None
+    ):
+        """Called by the commit service when a new track is confirmed.
 
         Detects mid-session album changes (v1.3.4): if this track resolved to
         a different Discogs release than the previous one in this session,
@@ -299,8 +301,31 @@ class ListenTracker:
         detection.  Both IDs must be present for a split: nothing seen yet
         means nothing to compare, and a missing track ID (FALLBACK metadata)
         means the album can't be distinguished.
+
+        ``is_stale`` (CONC-6): a predicate supplied by the caller that returns
+        True if the audio this track came from belongs to a session that has
+        since ended.  It is re-evaluated *after* the lifecycle lock is acquired,
+        because that lock can be held for a while by a previous session's Discogs
+        write (CONC-2) and a SESSION_ENDED landing in that window ends the session
+        and bumps the epoch.  Without the check, this method would then see
+        ``_session is None`` and start a PHANTOM session for audio that already
+        stopped — which a later album split could phantom-credit.  A stale track
+        is dropped instead.  Defaults to None (no check) for callers that don't
+        thread it.
         """
         async with self._lifecycle_lock:
+            # CONC-6: now that we hold the lock, drop this track if its session
+            # ended while we were waiting for the lock — do not resurrect it as a
+            # phantom session (see is_stale in the docstring).
+            if is_stale is not None and is_stale():
+                log.info(
+                    "Dropping stale track '%s' — its session ended while this commit "
+                    "waited for the lifecycle lock (CONC-6); not starting a phantom "
+                    "session for audio that already stopped.",
+                    track.title,
+                )
+                return
+
             if self._session is None:
                 self._start_session()
 
