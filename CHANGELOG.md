@@ -181,6 +181,21 @@ same implement → RED test → mutation-check → cold-review discipline.
   clock-skip is not mislabeled as a failure by the tracker's finalize log.
   RED-reproduced (a 1970 POST over the real field); the gate and both call-site
   guards are mutation-verified; cold review + a narrow second pass both PASS.
+- **A stale commit no longer resurrects a dead session as a phantom (CONC-6, #87
+  — LOW).** The commit epoch guard covered the resolve await but not the
+  `on_track_identified` await. That await can park on the tracker's contended
+  `_lifecycle_lock` (a previous session's Discogs write holds it); a SESSION_ENDED
+  landing in that window ends the session and bumps the epoch, and the tracker
+  would then acquire the lock, see `_session is None`, and start a PHANTOM session
+  for audio that already stopped — which a later album split could phantom-credit
+  (and a FALLBACK track with no release_id can't split away to clean up). `commit`
+  now hands `on_track_identified` a staleness predicate
+  (`is_stale=lambda: state.session_epoch != audio_epoch`, using PCONC-1's
+  audio-bound epoch); the tracker re-checks it *after* acquiring the lock and drops
+  the stale track — starting no session, logging nothing — rather than resurrecting
+  it. No false-drop: an album-swap split isn't a silence event and doesn't bump the
+  epoch, so a live track is never dropped. Mutation-verified; a real-lock cold-review
+  reproduction confirmed the phantom forms pre-fix and is dropped after.
 
 ---
 

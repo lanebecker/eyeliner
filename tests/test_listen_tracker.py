@@ -436,6 +436,41 @@ async def test_real_last_played_failure_is_still_logged(caplog):
 
 
 # ---------------------------------------------------------------------------
+# CONC-6 — a track whose session ended while awaiting the lifecycle lock is
+# dropped, not resurrected as a phantom session.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stale_track_is_dropped_not_started_as_a_phantom_session():
+    """CONC-6: if is_stale() is True when on_track_identified acquires the lock
+    (the audio's session ended while it waited), drop the track — start no
+    session and log nothing."""
+    tracker, writer = make_tracker()
+    assert tracker._session is None
+    await tracker.on_track_identified(make_track("StaleTrack"), is_stale=lambda: True)
+    assert tracker._session is None   # no phantom session created for dead audio
+
+
+@pytest.mark.asyncio
+async def test_live_track_is_logged_when_not_stale():
+    """is_stale() False → normal behavior: a session starts and the track logs."""
+    tracker, writer = make_tracker()
+    await tracker.on_track_identified(make_track("Catholic Block"), is_stale=lambda: False)
+    assert tracker._session is not None
+    assert tracker._session.identified_tracks[-1].title == "Catholic Block"
+
+
+@pytest.mark.asyncio
+async def test_on_track_identified_without_is_stale_behaves_normally():
+    """Backward compat: no is_stale predicate → no staleness check (the recognition
+    loop's other callers and the existing suite pass none)."""
+    tracker, writer = make_tracker()
+    await tracker.on_track_identified(make_track("Catholic Block"))
+    assert tracker._session is not None
+    assert tracker._session.identified_tracks[-1].title == "Catholic Block"
+
+
+# ---------------------------------------------------------------------------
 # Background task management (v1.3.3)
 #
 # SESSION_ENDED schedules _end_session() as an asyncio task. asyncio holds

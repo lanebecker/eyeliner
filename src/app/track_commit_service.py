@@ -104,7 +104,14 @@ class TrackCommitService:
             return False
 
         self.state.set_track(metadata)
-        await self.tracker.on_track_identified(metadata)
+        # Hand the tracker a staleness predicate it re-checks AFTER it acquires the
+        # lifecycle lock (CONC-6): on_track_identified can park on that lock while a
+        # previous session's Discogs write holds it, and a SESSION_ENDED landing in
+        # that window ends this audio's session. The predicate lets the tracker drop
+        # the track then, instead of resurrecting it as a phantom session.
+        await self.tracker.on_track_identified(
+            metadata, is_stale=lambda: self.state.session_epoch != audio_epoch
+        )
         # Advance the dedup key (current_raw) only AFTER the tracker has accepted
         # the track, and only while the session is still the one this audio came
         # from (LB-1 + B-19).  Two failures are handled here that the old order
