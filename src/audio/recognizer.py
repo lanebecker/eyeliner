@@ -258,15 +258,29 @@ class RecognitionLoop:
         """Main recognition loop."""
         log.info("Recognition loop started.")
         while True:
+            # CONC-4: the wait_for timeout — and ONLY it — means "no audio queued".
+            # On Python 3.11 asyncio.TimeoutError IS builtins.TimeoutError (== a
+            # socket timeout, and the base of aiohttp's ServerTimeoutError), so if
+            # recognize()/_handle_result() sat inside this same try, a genuine
+            # network timeout on the resolve/commit path would be misread as an
+            # idle poll — swallowed with no log and retried immediately, hot-spinning
+            # on a failing network with nothing in the journal. Keep that try around
+            # the queue get alone.
             try:
                 audio, sample_rate, epoch = await asyncio.wait_for(
                     self._audio_queue.get(), timeout=self.poll_interval
                 )
+            except asyncio.TimeoutError:
+                continue  # No audio queued within poll_interval — idle; poll again.
+
+            try:
                 result = await self.backend.recognize(audio, sample_rate)
                 await self._handle_result(result, epoch)
-            except asyncio.TimeoutError:
-                pass  # No audio queued — fine
             except Exception as e:
+                # Any error under the recognize/commit path — INCLUDING a genuine
+                # TimeoutError — is logged and backed off, not silently dropped.
+                # (asyncio.CancelledError is a BaseException, so a task cancel still
+                # unwinds the loop cleanly.)
                 log.error(f"Recognition loop error: {e}")
                 await asyncio.sleep(2)
 

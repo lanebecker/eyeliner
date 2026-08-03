@@ -148,6 +148,25 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   unconditionally, so a split commit can briefly wait behind an unrelated in-flight
   credit (strictly better than before, filed as #166) — resolved here as a comment
   correction, not a scope-creeping behavior change.
+- **A genuine network timeout on the recognize/commit path is now logged and
+  backed off instead of silently swallowed (CONC-4, #97 — MEDIUM).** In
+  `RecognitionLoop.run()` the `wait_for` timeout — meant only to signal "no audio
+  queued" — shared one `try` with `backend.recognize()` and `_handle_result()`.
+  On Python 3.11 `asyncio.TimeoutError` IS `builtins.TimeoutError` (== a socket
+  timeout, and the base of aiohttp's `ServerTimeoutError`), so a real network
+  timeout on the resolve/commit path was caught by `except asyncio.TimeoutError:
+  pass`, classified as an idle poll, and retried immediately — hot-spinning on a
+  failing network with nothing in the journal, while the sibling `except Exception`
+  one line down would have logged it and backed off. The `try` is now split so the
+  `except asyncio.TimeoutError` covers ONLY the queue `wait_for` (`continue` on an
+  idle poll); `recognize()` + `_handle_result()` sit in a second `try` whose
+  `except Exception` logs and `sleep(2)`-backs-off any error — a genuine
+  `TimeoutError` included. `asyncio.CancelledError` is a `BaseException`, so a task
+  cancel still unwinds the loop cleanly. RED-first (the swallowed timeout
+  reproduced); the try split, the idle-path `continue`, and the broad error
+  handler are each mutation-pinned; cold review SPEC / QUALITY PASS (clean
+  cancellation at every await point, no lost behavior). The recognize call still
+  has no per-call timeout — that is the separate PCONC-2 (#100), out of scope here.
 
 ## [1.5.2] — 2026-08-03
 

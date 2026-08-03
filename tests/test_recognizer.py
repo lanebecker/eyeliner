@@ -449,6 +449,86 @@ async def test_run_swallows_a_backend_error_and_keeps_looping(monkeypatch):
     on_confirmed.assert_awaited_once_with(raw, state.session_epoch)
 
 
+@pytest.mark.asyncio
+async def test_run_timeout_from_recognize_is_logged_and_backed_off_not_swallowed(monkeypatch):
+    """CONC-4: on Python 3.11 asyncio.TimeoutError IS builtins.TimeoutError. A
+    socket timeout (or aiohttp ServerTimeoutError) escaping recognize()/commit()
+    must be logged + backed off like any other error — NOT silently classified as
+    'no audio queued' by the wait_for handler, which would hot-spin on a failing
+    network with nothing in the journal."""
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
+
+    raw = make_raw()
+    # First recognize raises a bare TimeoutError (== asyncio.TimeoutError on 3.11);
+    # the second succeeds, proving the loop logged, backed off, and recovered.
+    loop.backend.recognize = AsyncMock(
+        side_effect=[TimeoutError("socket read timed out"), raw]
+    )
+
+    errors = []
+    monkeypatch.setattr(
+        "src.audio.recognizer.log.error", lambda msg, *a, **k: errors.append(msg)
+    )
+    slept = []
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(secs):
+        slept.append(secs)
+        await real_sleep(0)
+
+    monkeypatch.setattr("src.audio.recognizer.asyncio.sleep", fast_sleep)
+
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
+    await loop.enqueue(np.ones(4, dtype=np.float32), 44100)
+
+    task = asyncio.create_task(loop.run())
+    for _ in range(30):
+        await asyncio.sleep(0)
+        if on_confirmed.await_count:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The timeout was LOGGED, not swallowed as an idle poll…
+    assert errors, "TimeoutError from recognize was swallowed silently (no log)"
+    # …the loop BACKED OFF instead of hot-spinning…
+    assert slept, "no back-off after the timeout — the loop would hot-spin"
+    # …and it recovered to process the next chunk.
+    assert loop.backend.recognize.await_count == 2
+    on_confirmed.assert_awaited_once_with(raw, state.session_epoch)
+
+
+@pytest.mark.asyncio
+async def test_run_idle_timeout_polls_again_without_error(monkeypatch):
+    """CONC-4: a genuine idle poll (no audio for poll_interval) must simply loop
+    again — no error logged, recognize() never reached — and must NOT fall through
+    to the recognize path with unbound audio (which the two-try split guards via
+    `continue`)."""
+    config = make_recognition_config(confirmation_required=1, poll_interval_seconds=0.01)
+    state = MagicMock()
+    state.current_raw = None
+    state.current_track = None
+    on_confirmed = AsyncMock()
+    with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
+        loop = RecognitionLoop(config, state, on_confirmed)
+    loop.backend.recognize = AsyncMock(return_value=make_raw())
+
+    errors = []
+    monkeypatch.setattr(
+        "src.audio.recognizer.log.error", lambda msg, *a, **k: errors.append(msg)
+    )
+
+    task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0.05)   # let a few idle polls (0.01s each) elapse on the EMPTY queue
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert errors == [], f"idle poll logged an error (fell through to recognize?): {errors}"
+    loop.backend.recognize.assert_not_awaited()   # never reached recognize on an idle poll
+
+
 # ---------------------------------------------------------------------------
 # PCONC-1 (#80) — the session epoch is bound to the AUDIO at enqueue (capture)
 # time and threaded through recognition → confirmation → commit, so a chunk that
