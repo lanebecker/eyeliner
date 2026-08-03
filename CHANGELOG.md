@@ -216,6 +216,29 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   single combined listener is killed by the fault test); cold review SPEC / QUALITY
   PASS, verifying fault isolation both directions, every AudioEvent still reaching
   the tracker, and no new race with CONC-2/CONC-6.
+- **A hung recognition call can no longer occupy the loop for minutes (PCONC-2,
+  #100 — MEDIUM).** `RecognitionLoop.run()`'s only `wait_for` guarded the audio-
+  queue `get()`, not `backend.recognize()` — and shazamio's default retry policy
+  is `attempts=20 × max_timeout=60`, so a single degraded call over flaky Pi wifi
+  could run for minutes, saturating the maxsize-5 audio queue until the consumer
+  worked on 40–50s-old audio (the lag PCONC-1 needs). `recognize()` is now wrapped
+  in its own `asyncio.wait_for`: a timeout cancels the call (a BaseException the
+  backend's `except Exception` can't swallow) and surfaces as a `TimeoutError` to
+  CONC-4's handler (logged + backed off; the next chunk retries). The bound is a
+  DEDICATED `recognize_timeout` (30s ≈ 3× the chunk hop cadence), deliberately
+  NOT `poll_interval` — cold review showed reusing the idle-poll timeout would let
+  a low `poll_interval_seconds` silently cap every real Shazam round-trip and
+  latch the display to ERROR. shazamio's retry policy is also pinned explicitly
+  (`Shazam(http_client=HTTPClient(retry_options=ExponentialRetry(attempts=2,
+  max_timeout=5, statuses={500,502,503,504,429})))`) — `attempts=2` is the
+  operative bound (`max_timeout` is aiohttp_retry's backoff cap, pinned low only
+  so we never inherit the 60s default; `run()`'s `wait_for` is the hard backstop
+  for a hung request). RED-first (the hung call reproduced occupying the loop);
+  the `wait_for`, the timeout value's decoupling from `poll_interval`, the
+  pinned retry attempts/statuses, and the non-empty (`repr`) timeout log are each
+  mutation-pinned; cold review SPEC / QUALITY PASS and a narrow second pass over
+  the reviewer-prompted rework verified the decoupling, cancellation cleanup, and
+  no session leak (shazamio builds its aiohttp session per-request).
 
 ## [1.5.2] — 2026-08-03
 

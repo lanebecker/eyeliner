@@ -17,11 +17,15 @@ from src.audio.recognizer import ShazamIOBackend, RawRecognitionResult
 
 @pytest.fixture
 def fake_shazamio(monkeypatch):
-    """Inject a fake `shazamio` module so recognize() runs without the real
-    (uninstalled) dependency."""
+    """Inject fake `shazamio` + `aiohttp_retry` modules so recognize() runs without
+    the real (uninstalled) dependencies.  Mirrors the imports `_call_shazam` makes:
+    Shazam(http_client=HTTPClient(retry_options=ExponentialRetry(...))) — PCONC-2."""
     mod = types.ModuleType("shazamio")
 
     class FakeShazam:
+        def __init__(self, http_client=None):   # PCONC-2: accepts the pinned client
+            self.http_client = http_client
+
         async def recognize(self, wav_bytes):
             FakeShazam.last_len = len(wav_bytes)
             return {"track": {
@@ -30,8 +34,22 @@ def fake_shazamio(monkeypatch):
                 "sections": [{"metadata": [{"title": "Album", "text": "Kind of Blue"}]}],
             }}
 
+    class FakeHTTPClient:
+        def __init__(self, retry_options=None):
+            self.retry_options = retry_options
+
     mod.Shazam = FakeShazam
+    mod.HTTPClient = FakeHTTPClient
     monkeypatch.setitem(sys.modules, "shazamio", mod)
+
+    retry_mod = types.ModuleType("aiohttp_retry")
+
+    class FakeExponentialRetry:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    retry_mod.ExponentialRetry = FakeExponentialRetry
+    monkeypatch.setitem(sys.modules, "aiohttp_retry", retry_mod)
     return FakeShazam
 
 

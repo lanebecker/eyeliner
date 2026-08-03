@@ -27,6 +27,26 @@ log = logging.getLogger(__name__)
 # track change, cheap enough to leave a journal breadcrumb when it happens.
 _CHURN_LOG_EVERY = 5
 
+# PCONC-2: hard bound on a single recognition call (~3× the ~10s chunk hop
+# cadence — chunk_seconds minus overlap_seconds at the defaults). A DEDICATED
+# constant, deliberately NOT poll_interval: reusing the idle-poll timeout would
+# mean tuning the poll rate DOWN silently caps every real Shazam round-trip
+# (routinely 3–8s) below its runtime, timing out every recognition and latching
+# the display to ERROR. 30s abandons a degraded call before the maxsize-5 queue
+# saturates (PCONC-1) while leaving ample headroom over a normal call.
+_RECOGNIZE_TIMEOUT_SECONDS = 30
+
+# PCONC-2: pin shazamio's HTTP retry policy instead of inheriting its default
+# (attempts=20 × max_timeout=60), which lets ONE degraded recognize retry for
+# minutes and occupy the recognition loop. `attempts` is the operative bound: a
+# couple of tries fails fast (the loop already re-tries on the next chunk and
+# confirmation needs several matches). `max_timeout` is aiohttp_retry's BACKOFF
+# cap, not a per-request timeout — with attempts=2 the single backoff is ~0.2s so
+# it never binds, but it is pinned low anyway so we never inherit the 60s default.
+# run()'s wait_for is the hard backstop that actually bounds a hung request.
+_SHAZAM_RETRY_ATTEMPTS = 2
+_SHAZAM_RETRY_MAX_TIMEOUT_SECONDS = 5
+
 
 @dataclass
 class RawRecognitionResult:
@@ -92,10 +112,22 @@ class ShazamIOBackend(RecognizerBackend):
         The shazamio import is kept lazy here so the module stays importable
         (and the suite testable) on machines without the audio stack (A-13).
         """
-        from shazamio import Shazam
+        from shazamio import Shazam, HTTPClient
+        from aiohttp_retry import ExponentialRetry
 
         if self._shazam is None:
-            self._shazam = Shazam()
+            # PCONC-2: pin the retry policy rather than inheriting shazamio's
+            # default (attempts=20, max_timeout=60), which lets one degraded call
+            # retry for minutes and occupy the recognition loop.
+            self._shazam = Shazam(
+                http_client=HTTPClient(
+                    retry_options=ExponentialRetry(
+                        attempts=_SHAZAM_RETRY_ATTEMPTS,
+                        max_timeout=_SHAZAM_RETRY_MAX_TIMEOUT_SECONDS,
+                        statuses={500, 502, 503, 504, 429},
+                    )
+                )
+            )
         return await self._shazam.recognize(wav_bytes)
 
     @staticmethod
@@ -174,6 +206,8 @@ class RecognitionLoop:
         # result — it no longer knows about the resolver/tracker/lastfm.
         self.on_confirmed = on_confirmed
         self.poll_interval: int = config.poll_interval_seconds
+        # PCONC-2: bound a single recognize() call, decoupled from poll_interval.
+        self.recognize_timeout: float = _RECOGNIZE_TIMEOUT_SECONDS
         self.confirmation_required: int = config.confirmation_required
         # Consecutive failed recognitions while LISTENING before the display
         # shows the error state (v1.4.1).  At ~10-12s per chunk, the default
@@ -274,14 +308,29 @@ class RecognitionLoop:
                 continue  # No audio queued within poll_interval — idle; poll again.
 
             try:
-                result = await self.backend.recognize(audio, sample_rate)
+                # PCONC-2: bound the recognition call itself. Without this a
+                # degraded shazamio call (its default retry is attempts=20 ×
+                # max_timeout=60 — see ShazamIOBackend) can occupy the loop for
+                # MINUTES over flaky wifi, saturating the maxsize-5 audio queue so
+                # the consumer ends up working on 40–50s-old audio (the lag PCONC-1
+                # needs). `recognize_timeout` is a DEDICATED bound, independent of
+                # poll_interval so tuning the idle-poll rate can't accidentally cap
+                # a real Shazam round-trip. On timeout wait_for raises TimeoutError,
+                # handled below like any other error, and the next chunk retries.
+                result = await asyncio.wait_for(
+                    self.backend.recognize(audio, sample_rate),
+                    timeout=self.recognize_timeout,
+                )
                 await self._handle_result(result, epoch)
             except Exception as e:
                 # Any error under the recognize/commit path — INCLUDING a genuine
-                # TimeoutError — is logged and backed off, not silently dropped.
+                # TimeoutError (a raw socket timeout OR the wait_for above) — is
+                # logged and backed off, not silently dropped. Use repr(e): a bare
+                # TimeoutError stringifies to "" and would log an empty message,
+                # hiding the exact flaky-wifi hang this bound exists to surface.
                 # (asyncio.CancelledError is a BaseException, so a task cancel still
                 # unwinds the loop cleanly.)
-                log.error(f"Recognition loop error: {e}")
+                log.error(f"Recognition loop error: {e!r}")
                 await asyncio.sleep(2)
 
     @staticmethod
