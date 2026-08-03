@@ -93,6 +93,36 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   epoch-tag are each mutation-pinned by their intended tests; cold review SPEC /
   QUALITY PASS, and a narrow second pass over the session-scoping rework could not
   break it (both scenarios execution-verified).
+- **An un-decodable or display-faulted cover no longer becomes an unbounded
+  download + unlink + log loop (STAB-1, #95 — HIGH).** `_render_now_playing`
+  calls `_load_cover` every frame and re-arms the render loop each frame (unless
+  `reduced_motion` is on), and `_load_cover`'s single `except Exception` treated
+  ANY failure as "corrupt cached file": it unlinked the file and spawned a fresh
+  download, with no failure counter, no negative cache and no spawn dedup. The
+  re-download re-landed the same bytes, bumped `_cover_version` and set `_dirty`,
+  so the cycle sustained itself at ~8.7 Hz — ~31k HTTPS GETs/hour, ~31k SD
+  unlinks/hour, ~9 GB/hour of SD writes and ~31k journald WARNINGs/hour,
+  indefinitely and unattended. Worse, the same clause fired for a `pygame.error`
+  raised by `.convert()` on an HDMI/X video-mode loss, so a transient display
+  glitch *deleted a perfectly good cover* and started hammering. The load path is
+  now bounded: a per-URL decode-failure counter unlinks + refetches at most once
+  (`_COVER_MAX_LOAD_FAILURES`), then negative-caches the URL (`_cover_bad_urls`)
+  so later frames early-return with no disk/network/log until a state change to a
+  new cover lifts it. Decode and convert are split into separate `try`s — a
+  `pygame.image.load()` failure is corrupt bytes (bounded refetch); a
+  convert/scale failure is a display fault on GOOD bytes, so the file is kept, no
+  refetch is issued, and the warning is latched (`_cover_decode_deferred`) to one
+  line per outage instead of ~10/second. Concurrent prefetches for one URL are
+  deduped against an in-flight set. RED-first (the undecodable loop, the good-file
+  deletion, and the double-download each reproduced); every load-bearing line is
+  mutation-pinned by its intended test; cold review SPEC / QUALITY PASS. The cold
+  review's narrow second pass caught a real regression — the fail-safe branch that
+  stops a stray non-`pygame` error from crashing the unguarded render loop was
+  itself an unbounded per-frame ERROR log — which was then folded into the same
+  latch (WARNING for the expected video-mode fault, ERROR for the unexpected) and
+  re-verified clean over a third pass. (A pre-existing, track-cadence — not
+  frame-rate — palette-decode WARNING on a blacklisted-but-on-disk cover was
+  surfaced and filed separately, not folded in.)
 
 ## [1.5.2] — 2026-08-03
 
