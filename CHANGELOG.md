@@ -9,6 +9,30 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Code-review hardening, round 3 (Wave 2 — keep the appliance alive).** Wave 2 of
+the same audit (`CODE_REVIEW_2026-07-30.md`): the liveness and crash-loop findings
+that decide whether the unattended appliance recovers on its own — through a device
+glitch, a bad config edit, or network trouble — or needs a power cycle. Not the
+irreversible-data issues (that was Wave 1), but the ones that keep it running.
+
+### Fixed
+
+- **A stalled capture stream is now detected and rebuilt instead of hanging
+  forever (CONC-5, #91 — HIGH).** Audio blocks reach the capture loop only via the
+  PortAudio callback's `call_soon_threadsafe`; if the USB interface browns out or
+  is unplugged mid-album (or the callback aborts from CFFI), the callback stops
+  firing, nothing raises in the consumer, and `await blocks.get()` parked `run()`
+  forever — capture silently dead while the process stayed alive, the display stuck
+  in IDLE, nothing in the journal. `run()` now waits for each block with a
+  `_BLOCK_STALL_TIMEOUT_SECONDS` (4s = 16 block intervals) timeout and, on a stall,
+  raises into the existing tear-down + backoff + rebuild path, so a recovered device
+  (or a fresh stream) resumes capture on its own. The PortAudio callback body is
+  also wrapped so a callback exception logs instead of silently aborting the CFFI
+  stream. RED-first (the hang reproduced); the timeout wrap, the timeout value, the
+  rebuild-on-stall, and the callback guard are mutation-pinned; cold review SPEC /
+  QUALITY PASS — buffered blocks win the `wait_for` race so a legitimate event-loop
+  stall can't false-trip it, and the rebuild cycle is bounded (~0.2 Hz).
+
 ## [1.5.2] — 2026-08-03
 
 **Code-review hardening, round 3 (Wave 1 — collection data integrity).** A third
