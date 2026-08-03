@@ -53,6 +53,18 @@ _BLOCK_QUEUE_MAX = 64
 # seconds, so 1s granularity is plenty and the cost (one comparison) is trivial.
 _SILENCE_TICK_SECONDS = 1.0
 
+# CONC-5: how long run() waits for a block before deciding the stream is DEAD.
+# Blocks arrive ~every _BLOCK_SECONDS (4×/s) on a healthy stream, so a gap of
+# 16 blocks' worth (4s) means the PortAudio callback has stopped firing — the
+# device browned out / was unplugged, or the callback aborted from CFFI — and
+# no exception surfaced in the consumer. Generous enough that a transient
+# event-loop hiccup can't false-trip it, short enough to recover promptly.
+_BLOCK_STALL_TIMEOUT_SECONDS = 16 * _BLOCK_SECONDS
+
+# Backoff before rebuilding the stream after a capture error (a construction
+# failure OR a detected stall). Named so tests can drive the retry fast.
+_STREAM_RETRY_BACKOFF_SECONDS = 1.0
+
 
 class AudioCapture:
     """Wraps sounddevice to stream overlapping audio chunks from the USB interface."""
@@ -139,11 +151,18 @@ class AudioCapture:
         _enqueue_block applies the drop-oldest overflow policy.
         """
         def callback(indata, frames, time_info, status):
-            if status:
-                log.warning(f"Audio input status: {status}")
-            # Copy: PortAudio reuses the indata buffer after the callback returns.
-            block = indata[:, 0].copy()
-            loop.call_soon_threadsafe(self._enqueue_block, blocks, block)
+            try:
+                if status:
+                    log.warning(f"Audio input status: {status}")
+                # Copy: PortAudio reuses the indata buffer after the callback returns.
+                block = indata[:, 0].copy()
+                loop.call_soon_threadsafe(self._enqueue_block, blocks, block)
+            except Exception as e:
+                # CONC-5: a raising callback aborts the PortAudio stream from CFFI
+                # with NO exception surfacing in run(), so capture would silently
+                # die. Swallow + log so the stream keeps running; a genuinely dead
+                # stream is then caught by the block-stall timeout in run().
+                log.error(f"Audio callback error: {e}")
 
         return callback
 
@@ -210,7 +229,23 @@ class AudioCapture:
                     )
                     with stream:
                         while self._running:
-                            block = await blocks.get()
+                            try:
+                                block = await asyncio.wait_for(
+                                    blocks.get(), timeout=_BLOCK_STALL_TIMEOUT_SECONDS
+                                )
+                            except asyncio.TimeoutError:
+                                # CONC-5: no block for the stall window while the
+                                # stream is open → the PortAudio callback stopped
+                                # firing (device brown-out/unplug, or a callback
+                                # abort from CFFI). Nothing raised on its own, so
+                                # raise here to reuse the tear-down + backoff +
+                                # rebuild path below — the same one a stream
+                                # CONSTRUCTION failure already takes.
+                                raise RuntimeError(
+                                    f"audio stream stalled: no block for "
+                                    f"{_BLOCK_STALL_TIMEOUT_SECONDS}s (device "
+                                    f"brown-out/unplug or callback abort)"
+                                )
                             if block is None:
                                 continue  # stop() sentinel — re-check self._running
                             for chunk in assembler.feed(block):
@@ -222,7 +257,7 @@ class AudioCapture:
                     # CancelledError is BaseException and intentionally NOT caught
                     # here — shutdown cancellation propagates to main() cleanly.
                     log.error(f"Audio capture error: {e}")
-                    await asyncio.sleep(1)  # Then retry with a fresh stream
+                    await asyncio.sleep(_STREAM_RETRY_BACKOFF_SECONDS)  # Then retry with a fresh stream
         finally:
             # Tear the ticker down with the capture loop (covers normal exit and
             # cancellation), and await it so it doesn't outlive run().

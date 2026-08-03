@@ -262,3 +262,76 @@ def test_stop_tolerates_a_full_block_queue():
     cap.stop()  # QueueFull is swallowed — run() already has something to wake for
 
     assert cap._running is False
+
+
+# ---------------------------------------------------------------------------
+# CONC-5 — a stream that goes quiet after starting (device brown-out/unplug, or
+# a callback that aborts from CFFI) delivers NO exception to run(); the consumer
+# used to park on blocks.get() forever. run() now times out the get() and
+# rebuilds the stream, and the callback body is guarded so it can't abort the
+# stream silently.
+# ---------------------------------------------------------------------------
+
+def _cm_stream_mock():
+    """A mock sd.InputStream that is a context manager and does NOT suppress
+    exceptions raised in the `with stream:` body (default MagicMock __exit__
+    returns a truthy mock, which WOULD suppress — that must be False here)."""
+    s = MagicMock()
+    s.__enter__ = MagicMock(return_value=s)
+    s.__exit__ = MagicMock(return_value=False)
+    return s
+
+
+@pytest.mark.asyncio
+async def test_stalled_stream_is_detected_and_rebuilt(monkeypatch):
+    """A stream whose callback never delivers a block (a dead device) must be
+    detected via the get() timeout and rebuilt — not parked on forever."""
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.sd, "query_devices",
+                        lambda *a, **k: [device("USB Audio Codec", 2)])
+    built = asyncio.Event()
+    streams = []
+
+    def make_stream(**kwargs):
+        s = _cm_stream_mock()
+        streams.append(s)
+        if len(streams) >= 2:      # a rebuild happened after the first stalled
+            built.set()
+        return s
+
+    input_stream = MagicMock(side_effect=make_stream)
+    monkeypatch.setattr(capture_module.sd, "InputStream", input_stream)
+    # Fast stall + fast rebuild so the test doesn't wall-clock wait.
+    monkeypatch.setattr(capture_module, "_BLOCK_STALL_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
+
+    task = asyncio.create_task(cap.run())
+    try:
+        # Fixed code: stall fires in ~0.02s → rebuild → 2nd stream → event set.
+        # Broken code: get() parks forever → event never set → wait_for raises.
+        await asyncio.wait_for(built.wait(), timeout=2.0)
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    assert input_stream.call_count >= 2   # the stalled stream was torn down + rebuilt
+
+
+def test_callback_error_is_logged_not_raised(caplog):
+    """A raising callback body aborts the PortAudio stream from CFFI with no
+    exception surfacing in run() (CONC-5) — capture would silently die. The
+    callback must swallow + log instead of propagating."""
+    import logging
+    cap = make_capture()
+    loop = MagicMock()
+    loop.call_soon_threadsafe.side_effect = RuntimeError("marshal boom")
+    callback = cap._make_callback(loop, asyncio.Queue(maxsize=4))
+
+    indata = np.array([[1.0], [2.0]], dtype=np.float32)
+    with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
+        callback(indata, 2, None, None)   # must NOT raise
+
+    assert any("callback" in r.message.lower() for r in caplog.records)
