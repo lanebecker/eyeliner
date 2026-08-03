@@ -196,6 +196,23 @@ same implement → RED test → mutation-check → cold-review discipline.
   it. No false-drop: an album-swap split isn't a silence event and doesn't bump the
   epoch, so a live track is never dropped. Mutation-verified; a real-lock cold-review
   reproduction confirmed the phantom forms pre-fix and is dropped after.
+- **A persistent Discogs 429 is now a distinct, loud outcome instead of a silent
+  lost credit (META-10, #88 — LOW).** The transport retried a 429 once after
+  sleeping the server's `Retry-After`, clamped to a 10s cap — so when Discogs
+  answers `Retry-After: 60` the retry landed back inside the same throttle window
+  and 429'd again, and the caller then logged a generic failure and returned
+  `False`, dropping the completed side's Play Count credit with nothing to
+  distinguish it from any other error. The cap stays (`request()` runs on the
+  shared executor pool; a long sleep starves cover fetches / scrobbles — P-2). Now
+  a `Retry-After` **beyond** the cap skips the futile retry entirely — no wasted
+  sleep, no second request hammering Discogs mid-backoff — and logs a distinct,
+  loud ERROR naming the lost-credit consequence; a retry that is **still** 429 logs
+  the same distinct ERROR rather than a generic failure. Actually waiting out a
+  long `Retry-After` so the write can still land (recovery) needs Discogs off the
+  shared pool and is deferred to the dedicated executor (#61). The read path still
+  returns `_READ_FAILED` on 429, so META-1's abort is unaffected, and B-15 POST
+  opt-in retry semantics are preserved. Mutation-verified (incl. the `>`/`>=`
+  boundary); cold review SPEC / QUALITY PASS.
 
 ---
 

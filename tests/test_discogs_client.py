@@ -767,17 +767,63 @@ def test_request_429_uses_default_wait_when_header_unparseable():
     mock_sleep.assert_called_once_with(_RATE_LIMIT_DEFAULT_WAIT)
 
 
-def test_request_429_wait_is_capped():
+def test_request_429_over_cap_skips_the_futile_retry(caplog):
+    """META-10: when Discogs asks to wait LONGER than our cap, a retry inside the
+    cap would still be throttled — so skip it (no wasted sleep, no second request,
+    no pool parking) and surface a distinct, loud error."""
+    import logging
     from src.metadata.discogs.transport import _RATE_LIMIT_MAX_WAIT
     client = make_client()
+    over_cap = str(_RATE_LIMIT_MAX_WAIT + 50)   # e.g. "60" — beyond our cap
+    client._http.session.get = MagicMock(return_value=make_429_response(over_cap))
+
+    with caplog.at_level(logging.ERROR), \
+         patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        resp = client._http.request("GET", "https://api.discogs.com/anything")
+
+    assert resp.status_code == 429
+    assert client._http.session.get.call_count == 1    # NO futile retry
+    mock_sleep.assert_not_called()                      # no pool parking
+    assert any("NOT retrying" in r.getMessage() for r in caplog.records)
+
+
+def test_persistent_429_after_retry_logs_a_distinct_error(caplog):
+    """META-10: a 429 whose Retry-After is within the cap IS retried once; if it
+    is STILL rate-limited, surface a distinct, loud error so a lost credit is not
+    silently conflated with a generic failure."""
+    import logging
+    client = make_client()
     client._http.session.get = MagicMock(
-        side_effect=[make_429_response("9999"), make_get_response(200, {})]
+        side_effect=[make_429_response("3"), make_429_response("3")]
+    )
+
+    with caplog.at_level(logging.ERROR), \
+         patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        resp = client._http.request("GET", "https://api.discogs.com/anything")
+
+    assert resp.status_code == 429
+    assert client._http.session.get.call_count == 2    # retried once
+    mock_sleep.assert_called_once_with(3)               # honored the in-cap wait
+    assert any("STILL rate-limiting" in r.getMessage() for r in caplog.records)
+
+
+def test_request_429_at_exactly_the_cap_still_retries():
+    """META-10 boundary: a Retry-After equal to the cap is WITHIN budget — it must
+    retry (honoring the wait), not be treated as over-cap and skipped. Pins the
+    `>` vs `>=` boundary against a future off-by-one."""
+    from src.metadata.discogs.transport import _RATE_LIMIT_MAX_WAIT
+    client = make_client()
+    ok = make_get_response(200, {})
+    client._http.session.get = MagicMock(
+        side_effect=[make_429_response(str(_RATE_LIMIT_MAX_WAIT)), ok]
     )
 
     with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
-        client._http.request("GET", "https://api.discogs.com/anything")
+        resp = client._http.request("GET", "https://api.discogs.com/anything")
 
-    mock_sleep.assert_called_once_with(_RATE_LIMIT_MAX_WAIT)
+    assert resp is ok
+    assert client._http.session.get.call_count == 2         # retried, not skipped
+    mock_sleep.assert_called_once_with(_RATE_LIMIT_MAX_WAIT)  # waited exactly the cap
 
 
 def test_request_does_not_retry_on_success():
