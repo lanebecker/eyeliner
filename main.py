@@ -21,6 +21,7 @@ import asyncio
 import logging
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from src.config import load_config, ConfigError
@@ -41,6 +42,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+# CRIT-3: workers for the owned shared I/O pool (the loop's default executor).
+# It serves every run_in_executor(None, …) blocking call that is NOT a Discogs
+# write (which keeps its own dedicated 2-worker pool, #61): Last.fm scrobble/love,
+# cover download, palette extraction, MusicBrainz cover-art lookup, and the
+# recognition-hot-path WAV encode. Sized to match the interpreter default's width
+# on the target hardware (min(32, cpu+4) ≈ 8 on a 4-core Pi) so OWNING the pool
+# doesn't NARROW I/O concurrency versus the default it replaces — in particular so
+# a burst of slow network calls (cover download + scrobble + love + MusicBrainz)
+# can't queue the CPU-bound WAV encode behind them and delay recognition. It is
+# still an explicit bound (never grows past this), so shutdown waits on at most
+# this many RUNNING calls; cancel_futures drops the rest and TimeoutStopSec
+# backstops a stuck one.
+_IO_EXECUTOR_MAX_WORKERS = 8
+
 
 def read_version() -> str:
     """Read the version string from the VERSION file at the repo root."""
@@ -48,6 +63,23 @@ def read_version() -> str:
         return (Path(__file__).resolve().parent / "VERSION").read_text().strip()
     except Exception:
         return "unknown"
+
+
+def install_io_executor(loop) -> ThreadPoolExecutor:
+    """Create the owned shared I/O pool and make it ``loop``'s DEFAULT executor.
+
+    Extracted from main() (like run_pipeline, T-1) so the routing is unit-testable:
+    after this, every ``run_in_executor(None, …)`` blocking call lands on a pool
+    WE own and shut down with cancel_futures at exit (CRIT-3) — not the
+    interpreter's default pool, whose in-flight work gates process exit. Returns
+    the executor so run_pipeline's finally can close it. Discogs keeps its own
+    dedicated pool (#61); its explicit-executor calls are unaffected.
+    """
+    io_executor = ThreadPoolExecutor(
+        max_workers=_IO_EXECUTOR_MAX_WORKERS, thread_name_prefix="vnp-io"
+    )
+    loop.set_default_executor(io_executor)
+    return io_executor
 
 
 def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenTracker):
@@ -71,7 +103,7 @@ def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenT
         state.clear()
 
 
-async def run_pipeline(tasks, capture, display, tracker, discogs_http):
+async def run_pipeline(tasks, capture, display, tracker, discogs_http, io_executor):
     """Run the pipeline legs until the first one finishes, then shut down.
 
     Extracted from main() (T-1) so the shutdown semantics are testable without
@@ -82,8 +114,9 @@ async def run_pipeline(tasks, capture, display, tracker, discogs_http):
       - drain the tracker's in-flight end-of-session credit tasks (CONC-1) —
         they are fire-and-forget, not pipeline legs, so nothing else awaits them
         and ``asyncio.run`` would otherwise cancel a mid-write credit — then
-        always stop capture and display, and finally close the dedicated Discogs
-        executor (#61), in the finally.
+        always stop capture and display, and finally close BOTH thread pools —
+        the dedicated Discogs executor (#61) and the owned shared I/O executor
+        (CRIT-3) — in the finally.
     """
     try:
         done, pending = await asyncio.wait(
@@ -115,14 +148,24 @@ async def run_pipeline(tasks, capture, display, tracker, discogs_http):
         await tracker.drain()
         capture.stop()
         display.stop()
-        # #61: close the dedicated Discogs executor LAST — after drain() has
-        # awaited the credit writes that run ON that pool. close() MUST stay the
-        # final statement here with NO await after it: a credit task resuming
-        # post-close would dispatch to a shut pool (RuntimeError). wait=False
-        # returns immediately even if drain() timed out with a write still
-        # running — that worker is bounded by its 15s socket timeout and joined
-        # at interpreter exit (the broader shutdown-deadline is CRIT-3, Wave 2).
+        # Close BOTH thread pools LAST — after drain() has awaited the credit
+        # writes that run on them (the Discogs pool via writer.run; the shared I/O
+        # pool via lastfm.love's run_in_executor). These MUST be the final
+        # statements with NO await after them: a credit task resuming post-close
+        # would dispatch to a shut pool (RuntimeError). Both use wait=False so they
+        # return immediately even if drain() timed out with a write still running.
+        # (#61 gave Discogs its own pool; CRIT-3 does the same for everything else.)
         discogs_http.close()
+        # CRIT-3: shut the owned I/O pool with cancel_futures so QUEUED blocking
+        # work (Last.fm scrobble/love, cover download, palette extraction,
+        # MusicBrainz lookup, WAV encode) is DROPPED rather than waited on. Without
+        # an owned pool this work sat on the interpreter's default executor, whose
+        # shutdown (asyncio.run → loop.shutdown_default_executor, a wait=True join
+        # with no timeout) then gated process exit on it — a SIGTERM could hang
+        # past systemd's 90s default and get SIGKILLed mid-write (CONC-1 becomes
+        # permanent). A still-RUNNING call can't be interrupted (Python can't kill
+        # a thread), so the unit's TimeoutStopSec is the backstop for that residue.
+        io_executor.shutdown(wait=False, cancel_futures=True)
 
 
 async def main():
@@ -135,6 +178,13 @@ async def main():
     except ConfigError as e:
         log.error(f"Configuration error:\n{e}")
         sys.exit(1)
+
+    # CRIT-3: own the shared I/O pool (see install_io_executor) so every
+    # run_in_executor(None, …) blocking call runs on a pool we shut down with
+    # cancel_futures at exit — instead of the interpreter's default pool, whose
+    # in-flight work gates process exit (see run_pipeline's finally).
+    loop = asyncio.get_running_loop()
+    io_executor = install_io_executor(loop)
 
     state = PlayerState()
     # A-4: one shared Discogs transport; the read half goes to the resolver, the
@@ -174,16 +224,16 @@ async def main():
         for t in tasks:
             t.cancel()
 
-    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _cancel_all)
 
     # FIRST_COMPLETED shutdown + cleanup live in run_pipeline (extracted for
     # testability — T-1).  The tracker is passed so shutdown can drain its
     # in-flight end-of-session credit before the loop closes (CONC-1); the shared
-    # DiscogsHttp is passed so run_pipeline's finally can close its dedicated
-    # executor LAST, after that credit has drained off the same pool (#61).
-    await run_pipeline(tasks, capture, display, tracker, discogs_http)
+    # DiscogsHttp and the owned I/O executor are passed so run_pipeline's finally
+    # can close BOTH pools LAST, after that credit has drained off them (#61 /
+    # CRIT-3).
+    await run_pipeline(tasks, capture, display, tracker, discogs_http, io_executor)
 
 
 if __name__ == "__main__":

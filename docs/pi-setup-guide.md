@@ -351,10 +351,21 @@ Environment="XAUTHORITY=/home/pi/.Xauthority"
 ExecStart=/home/pi/vinyl-now-playing/venv/bin/python3 main.py
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=30
 
 [Install]
 WantedBy=graphical.target
 ```
+
+`TimeoutStopSec=30` (CRIT-3) is the backstop for shutdown. On SIGTERM the app
+cancels its legs, drains any in-flight end-of-session Discogs credit (bounded to
+~10s), and shuts down both thread pools with `cancel_futures` so *queued* blocking
+work is dropped. What it can't drop is a call already *running* on a worker thread
+— Python can't interrupt a blocking C call — so a network request with no overall
+deadline (a slow cover download, a hung Last.fm POST) could otherwise hold the
+process open until systemd's 90s default. `TimeoutStopSec=30` SIGKILLs at 30s
+instead: comfortably above the normal clean shutdown (drain + a ~15s socket
+timeout), far below the point where a power-cut owner assumes the Pi has wedged.
 
 **Why the `[Unit]` ordering matters — read this before enabling.** The Raspberry
 Pi has no battery-backed real-time clock, so at boot its clock is whatever

@@ -18,7 +18,7 @@ import pytest
 # real sounddevice untouched where it exists.
 sys.modules.setdefault("sounddevice", MagicMock())
 
-from main import handle_silence_event, run_pipeline
+from main import handle_silence_event, run_pipeline, install_io_executor, _IO_EXECUTOR_MAX_WORKERS
 from src.audio.silence import AudioEvent
 from src.state.player_state import PlayerState, PlayerStatus
 
@@ -85,7 +85,7 @@ async def test_run_pipeline_cancels_pending_and_stops():
     done_leg = asyncio.create_task(quick())
     pending_leg = asyncio.create_task(forever())
 
-    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock())
+    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
 
     assert pending_leg.cancelled()
     capture.stop.assert_called_once()
@@ -93,31 +93,35 @@ async def test_run_pipeline_cancels_pending_and_stops():
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_drains_then_stops_subsystems_then_closes_discogs():
-    """CONC-1 + #61: shutdown must (1) await the tracker's in-flight credit tasks
-    (drain) BEFORE tearing down capture/display, and (2) close the dedicated
-    Discogs executor LAST — after drain, because those credit writes run on that
-    very pool, so closing it earlier could reject an in-flight write. Deleting the
-    discogs_http.close() line (or reordering it before drain) fails this test."""
+async def test_run_pipeline_drains_then_stops_subsystems_then_closes_pools():
+    """CONC-1 + #61 + CRIT-3: shutdown must (1) await the tracker's in-flight
+    credit tasks (drain) BEFORE tearing down capture/display, and (2) close BOTH
+    thread pools LAST — after drain, because those credit writes run on them (the
+    Discogs pool via writer.run, the shared I/O pool via lastfm.love), so closing
+    earlier could reject an in-flight write. The owned I/O pool is shut with
+    cancel_futures so queued work is dropped. Deleting either close (or reordering
+    before drain) fails this test."""
     capture, display = MagicMock(), MagicMock()
     tracker = _drainable_tracker()
     discogs_http = MagicMock()
+    io_executor = MagicMock()
     order = []
     tracker.drain.side_effect = lambda *a, **k: order.append("drain")
     capture.stop.side_effect = lambda: order.append("capture.stop")
     display.stop.side_effect = lambda: order.append("display.stop")
     discogs_http.close.side_effect = lambda: order.append("discogs.close")
+    io_executor.shutdown.side_effect = lambda *a, **k: order.append("io.shutdown")
 
     async def quick():
         return
 
-    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker, discogs_http)
+    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker, discogs_http, io_executor)
 
     tracker.drain.assert_awaited_once()
     discogs_http.close.assert_called_once()
+    io_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
     assert order[0] == "drain"                 # credit finishes before anything else
-    assert order[-1] == "discogs.close"        # pool closed LAST, after the credit drained off it
-    assert order == ["drain", "capture.stop", "display.stop", "discogs.close"]
+    assert order == ["drain", "capture.stop", "display.stop", "discogs.close", "io.shutdown"]
 
 
 @pytest.mark.asyncio
@@ -132,7 +136,7 @@ async def test_run_pipeline_still_drains_when_a_leg_faults():
 
     discogs_http = MagicMock()
     with pytest.raises(RuntimeError, match="leg died"):
-        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker, discogs_http)
+        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker, discogs_http, MagicMock())
 
     tracker.drain.assert_awaited_once()
     capture.stop.assert_called_once()
@@ -156,7 +160,7 @@ async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
     pending_leg = asyncio.create_task(forever())
 
     with pytest.raises(RuntimeError, match="leg died"):
-        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock())
+        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
 
     # finally ran despite the re-raise…
     capture.stop.assert_called_once()
@@ -186,10 +190,82 @@ async def test_run_pipeline_logs_every_faulted_leg(caplog):
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises((RuntimeError, ValueError)):
-            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker(), MagicMock())
+            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
 
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "leg A died" in logged
     assert "leg B died" in logged
     capture.stop.assert_called_once()
     display.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_shuts_down_the_io_executor_dropping_queued_work():
+    """CRIT-3: run_pipeline owns the bounded I/O executor and shuts it down with
+    cancel_futures at the end of teardown — so QUEUED blocking work is DROPPED at
+    exit rather than waited on. On the interpreter's default pool that queued work
+    gated process exit (asyncio.run awaits shutdown_default_executor, a wait=True
+    join with no timeout)."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    io_executor = ThreadPoolExecutor(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    ran_queued = []
+
+    def occupy():
+        started.set()
+        release.wait(timeout=2)
+
+    def queued():
+        ran_queued.append("ran")
+
+    io_executor.submit(occupy)
+    assert started.wait(timeout=1)       # the single worker is busy
+    io_executor.submit(queued)           # this one sits in the queue
+
+    capture, display = MagicMock(), MagicMock()
+
+    async def quick():
+        return
+
+    await run_pipeline(
+        [asyncio.create_task(quick())], capture, display,
+        _drainable_tracker(), MagicMock(), io_executor,
+    )
+
+    # The executor was shut down — new submissions are rejected…
+    with pytest.raises(RuntimeError):
+        io_executor.submit(lambda: None)
+    # …and the queued work was cancelled (cancel_futures), never run.
+    release.set()
+    time.sleep(0.1)
+    assert ran_queued == [], "queued blocking work was NOT cancelled at shutdown"
+
+
+@pytest.mark.asyncio
+async def test_install_io_executor_routes_default_run_in_executor():
+    """CRIT-3: after install_io_executor, every run_in_executor(None, …) runs on
+    the OWNED bounded pool (thread-name prefix 'vnp-io'), not the interpreter's
+    default — so the cancel_futures shutdown actually governs those calls. Without
+    the set_default_executor inside, this routing is lost and the fix is inert."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    loop = asyncio.get_running_loop()
+    ex = install_io_executor(loop)
+    try:
+        assert isinstance(ex, ThreadPoolExecutor)
+        assert ex._max_workers == _IO_EXECUTOR_MAX_WORKERS   # bounded, owned pool
+
+        seen = {}
+
+        def work():
+            seen["thread"] = threading.current_thread().name
+
+        await loop.run_in_executor(None, work)   # None → loop default → owned pool
+        assert seen["thread"].startswith("vnp-io"), seen
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
