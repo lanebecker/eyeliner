@@ -17,7 +17,7 @@ Covers update_last_played integration:
 No audio hardware, display, or Discogs account required. DiscogsClient is mocked.
 """
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 
 from src.audio.silence import AudioEvent
@@ -45,6 +45,12 @@ def make_writer_mock(
     writer.increment_play_count.return_value = increment_play_count_return
     writer.last_played_field_name = last_played_field_name
     writer.update_last_played.return_value = update_last_played_return
+    # #61: the tracker now dispatches the Play Count / Last Played writes through
+    # writer.run(fn, …) (the dedicated-executor delegate) instead of
+    # loop.run_in_executor(None, …). The mock's run awaits and calls the target,
+    # so increment_play_count / update_last_played return values + call-assertions
+    # are unchanged.
+    writer.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     return writer
 
 
@@ -368,6 +374,24 @@ async def test_full_album_calls_update_last_played_when_configured():
 
     writer.increment_play_count.assert_called_once_with(12345, 67890)
     writer.update_last_played.assert_called_once_with(12345, 67890)
+
+
+@pytest.mark.asyncio
+async def test_discogs_writes_dispatch_through_the_dedicated_executor():
+    """#61: the Play Count and Last Played writes go through writer.run (the
+    dedicated executor delegate), not the shared default run_in_executor(None, …)
+    pool. Reverting either write site would stop calling writer.run and fail this.
+    With no Last.fm client the love path is skipped, so writer.run is called for
+    exactly the two Discogs writes — nothing else is routed through it."""
+    tracker, writer = make_tracker(last_played_field_name="Last Played")
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    await tracker._end_session()
+
+    dispatched = [c.args[0] for c in writer.run.call_args_list]
+    assert writer.increment_play_count in dispatched
+    assert writer.update_last_played in dispatched
+    assert len(dispatched) == 2
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,10 @@ reference to one of these; neither owns the transport, and neither can see the
 other's caches or methods.
 """
 
+import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -103,6 +105,18 @@ class DiscogsHttp:
             "Content-Type": "application/json",
         })
 
+        # #61: Discogs blocking calls — every reader/writer method AND the 429
+        # backoff time.sleep() inside request() — run on this DEDICATED pool,
+        # never the shared default run_in_executor(None, …) executor. A rate-limit
+        # sleep here therefore can NOT park a worker that cover downloads or
+        # Last.fm scrobbles need (the P-2 concern that capped the backoff at 10s).
+        # max_workers=2: the reader and writer halves each have at most one call
+        # in flight in this single-turntable appliance, so two workers cover the
+        # real concurrency without over-threading the Pi. Threads spawn lazily on
+        # first submit, so constructing a DiscogsHttp stays cheap (tests that
+        # build one but never dispatch pay nothing).
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="discogs")
+
     def request(
         self, method: str, url: str, retry_on_429: Optional[bool] = None, **kwargs
     ) -> requests.Response:
@@ -179,3 +193,30 @@ class DiscogsHttp:
                     method, _redact_url(url),
                 )
         return resp
+
+    async def run(self, fn, *args):
+        """Dispatch a blocking Discogs call on the DEDICATED executor (#61).
+
+        Every Discogs reader/writer method is synchronous — it ends in a
+        ``requests`` call, possibly with a 429 backoff ``time.sleep()``. The
+        async pipeline (the resolver's collection/database searches, the listen
+        tracker's Play Count / Last Played writes) invokes it through here
+        instead of ``loop.run_in_executor(None, …)`` so the blocking work — and
+        any backoff sleep — lands on THIS pool, isolated from the shared default
+        executor that serves cover downloads and Last.fm scrobbles/loves.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, fn, *args)
+
+    def close(self) -> None:
+        """Shut the dedicated executor down at composition-root teardown (#61).
+
+        ``cancel_futures=True`` drops work still QUEUED (never handed to a
+        thread); ``wait=False`` means we do NOT block shutdown on a call already
+        running — a Discogs request is bounded by its 15s socket timeout plus at
+        most one 10s backoff sleep, and the interpreter joins the worker at exit.
+        Blocking here (``wait=True``) is deliberately avoided so this teardown can
+        never hang shutdown the way the default executor can (CRIT-3, Wave 2).
+        Idempotent: a second call is a harmless no-op on an already-shut pool.
+        """
+        self._executor.shutdown(wait=False, cancel_futures=True)

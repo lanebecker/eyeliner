@@ -245,6 +245,26 @@ same implement → RED test → mutation-check → cold-review discipline.
   the encoded username as one segment, whereas a raw `a/b…` previously leaked the
   `b` as a separate, unmasked path segment. RED-first; all five sites plus the
   encode and the `safe=""` parameter mutation-pinned; cold review SPEC / QUALITY PASS.
+- **Discogs blocking calls run on a dedicated executor, isolated from cover art
+  and Last.fm (#61 — MEDIUM).** Every Discogs reader/writer call — and the 429
+  backoff `time.sleep()` inside `request()` — used to run on the SHARED default
+  `run_in_executor(None, …)` pool that also serves cover downloads and Last.fm
+  scrobbles/loves, so a rate-limit sleep parked a worker those tasks needed (P-2,
+  which capped the backoff at 10s as an interim mitigation). `DiscogsHttp` now
+  owns a bounded `ThreadPoolExecutor(max_workers=2, thread_name_prefix="discogs")`
+  and an async `run()` helper; the reader and writer expose thin `run()`
+  delegates, and the resolver's collection/database searches and the tracker's
+  Play Count / Last Played writes dispatch through them. Cover art and Last.fm
+  deliberately STAY on the default pool. The composition root passes the shared
+  `DiscogsHttp` to `run_pipeline`, whose shutdown `finally` closes the executor
+  LAST — after the in-flight credit writes have drained off it (`wait=False`, so
+  it never hangs shutdown). Re-rated MEDIUM and pulled into Wave 1 because the
+  429 path has data-integrity consequences (META-1 / META-10); actually waiting
+  out a long `Retry-After` (raising the now-unjustified 10s cap) is a follow-up
+  this isolation *enables*, not part of it, and the broader own-all-executors /
+  shutdown-deadline work stays scoped to CRIT-3 (Wave 2). RED-first; all four
+  dispatch sites, the dedicated-pool selection, the thread prefix, and the
+  drain→close ordering are mutation-pinned; cold review SPEC / QUALITY PASS.
 
 ---
 

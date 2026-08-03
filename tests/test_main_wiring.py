@@ -85,7 +85,7 @@ async def test_run_pipeline_cancels_pending_and_stops():
     done_leg = asyncio.create_task(quick())
     pending_leg = asyncio.create_task(forever())
 
-    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker())
+    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock())
 
     assert pending_leg.cancelled()
     capture.stop.assert_called_once()
@@ -93,24 +93,31 @@ async def test_run_pipeline_cancels_pending_and_stops():
 
 
 @pytest.mark.asyncio
-async def test_run_pipeline_drains_tracker_before_stopping_subsystems():
-    """CONC-1: shutdown must await the tracker's in-flight credit tasks (drain)
-    in the finally, and do so BEFORE tearing down capture/display."""
+async def test_run_pipeline_drains_then_stops_subsystems_then_closes_discogs():
+    """CONC-1 + #61: shutdown must (1) await the tracker's in-flight credit tasks
+    (drain) BEFORE tearing down capture/display, and (2) close the dedicated
+    Discogs executor LAST — after drain, because those credit writes run on that
+    very pool, so closing it earlier could reject an in-flight write. Deleting the
+    discogs_http.close() line (or reordering it before drain) fails this test."""
     capture, display = MagicMock(), MagicMock()
     tracker = _drainable_tracker()
+    discogs_http = MagicMock()
     order = []
     tracker.drain.side_effect = lambda *a, **k: order.append("drain")
     capture.stop.side_effect = lambda: order.append("capture.stop")
     display.stop.side_effect = lambda: order.append("display.stop")
+    discogs_http.close.side_effect = lambda: order.append("discogs.close")
 
     async def quick():
         return
 
-    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker)
+    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker, discogs_http)
 
     tracker.drain.assert_awaited_once()
-    assert order[0] == "drain"                 # credit finishes before subsystems stop
-    assert "capture.stop" in order and "display.stop" in order
+    discogs_http.close.assert_called_once()
+    assert order[0] == "drain"                 # credit finishes before anything else
+    assert order[-1] == "discogs.close"        # pool closed LAST, after the credit drained off it
+    assert order == ["drain", "capture.stop", "display.stop", "discogs.close"]
 
 
 @pytest.mark.asyncio
@@ -123,12 +130,16 @@ async def test_run_pipeline_still_drains_when_a_leg_faults():
     async def boom():
         raise RuntimeError("leg died")
 
+    discogs_http = MagicMock()
     with pytest.raises(RuntimeError, match="leg died"):
-        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker)
+        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker, discogs_http)
 
     tracker.drain.assert_awaited_once()
     capture.stop.assert_called_once()
     display.stop.assert_called_once()
+    # #61: a faulted leg must not leak the dedicated executor — close() is in the
+    # same finally, so it runs before the exception propagates.
+    discogs_http.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -145,7 +156,7 @@ async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
     pending_leg = asyncio.create_task(forever())
 
     with pytest.raises(RuntimeError, match="leg died"):
-        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker())
+        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock())
 
     # finally ran despite the re-raise…
     capture.stop.assert_called_once()
@@ -175,7 +186,7 @@ async def test_run_pipeline_logs_every_faulted_leg(caplog):
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises((RuntimeError, ValueError)):
-            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker())
+            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker(), MagicMock())
 
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "leg A died" in logged

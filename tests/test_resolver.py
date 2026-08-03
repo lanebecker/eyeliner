@@ -12,7 +12,7 @@ Verifies:
   - NotImplementedError (stub) falls through gracefully
   - All TrackMetadata fields are populated correctly from each source
 """
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 import pytest
 
 from src.audio.recognizer import RawRecognitionResult
@@ -51,6 +51,11 @@ def mock_discogs():
     m = MagicMock()
     m.search_collection.return_value = None
     m.search_database.return_value = None
+    # #61: the resolver now dispatches Discogs searches through reader.run(fn, …)
+    # (the dedicated-executor delegate) instead of loop.run_in_executor(None, …).
+    # The mock's run awaits and simply calls the target, so return values /
+    # call-assertions on search_collection / search_database behave as before.
+    m.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     return m
 
 
@@ -71,6 +76,28 @@ def resolver(mock_discogs, mock_coverart):
     r.coverart = mock_coverart
     r._album_cache = {}  # Normally created in __init__ (bypassed via __new__)
     return r
+
+
+# ---------------------------------------------------------------------------
+# #61 — both Discogs tiers are dispatched through reader.run (the dedicated
+# executor delegate), never the shared default run_in_executor(None, …) pool.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_discogs_searches_dispatch_through_the_dedicated_executor(resolver, mock_discogs):
+    """Both the collection and the database search go through reader.run, in
+    order. Reverting either call site to loop.run_in_executor(None, …) would stop
+    calling reader.run and fail this. The fallback cover-art fetch deliberately
+    stays on the default pool, so it must NOT show up in reader.run's calls."""
+    mock_discogs.search_collection.return_value = None  # miss → database tier runs
+    mock_discogs.search_database.return_value = None    # miss → fallback runs
+
+    await resolver.resolve(make_raw())
+
+    dispatched = [c.args[0] for c in mock_discogs.run.call_args_list]
+    assert dispatched == [mock_discogs.search_collection, mock_discogs.search_database]
+    # the two searches, and ONLY the two searches, were dispatched via reader.run
+    assert mock_discogs.run.call_count == 2
 
 
 # ---------------------------------------------------------------------------

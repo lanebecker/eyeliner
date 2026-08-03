@@ -6,7 +6,7 @@ album to a downgraded fallback result for the rest of the session.  A clean
 "searched everywhere, no match" still caches the fallback (the existing,
 desired behaviour).
 """
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
@@ -22,6 +22,10 @@ def make_raw():
 def make_resolver():
     r = MetadataResolver.__new__(MetadataResolver)  # bypass real client construction
     r.reader = MagicMock()
+    # #61: resolver dispatches Discogs searches through reader.run(fn, …); the
+    # mock awaits and calls the target, so a search_collection side_effect
+    # (ConnectionError, etc.) still propagates exactly as run_in_executor did.
+    r.reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     r.coverart = MagicMock()
     r.coverart.get_cover_art_url.return_value = "https://coverartarchive.org/x/front"
     r._album_cache = {}

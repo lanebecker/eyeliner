@@ -71,7 +71,7 @@ def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenT
         state.clear()
 
 
-async def run_pipeline(tasks, capture, display, tracker):
+async def run_pipeline(tasks, capture, display, tracker, discogs_http):
     """Run the pipeline legs until the first one finishes, then shut down.
 
     Extracted from main() (T-1) so the shutdown semantics are testable without
@@ -82,7 +82,8 @@ async def run_pipeline(tasks, capture, display, tracker):
       - drain the tracker's in-flight end-of-session credit tasks (CONC-1) —
         they are fire-and-forget, not pipeline legs, so nothing else awaits them
         and ``asyncio.run`` would otherwise cancel a mid-write credit — then
-        always stop capture and display in the finally.
+        always stop capture and display, and finally close the dedicated Discogs
+        executor (#61), in the finally.
     """
     try:
         done, pending = await asyncio.wait(
@@ -114,6 +115,14 @@ async def run_pipeline(tasks, capture, display, tracker):
         await tracker.drain()
         capture.stop()
         display.stop()
+        # #61: close the dedicated Discogs executor LAST — after drain() has
+        # awaited the credit writes that run ON that pool. close() MUST stay the
+        # final statement here with NO await after it: a credit task resuming
+        # post-close would dispatch to a shut pool (RuntimeError). wait=False
+        # returns immediately even if drain() timed out with a write still
+        # running — that worker is bounded by its 15s socket timeout and joined
+        # at interpreter exit (the broader shutdown-deadline is CRIT-3, Wave 2).
+        discogs_http.close()
 
 
 async def main():
@@ -171,8 +180,10 @@ async def main():
 
     # FIRST_COMPLETED shutdown + cleanup live in run_pipeline (extracted for
     # testability — T-1).  The tracker is passed so shutdown can drain its
-    # in-flight end-of-session credit before the loop closes (CONC-1).
-    await run_pipeline(tasks, capture, display, tracker)
+    # in-flight end-of-session credit before the loop closes (CONC-1); the shared
+    # DiscogsHttp is passed so run_pipeline's finally can close its dedicated
+    # executor LAST, after that credit has drained off the same pool (#61).
+    await run_pipeline(tasks, capture, display, tracker, discogs_http)
 
 
 if __name__ == "__main__":
