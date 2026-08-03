@@ -123,6 +123,31 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   re-verified clean over a third pass. (A pre-existing, track-cadence — not
   frame-rate — palette-decode WARNING on a blacklisted-but-on-disk cover was
   surfaced and filed separately, not folded in.)
+- **A slow end-of-session Discogs write no longer stalls recognition of the next
+  record (CONC-2, #96 — MEDIUM).** `_end_session` held `_lifecycle_lock` for the
+  whole of `_finalize_session` — up to three executor-dispatched HTTP round trips
+  (Play Count, Last Played, Last.fm love), each bounded-retried. `on_track_identified`
+  takes that same lock first and is awaited inline by the recognition pipeline
+  (`TrackCommitService.commit → RecognitionLoop.run`), so a slow Play Count write
+  for the record that just ended was one-for-one dead time for recognition: drop
+  side B within 20s of side A ending on a slow uplink and every confirmed track of
+  side B blocked on the lock while `RecognitionLoop` stopped draining its
+  maxsize-5 audio queue, so side B's opening was never identified. The session is
+  now **detached synchronously** under the lifecycle lock (`_detach_session_locked`,
+  which — being await-free — also strengthens the B-2 atomicity), and the crediting
+  runs **outside** the lock. A dedicated `_finalize_lock` serializes the crediting
+  work so moving it off the lifecycle lock doesn't let two detached sessions hit
+  the shared Discogs `requests.Session` (`max_workers=2` pool) concurrently; the
+  two locks are never nested, so there's no deadlock. RED-first (the stall
+  reproduced: a stuck credit blocked `on_track_identified` on today's code); the
+  finalize-outside-the-lock move and the finalize-lock serialization are each
+  mutation-pinned, and the B-2 split-race + idempotency suites still pass. Cold
+  review SPEC / QUALITY PASS, verifying no double/lost credit, no deadlock, and an
+  intact B-2 / CONC-1 (drain) / CONC-6 (is_stale). It surfaced one bounded residual
+  — an album-split credit is still awaited inline and takes `_finalize_lock`
+  unconditionally, so a split commit can briefly wait behind an unrelated in-flight
+  credit (strictly better than before, filed as #166) — resolved here as a comment
+  correction, not a scope-creeping behavior change.
 
 ## [1.5.2] — 2026-08-03
 

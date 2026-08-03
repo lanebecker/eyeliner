@@ -62,14 +62,13 @@ _SHUTDOWN_DRAIN_SECONDS = 10.0
 #
 # Bounded and SHORT for two reasons. First, the attempts must fit within the
 # _SHUTDOWN_DRAIN_SECONDS window on shutdown (1s + 2s = 3s of backoff across 3
-# attempts) and never spin. Second — on the album-split path — _finalize_session
-# runs while on_track_identified still holds the lifecycle lock, so this backoff
-# is held UNDER that lock and delays the incoming record's session start. That is
-# a pure latency cost, NOT data loss: CONC-6's is_stale predicate still prevents
-# any phantom credit, the event loop is not blocked (sleep + writer.run yield),
-# and the delay self-resolves when the lock releases. The structural fix that
-# would move the retry off the lock is finalizing OUTSIDE it (CONC-2, #96); until
-# then the short backoff keeps that lengthened lock window small.
+# attempts) and never spin. Second, on the album-split path the split-off
+# session's finalize is awaited inline by on_track_identified (and so by the
+# recognition pipeline). Since CONC-2 (#96) that finalize runs OUTSIDE the
+# lifecycle lock, so it no longer stalls the next record's session start; a short
+# bound still keeps that inline credit from lengthening the splitting commit.
+# CONC-6's is_stale predicate prevents any phantom credit and the event loop is
+# never blocked (sleep + writer.run yield).
 _FINALIZE_WRITE_ATTEMPTS = 3
 _FINALIZE_RETRY_BACKOFF_SECONDS = 1.0
 
@@ -97,8 +96,17 @@ class ListenTracker:
         # Serializes every session-lifecycle transition (start / end / the
         # split's end-then-start).  Without it, the album-split path and a
         # fire-and-forget SESSION_ENDED task can interleave and end the wrong
-        # session (B-2).
+        # session (B-2).  CONC-2: this lock now guards ONLY the fast, synchronous
+        # session-pointer transitions — it is never held across an await — so a
+        # slow end-of-session write can't stall the recognition pipeline behind it.
         self._lifecycle_lock = asyncio.Lock()
+        # CONC-2: serializes the end-of-session crediting work (the Discogs /
+        # Last.fm writes), which now runs OUTSIDE the lifecycle lock.  It preserves
+        # the pre-CONC-2 guarantee that at most one crediting run — i.e. one
+        # Discogs *writer* call over the shared requests.Session / max_workers=2
+        # pool — is in flight at a time, without coupling that serialization to the
+        # lifecycle lock the recognition pipeline needs.
+        self._finalize_lock = asyncio.Lock()
 
     def on_silence_event(self, event: AudioEvent):
         """Receive silence events from SilenceDetector (wired up in main.py)."""
@@ -157,15 +165,15 @@ class ListenTracker:
           2. It has no ``await``, so it runs atomically; nothing interleaves
              inside it.
           3. The one place a session is *destroyed* (``_session = None`` in
-             ``_end_session_locked``) has no ``await`` between acquiring the lock
-             and the null, so a synchronous ``_start_session`` cannot slip in
-             between them and have its new session immediately nulled.
-          4. The only critical section that holds the lock across an ``await``
-             (``on_track_identified``'s album split + ``_finalize_session``)
-             operates on a *local* session reference after nulling
-             ``self._session``, and re-checks ``self._session is None`` under the
-             lock — so a session created by a concurrent MUSIC_STARTED is adopted,
-             not corrupted.
+             ``_detach_session_locked``) is synchronous and holds no ``await``, so
+             a synchronous ``_start_session`` cannot slip in between the lock
+             acquisition and the null and have its new session immediately nulled.
+          4. Since CONC-2, NO lifecycle critical section holds the lock across an
+             ``await`` at all — the album split detaches *synchronously* and defers
+             the (awaited) crediting to AFTER the lock is released — so the locked
+             body runs to completion with nothing interleaving inside it, and there
+             is no window for a concurrent MUSIC_STARTED to have its new session
+             corrupted.
 
         Routing this through the lock would require scheduling (``on_silence_event``
         is sync), which would break the synchronous "session exists immediately
@@ -177,35 +185,66 @@ class ListenTracker:
             log.info("Play session started.")
 
     async def _end_session(self, expected=_CURRENT_SESSION):
-        """End the active session, holding the lifecycle lock.
+        """End the active session: detach it under the lifecycle lock, then credit
+        it OUTSIDE the lock (CONC-2).
 
         `expected` lets a scheduled SESSION_ENDED bind to the session that was
         active when the silence fired; if an album split has since swapped in a
         new session, ending is skipped.  The default sentinel means "end
         whatever session is current" (used by the direct-await callers and the
         existing test suite).
+
+        The crediting work (up to three executor-dispatched HTTP round trips with
+        bounded retry) must NOT run under `_lifecycle_lock`: `on_track_identified`
+        takes that lock first and is awaited inline by the recognition pipeline,
+        so holding it across the writes stalled recognition of the next record for
+        the whole retry window (CONC-2).  The detach is synchronous and atomic
+        under the lock (B-2); the finalize is serialized separately by
+        `_finalize_detached`.
         """
         async with self._lifecycle_lock:
-            await self._end_session_locked(expected=expected)
+            detached = self._detach_session_locked(expected=expected)
+        if detached is not None:
+            await self._finalize_detached(detached)
 
-    async def _end_session_locked(self, expected=_CURRENT_SESSION):
-        """End the active session.  The caller MUST hold self._lifecycle_lock.
+    def _detach_session_locked(self, expected=_CURRENT_SESSION):
+        """Detach and return the active session (or None).  SYNCHRONOUS — no
+        await — so the null-and-check runs atomically under the lifecycle lock,
+        which the caller MUST hold.  The caller finalizes the returned session
+        AFTER releasing the lock (CONC-2).
 
-        Split into this lock-free body so the album-split path can end and then
-        restart a session under a single lock acquisition without deadlocking
-        on a re-entrant lock.
+        Kept a separate method (was `_end_session_locked`) so the album-split path
+        can detach-then-restart under a single lock acquisition; being await-free,
+        it also strengthens B-2 (nothing can interleave inside it).
         """
         if self._session is None:
-            return
+            return None
         if expected is not _CURRENT_SESSION and self._session is not expected:
             # A stale SESSION_ENDED whose session was already ended by an album
             # split (and possibly replaced by a new one) — do nothing.
             log.debug("Ignoring stale SESSION_ENDED for an already-replaced session.")
-            return
+            return None
 
         session = self._session
         self._session = None
-        await self._finalize_session(session)
+        return session
+
+    async def _finalize_detached(self, session: PlaySession):
+        """Credit an already-detached session, serialized against every other
+        finalize (CONC-2).
+
+        `_finalize_lock` preserves the pre-CONC-2 guarantee that at most one
+        crediting run — one Discogs *writer* call over the shared requests.Session
+        / max_workers=2 pool — is in flight at a time.  Before CONC-2 the
+        lifecycle lock provided that serialization as a side effect of being held
+        across the writes; now that the writes run outside it, this dedicated lock
+        provides it directly, so a SESSION_ENDED credit and an album-split credit
+        for two different detached sessions can never hit the writer concurrently.
+        The two locks are never held at the same time, so there is no ordering
+        deadlock.
+        """
+        async with self._finalize_lock:
+            await self._finalize_session(session)
 
     async def _finalize_session(self, session: PlaySession):
         """Do the end-of-session crediting work for an already-detached session.
@@ -429,15 +468,18 @@ class ListenTracker:
 
         ``is_stale`` (CONC-6): a predicate supplied by the caller that returns
         True if the audio this track came from belongs to a session that has
-        since ended.  It is re-evaluated *after* the lifecycle lock is acquired,
-        because that lock can be held for a while by a previous session's Discogs
-        write (CONC-2) and a SESSION_ENDED landing in that window ends the session
-        and bumps the epoch.  Without the check, this method would then see
-        ``_session is None`` and start a PHANTOM session for audio that already
-        stopped — which a later album split could phantom-credit.  A stale track
-        is dropped instead.  Defaults to None (no check) for callers that don't
-        thread it.
+        since ended.  It is re-evaluated *after* the lifecycle lock is acquired:
+        between this track's audio being captured and this commit taking the lock,
+        a SESSION_ENDED can detach the session and bump the epoch.  Without the
+        check, this method would then see ``_session is None`` and start a PHANTOM
+        session for audio that already stopped — which a later album split could
+        phantom-credit.  A stale track is dropped instead.  Defaults to None (no
+        check) for callers that don't thread it.  (Before CONC-2 that window could
+        be seconds long, because the lock was held across the previous session's
+        Discogs write; the finalize now runs outside the lock so the window is
+        brief, but the race still exists, so the guard stays.)
         """
+        detached = None
         async with self._lifecycle_lock:
             # CONC-6: now that we hold the lock, drop this track if its session
             # ended while we were waiting for the lock — do not resurrect it as a
@@ -464,11 +506,26 @@ class ListenTracker:
                     f"(release {self._session.last_release_id} → "
                     f"{track.discogs_release_id}) — splitting session."
                 )
-                # End + restart atomically under the lock so a concurrently
-                # scheduled SESSION_ENDED can't slip between them (B-2).
-                await self._end_session_locked()
+                # Detach + restart atomically under the lock so a concurrently
+                # scheduled SESSION_ENDED can't slip between them (B-2).  The
+                # detach is synchronous; the OLD session's crediting is deferred to
+                # AFTER the lock is released (CONC-2), so a slow write for the
+                # previous record no longer holds the lock this commit — and the
+                # next one — needs.
+                detached = self._detach_session_locked()
                 self._start_session()
 
             self._session.log_track(track)
             if track.is_last_track:
                 log.info(f"Last track of album identified: '{track.title}' — watching for session end.")
+
+        # CONC-2: credit the split-off session OUTSIDE the lifecycle lock, so the
+        # NEXT record's session start (under the lock above) is never blocked by a
+        # slow write.  This is still awaited inline by the recognition pipeline and
+        # takes `_finalize_lock` UNCONDITIONALLY, so a split commit can briefly wait
+        # here behind an unrelated in-flight credit — bounded by the retry window,
+        # far smaller and rarer than the pre-CONC-2 whole-pipeline stall, but not
+        # zero even for a non-creditable mid-album swap (which does no write yet
+        # still takes the lock).  #166 tracks skipping the lock in that case.
+        if detached is not None:
+            await self._finalize_detached(detached)
