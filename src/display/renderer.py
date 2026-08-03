@@ -125,6 +125,13 @@ _PALETTE_CACHE_MAX = 200
 # and tiny next to re-decoding a JPEG ten times a second.
 _COVER_CACHE_MAX = 16
 
+# STAB-1: how many times a cached cover that won't DECODE may be unlinked +
+# re-downloaded before the URL is given up on (negative-cached).  A genuinely
+# corrupt/unsupported file re-lands the same bad bytes on refetch, so one retry
+# is enough to distinguish a transient partial-write (recovers) from a permanent
+# bad object (blacklisted) — without a per-frame download/unlink/log loop.
+_COVER_MAX_LOAD_FAILURES = 1
+
 # Cap on the tracked-label Surface cache (letter-spaced mono labels).
 # Labels are tiny surfaces and mostly static per track; 128 is plenty.
 _LABEL_CACHE_MAX = 128
@@ -374,6 +381,20 @@ class DisplayRenderer:
         # recompose — a stable replacement for the old id(cover), whose ids could
         # be recycled after GC and falsely match a stale frame.
         self._cover_version: int = 0
+        # STAB-1: bound the corrupt-cover recovery loop.  A cached cover that
+        # will not decode used to be unlinked + re-downloaded every render frame
+        # (~8.7 Hz), re-landing the same bad bytes forever (~31k GETs/hour,
+        # ~9 GB/hour of SD writes, ~31k WARNING lines/hour).  Track per-URL
+        # decode failures and, after _COVER_MAX_LOAD_FAILURES fruitless
+        # refetches, mark the URL bad and stop touching disk/network/log for it.
+        self._cover_load_failures: dict = {}    # url → consecutive decode failures
+        self._cover_bad_urls: set = set()        # urls given up on (negative cache)
+        # Dedupe concurrent downloads for one URL: a state-change prefetch and a
+        # load-failure refetch must not both hit the network for the same cover.
+        self._cover_prefetch_inflight: set = set()
+        # True while the display surface is unavailable (video-mode loss);
+        # suppresses per-frame "decode deferred" logging until a cover decodes.
+        self._cover_decode_deferred: bool = False
         self._gradient_key: Optional[tuple] = None           # (bg, surface, w, h)
         self._gradient_surface = None                        # pygame.Surface
 
@@ -463,6 +484,13 @@ class DisplayRenderer:
         # When a new track arrives, queue a palette transition and prefetch cover art
         if state.status == PlayerStatus.PLAYING and state.current_track:
             url = state.current_track.cover_art_url
+            if url and url != self._wanted_cover_url:
+                # STAB-1: a genuinely NEW cover is the "state change" that lifts a
+                # prior blacklist — give it a fresh bounded decode attempt.  (A
+                # repeat state-change for the SAME cover does not, so a permanently
+                # bad cover can't be re-triggered into the loop by state churn.)
+                self._cover_bad_urls.discard(url)
+                self._cover_load_failures.pop(url, None)
             self._wanted_cover_url = url
             self._queue_palette(url)
             if url:
@@ -1385,21 +1413,31 @@ class DisplayRenderer:
         when the cover is ALREADY on disk (e.g. cached from a previous session) —
         that warm-cache case is exactly what used to decode inline on the loop
         (P-9).
-        """
-        if not self._cover_store.exists(url):
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._cover_store.download, url)
-                log.debug(f"Cover art cached: {self._cover_store.path_for(url).name}")
-            except Exception as e:
-                log.warning(f"Failed to download cover art from {url}: {e}")
-                return
 
-        await self._extract_palette_async(url)
-        # A cover for `url` is now on disk — bump the version so the next render
-        # recomposes the static frame and picks it up (B-22).
-        self._cover_version += 1
-        self._dirty = True
+        STAB-1: deduped against in-flight downloads for the same URL — a
+        state-change prefetch and a load-failure refetch must not both hit the
+        network for one cover.
+        """
+        if url in self._cover_prefetch_inflight:
+            return
+        self._cover_prefetch_inflight.add(url)
+        try:
+            if not self._cover_store.exists(url):
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self._cover_store.download, url)
+                    log.debug(f"Cover art cached: {self._cover_store.path_for(url).name}")
+                except Exception as e:
+                    log.warning(f"Failed to download cover art from {url}: {e}")
+                    return
+
+            await self._extract_palette_async(url)
+            # A cover for `url` is now on disk — bump the version so the next
+            # render recomposes the static frame and picks it up (B-22).
+            self._cover_version += 1
+            self._dirty = True
+        finally:
+            self._cover_prefetch_inflight.discard(url)
 
     async def _extract_palette_async(self, url: str):
         """Extract a cover's palette in an executor, cache it, and re-queue the
@@ -1453,31 +1491,91 @@ class DisplayRenderer:
         if cached is not None:
             return cached
 
+        if url in self._cover_bad_urls:
+            # STAB-1: already gave up on this URL — no disk read, no unlink, no
+            # refetch, no log.  A state change to a NEW cover clears the
+            # blacklist (see _on_state_change), giving a fresh play a clean try.
+            return None
+
         cache_path = self._cover_store.path_for(url)
         if not cache_path.exists():
             return None
 
+        # STAB-1: DECODE and CONVERT are distinct failure classes that must be
+        # handled differently — and both raise pygame.error, so they can only be
+        # told apart by WHICH call failed, not by exception type.
+        #   * pygame.image.load() failing → the bytes are corrupt/unreadable
+        #     (partial write, SD read error, codec gap): worth ONE bounded
+        #     unlink + refetch, then blacklist.
+        #   * .convert() failing → no video mode (a transient display fault, e.g.
+        #     HDMI hotplug) on PERFECTLY GOOD bytes: must NOT delete the file or
+        #     hit the network — just show the placeholder until the surface
+        #     returns.  (The old single-try except Exception conflated the two:
+        #     a display glitch deleted a good cover and started hammering.)
         try:
-            img = pygame.image.load(str(cache_path)).convert()
-            scaled = pygame.transform.smoothscale(img, (w, h))
-            self._cover_cache.put((url, w, h), scaled)
-            return scaled
+            raw = pygame.image.load(str(cache_path))
         except Exception as e:
-            log.warning(f"Failed to load cached cover art: {e}")
-            cache_path.unlink(missing_ok=True)
-            # The cached file was corrupt (partial write, decoder hiccup).  Kick
-            # off a re-fetch now so the cover can recover within this track,
-            # rather than showing the placeholder until the next state change
-            # re-triggers a prefetch (B-18).  Guard the spawn so a call outside
-            # the event loop (e.g. a unit test) degrades gracefully.
-            if url:
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    pass  # No running loop (e.g. unit test) — nothing to schedule
+            return self._handle_corrupt_cover(url, cache_path, e)
+
+        try:
+            scaled = pygame.transform.smoothscale(raw.convert(), (w, h))
+        except Exception as e:
+            # convert()/scale failed on ALREADY-decoded bytes.  The FILE is fine —
+            # corrupt bytes fail at load() above, not here — so never delete or
+            # refetch (that would just relocate the STAB-1 loop to the scale path).
+            # A pygame.error is the expected display fault (no video mode after an
+            # HDMI hotplug); anything else is unexpected.  Either way show the
+            # placeholder and LATCH: _load_cover runs every frame and the render
+            # loop re-arms _dirty each frame (reduced_motion off), so a PERSISTENT
+            # fault must log ONCE per episode, not ~10×/second.  The latch clears
+            # on the next clean decode (below), so a fresh episode logs again.
+            # Catching Exception (not just pygame.error) also stops a stray
+            # non-pygame error from escaping into run(), which does not guard
+            # _render() — fail safe to the placeholder rather than crash the task.
+            if not self._cover_decode_deferred:
+                if isinstance(e, pygame.error):
+                    log.warning(f"Cover decode deferred — display not ready: {e}")
                 else:
-                    self._spawn(self._prefetch_cover(url))
+                    log.error(f"Unexpected error scaling cover art for {url}: {e}")
+                self._cover_decode_deferred = True
             return None
+
+        self._cover_cache.put((url, w, h), scaled)
+        self._cover_load_failures.pop(url, None)   # a clean load clears the tally
+        self._cover_decode_deferred = False         # display is back
+        return scaled
+
+    def _handle_corrupt_cover(self, url: str, cache_path, error) -> None:
+        """STAB-1: a cached cover failed to DECODE (corrupt/partial bytes).
+
+        Unlink + re-fetch it at most ``_COVER_MAX_LOAD_FAILURES`` times so a
+        transient partial write can still self-heal within the track (B-18);
+        past that the re-download keeps re-landing the same bad bytes, so mark
+        the URL bad and stop the per-frame disk/network/log loop.  Always
+        returns None (the caller shows the placeholder).
+        """
+        failures = self._cover_load_failures.get(url, 0) + 1
+        self._cover_load_failures[url] = failures
+        if failures > _COVER_MAX_LOAD_FAILURES:
+            self._cover_bad_urls.add(url)
+            log.error(
+                f"Cover art at {url} still undecodable after {failures} "
+                f"attempts — giving up until the track changes: {error}"
+            )
+            return None
+        log.warning(f"Failed to load cached cover art (attempt {failures}): {error}")
+        cache_path.unlink(missing_ok=True)
+        # Re-fetch so the cover can recover within the track (B-18), but only if
+        # a download for this URL isn't already in flight (STAB-1 dedup) and we
+        # are on the event loop (an off-loop unit-test call degrades to no-op).
+        if url not in self._cover_prefetch_inflight:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass  # No running loop (e.g. unit test) — nothing to schedule
+            else:
+                self._spawn(self._prefetch_cover(url))
+        return None
 
     def stop(self):
         self._running = False

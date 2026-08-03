@@ -18,7 +18,9 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from src.display.renderer import DisplayRenderer, _BoundedCache  # noqa: E402
+from src.display.renderer import (  # noqa: E402
+    DisplayRenderer, _BoundedCache, _COVER_MAX_LOAD_FAILURES,
+)
 from src.display.cover_cache import CoverArtCache  # noqa: E402
 from src.display.palette import extract_palette  # noqa: E402
 from src.display.layouts import get_now_playing_layout, Rect  # noqa: E402
@@ -36,6 +38,11 @@ def make_renderer():
     r._font_cache = _BoundedCache(64)   # P-8: matches the real bounded cache
     r._label_cache = _BoundedCache(64)
     r._dot_cache = _BoundedCache(64)
+    # STAB-1 cover-loop state (mirrors DisplayRenderer.__init__)
+    r._cover_load_failures = {}
+    r._cover_bad_urls = set()
+    r._cover_prefetch_inflight = set()
+    r._cover_decode_deferred = False
     return r
 
 
@@ -146,6 +153,264 @@ async def test_missing_cover_does_not_refetch(tmp_path):
 
     assert result is None
     assert refetched == []
+
+
+# ---------------------------------------------------------------------------
+# STAB-1 — an un-decodable / display-faulted cover must NOT become an unbounded
+#          download + unlink + log loop
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stab1_undecodable_cover_stops_after_one_refetch(tmp_path):
+    """A cached cover that will NOT decode used to be unlinked + re-downloaded on
+    every render frame (~8.7 Hz), re-landing the same bad bytes forever.  The
+    refetch is now bounded: at most one unlink+refetch, then the URL is
+    negative-cached and the disk/network/log loop stops."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/bad.jpg"
+    cache_path = r._cover_store.path_for(url)
+    cache_path.write_bytes(b"not a real image")
+
+    spawns = []
+
+    async def relanding_prefetch(u):
+        spawns.append(u)
+        cache_path.write_bytes(b"still not a real image")  # re-download re-lands bad bytes
+
+    r._prefetch_cover = relanding_prefetch
+
+    # Drive the render hot-path repeatedly, as the loop would at frame rate.
+    for _ in range(6):
+        assert r._load_cover(url, 100, 100) is None
+        await asyncio.sleep(0)      # let the spawned refetch re-land the file
+
+    assert len(spawns) <= 1, f"unbounded refetch loop: {len(spawns)} spawns"
+    assert url in r._cover_bad_urls           # negative-cached → loop stopped
+    # Once blacklisted, later frames early-return BEFORE re-attempting the decode,
+    # so the failure tally stops climbing (no per-frame load / log.error spam).
+    assert r._cover_load_failures.get(url) == _COVER_MAX_LOAD_FAILURES + 1
+
+
+@pytest.mark.asyncio
+async def test_stab1_display_fault_does_not_delete_a_good_cover(tmp_path):
+    """A video-mode loss (HDMI hotplug / lost X) makes .convert() raise on a
+    PERFECTLY GOOD cover.  That transient display fault must NOT be treated as a
+    corrupt file: the good bytes must survive, no re-download is triggered, and
+    the URL is not blacklisted."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/good.jpg"
+    cache_path = r._cover_store.path_for(url)
+    Image.new("RGB", (120, 120), (60, 110, 190)).save(cache_path)  # a VALID cover
+
+    spawns = []
+
+    async def fake_prefetch(u):
+        spawns.append(u)
+
+    r._prefetch_cover = fake_prefetch
+
+    pygame.display.quit()   # ensure no video mode → .convert() raises, whatever the test order
+    result = r._load_cover(url, 100, 100)
+
+    assert result is None
+    assert cache_path.exists()             # a display fault must NOT delete a good file
+    assert r._cover_decode_deferred is True   # …the defer flag latched (rate-limits the log)
+    await asyncio.sleep(0)
+    assert spawns == []                    # …and must NOT hammer the network
+    assert url not in r._cover_bad_urls    # …and must NOT blacklist a good URL
+
+
+@pytest.mark.asyncio
+async def test_stab1_concurrent_prefetch_for_same_url_downloads_once(tmp_path, monkeypatch):
+    """A state-change prefetch and a load-failure refetch for the SAME URL must
+    not both hit the network — the second is deduped against the in-flight
+    download."""
+    import time
+
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._bg_tasks = set()
+    r.dynamic_theming = False        # skip palette extraction
+    r._cover_version = 0
+    r._dirty = False
+    url = "https://i.discogs.com/x.jpg"
+
+    downloads = []
+
+    def counting_download(u):        # runs in the executor thread
+        downloads.append(u)
+        time.sleep(0.02)             # hold the download open so both tasks overlap
+
+    monkeypatch.setattr(r._cover_store, "download", counting_download)
+    monkeypatch.setattr(r._cover_store, "exists", lambda u: False)
+
+    await asyncio.gather(r._prefetch_cover(url), r._prefetch_cover(url))
+
+    assert downloads.count(url) == 1              # deduped — exactly one network fetch
+    assert r._cover_prefetch_inflight == set()    # …and the in-flight guard cleared afterward
+
+
+@pytest.mark.asyncio
+async def test_stab1_transient_decode_failure_still_recovers(tmp_path):
+    """Non-regression (B-18): a ONE-OFF decode failure (transient SD read) must
+    still self-heal — unlink + one refetch, and when the re-download lands good
+    bytes the cover loads cleanly and the URL is NOT permanently blacklisted."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/flaky.jpg"
+    cache_path = r._cover_store.path_for(url)
+    cache_path.write_bytes(b"corrupt just this once")
+
+    async def healing_prefetch(u):
+        Image.new("RGB", (100, 100), (30, 60, 90)).save(cache_path)  # good bytes this time
+
+    r._prefetch_cover = healing_prefetch
+
+    pygame.display.set_mode((64, 64))    # a video mode so a good cover can .convert()
+    try:
+        assert r._load_cover(url, 100, 100) is None   # first decode fails → one refetch
+        await asyncio.sleep(0)                          # good bytes land
+        surface = r._load_cover(url, 100, 100)          # now decodes cleanly
+        assert surface is not None
+        assert url not in r._cover_bad_urls             # a transient glitch is NOT permanent
+        assert url not in r._cover_load_failures        # tally cleared on a clean load
+    finally:
+        pygame.display.quit()
+
+
+@pytest.mark.asyncio
+async def test_stab1_deferred_flag_clears_when_display_returns(tmp_path):
+    """The video-mode-loss defer state latches (so the warning is logged once,
+    not per frame) and then CLEARS on the next clean decode — so a recovered
+    display resumes normal per-frame logging behaviour."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/good.jpg"
+    cache_path = r._cover_store.path_for(url)
+    Image.new("RGB", (100, 100), (10, 20, 30)).save(cache_path)   # a VALID cover
+
+    pygame.display.quit()                          # no video mode → .convert() fails
+    assert r._load_cover(url, 100, 100) is None
+    assert r._cover_decode_deferred is True        # latched (log emitted once)
+
+    pygame.display.set_mode((64, 64))              # video mode returns
+    try:
+        surface = r._load_cover(url, 100, 100)
+        assert surface is not None                 # decodes cleanly now
+        assert r._cover_decode_deferred is False    # …and the defer flag cleared
+    finally:
+        pygame.display.quit()
+
+
+@pytest.mark.asyncio
+async def test_stab1_unexpected_scale_error_fails_safe(tmp_path, monkeypatch):
+    """An UNEXPECTED (non-pygame) error while converting/scaling already-decoded
+    bytes must fail safe — placeholder, good file preserved, no refetch — and must
+    NOT escape _load_cover to crash the unguarded render loop (cold-review #1)."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/good.jpg"
+    cache_path = r._cover_store.path_for(url)
+    Image.new("RGB", (100, 100), (5, 5, 5)).save(cache_path)   # a VALID cover
+
+    spawns = []
+
+    async def fake_prefetch(u):
+        spawns.append(u)
+
+    r._prefetch_cover = fake_prefetch
+
+    def boom(surface, size):
+        raise ValueError("simulated non-pygame scale failure")
+
+    monkeypatch.setattr(pygame.transform, "smoothscale", boom)
+
+    pygame.display.set_mode((64, 64))    # video mode so convert() succeeds → reach smoothscale
+    try:
+        result = r._load_cover(url, 100, 100)   # must NOT raise
+        assert result is None
+        assert cache_path.exists()               # good file preserved
+        await asyncio.sleep(0)
+        assert spawns == []                      # no refetch
+        assert url not in r._cover_bad_urls      # not blacklisted
+    finally:
+        pygame.display.quit()
+
+
+@pytest.mark.asyncio
+async def test_stab1_persistent_scale_error_is_log_bounded(tmp_path, monkeypatch):
+    """A PERSISTENT unexpected scale error must be latched like the video-mode
+    case — logged ONCE per episode, not once per render frame (~10 Hz).  Without
+    the latch the fail-safe ERROR branch becomes the very per-frame log flood
+    STAB-1 eliminates, just moved to the scale path (cold-review narrow pass)."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/good.jpg"
+    cache_path = r._cover_store.path_for(url)
+    Image.new("RGB", (100, 100), (5, 5, 5)).save(cache_path)   # a VALID cover
+
+    def boom(surface, size):
+        raise ValueError("persistent non-pygame scale failure")
+
+    monkeypatch.setattr(pygame.transform, "smoothscale", boom)
+    errors = []
+    monkeypatch.setattr("src.display.renderer.log.error", lambda *a, **k: errors.append(a))
+
+    pygame.display.set_mode((64, 64))    # video mode so convert() succeeds → reach smoothscale
+    try:
+        for _ in range(10):              # 10 render frames on the same persistent fault
+            assert r._load_cover(url, 100, 100) is None
+    finally:
+        pygame.display.quit()
+
+    assert len(errors) == 1, f"unbounded ERROR log loop: {len(errors)} logs in 10 frames"
+    assert r._cover_decode_deferred is True   # latched after the first frame
+
+
+def test_stab1_new_cover_state_change_lifts_blacklist(tmp_path):
+    """A blacklist is not permanent for the whole process: a state change to a
+    genuinely NEW wanted cover clears that URL's blacklist + tally, giving a
+    later play a fresh bounded attempt (the finding's "until state changes")."""
+    from src.state.player_state import PlayerState, PlayerStatus
+    from src.metadata.models import TrackMetadata, MetadataSource
+
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._bg_tasks = set()
+    r._wanted_cover_url = "https://i.discogs.com/current.jpg"
+    r._queue_palette = lambda u: None
+    r._prefetch_cover = lambda u: None
+    r._spawn = lambda coro: None
+
+    url = "https://i.discogs.com/bad.jpg"
+    r._cover_bad_urls.add(url)
+    r._cover_load_failures[url] = _COVER_MAX_LOAD_FAILURES + 1
+
+    st = PlayerState()
+    st.current_track = TrackMetadata(
+        title="t", artist="a", album="al", source=MetadataSource.FALLBACK,
+        cover_art_url=url, tracklist=[],          # a NEW wanted cover
+    )
+    st.status = PlayerStatus.PLAYING
+
+    r._on_state_change(st)
+
+    assert url not in r._cover_bad_urls            # new wanted cover → blacklist lifted
+    assert url not in r._cover_load_failures       # …and its failure tally reset
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +525,10 @@ def test_static_frame_recomposes_when_cover_version_bumps(tmp_path):
     r._target_palette = FALLBACK_PALETTE
     r._transition_start = 0.0
     r._cover_version = 0
+    r._cover_load_failures = {}          # STAB-1 cover-loop state
+    r._cover_bad_urls = set()
+    r._cover_prefetch_inflight = set()
+    r._cover_decode_deferred = False
     r._dirty = False
 
     state = PlayerState()

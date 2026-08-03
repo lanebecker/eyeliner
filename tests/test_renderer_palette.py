@@ -58,6 +58,7 @@ def make_renderer(tmp_path, dynamic_theming=True):
     r._target_palette = FALLBACK_PALETTE
     r._transition_start = 0.0
     r._wanted_cover_url = None
+    r._cover_prefetch_inflight = set()   # STAB-1 in-flight download dedup
     return r
 
 
