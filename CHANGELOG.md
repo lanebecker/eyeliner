@@ -9,10 +9,13 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.2] — 2026-08-03
+
 **Code-review hardening, round 3 (Wave 1 — collection data integrity).** A third
 adversarial cold audit (`CODE_REVIEW_2026-07-30.md`) filed 88 issues across five
-milestones; this section tracks the Wave 1 fixes as they land, each through the
-same implement → RED test → mutation-check → cold-review discipline.
+milestones; this release lands the Wave 1 (collection data-integrity) fixes — the
+one irreversible wave, shipped before the Pi is powered on — each through the same
+implement → RED test → mutation-check → cold-review discipline.
 
 ### Fixed
 
