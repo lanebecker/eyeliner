@@ -13,6 +13,7 @@ It has no knowledge of the write side (play-count / last-played) — that lives 
 
 import logging
 from typing import Optional, TYPE_CHECKING
+from urllib.parse import quote
 
 import discogs_client
 
@@ -31,6 +32,11 @@ class DiscogsReader:
     def __init__(self, http: DiscogsHttp, config: "DiscogsConfig"):
         self._http = http
         self.username: str = config.username
+        # SEC-7: percent-encode the username once for use as a URL PATH SEGMENT
+        # (operator-authored, so a '/', '?' or '#' would otherwise reshape the
+        # request path). Mirrors DiscogsCollectionWriter; the collection-index
+        # GET below uses this encoded form, not the raw ``self.username``.
+        self._username_path: str = quote(config.username, safe="")
 
         # High-level client — used for search() and release() lookups.
         # set_timeout() applies the same timeout discipline to the library's
@@ -248,7 +254,7 @@ class DiscogsReader:
         while True:
             resp = self._http.request(
                 "GET",
-                f"{_API_BASE}/users/{self.username}/collection/folders/0/releases",
+                f"{_API_BASE}/users/{self._username_path}/collection/folders/0/releases",
                 params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
             )
             resp.raise_for_status()

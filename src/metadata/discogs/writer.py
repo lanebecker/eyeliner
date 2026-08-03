@@ -13,6 +13,7 @@ It has no knowledge of the read side (search/tracklist/year) — that lives in
 import logging
 from datetime import date
 from typing import Optional, Union, TYPE_CHECKING
+from urllib.parse import quote
 
 from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _as_id
 from src.util.clock import clock_is_trustworthy
@@ -50,6 +51,14 @@ class DiscogsCollectionWriter:
     def __init__(self, http: DiscogsHttp, config: "DiscogsConfig"):
         self._http = http
         self.username: str = config.username
+        # SEC-7: percent-encode the username ONCE for use as a URL PATH SEGMENT.
+        # It is operator-authored (config.yaml), so a value containing '/', '?'
+        # or '#' would otherwise silently reshape the request path (extra
+        # segments, a stray query string, a fragment). ``self.username`` stays
+        # raw for identity/logging; every collection URL below uses this encoded
+        # form. ``safe=""`` encodes ALL reserved characters, since the whole
+        # value is a single segment (a normal alphanumeric username is unchanged).
+        self._username_path: str = quote(config.username, safe="")
         self.play_count_field_name: str = config.play_count_field_name
         self.last_played_field_name: Optional[str] = config.last_played_field_name
 
@@ -119,7 +128,7 @@ class DiscogsCollectionWriter:
 
             # Validate every ID before it lands in the write URL (S-5).
             url = (
-                f"{_API_BASE}/users/{self.username}/collection"
+                f"{_API_BASE}/users/{self._username_path}/collection"
                 f"/folders/0/releases/{_as_id(release_id, 'release_id')}"
                 f"/instances/{_as_id(instance_id, 'instance_id')}"
                 f"/fields/{_as_id(field_id, 'field_id')}"
@@ -190,7 +199,7 @@ class DiscogsCollectionWriter:
 
             # Validate every ID before it lands in the write URL (S-5).
             url = (
-                f"{_API_BASE}/users/{self.username}/collection"
+                f"{_API_BASE}/users/{self._username_path}/collection"
                 f"/folders/0/releases/{_as_id(release_id, 'release_id')}"
                 f"/instances/{_as_id(instance_id, 'instance_id')}"
                 f"/fields/{_as_id(field_id, 'field_id')}"
@@ -227,7 +236,7 @@ class DiscogsCollectionWriter:
             return self._collection_fields
 
         resp = self._http.request(
-            "GET", f"{_API_BASE}/users/{self.username}/collection/fields"
+            "GET", f"{_API_BASE}/users/{self._username_path}/collection/fields"
         )
         resp.raise_for_status()
         data = resp.json()
@@ -258,7 +267,7 @@ class DiscogsCollectionWriter:
         try:
             resp = self._http.request(
                 "GET",
-                f"{_API_BASE}/users/{self.username}/collection"
+                f"{_API_BASE}/users/{self._username_path}/collection"
                 f"/releases/{_as_id(release_id, 'release_id')}",
             )
             if resp.status_code != 200:

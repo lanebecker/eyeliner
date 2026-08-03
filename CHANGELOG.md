@@ -230,6 +230,21 @@ same implement → RED test → mutation-check → cold-review discipline.
   RED-first; both disagreement directions mutation-pinned (the XOR, the clock gate,
   and each message operand); cold review SPEC / QUALITY PASS after adding the
   reverse-direction `(F,T)` test the first pass flagged as an unpinned branch.
+- **The account username is percent-encoded in every Discogs collection URL
+  (SEC-7, #90 — NIT).** Every numeric id in a write path is hardened through
+  `_as_id`, but the operator-authored `username` (from `config.yaml`) was
+  interpolated raw into all five `/users/{username}/collection…` paths — four in
+  the writer (increment POST, Last Played POST, fields GET, field-value read GET)
+  and one in the reader's collection index. A username containing a URL-reserved
+  character — `/`, `?`, `#`, a space — silently reshaped the request path (extra
+  segments, a stray query string, a fragment) rather than failing. Both classes
+  now compute `quote(username, safe="")` once at construction and use that single
+  encoded segment at every URL site; `self.username` stays raw for
+  identity/logging. Not an attack surface (the value is operator-authored) — a
+  robustness fix — and it incidentally tightens log hygiene: `_redact_url` masks
+  the encoded username as one segment, whereas a raw `a/b…` previously leaked the
+  `b` as a separate, unmasked path segment. RED-first; all five sites plus the
+  encode and the `safe=""` parameter mutation-pinned; cold review SPEC / QUALITY PASS.
 
 ---
 

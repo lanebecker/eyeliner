@@ -975,3 +975,87 @@ def test_build_result_falls_back_to_pressing_year():
     client.get_original_year = MagicMock(return_value=None)
     result = client._build_result(_make_full_release(pressing_year=2026), instance_id=None)
     assert result["year"] == "2026"
+
+
+# ---------------------------------------------------------------------------
+# SEC-7 — the account username is interpolated into every Discogs collection
+# URL and must be percent-encoded so a value containing a URL-reserved
+# character ('/', '?', '#', space, …) stays ONE path segment instead of
+# silently reshaping the request path. The username is operator-authored in
+# config.yaml (a robustness nit, not an attack surface), but a stray '/' would
+# add path segments, a '?' would start a query string, and a '#' a fragment.
+# One test per distinct URL-building site so a per-site regression is caught.
+# ---------------------------------------------------------------------------
+
+# A username exercising all three of the reserved characters the finding names.
+# quote(..., safe="") maps '/'→%2F, '?'→%3F, '#'→%23; alphanumerics pass through.
+_SPECIAL_USERNAME = "a/b?c#d"
+_ENCODED_USERNAME = "a%2Fb%3Fc%23d"
+
+
+def test_increment_play_count_percent_encodes_username_in_both_urls():
+    """SEC-7: increment is a read-then-write, so the username must be encoded in
+    BOTH the value-read GET and the increment POST (two distinct URL sites)."""
+    writer = make_discogs_writer(config=make_discogs_config(username=_SPECIAL_USERNAME))
+    writer._collection_fields = {"Play Count": _FIELD_ID}
+    writer._http.session.get = MagicMock(
+        return_value=make_get_response(200, instance_response(42, _FIELD_ID, "5"))
+    )
+    writer._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    assert writer.increment_play_count(release_id=111, instance_id=42) is True
+
+    get_url = writer._http.session.get.call_args[0][0]
+    post_url = writer._http.session.post.call_args[0][0]
+    for url in (get_url, post_url):
+        assert f"/users/{_ENCODED_USERNAME}/collection" in url
+        # the raw, path-reshaping form must be gone
+        assert f"/users/{_SPECIAL_USERNAME}/" not in url
+
+
+def test_update_last_played_percent_encodes_username_in_url():
+    """SEC-7: the Last Played POST site (writer.py) encodes the username."""
+    writer = make_discogs_writer(config=make_discogs_config(
+        username=_SPECIAL_USERNAME, last_played_field_name="Last Played"))
+    writer._collection_fields = {"Play Count": _FIELD_ID, "Last Played": _LAST_PLAYED_FIELD_ID}
+    writer._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    # update_last_played is clock-gated (STAB-2); force trustworthy so the POST fires.
+    with patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=True):
+        assert writer.update_last_played(release_id=111, instance_id=42) is True
+
+    post_url = writer._http.session.post.call_args[0][0]
+    assert f"/users/{_ENCODED_USERNAME}/collection" in post_url
+    assert f"/users/{_SPECIAL_USERNAME}/" not in post_url
+
+
+def test_get_collection_fields_percent_encodes_username_in_url():
+    """SEC-7: the collection-fields GET site (writer.py) encodes the username."""
+    writer = make_discogs_writer(config=make_discogs_config(username=_SPECIAL_USERNAME))
+    assert writer._collection_fields is None  # force the live fetch
+    writer._http.request = MagicMock(return_value=_fields_response(
+        [{"name": "Play Count", "id": 3}]))
+
+    writer._get_collection_fields()
+
+    method, url = writer._http.request.call_args[0][:2]
+    assert method == "GET"
+    assert url.endswith(f"/users/{_ENCODED_USERNAME}/collection/fields")
+    assert f"/users/{_SPECIAL_USERNAME}/" not in url
+
+
+def test_reader_collection_index_percent_encodes_username_in_url():
+    """SEC-7: the reader's collection-index GET site (reader.py) encodes the username."""
+    reader = make_discogs_reader(config=make_discogs_config(username=_SPECIAL_USERNAME))
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"releases": [], "pagination": {"pages": 1}}
+    reader._http.request = MagicMock(return_value=resp)
+
+    reader._get_collection_index()
+
+    method, url = reader._http.request.call_args[0][:2]
+    assert method == "GET"
+    assert f"/users/{_ENCODED_USERNAME}/collection/folders/0/releases" in url
+    assert f"/users/{_SPECIAL_USERNAME}/" not in url
