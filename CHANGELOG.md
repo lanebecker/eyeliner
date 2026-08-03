@@ -69,6 +69,30 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   backend reproduced); the membership check, the set contents, and the
   direct-construction backstop are mutation-pinned; cold review SPEC / QUALITY
   PASS (no circular import, no drift, type-safe).
+- **A track identified every OTHER chunk now confirms instead of latching the
+  display to ERROR (REC-1, #94 — HIGH).** `_handle_result` zeroed the pending
+  candidate (`_pending_result` + `_pending_count`) on *every* `None` result, so a
+  confirmation needed N matching results with no intervening miss. On vinyl a
+  hit/miss/hit/miss pattern is the *normal* failure mode (surface noise, a worn
+  side): Shazam re-identified the same track every other chunk, the pending kept
+  resetting so it never reached `confirmation_required`, and `_register_miss`
+  drove the player to ERROR ("NO MATCH FOUND") — no now-playing card, no play
+  count, no scrobble, recovery only via a manual needle reposition. A `None` result
+  (which carries no recognition information) no longer discards the pending; the
+  miss still counts toward the ERROR threshold, but a genuine alternating
+  identification now confirms first, so ERROR fires only when the side is truly
+  unrecognizable. Because a surviving pending is no longer session-bound by the
+  wipe, the fix also session-scopes it: a new `_pending_epoch` tags each pending
+  with the `session_epoch` it was built under, and a chunk from a *different*
+  session discards the stale pending — closing a cross-session phantom-commit the
+  first cold review caught (a single spurious live hit of the previous record
+  could otherwise confirm a stale track into the NEXT record's session, a phantom
+  the commit-boundary epoch guard cannot catch because the confirming audio is
+  genuinely live). RED-first (both the ERROR-latch and the phantom-commit
+  reproduced); the pending-preservation, the epoch-mismatch reset, and the
+  epoch-tag are each mutation-pinned by their intended tests; cold review SPEC /
+  QUALITY PASS, and a narrow second pass over the session-scoping rework could not
+  break it (both scenarios execution-verified).
 
 ## [1.5.2] — 2026-08-03
 

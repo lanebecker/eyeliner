@@ -184,6 +184,11 @@ class RecognitionLoop:
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
         self._pending_result: Optional[RawRecognitionResult] = None
         self._pending_count: int = 0
+        # REC-1 review: the session epoch the pending candidate was built under.
+        # A pending is void once a new session begins (a needle lift bumps
+        # session_epoch via clear()), so a leftover count can't let a single
+        # spurious hit confirm a stale track into the NEXT record's session.
+        self._pending_epoch: int = 0
         self._miss_count: int = 0
         # Consecutive unconfirmable non-None results (alternating matches that
         # never reach confirmation_required).  Purely diagnostic — it leaves a
@@ -299,9 +304,38 @@ class RecognitionLoop:
         ``audio_epoch`` and fails safe, so the worst case is the guard discarding
         live commits (loud missed identifications), never a silent bad write.
         """
-        if result is None:
+        # REC-1 review: void the pending candidate across a SESSION boundary. The
+        # pending (result + count) lives on this loop, not the session; a needle
+        # lift ends the session and bumps `session_epoch` (clear()), and — now that
+        # a miss no longer zeroes the pending (below) — a leftover count would
+        # otherwise let a SINGLE spurious hit of the previous record confirm it into
+        # the NEW record's session (a phantom now-playing card + play count +
+        # scrobble the epoch guard can't catch, because the confirming audio is
+        # genuinely live). A chunk whose epoch differs from the pending's belongs to
+        # a different session, so the stale pending is discarded. Within a session
+        # the epoch is constant, so REC-1's accumulate-across-misses is unaffected.
+        # (`_pending_epoch` is intentionally NOT cleared here — it is only ever
+        # read while `_pending_result is not None`, and the sole site that sets
+        # the pending non-None re-tags the epoch on the same pass, so a stale
+        # epoch beside a None pending is inert.)
+        if self._pending_result is not None and epoch != self._pending_epoch:
             self._pending_result = None
             self._pending_count = 0
+
+        if result is None:
+            # REC-1: a None (unrecognized-audio) result carries NO recognition
+            # information — it must NOT discard the pending candidate. On vinyl,
+            # hit/miss/hit/miss is the normal failure mode (surface noise, a worn
+            # side); zeroing the pending here meant a track Shazam identified every
+            # OTHER chunk could never reach confirmation_required consecutive
+            # matches, so it never committed and _register_miss eventually latched
+            # the display to ERROR ("NO MATCH FOUND"). Leaving the pending
+            # untouched lets alternating matches of the SAME track still accumulate
+            # to a confirmation — a DIFFERENT non-None result still replaces the
+            # pending below, so genuine churn is unaffected. The miss still counts
+            # toward the ERROR threshold, but a real alternating identification now
+            # confirms first, so ERROR fires only when the side is genuinely
+            # unrecognizable (and a later reappearance still recovers).
             self._register_miss()
             return
 
@@ -315,6 +349,7 @@ class RecognitionLoop:
         else:
             self._pending_result = result
             self._pending_count = 1
+        self._pending_epoch = epoch  # tag the pending with its session (REC-1 review)
 
         if self._pending_count >= self.confirmation_required:
             log.info(f"Track confirmed: {result.artist} — {result.title}")
