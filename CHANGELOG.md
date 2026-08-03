@@ -265,6 +265,28 @@ same implement → RED test → mutation-check → cold-review discipline.
   shutdown-deadline work stays scoped to CRIT-3 (Wave 2). RED-first; all four
   dispatch sites, the dedicated-pool selection, the thread prefix, and the
   drain→close ordering are mutation-pinned; cold review SPEC / QUALITY PASS.
+- **An album-split finalize no longer loses the previous record's Play Count
+  credit on a transient write failure (#163 — MEDIUM).** `_finalize_session`
+  latched `credited = True` BEFORE the increment await (a deliberate B-8
+  double-increment guard) while the session was already detached — so if the
+  Discogs write failed (a transient 500 / 429 / network drop, which
+  `increment_play_count` catches and returns False), the completed play was
+  marked credited, detached, and never retried. Reproduced RED-first: a fast swap
+  to a new record before the silence threshold triggers the album split, which
+  finalizes the previous session; the increment returns False and its play is
+  silently lost. `PlaySession` now separates the "in-flight" latch (`crediting` /
+  `loving`, set BEFORE the await to preserve the B-8 / B-23 re-entrancy guard)
+  from the "committed" flag (`credited` / `loved`, set only AFTER the write
+  lands), and the increment and the Last.fm love are each bounded-retried
+  (3 attempts, 1s + 2s backoff — short so it fits the shutdown drain window and
+  keeps the album-split lock-hold small). `update_last_played` stays a single
+  attempt: it never had the false-latch bug (it always ran exactly once), it is
+  self-correcting on the next play (META-7), and retrying it would fight the
+  STAB-2 deliberate clock-skip. RED-first; commit-on-success, both in-flight
+  guards, the retry bound, and early-return-on-success are mutation-pinned; cold
+  review SPEC / QUALITY PASS (one LOW liveness note — the split-path retry runs
+  under the lifecycle lock, structurally resolved by finalizing outside it,
+  CONC-2 / #96 — documented, not data loss).
 
 ---
 

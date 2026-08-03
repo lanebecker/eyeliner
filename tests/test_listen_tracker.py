@@ -305,13 +305,89 @@ async def test_end_session_with_no_session_does_not_crash():
 
 @pytest.mark.asyncio
 async def test_increment_play_count_returning_false_does_not_raise():
-    """Discogs API returning failure should log a warning but not crash."""
+    """Discogs API returning failure should log a warning but not crash. Since
+    #163 the failed write is bounded-retried, so it is attempted (not once but)
+    _FINALIZE_WRITE_ATTEMPTS times — still without raising."""
+    from src.tracking.listen_tracker import _FINALIZE_WRITE_ATTEMPTS
     tracker, writer = make_tracker(increment_play_count_return=False)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik"))
     # Should complete without raising
-    await tracker._end_session()
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
+        await tracker._end_session()
+    assert writer.increment_play_count.call_count == _FINALIZE_WRITE_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# #163 — album-split finalize write failure must not lose the credit. The old
+# code latched `credited = True` BEFORE the increment await and detached the
+# session before finalize, so a transient write failure (increment returns False)
+# left the completed play marked credited, detached, and never retried. The fix
+# splits in-flight (`crediting`) from committed (`credited`, set only on success)
+# and bounded-retries the write.
+# ---------------------------------------------------------------------------
+from src.tracking.listen_tracker import _FINALIZE_WRITE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_failed_credit_is_not_committed_and_is_bounded_retried(caplog):
+    """A transient increment failure (returns False on every attempt) must NOT
+    latch `credited`, and the write must be retried _FINALIZE_WRITE_ATTEMPTS times
+    — reproduces the #163 loss (old code: credited=True after 1 attempt)."""
+    import logging
+    tracker, writer = make_tracker(increment_play_count_return=False)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()), \
+         caplog.at_level(logging.ERROR):
+        await tracker._end_session()
+    assert session.credited is False                    # not falsely committed
+    assert session.crediting is True                    # in-flight latch was set (B-8)
+    assert writer.increment_play_count.call_count == _FINALIZE_WRITE_ATTEMPTS
+    assert "LOST" in caplog.text                         # the loss is logged loudly
+
+
+@pytest.mark.asyncio
+async def test_credit_is_committed_when_a_retry_eventually_succeeds():
+    """Increment fails twice then succeeds → committed, and it stopped retrying
+    the moment it landed (no wasted attempt after success)."""
+    tracker, writer = make_tracker()
+    writer.increment_play_count.side_effect = [False, False, True]
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
+        await tracker._end_session()
+    assert session.credited is True
+    assert writer.increment_play_count.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_successful_credit_does_not_retry():
+    """The happy path is unchanged: a first-attempt success commits and never
+    issues a second increment."""
+    tracker, writer = make_tracker(increment_play_count_return=True)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
+        await tracker._end_session()
+    assert session.credited is True
     writer.increment_play_count.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reentrant_finalize_while_crediting_does_not_double_increment():
+    """B-8 preserved: a finalize of a session whose credit is already in flight
+    (crediting latched) must NOT issue a second increment."""
+    tracker, writer = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    session.crediting = True   # a concurrent finalize already owns the credit
+    await tracker._finalize_session(session)
+    writer.increment_play_count.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +619,7 @@ async def test_divergence_warning_when_last_played_lands_but_playcount_fails(cap
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik"))
     with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()), \
          patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
         await tracker._end_session()
     diverged = [r for r in caplog.records if "DIVERGED" in r.getMessage()]
@@ -584,6 +661,7 @@ async def test_no_divergence_warning_when_both_writes_fail(caplog):
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik"))
     with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()), \
          patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
         await tracker._end_session()
     assert not any("DIVERGED" in r.getMessage() for r in caplog.records)
@@ -845,6 +923,67 @@ async def test_love_not_repeated_on_double_finalize_fallback_album():
 
     lastfm.love.assert_called_once()           # the `loved` flag held the line
     assert session.loved is True
+
+
+# ---------------------------------------------------------------------------
+# #163 (love side) — the Last.fm love gets the same in-flight/committed +
+# bounded-retry treatment as the credit: `loving` is latched before the await
+# (B-23 re-entrancy), `loved` is committed only after the love lands, and a
+# transient failure is retried instead of silently latched.
+# ---------------------------------------------------------------------------
+
+def _make_love_tracker(love_return=True, love_side_effect=None):
+    writer = make_writer_mock()
+    lastfm = MagicMock()
+    lastfm.love_on_completion = True
+    if love_side_effect is not None:
+        lastfm.love = MagicMock(side_effect=love_side_effect)
+    else:
+        lastfm.love = MagicMock(return_value=love_return)
+    return ListenTracker(writer, lastfm), lastfm
+
+
+@pytest.mark.asyncio
+async def test_failed_love_is_not_committed_and_is_bounded_retried():
+    """A transient Last.fm love failure must NOT latch `loved`, and must be
+    retried _FINALIZE_WRITE_ATTEMPTS times."""
+    from src.tracking.listen_tracker import _FINALIZE_WRITE_ATTEMPTS
+    tracker, lastfm = _make_love_tracker(love_return=False)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
+        await tracker._end_session()
+    assert session.loved is False
+    assert session.loving is True
+    assert lastfm.love.call_count == _FINALIZE_WRITE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_love_is_committed_when_a_retry_succeeds():
+    """Love fails once then succeeds → committed, and it stopped retrying on the
+    success."""
+    tracker, lastfm = _make_love_tracker(love_side_effect=[False, True])
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
+        await tracker._end_session()
+    assert session.loved is True
+    assert lastfm.love.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reentrant_finalize_while_loving_does_not_double_love():
+    """B-23 preserved: a finalize of a session whose love is already in flight
+    (loving latched) must NOT issue a second love."""
+    tracker, lastfm = _make_love_tracker(love_return=True)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    session.loving = True   # a concurrent finalize already owns the love
+    await tracker._finalize_session(session)
+    lastfm.love.assert_not_called()
 
 
 @pytest.mark.asyncio

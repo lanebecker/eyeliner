@@ -302,15 +302,27 @@ class PlaySession:
     # DB-resolved (nothing latched → no difference detected → record 2 could
     # be phantom-credited with record 1's completed play).
     last_release_id: Optional[int] = None
-    # Set True once this session's Play Count has been credited, so a re-entrant
-    # end (the B-2 race, or a split misfire that finalizes the same session
-    # twice) cannot double-increment the same release (B-8).
+    # Set True once this session's Play Count has actually been credited
+    # (the write LANDED), so a re-entrant end (the B-2 race, or a split misfire
+    # that finalizes the same session twice) cannot double-increment the same
+    # release (B-8).  #163: this is the "committed" flag — set only AFTER the
+    # write succeeds, NOT before the await, so a transient write failure leaves it
+    # False and the completed play stays eligible for the bounded finalize retry
+    # instead of being silently marked done.
     credited: bool = False
-    # Set True once this session's last track has been Loved on Last.fm, so the
-    # same re-entrant/double-finalize paths can't double-love it (B-23).  Tracked
-    # separately from `credited` because loving runs independently of the Discogs
-    # credit (a Discogs failure doesn't gate it).
+    # #163: the "in-flight" latch, SEPARATE from `credited`.  Set True the moment
+    # the Play Count write BEGINS (before any await), so a re-entrant finalize
+    # that slips in mid-write bails instead of issuing a second increment — the
+    # B-8 guarantee, now preserved WITHOUT prematurely recording success.
+    crediting: bool = False
+    # Set True once this session's last track has actually been Loved on Last.fm
+    # (the love LANDED), so the same re-entrant/double-finalize paths can't
+    # double-love it (B-23).  Tracked separately from `credited` because loving
+    # runs independently of the Discogs credit (a Discogs failure doesn't gate
+    # it).  #163: like `credited`, set only AFTER the love succeeds.
     loved: bool = False
+    # #163: the love-side "in-flight" latch — the B-23 analogue of `crediting`.
+    loving: bool = False
 
     def log_track(self, track: TrackMetadata):
         """Record a newly identified track in this session."""
