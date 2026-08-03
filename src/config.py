@@ -249,6 +249,18 @@ class LastFmConfig:
         )
 
 
+# CRIT-2: the recognition backends this build actually IMPLEMENTS — the allowed
+# values for ``recognition.backend``. config.example.yaml advertises "acrcloud"
+# and "audd" as future options, but only "shazamio" is built; selecting an
+# unimplemented one used to pass config's type check and then raise ValueError
+# from RecognitionLoop.__init__ (constructed outside main()'s try/except) into a
+# systemd crash loop. This is the SINGLE SOURCE OF TRUTH: RecognitionConfig
+# validates against it here, and recognizer._init_backend constructs against it,
+# so the two can never drift. Add a backend by adding its name here AND a
+# constructor branch in _init_backend.
+IMPLEMENTED_BACKENDS = frozenset({"shazamio"})
+
+
 @dataclass(frozen=True)
 class RecognitionConfig:
     """``[recognition]`` — backend selection + confirmation/miss thresholds."""
@@ -273,6 +285,13 @@ class RecognitionConfig:
                f"  • {s}.confirmation_required: must be >= 1, got {confirmation_required!r}", errors)
         _check(error_after_misses is None or error_after_misses >= 1,
                f"  • {s}.error_after_misses: must be >= 1, got {error_after_misses!r}", errors)
+        # CRIT-2: a type-valid but UNIMPLEMENTED backend (acrcloud/audd) would pass
+        # here and then crash RecognitionLoop.__init__ outside main()'s try/except.
+        # (A type error already fell back to the valid "shazamio" default, so this
+        # never double-reports.)
+        _check(backend is None or backend in IMPLEMENTED_BACKENDS,
+               f"  • {s}.backend: must be one of {sorted(IMPLEMENTED_BACKENDS)}, "
+               f"got {backend!r}", errors)
 
         return cls(
             poll_interval_seconds=poll_interval_seconds,

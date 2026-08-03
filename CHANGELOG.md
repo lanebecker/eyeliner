@@ -54,6 +54,21 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   and the type-error None-guard are mutation-pinned; cold review SPEC / QUALITY
   PASS — the overlap deviation independently execution-verified as more correct
   than the finding.
+- **An unimplemented `recognition.backend` is now a friendly startup error, not a
+  crash loop (CRIT-2, #93 — HIGH).** Only `shazamio` is built, but
+  `config.example.yaml` advertised `acrcloud`/`audd` as options; selecting one
+  passed config's type check and then raised `ValueError` from
+  `RecognitionLoop.__init__` — constructed OUTSIDE main()'s only try/except (which
+  wraps `load_config` alone) — exiting with a raw traceback into a systemd crash
+  loop, exactly the CRIT-1 class. A new `IMPLEMENTED_BACKENDS` frozenset in
+  `config.py` is the single source of truth: `RecognitionConfig` validates
+  `backend` against it (landing in the same aggregated `ConfigError`), and
+  `recognizer._init_backend` constructs against the same set, so config and
+  construction can never drift. The example config's comment no longer advertises
+  the unimplemented backends as selectable. RED-first (the accepted-then-crashed
+  backend reproduced); the membership check, the set contents, and the
+  direct-construction backstop are mutation-pinned; cold review SPEC / QUALITY
+  PASS (no circular import, no drift, type-safe).
 
 ## [1.5.2] — 2026-08-03
 

@@ -334,3 +334,42 @@ def test_domain_check_does_not_raise_on_an_upstream_type_error():
     with pytest.raises(ConfigError) as exc:
         AppConfig.from_dict(raw)   # must be ConfigError, not TypeError
     assert "audio.sample_rate" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# CRIT-2 — recognition.backend must name an IMPLEMENTED backend. config.example
+# advertises acrcloud/audd, but only shazamio is built; an unimplemented value
+# used to sail through config and raise ValueError from RecognitionLoop.__init__
+# — constructed OUTSIDE main()'s only try/except → raw traceback → crash loop.
+# It must now be one friendly, aggregated ConfigError like any other bad value.
+# ---------------------------------------------------------------------------
+
+def test_unimplemented_backend_is_rejected():
+    raw = _valid_raw()
+    raw["recognition"]["backend"] = "acrcloud"   # advertised but not implemented
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert "recognition.backend" in str(exc.value)
+
+
+def test_default_backend_is_valid_when_absent():
+    raw = _valid_raw()
+    raw["recognition"].pop("backend", None)      # absent → default "shazamio"
+    cfg = AppConfig.from_dict(raw)
+    assert cfg.recognition.backend == "shazamio"
+
+
+def test_explicit_shazamio_backend_is_valid():
+    raw = _valid_raw()
+    raw["recognition"]["backend"] = "shazamio"
+    assert AppConfig.from_dict(raw).recognition.backend == "shazamio"
+
+
+def test_unimplemented_backend_aggregates_with_other_errors():
+    raw = _valid_raw()
+    raw["recognition"]["backend"] = "audd"
+    raw["audio"]["sample_rate"] = 0
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    msg = str(exc.value)
+    assert "recognition.backend" in msg and "audio.sample_rate" in msg
