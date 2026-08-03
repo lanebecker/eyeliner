@@ -52,7 +52,9 @@ lastfm:
   love_on_completion: false
 
 recognition:
-  # Options: "shazamio" | "acrcloud" | "audd"
+  # Currently the only implemented backend is "shazamio". ("acrcloud" and "audd"
+  # are planned — the sub-sections below reserve their config — but selecting
+  # them is rejected at startup until they are built.)
   backend: "shazamio"
   poll_interval_seconds: 30
   # How many consecutive matching results before we commit a track change

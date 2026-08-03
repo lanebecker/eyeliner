@@ -12,6 +12,7 @@ from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 import numpy as np
 
+from src.config import IMPLEMENTED_BACKENDS
 from src.state.player_state import PlayerStatus
 
 if TYPE_CHECKING:
@@ -192,10 +193,26 @@ class RecognitionLoop:
         self.backend: RecognizerBackend = self._init_backend()
 
     def _init_backend(self) -> RecognizerBackend:
+        # CRIT-2: config validation (RecognitionConfig, against the shared
+        # IMPLEMENTED_BACKENDS set) rejects an unimplemented backend BEFORE we get
+        # here, so in the normal flow this raise is unreachable — it is a
+        # defensive backstop for direct construction (tests, or a future caller
+        # that bypasses config). Validating against the same set keeps config and
+        # construction from ever drifting.
+        if self.backend_name not in IMPLEMENTED_BACKENDS:
+            raise ValueError(
+                f"Unknown recognition backend: {self.backend_name!r} "
+                f"(implemented: {sorted(IMPLEMENTED_BACKENDS)})"
+            )
         if self.backend_name == "shazamio":
             return ShazamIOBackend()
-        # TODO: add AcrcloudBackend, AuddBackend
-        raise ValueError(f"Unknown recognition backend: '{self.backend_name}'")
+        # A name that is in IMPLEMENTED_BACKENDS but has no constructor branch
+        # above is a programming error — someone widened the set but not this
+        # method. (TODO: add AcrcloudBackend, AuddBackend when implemented.)
+        raise ValueError(  # pragma: no cover
+            f"recognition backend {self.backend_name!r} is allowed but has no "
+            f"constructor in _init_backend."
+        )
 
     async def enqueue(self, audio: np.ndarray, sample_rate: int):
         """Called by AudioCapture to hand off a chunk for recognition.

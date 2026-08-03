@@ -52,6 +52,18 @@ def make_loop(confirmation_required=2):
     return loop, state, on_confirmed
 
 
+def test_init_backend_rejects_an_unimplemented_backend():
+    """CRIT-2 backstop: even if config validation is bypassed (direct
+    construction), _init_backend rejects a backend not in the shared
+    IMPLEMENTED_BACKENDS set — it never silently constructs a missing backend,
+    and it validates against the SAME set config does (no drift)."""
+    from src.config import IMPLEMENTED_BACKENDS
+    assert "acrcloud" not in IMPLEMENTED_BACKENDS   # sanity: advertised, not built
+    config = make_recognition_config(backend="acrcloud")
+    with pytest.raises(ValueError, match="Unknown recognition backend"):
+        RecognitionLoop(config, MagicMock(), MagicMock())
+
+
 # ---------------------------------------------------------------------------
 # Single result never commits
 # ---------------------------------------------------------------------------
