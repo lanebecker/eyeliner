@@ -201,27 +201,49 @@ async def test_none_result_does_not_commit():
 
 
 @pytest.mark.asyncio
-async def test_none_result_clears_pending_state():
+async def test_none_result_preserves_the_pending_candidate():
+    """REC-1: a None miss carries NO recognition information, so it must NOT
+    discard the pending candidate. On vinyl a hit/miss/hit pattern is the normal
+    failure mode (surface noise, a worn side); zeroing the pending on every miss
+    meant a repeatedly-identified track could never accumulate to confirmation."""
     loop, state, _ = make_loop(confirmation_required=2)
     state.current_raw = None
 
-    await loop._handle_result(make_raw())  # count = 1
-    await loop._handle_result(None)        # should reset
+    await loop._handle_result(make_raw())  # pending = A, count = 1
+    await loop._handle_result(None)        # miss — pending must be KEPT
 
-    assert loop._pending_count == 0
-    assert loop._pending_result is None
+    assert loop._pending_count == 1
+    assert loop._pending_result is not None
 
 
 @pytest.mark.asyncio
-async def test_none_after_one_then_two_matching_does_not_commit():
-    """None mid-sequence breaks the streak; must start fresh."""
+async def test_none_between_matching_results_still_confirms():
+    """REC-1: hit / miss / hit — the normal vinyl failure mode — must still reach
+    confirmation. The intervening None no longer resets the streak, so the second
+    matching result takes the pending count to confirmation_required and commits."""
     loop, state, on_confirmed = make_loop(confirmation_required=2)
     state.current_raw = None
 
     await loop._handle_result(make_raw("So What"))  # count = 1
-    await loop._handle_result(None)                  # reset
-    await loop._handle_result(make_raw("So What"))  # count = 1 again (not 2)
+    await loop._handle_result(None)                  # miss — pending kept
+    await loop._handle_result(make_raw("So What"))  # count = 2 → confirm
 
+    on_confirmed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_different_track_still_resets_the_pending_across_a_miss():
+    """The miss no longer resets the pending, but a DIFFERENT non-None result
+    still does — genuine churn (two records bleeding together) must not confirm."""
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
+    state.current_raw = None
+
+    await loop._handle_result(make_raw("So What"))     # pending = A, count = 1
+    await loop._handle_result(None)                     # miss — pending kept (A)
+    await loop._handle_result(make_raw("Blue in Green"))  # different → pending = B, count = 1
+    await loop._handle_result(make_raw("So What"))     # A again → pending = A, count = 1
+
+    assert loop._pending_count == 1
     on_confirmed.assert_not_awaited()
 
 

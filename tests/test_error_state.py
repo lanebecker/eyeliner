@@ -187,6 +187,104 @@ async def test_non_confirming_hit_no_longer_wipes_miss_streak():
     assert state.status == PlayerStatus.ERROR
 
 
+@pytest.mark.asyncio
+async def test_rec1_alternating_hit_miss_confirms_instead_of_erroring():
+    """REC-1 (the finding's repro): a track Shazam identifies on ALTERNATING
+    chunks — [hit, miss] repeated, the normal vinyl failure mode — must confirm
+    and go PLAYING, not have the pending wiped by each miss and latch the display
+    to ERROR (NO MATCH FOUND). Uses a real PlayerState so the status transitions."""
+    from tests.test_recognizer import make_raw
+    committed = []
+    config = make_recognition_config(confirmation_required=2, error_after_misses=6)
+    state = PlayerState()
+
+    async def commit(r, audio_epoch=0):
+        committed.append(r)
+        state.set_track(MagicMock())
+        state.set_raw(r)
+        return True
+
+    with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
+        loop = RecognitionLoop(config, state, commit)
+    state.set_status(PlayerStatus.LISTENING)
+
+    # [Track A, None] × 6 — Shazam identifies Track A every other chunk.
+    for _ in range(6):
+        await loop._handle_result(make_raw("Track A"))
+        await loop._handle_result(None)
+
+    assert committed, "the alternating-identified track never confirmed (REC-1)"
+    assert state.status == PlayerStatus.PLAYING
+    assert state.status != PlayerStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_rec1_pending_does_not_leak_across_a_session_boundary():
+    """REC-1 review: the pending candidate must NOT survive a needle lift. A track
+    identified once in session 1 and left pending when the needle lifts (clear()
+    bumps the session epoch) must not let a SINGLE spurious hit in session 2
+    confirm a phantom now-playing card / play count / scrobble for the leftover
+    track while a DIFFERENT record is playing."""
+    from tests.test_recognizer import make_raw
+    committed = []
+    config = make_recognition_config(confirmation_required=2, error_after_misses=6)
+    state = PlayerState()
+
+    async def commit(r, audio_epoch=0):
+        committed.append(r)
+        state.set_track(MagicMock())
+        state.set_raw(r)
+        return True
+
+    with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
+        loop = RecognitionLoop(config, state, commit)
+
+    state.set_status(PlayerStatus.LISTENING)
+    A = make_raw("Leftover Track A")
+    await loop._handle_result(A, epoch=state.session_epoch)  # session 1: A pending, count 1
+    assert loop._pending_count == 1
+
+    state.clear()                             # needle lift → session epoch bumps
+    e2 = state.session_epoch
+    state.set_status(PlayerStatus.LISTENING)  # record 2 begins
+    await loop._handle_result(A, epoch=e2)    # ONE spurious A while record 2 plays
+
+    assert committed == [], "a leftover pending phantom-committed into the next session"
+    assert loop._pending_count == 1           # A is now a FRESH session-2 candidate (needs one more)
+
+
+@pytest.mark.asyncio
+async def test_new_session_confirms_normally_after_the_boundary_reset():
+    """REC-1 review: after the session-boundary reset voids a stale pending, the
+    NEW session must still confirm normally — two matching hits at the new epoch
+    commit. Guards against over-resetting every new-session chunk (which is what
+    happens if the pending is not re-tagged with the new session's epoch)."""
+    from tests.test_recognizer import make_raw
+    committed = []
+    config = make_recognition_config(confirmation_required=2, error_after_misses=6)
+    state = PlayerState()
+
+    async def commit(r, audio_epoch=0):
+        committed.append(r)
+        state.set_track(MagicMock())
+        state.set_raw(r)
+        return True
+
+    with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
+        loop = RecognitionLoop(config, state, commit)
+
+    state.set_status(PlayerStatus.LISTENING)
+    await loop._handle_result(make_raw("Old A"), epoch=state.session_epoch)  # session-1 leftover
+    state.clear()
+    e2 = state.session_epoch
+    state.set_status(PlayerStatus.LISTENING)
+    # session 2: a NEW track identified twice at the new epoch → must confirm.
+    await loop._handle_result(make_raw("New B"), epoch=e2)
+    await loop._handle_result(make_raw("New B"), epoch=e2)
+
+    assert [r.title for r in committed] == ["New B"]
+
+
 # ---------------------------------------------------------------------------
 # Boot label progression
 # ---------------------------------------------------------------------------
