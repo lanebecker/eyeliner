@@ -167,6 +167,33 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   handler are each mutation-pinned; cold review SPEC / QUALITY PASS (clean
   cancellation at every await point, no lost behavior). The recognize call still
   has no per-call timeout — that is the separate PCONC-2 (#100), out of scope here.
+- **Shutdown no longer hangs on the interpreter's default thread pool (CRIT-3,
+  #98 — MEDIUM).** After `main()` returned, `asyncio.run()` on Python 3.11 awaits
+  `loop.shutdown_default_executor()`, a `shutdown(wait=True)` join with no timeout.
+  Every non-Discogs blocking call funnelled through that default pool — Last.fm
+  scrobble/love, cover download, palette extraction, MusicBrainz cover-art lookup,
+  WAV encode — so a backed-up queue of them (side A's credit in flight over a slow
+  link, side B's scrobbles behind it) made process exit wait for the WHOLE queue
+  to run; with no `TimeoutStopSec` in the documented unit, systemd SIGKILLed at its
+  90s default, which is exactly when CONC-1's half-written collection update
+  becomes permanent. The app now OWNS that pool: `install_io_executor` creates a
+  bounded `ThreadPoolExecutor` and makes it the loop's default (so all six
+  `run_in_executor(None, …)` sites route to it; the Discogs writes keep their own
+  dedicated pool, #61), and `run_pipeline`'s finally shuts it down with
+  `wait=False, cancel_futures=True` as the last teardown step — after `drain()`,
+  so an in-flight credit's Last.fm love isn't dispatched to a closed pool. That
+  drops QUEUED blocking work at exit instead of waiting on it (measured: a
+  backed-up queue that made shutdown take 6.0s now takes 2.0s). A call already
+  RUNNING on a worker can't be interrupted (Python can't kill a thread), so the
+  documented systemd unit gains `TimeoutStopSec=30` as the backstop. RED-first
+  (run_pipeline didn't own the pool's shutdown); the shutdown call, its
+  `cancel_futures`/`wait` flags, and the `set_default_executor` routing are each
+  mutation-pinned (the routing via a new `install_io_executor` extracted for
+  testability); cold review SPEC / QUALITY PASS — routing, drain-then-close
+  ordering, double-shutdown idempotence, and no closed-pool dispatch all
+  execution-verified. The owned pool is sized to the interpreter default's width
+  (8) rather than narrower, so the recognition-hot-path WAV encode is never queued
+  behind a burst of slow network I/O.
 
 ## [1.5.2] — 2026-08-03
 
