@@ -54,6 +54,25 @@ _CURRENT_SESSION = object()
 # stay well within systemd's default 90s stop timeout even on a stuck network.
 _SHUTDOWN_DRAIN_SECONDS = 10.0
 
+# #163: an end-of-session Discogs credit (or Last.fm love) that fails transiently
+# is retried a bounded number of times before the session is discarded. An
+# album-split finalize detaches the session, so if the FIRST attempt fails there
+# is no later chance to credit the completed play — the old code latched
+# `credited` BEFORE the write and lost the credit on any failure.
+#
+# Bounded and SHORT for two reasons. First, the attempts must fit within the
+# _SHUTDOWN_DRAIN_SECONDS window on shutdown (1s + 2s = 3s of backoff across 3
+# attempts) and never spin. Second — on the album-split path — _finalize_session
+# runs while on_track_identified still holds the lifecycle lock, so this backoff
+# is held UNDER that lock and delays the incoming record's session start. That is
+# a pure latency cost, NOT data loss: CONC-6's is_stale predicate still prevents
+# any phantom credit, the event loop is not blocked (sleep + writer.run yield),
+# and the delay self-resolves when the lock releases. The structural fix that
+# would move the retry off the lock is finalizing OUTSIDE it (CONC-2, #96); until
+# then the short backoff keeps that lengthened lock window small.
+_FINALIZE_WRITE_ATTEMPTS = 3
+_FINALIZE_RETRY_BACKOFF_SECONDS = 1.0
+
 
 class ListenTracker:
     """Manages play sessions and triggers Discogs field updates on album completion."""
@@ -210,72 +229,22 @@ class ListenTracker:
         )
 
         if session.potential_last_track and session.album_release_id:
-            # Mark credited *before* the await so a re-entrant finalize that
-            # slips in mid-write sees the flag and bails instead of issuing a
-            # second increment for the same release (B-8).
-            session.credited = True
-            log.info(
-                f"Last track confirmed for release {session.album_release_id} — "
-                f"incrementing Play Count and updating Last Played in Discogs."
-            )
-            success = await self.writer.run(
-                self.writer.increment_play_count,
-                session.album_release_id,
-                session.album_instance_id,
-            )
-            if success:
-                log.info("✅ Discogs Play Count incremented successfully.")
+            if session.crediting:
+                # A concurrent/re-entrant finalize already owns this session's
+                # credit — in flight, or having already exhausted its bounded
+                # retries. Never issue a second increment for the same release
+                # (B-8). The old code enforced this by latching `credited` before
+                # the await, which is exactly what lost the credit on failure
+                # (#163); the in-flight `crediting` latch preserves the guarantee
+                # without prematurely recording success.
+                log.debug("Credit already in flight for this session — skipping (B-8).")
             else:
-                log.warning("⚠ Failed to increment Discogs Play Count.")
-
-            if self.writer.last_played_field_name:
-                last_played_success = await self.writer.run(
-                    self.writer.update_last_played,
-                    session.album_release_id,
-                    session.album_instance_id,
-                )
-                if last_played_success:
-                    log.info("✅ Discogs Last Played updated successfully.")
-                elif not clock_is_trustworthy():
-                    # A pre-NTP clock made update_last_played skip the write (it
-                    # already logged its own WARNING).  A deliberate skip is NOT a
-                    # failure, so don't ALSO report it as one (STAB-2).  A False
-                    # return with an untrustworthy clock is always the skip path —
-                    # the writer's gate short-circuits before the POST — never a
-                    # real write failure, so this can't mask a genuine error.
-                    pass
-                else:
-                    log.warning("⚠ Failed to update Discogs Last Played.")
-
-                # META-7: the two writes are independent POSTs and the session is
-                # destroyed right after, so if EXACTLY ONE lands the record is left
-                # inconsistent (e.g. Play Count incremented but Last Played stale)
-                # with no retry until it plays again. The two per-write logs above
-                # don't say they belong together, so surface ONE explicit
-                # divergence line naming the item.
-                #
-                # The trustworthy-clock gate excludes the STAB-2 case: on a pre-NTP
-                # boot the writer DELIBERATELY skips Last Played (it defers rather
-                # than fails, and has already WARNed to that effect), so counting it
-                # as a divergence would cry wolf on every album finished before NTP
-                # sync. This is a SECOND, independent clock read — not literally the
-                # writer's decision — so only an NTP step across the 2026 sanity
-                # floor in the gap between that write and this check could desync the
-                # two; that does not happen in steady state. Genuine post-sync
-                # failures (a 429 on the second POST, a dropped connection) run on a
-                # trustworthy clock and still fire. Both disagreement directions are
-                # reported: Play-Count-only (Last Played failed) AND Last-Played-only
-                # (the increment failed but the date write landed).
-                if success != last_played_success and clock_is_trustworthy():
-                    log.warning(
-                        "⚠ Discogs writes DIVERGED for release %s / instance %s: "
-                        "Play Count %s but Last Played %s — the collection item is "
-                        "now inconsistent and nothing will retry it until this "
-                        "record is played again.",
-                        session.album_release_id, session.album_instance_id,
-                        "was incremented" if success else "did NOT increment",
-                        "was updated" if last_played_success else "did NOT update",
-                    )
+                # #163: latch IN-FLIGHT before any await (a re-entrant finalize
+                # bails on the guard above) — but commit `credited` only AFTER the
+                # write lands, inside the helper, so a transient failure stays
+                # uncommitted and is bounded-retried instead of silently lost.
+                session.crediting = True
+                await self._credit_completed_album(session)
 
         elif session.potential_last_track and not session.album_release_id:
             log.info(
@@ -290,27 +259,155 @@ class ListenTracker:
 
         # Last.fm: love the last track if the full side completed and love is enabled.
         # Runs independently of Discogs — a Discogs failure doesn't prevent this.
-        # Gated on (and latching) session.loved so a re-entrant/double finalize
-        # can't love the same track twice (B-23) — the love-side analogue of the
-        # B-8 `credited` guard above.
+        # Gated on session.loved (committed) AND session.loving (in-flight) so a
+        # re-entrant/double finalize can't love the same track twice (B-23) — the
+        # love-side analogue of the B-8 credited/crediting guard above.
         if (
             session.potential_last_track
             and not session.loved
+            and not session.loving
             and self.lastfm
             and self.lastfm.love_on_completion
         ):
             last_track = session.identified_tracks[-1] if session.identified_tracks else None
             if last_track:
-                # Latch before the await so a re-entrant finalize bails instead of
-                # issuing a second love for the same track.
-                session.loved = True
-                love_success = await asyncio.get_running_loop().run_in_executor(
-                    None, self.lastfm.love, last_track
+                # #163: latch IN-FLIGHT before the await (a re-entrant finalize
+                # bails on the guard above), but commit `loved` only AFTER the love
+                # lands. The love is bounded-retried like the credit, so a
+                # transient Last.fm failure doesn't silently latch loved=True and
+                # lose the love with no retry.
+                session.loving = True
+                love_success = await self._finalize_write_with_retry(
+                    "Last.fm love",
+                    lambda: asyncio.get_running_loop().run_in_executor(
+                        None, self.lastfm.love, last_track
+                    ),
                 )
                 if love_success:
+                    session.loved = True
                     log.info(f"✅ Last.fm loved: {last_track.artist} — {last_track.title}")
                 else:
-                    log.warning("⚠ Failed to love track on Last.fm.")
+                    log.warning(
+                        "⚠ Failed to love track on Last.fm after %d attempts.",
+                        _FINALIZE_WRITE_ATTEMPTS,
+                    )
+
+    async def _finalize_write_with_retry(self, label: str, attempt) -> bool:
+        """Run one end-of-session write with a BOUNDED retry (#163).
+
+        ``attempt`` is a zero-arg callable returning a fresh awaitable that
+        performs ONE write and resolves truthy on success. The write is retried
+        up to ``_FINALIZE_WRITE_ATTEMPTS`` times — treating BOTH a falsy result
+        and a raised exception as a failure — with a short linear backoff between
+        attempts. Returns True the instant one attempt lands, False if all fail.
+
+        This exists because an album-split finalize DETACHES the session before
+        crediting it: a first-attempt failure would otherwise be the ONLY attempt,
+        losing the completed play's Play Count credit (or its Last.fm love) with
+        nothing to retry it (#163). The caller commits its latch (``credited`` /
+        ``loved``) only when this returns True. The bound keeps the total backoff
+        (1s + 2s = 3s) inside the shutdown drain window (_SHUTDOWN_DRAIN_SECONDS)
+        and — on the album-split path, where this runs under the lifecycle lock —
+        keeps that lengthened lock window small (see the constants above).
+        """
+        for n in range(1, _FINALIZE_WRITE_ATTEMPTS + 1):
+            try:
+                if await attempt():
+                    return True
+                log.warning("%s attempt %d/%d failed.", label, n, _FINALIZE_WRITE_ATTEMPTS)
+            except Exception as e:
+                log.warning(
+                    "%s attempt %d/%d raised: %s", label, n, _FINALIZE_WRITE_ATTEMPTS, e
+                )
+            if n < _FINALIZE_WRITE_ATTEMPTS:
+                await asyncio.sleep(_FINALIZE_RETRY_BACKOFF_SECONDS * n)
+        return False
+
+    async def _credit_completed_album(self, session: PlaySession):
+        """Credit a completed album: increment Play Count (bounded retry, #163)
+        and update Last Played. The caller has already set ``session.crediting``
+        (in-flight) after confirming it was not already set, so this runs exactly
+        once per session. Commits ``session.credited`` ONLY when the increment
+        actually lands, leaving a transient failure uncommitted (and logged loud).
+        """
+        log.info(
+            f"Last track confirmed for release {session.album_release_id} — "
+            f"incrementing Play Count and updating Last Played in Discogs."
+        )
+        success = await self._finalize_write_with_retry(
+            "Discogs Play Count increment",
+            lambda: self.writer.run(
+                self.writer.increment_play_count,
+                session.album_release_id,
+                session.album_instance_id,
+            ),
+        )
+        if success:
+            session.credited = True  # committed ONLY after the write landed (#163)
+            log.info("✅ Discogs Play Count incremented successfully.")
+        else:
+            log.error(
+                "⚠ Discogs Play Count credit LOST for release %s / instance %s after "
+                "%d attempts — this completed play was NOT credited and nothing will "
+                "retry it. `credited` left False (not falsely latched).",
+                session.album_release_id, session.album_instance_id,
+                _FINALIZE_WRITE_ATTEMPTS,
+            )
+
+        if self.writer.last_played_field_name:
+            # update_last_played is a SINGLE attempt (NOT bounded-retried): a stale
+            # Last Played is small and self-correcting on the next play (META-7),
+            # and retrying it would tangle with the STAB-2 deliberate clock-skip (a
+            # pre-NTP boot returns False on purpose and must not be retried). It
+            # still inherits the crediting/committed split — it runs inside the
+            # in-flight-guarded credit path.
+            last_played_success = await self.writer.run(
+                self.writer.update_last_played,
+                session.album_release_id,
+                session.album_instance_id,
+            )
+            if last_played_success:
+                log.info("✅ Discogs Last Played updated successfully.")
+            elif not clock_is_trustworthy():
+                # A pre-NTP clock made update_last_played skip the write (it
+                # already logged its own WARNING).  A deliberate skip is NOT a
+                # failure, so don't ALSO report it as one (STAB-2).  A False
+                # return with an untrustworthy clock is always the skip path —
+                # the writer's gate short-circuits before the POST — never a
+                # real write failure, so this can't mask a genuine error.
+                pass
+            else:
+                log.warning("⚠ Failed to update Discogs Last Played.")
+
+            # META-7: the two writes are independent POSTs and the session is
+            # destroyed right after, so if EXACTLY ONE lands the record is left
+            # inconsistent (e.g. Play Count incremented but Last Played stale)
+            # with no retry until it plays again. The two per-write logs above
+            # don't say they belong together, so surface ONE explicit divergence
+            # line naming the item.
+            #
+            # The trustworthy-clock gate excludes the STAB-2 case: on a pre-NTP
+            # boot the writer DELIBERATELY skips Last Played (it defers rather
+            # than fails, and has already WARNed to that effect), so counting it
+            # as a divergence would cry wolf on every album finished before NTP
+            # sync. This is a SECOND, independent clock read — not literally the
+            # writer's decision — so only an NTP step across the 2026 sanity floor
+            # in the gap between that write and this check could desync the two;
+            # that does not happen in steady state. Genuine post-sync failures (a
+            # 429 on the second POST, a dropped connection) run on a trustworthy
+            # clock and still fire. Both disagreement directions are reported:
+            # Play-Count-only (Last Played failed) AND Last-Played-only (the
+            # increment failed but the date write landed).
+            if success != last_played_success and clock_is_trustworthy():
+                log.warning(
+                    "⚠ Discogs writes DIVERGED for release %s / instance %s: "
+                    "Play Count %s but Last Played %s — the collection item is "
+                    "now inconsistent and nothing will retry it until this "
+                    "record is played again.",
+                    session.album_release_id, session.album_instance_id,
+                    "was incremented" if success else "did NOT increment",
+                    "was updated" if last_played_success else "did NOT update",
+                )
 
     async def on_track_identified(
         self, track: TrackMetadata, is_stale: Optional[Callable[[], bool]] = None
