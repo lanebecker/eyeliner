@@ -249,6 +249,36 @@ class ListenTracker:
                 else:
                     log.warning("⚠ Failed to update Discogs Last Played.")
 
+                # META-7: the two writes are independent POSTs and the session is
+                # destroyed right after, so if EXACTLY ONE lands the record is left
+                # inconsistent (e.g. Play Count incremented but Last Played stale)
+                # with no retry until it plays again. The two per-write logs above
+                # don't say they belong together, so surface ONE explicit
+                # divergence line naming the item.
+                #
+                # The trustworthy-clock gate excludes the STAB-2 case: on a pre-NTP
+                # boot the writer DELIBERATELY skips Last Played (it defers rather
+                # than fails, and has already WARNed to that effect), so counting it
+                # as a divergence would cry wolf on every album finished before NTP
+                # sync. This is a SECOND, independent clock read — not literally the
+                # writer's decision — so only an NTP step across the 2026 sanity
+                # floor in the gap between that write and this check could desync the
+                # two; that does not happen in steady state. Genuine post-sync
+                # failures (a 429 on the second POST, a dropped connection) run on a
+                # trustworthy clock and still fire. Both disagreement directions are
+                # reported: Play-Count-only (Last Played failed) AND Last-Played-only
+                # (the increment failed but the date write landed).
+                if success != last_played_success and clock_is_trustworthy():
+                    log.warning(
+                        "⚠ Discogs writes DIVERGED for release %s / instance %s: "
+                        "Play Count %s but Last Played %s — the collection item is "
+                        "now inconsistent and nothing will retry it until this "
+                        "record is played again.",
+                        session.album_release_id, session.album_instance_id,
+                        "was incremented" if success else "did NOT increment",
+                        "was updated" if last_played_success else "did NOT update",
+                    )
+
         elif session.potential_last_track and not session.album_release_id:
             log.info(
                 "Last track reached but release not in Discogs collection — "

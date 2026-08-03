@@ -471,6 +471,121 @@ async def test_on_track_identified_without_is_stale_behaves_normally():
 
 
 # ---------------------------------------------------------------------------
+# META-7 — the two Discogs collection writes (Play Count + Last Played) are
+# independent POSTs and the session is destroyed right after.  If EXACTLY ONE
+# lands, the collection item is left inconsistent with nothing to retry it.
+# Surface ONE explicit divergence warning naming the item when the two writes
+# disagree — but NOT for a deliberate STAB-2 clock-skip (intentional, self-
+# correcting), which is excluded by the same clock gate.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_divergence_warning_when_playcount_lands_but_last_played_fails(caplog):
+    """META-7: Play Count incremented but Last Played genuinely failed (trustworthy
+    clock) → the item is inconsistent, so ONE DIVERGED warning naming the release
+    is logged in addition to the per-write failure line."""
+    import logging
+    tracker, writer = make_tracker(
+        last_played_field_name="Last Played",
+        increment_play_count_return=True,
+        update_last_played_return=False,
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
+        await tracker._end_session()
+    diverged = [r for r in caplog.records if "DIVERGED" in r.getMessage()]
+    assert len(diverged) == 1, "exactly one divergence line expected"
+    msg = diverged[0].getMessage()
+    assert "12345" in msg and "67890" in msg   # names the release / instance
+    assert "was incremented" in msg            # Play Count side landed
+    assert "did NOT update" in msg             # Last Played side did not
+
+
+@pytest.mark.asyncio
+async def test_divergence_warning_when_last_played_lands_but_playcount_fails(caplog):
+    """META-7 (reverse direction): the increment POST fails (e.g. a 429 or a
+    read-before-write abort) but the subsequent Last Played POST succeeds → the
+    item is inconsistent the OTHER way (stale count, fresh date).  This pins the
+    two message operands the forward-direction test never reaches — 'did NOT
+    increment' and 'was updated' — so a mutation of either branch string is caught."""
+    import logging
+    tracker, writer = make_tracker(
+        last_played_field_name="Last Played",
+        increment_play_count_return=False,
+        update_last_played_return=True,
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
+        await tracker._end_session()
+    diverged = [r for r in caplog.records if "DIVERGED" in r.getMessage()]
+    assert len(diverged) == 1, "exactly one divergence line expected"
+    msg = diverged[0].getMessage()
+    assert "12345" in msg and "67890" in msg   # names the release / instance
+    assert "did NOT increment" in msg          # Play Count side did NOT land
+    assert "was updated" in msg                # Last Played side did
+
+
+@pytest.mark.asyncio
+async def test_no_divergence_warning_when_both_writes_succeed(caplog):
+    """META-7: both writes land → the item is consistent → no DIVERGED line."""
+    import logging
+    tracker, writer = make_tracker(
+        last_played_field_name="Last Played",
+        increment_play_count_return=True,
+        update_last_played_return=True,
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
+        await tracker._end_session()
+    assert not any("DIVERGED" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_no_divergence_warning_when_both_writes_fail(caplog):
+    """META-7: NEITHER write lands → the item is (still) consistent with itself,
+    nothing partially applied → no DIVERGED line (the per-write failures log
+    on their own)."""
+    import logging
+    tracker, writer = make_tracker(
+        last_played_field_name="Last Played",
+        increment_play_count_return=False,
+        update_last_played_return=False,
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
+        await tracker._end_session()
+    assert not any("DIVERGED" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_no_divergence_warning_for_a_deliberate_clock_skip(caplog):
+    """META-7 × STAB-2: Play Count landed but Last Played returned False because the
+    clock is untrustworthy (a deliberate skip, not a failure).  The XOR is true, so
+    the clock gate is what MUST suppress the DIVERGED line — a skipped-on-purpose
+    Last Played is self-correcting on the next trustworthy play, not a divergence."""
+    import logging
+    tracker, writer = make_tracker(
+        last_played_field_name="Last Played",
+        increment_play_count_return=True,
+        update_last_played_return=False,   # writer's own gate short-circuited the POST
+    )
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    with caplog.at_level(logging.WARNING), \
+         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=False):
+        await tracker._end_session()
+    assert not any("DIVERGED" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # Background task management (v1.3.3)
 #
 # SESSION_ENDED schedules _end_session() as an asyncio task. asyncio holds
