@@ -529,6 +529,103 @@ async def test_run_idle_timeout_polls_again_without_error(monkeypatch):
     loop.backend.recognize.assert_not_awaited()   # never reached recognize on an idle poll
 
 
+@pytest.mark.asyncio
+async def test_run_hung_recognize_is_bounded_and_the_loop_recovers(monkeypatch):
+    """PCONC-2: a recognize() that hangs (flaky wifi + shazamio's 20×60s retry
+    default) must be abandoned by a wait_for timeout — not left to occupy the loop
+    for minutes and saturate the audio queue (the lag PCONC-1 needs). The timeout
+    surfaces as a TimeoutError to CONC-4's handler (logged + backed off) and the
+    loop recovers on the next chunk."""
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
+    loop.recognize_timeout = 0.05      # tiny recognize bound so the hung call is abandoned fast
+
+    raw = make_raw()
+    calls = {"n": 0}
+    hang = asyncio.Event()               # never set → the first recognize hangs on it
+
+    async def recognize(audio, sample_rate):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await hang.wait()            # hangs forever (independent of asyncio.sleep)
+        return raw                        # a later call succeeds
+
+    loop.backend.recognize = recognize
+
+    errors = []
+    monkeypatch.setattr(
+        "src.audio.recognizer.log.error", lambda msg, *a, **k: errors.append(msg)
+    )
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(secs):          # collapse only the recognizer's error-path backoff
+        await real_sleep(0)
+
+    monkeypatch.setattr("src.audio.recognizer.asyncio.sleep", fast_sleep)
+
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
+    await loop.enqueue(np.ones(4, dtype=np.float32), 44100)
+
+    task = asyncio.create_task(loop.run())
+    for _ in range(100):
+        await real_sleep(0.01)           # REAL time so the 0.05s wait_for can fire
+        if on_confirmed.await_count:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert on_confirmed.await_count == 1   # abandoned the hung call, recovered on the next
+    assert errors                           # the timeout was logged (CONC-4), not swallowed
+    # …with a non-empty message: a bare TimeoutError stringifies to "" so it is
+    # logged via repr(), naming the failure this bound exists to surface.
+    assert any("TimeoutError" in m for m in errors), errors
+
+
+@pytest.mark.asyncio
+async def test_shazam_client_pins_the_retry_policy(monkeypatch):
+    """PCONC-2: the Shazam client is built with an EXPLICIT, SHORT ExponentialRetry
+    — not shazamio's minutes-long attempts=20 / max_timeout=60 default that lets one
+    degraded call occupy the recognition loop."""
+    shazamio = pytest.importorskip("shazamio")
+    aiohttp_retry = pytest.importorskip("aiohttp_retry")
+    from src.audio.recognizer import (
+        ShazamIOBackend, _SHAZAM_RETRY_ATTEMPTS, _SHAZAM_RETRY_MAX_TIMEOUT_SECONDS,
+    )
+
+    captured = {}
+
+    class FakeRetry:
+        def __init__(self, **kw):
+            captured["retry"] = kw
+
+    class FakeHTTPClient:
+        def __init__(self, retry_options=None):
+            captured["retry_options"] = retry_options
+
+    class FakeShazam:
+        def __init__(self, http_client=None):
+            captured["http_client"] = http_client
+
+        async def recognize(self, wav):
+            return {"track": None}
+
+    monkeypatch.setattr(shazamio, "Shazam", FakeShazam)
+    monkeypatch.setattr(shazamio, "HTTPClient", FakeHTTPClient)
+    monkeypatch.setattr(aiohttp_retry, "ExponentialRetry", FakeRetry)
+
+    backend = ShazamIOBackend()
+    await backend._call_shazam(b"fake-wav-bytes")
+
+    # The retry policy was pinned to our small values, wired through HTTPClient
+    # into the Shazam client — not left as the default (http_client=None → 20×60).
+    assert captured["retry"]["attempts"] == _SHAZAM_RETRY_ATTEMPTS
+    assert captured["retry"]["max_timeout"] == _SHAZAM_RETRY_MAX_TIMEOUT_SECONDS
+    assert captured["retry"]["statuses"] == {500, 502, 503, 504, 429}  # retryable codes preserved
+    assert _SHAZAM_RETRY_ATTEMPTS < 20                 # tighter than shazamio's default
+    assert captured["http_client"] is not None         # an explicit client was passed
+    assert isinstance(captured["retry_options"], FakeRetry)
+
+
 # ---------------------------------------------------------------------------
 # PCONC-1 (#80) — the session epoch is bound to the AUDIO at enqueue (capture)
 # time and threaded through recognition → confirmation → commit, so a chunk that
