@@ -1,0 +1,118 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4178113..c6d7621 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -59,6 +59,19 @@ same implement → RED test → mutation-check → cold-review discipline.
+   effect this also resolves the `title: null` half of REC-2 (a null title no
+   longer reaches — and crashes — the dedup comparison); the null-*artist* half
+   remains tracked separately under REC-2.
++- **A duplicated Discogs position string no longer credits a phantom play
++  (META-4, #78 — HIGH).** `SideIndex.is_last_track` — the sole gate on the
++  end-of-side Play Count / Last Played write — compared the current track's
++  position string to the last entry's. Discogs positions are community-edited
++  free text and not guaranteed unique, so a mid-album track that merely *shared*
++  the closer's position string ("B2") was flagged the last track and credited a
++  play for a side that never finished. `is_last_track` is now derived from the
++  already-computed, position-AND-title-disambiguated `global_index`, so only the
++  genuine final entry credits. The deliberately conservative reprise behavior (a
++  closer whose title is duplicated earlier resolves to the first occurrence and
++  is *not* credited — a missed play rather than a phantom one) is preserved; a
++  20,000-tracklist differential fuzz confirmed the change only ever removes
++  phantoms, never flips a correct result.
+ 
+ ---
+ 
+diff --git a/src/metadata/models.py b/src/metadata/models.py
+index a911701..2860092 100644
+--- a/src/metadata/models.py
++++ b/src/metadata/models.py
+@@ -107,13 +107,16 @@ class SideIndex:
+             the side filter is empty; the logic falls back to the title match
+             and still yields correct adjacency.
+ 
+-        ``is_last_track`` is matched by POSITION (not title): it is the sole
+-        gate on Discogs play-count updates, and pure title matching let an
+-        earlier track sharing the closer's title (reprises, live sets) latch a
+-        phantom "last track".  The deliberately conservative failure mode
+-        remains: when a GENUINE closer duplicates an earlier title, the current
+-        entry resolves to the first occurrence and ``is_last_track`` is False —
+-        a missed play count rather than a phantom one.
++        ``is_last_track`` is derived from the disambiguated ``global_index``
++        (matched by position AND title), NOT from a bare position-string
++        comparison: it is the sole gate on Discogs play-count updates, and both
++        a duplicated TITLE (reprises, live sets) and a duplicated POSITION string
++        (Discogs positions are community-edited free text and not guaranteed
++        unique, META-4) would otherwise let an earlier track latch a phantom
++        "last track".  The deliberately conservative failure mode remains: when a
++        GENUINE closer duplicates an earlier title, the current entry resolves to
++        the first occurrence and ``is_last_track`` is False — a missed play count
++        rather than a phantom one.
+         """
+         if not tracklist:
+             return cls.empty()
+@@ -174,7 +177,13 @@ class SideIndex:
+             if global_index is None:
+                 global_index = fallback
+ 
+-        is_last_track = bool(current and current.position == tracklist[-1].position)
++        # is_last_track gates the collection Play Count write, so a wrong True
++        # is a data-integrity bug. Derive it from the disambiguated global_index
++        # (matched by position AND title, above) rather than a naive comparison
++        # of position strings: Discogs positions are community-edited free text
++        # and NOT guaranteed unique, so a mid-album track that merely SHARES the
++        # closer's position string must not be flagged the last track (META-4).
++        is_last_track = global_index is not None and global_index == len(tracklist) - 1
+ 
+         prev_title = None
+         next_title = None
+diff --git a/tests/test_models.py b/tests/test_models.py
+index 2bab6e8..e09de1e 100644
+--- a/tests/test_models.py
++++ b/tests/test_models.py
+@@ -94,6 +94,46 @@ def test_is_last_track_false_when_not_in_tracklist():
+     assert make_track("Unknown Song").is_last_track is False
+ 
+ 
++# ---------------------------------------------------------------------------
++# META-4 — is_last_track must not be fooled by DUPLICATE position strings.
++# Discogs positions are community-edited free text and are NOT guaranteed
++# unique. is_last_track gates the collection Play Count write, so an early
++# track that merely shares the closer's position string must not be flagged
++# the last track — that would credit a phantom play for a side that never
++# finished. The fix derives is_last_track from the disambiguated global_index
++# (position AND title) rather than a naive last-position comparison.
++# ---------------------------------------------------------------------------
++
++def _dup_position_tracklist():
++    """A tracklist where a MID-album track shares the closer's position 'B2'."""
++    return [
++        TracklistEntry("A1", "One"),
++        TracklistEntry("B2", "Mid-Album Track"),   # duplicate position, NOT the closer
++        TracklistEntry("B1", "Three"),
++        TracklistEntry("B2", "Closer"),            # the genuine last track
++    ]
++
++
++def test_is_last_track_false_for_mid_track_sharing_closer_position():
++    """A mid-album track that only SHARES the closer's position string must be
++    is_last_track False — otherwise identifying it credits a phantom play."""
++    tl = _dup_position_tracklist()
++    assert make_track("Mid-Album Track", tracklist=tl).is_last_track is False
++
++
++def test_is_last_track_true_for_real_closer_despite_duplicate_position():
++    """The genuine last track still credits, even when an earlier track shares
++    its position string — no regression from the duplicate-position fix."""
++    tl = _dup_position_tracklist()
++    assert make_track("Closer", tracklist=tl).is_last_track is True
++
++
++def test_is_last_track_true_for_single_track_release():
++    """A one-track release: the only track is the last track."""
++    tl = [TracklistEntry("A", "Only")]
++    assert make_track("Only", tracklist=tl).is_last_track is True
++
++
+ # ---------------------------------------------------------------------------
+ # TrackMetadata.track_display
+ # ---------------------------------------------------------------------------

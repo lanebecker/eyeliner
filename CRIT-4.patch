@@ -1,0 +1,87 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5fbdaa8..0c6ccfa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -113,6 +113,21 @@ same implement → RED test → mutation-check → cold-review discipline.
+   commit-time re-sample. Reproduced RED at the commit boundary; the epoch
+   threading is mutation-verified (a dequeue-time re-read, a dropped epoch, a
+   constant-epoch enqueue, and a re-sample-at-entry mutant are all killed).
++- **The systemd unit now waits for a synced clock and an up network before
++  starting (CRIT-4, #83 — the root cause behind the unset-clock date
++  corruption).** The documented `vinyl-now-playing.service` ordered only on
++  `network.target` (the network stack is *configured*, not up) with nothing
++  waiting on the clock. The Pi has no battery-backed RTC, so the app could start
++  with a stale `fake-hwclock` time and stamp wrong **Last Played** dates into the
++  Discogs collection before `systemd-timesyncd` synced over the network. The unit
++  now orders `After=network-online.target time-sync.target graphical.target` with
++  `Wants=network-online.target`, and `docs/pi-setup-guide.md` adds the two steps
++  that give that ordering teeth: enabling `systemd-time-wait-sync.service`
++  (without it, `time-sync.target` can be reached *before* the clock is set — a
++  documented systemd behavior with plain `timesyncd`) and setting the timezone
++  via raspi-config (covers VNEW-1). This is the deployment-side root-cause fix;
++  the defensive writer-side clock gate (STAB-2, #86) is complementary and tracked
++  separately.
+ 
+ ---
+ 
+diff --git a/docs/pi-setup-guide.md b/docs/pi-setup-guide.md
+index 9d376f1..47d97f1 100644
+--- a/docs/pi-setup-guide.md
++++ b/docs/pi-setup-guide.md
+@@ -339,7 +339,8 @@ Paste this (adjust the username if you're not using `pi`):
+ ```ini
+ [Unit]
+ Description=vinyl-now-playing
+-After=network.target graphical.target
++Wants=network-online.target
++After=network-online.target time-sync.target graphical.target
+ 
+ [Service]
+ Type=simple
+@@ -355,6 +356,46 @@ RestartSec=10
+ WantedBy=graphical.target
+ ```
+ 
++**Why the `[Unit]` ordering matters — read this before enabling.** The Raspberry
++Pi has no battery-backed real-time clock, so at boot its clock is whatever
++`fake-hwclock` last saved — stale, sometimes by hours or days — until
++`systemd-timesyncd` reaches an NTP server *over the network*. If the app starts
++before that happens, every **Last Played** date it stamps into your Discogs
++collection is wrong, and the error is silent and irreversible. The ordering above
++holds the service until the network is actually up (`network-online.target`,
++which must be pulled in by the matching `Wants=` — ordering after it alone does
++nothing) and the clock has been synchronized (`time-sync.target`).
++
++One catch: `After=time-sync.target` only has teeth if the unit that *waits* for
++the clock is enabled. With plain `systemd-timesyncd`, `time-sync.target` can be
++reached **before** the clock is actually set. Enable the waiter once:
++
++```bash
++sudo systemctl enable systemd-time-wait-sync.service
++```
++
++Also set the Pi's timezone, so Last Played is stamped in your local time rather
++than the default zone:
++
++```bash
++sudo raspi-config
++```
++
++Choose **Localisation Options → Timezone**. (Non-interactive equivalent, using
++your own zone: `sudo timedatectl set-timezone America/Los_Angeles`.)
++
++Confirm both took effect with `timedatectl` — it should report
++`System clock synchronized: yes` and your chosen `Time zone`.
++
++Two things to know about this gate. Enabling `systemd-time-wait-sync.service` is
++system-wide — it delays *every* unit ordered after `time-sync.target`; on this
++dedicated Pi that is exactly what you want. And if the Pi ever boots **offline**,
++the app will not appear until the network is up and the clock syncs — a blank
++screen then is the service correctly *waiting*, not a crash (`systemctl status
++systemd-time-wait-sync.service` shows it still starting, blocking on the clock,
++and `journalctl -u vinyl-now-playing` stays quiet rather than logging an error).
++It needs the network for recognition anyway, so this costs nothing in practice.
++
+ Enable and start:
+ 
+ ```bash

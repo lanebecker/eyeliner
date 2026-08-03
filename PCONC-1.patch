@@ -1,0 +1,497 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ab3019d..5fbdaa8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -96,6 +96,23 @@ same implement → RED test → mutation-check → cold-review discipline.
+   is *not* credited — a missed play rather than a phantom one) is preserved; a
+   20,000-tracklist differential fuzz confirmed the change only ever removes
+   phantoms, never flips a correct result.
++- **A queue-lagged audio chunk no longer commits a dead track into a fresh
++  session (PCONC-1, #80 — HIGH).** The epoch guard sampled the session token at
++  `TrackCommitService.commit` *entry* — after the audio was captured, queued, and
++  confirmed. A chunk captured while a record played can sit in the recognition
++  queue (maxsize 5) past a needle-lift (`clear()` bumps the epoch); once a new
++  session begins it is dequeued, confirmed, and committed — and the entry-time
++  sample reads the *new* epoch, finds it stable across the resolve, and writes the
++  previous record's track onto the screen and, downstream, into the Discogs
++  collection. The epoch is now bound to the audio at `enqueue` (≈ capture) time,
++  travels with the chunk through recognition, and is passed to `commit` as a
++  required `audio_epoch`; a commit whose audio predates the live session is
++  discarded. This closes the queue-lag window the mid-resolve guard (B-1) never
++  covered, while preserving the mid-resolve (B-1) and tracker-tail (B-19) checks
++  exactly — all three now validate against the audio's own epoch rather than a
++  commit-time re-sample. Reproduced RED at the commit boundary; the epoch
++  threading is mutation-verified (a dequeue-time re-read, a dropped epoch, a
++  constant-epoch enqueue, and a re-sample-at-entry mutant are all killed).
+ 
+ ---
+ 
+diff --git a/src/app/track_commit_service.py b/src/app/track_commit_service.py
+index 6c08614..c0d434c 100644
+--- a/src/app/track_commit_service.py
++++ b/src/app/track_commit_service.py
+@@ -12,11 +12,17 @@ The audio layer now only *confirms* a :class:`RawRecognitionResult` and hands it
+ off; this service owns resolve → state → track → scrobble.  The two correctness
+ invariants that lived in the old ``_commit_track`` are preserved exactly:
+ 
+-  * **B-1 (epoch guard).** ``resolve()`` yields the event loop; a SESSION_ENDED
+-    (needle lift) during it runs ``state.clear()`` and bumps the session epoch.
+-    The epoch captured *before* resolving is re-checked *after*; a commit for
+-    audio that already stopped is discarded rather than resurrecting a dead
+-    track onto the screen or corrupting a fresh session.
++  * **B-1 / PCONC-1 (epoch guard).** Every chunk carries the session epoch it
++    was captured under (bound at enqueue in the recognition loop, and passed to
++    :meth:`commit` as ``audio_epoch``).  A SESSION_ENDED (needle lift) bumps the
++    session epoch via ``state.clear()`` — whether it lands *during* the resolve
++    await OR *before* this confirmed commit ran at all, while the chunk lagged in
++    the recognition queue.  The commit compares the live epoch against the
++    AUDIO's epoch; a commit for audio whose session already ended is discarded
++    rather than resurrecting a dead track onto the screen or corrupting a fresh
++    session.  Sampling the epoch at commit *entry* (the pre-PCONC-1 design) could
++    not see the queue-lag case: the entry sample already read the post-lift epoch
++    and then found it "stable" across the resolve.
+   * **B-11 (ordering).** ``set_raw`` is advanced only *after* ``set_track``
+     succeeds — otherwise ``current_raw`` would lead ``current_track`` and the
+     loop's dedup would treat the new track as "already playing" and never
+@@ -59,21 +65,35 @@ class TrackCommitService:
+         self.tracker = tracker
+         self.lastfm = lastfm
+ 
+-    async def commit(self, raw: "RawRecognitionResult") -> bool:
++    async def commit(self, raw: "RawRecognitionResult", audio_epoch: int) -> bool:
+         """Resolve full metadata for *raw* and commit it everywhere.
+ 
++        ``audio_epoch`` is the session epoch this audio was captured under, bound
++        at enqueue time by the recognition loop (PCONC-1) and threaded through
++        confirmation to here.  It is **required** — the guard is only sound if
++        the caller supplies the audio's own epoch; there is deliberately no
++        default that would silently fall back to re-sampling at commit time (the
++        exact defect PCONC-1 fixes).
++
+         Returns ``True`` when the track was committed, ``False`` when the commit
+-        was discarded because the session ended mid-resolve (B-1).  Resolver
+-        exceptions are NOT swallowed — they propagate to the recognition loop's
+-        ``run()`` handler, exactly as the old ``_commit_track`` did, so a
+-        transient resolve failure leaves ``current_raw`` un-advanced (B-11) and
+-        the track is re-attempted on the next chunk.
++        was discarded because the session that produced this audio has ended —
++        whether the needle lifted mid-resolve (B-1) or before the queue-lagged
++        commit ran at all (PCONC-1).  Resolver exceptions are NOT swallowed —
++        they propagate to the recognition loop's ``run()`` handler, exactly as
++        the old ``_commit_track`` did, so a transient resolve failure leaves
++        ``current_raw`` un-advanced (B-11) and the track is re-attempted on the
++        next chunk.
+         """
+         timestamp = int(time.time())
+-        # Capture the session token before the resolve await (B-1).
+-        commit_epoch = self.state.session_epoch
++        # The epoch is bound to the AUDIO at capture/enqueue time (PCONC-1) and
++        # passed in — NOT re-sampled here.  A commit-entry sample missed the
++        # queue-lag race: a chunk captured before the needle lifted could be
++        # dequeued and confirmed AFTER a new session began, and the entry sample
++        # would read the new (stable-across-resolve) epoch and commit the dead
++        # track into the fresh session.  Validating against the audio's own epoch
++        # closes that window as well as the mid-resolve one (B-1).
+         metadata = await self.resolver.resolve(raw)
+-        if self.state.session_epoch != commit_epoch:
++        if self.state.session_epoch != audio_epoch:
+             log.info(
+                 "Discarding stale commit for %s — %s: the session ended while "
+                 "metadata was resolving.",
+@@ -96,7 +116,7 @@ class TrackCommitService:
+         # album-split path awaits a Discogs write), and a SESSION_ENDED during that
+         # window means the needle lifted.  Don't scrobble a track whose session has
+         # already ended.
+-        if self.lastfm and self.state.session_epoch == commit_epoch:
++        if self.lastfm and self.state.session_epoch == audio_epoch:
+             try:
+                 await asyncio.get_running_loop().run_in_executor(
+                     None, self.lastfm.scrobble, metadata, timestamp
+diff --git a/src/audio/recognizer.py b/src/audio/recognizer.py
+index 2dd55aa..f0f417a 100644
+--- a/src/audio/recognizer.py
++++ b/src/audio/recognizer.py
+@@ -165,7 +165,7 @@ class RecognitionLoop:
+         self,
+         config: "RecognitionConfig",
+         state: "PlayerState",
+-        on_confirmed: Callable[["RawRecognitionResult"], Awaitable[object]],
++        on_confirmed: Callable[["RawRecognitionResult", int], Awaitable[object]],
+     ):
+         self.state = state
+         # Called with a confirmed RawRecognitionResult; owns resolve → state →
+@@ -208,7 +208,18 @@ class RecognitionLoop:
+         kept grinding through stale audio and delayed track-change
+         detection.)  Drops are logged at debug level so a "stopped
+         identifying" complaint has a breadcrumb in the journal.
++
++        The current session epoch is captured HERE, at enqueue (≈ capture) time,
++        and travels with the chunk (PCONC-1).  A chunk can sit in this queue
++        while the needle lifts and a new session begins; binding the epoch at
++        enqueue — not when the chunk is later dequeued, recognized, or committed
++        — is what lets the commit service recognise audio that predates the live
++        session and discard it instead of committing a dead track into a fresh
++        one.  (Dequeue-time would already read the post-lift epoch and defeat the
++        guard.)
+         """
++        # Bind the session epoch to the audio at capture time (PCONC-1).
++        epoch = self.state.session_epoch
+         if self._audio_queue.full():
+             try:
+                 self._audio_queue.get_nowait()  # Drop the OLDEST — recent audio wins
+@@ -219,18 +230,18 @@ class RecognitionLoop:
+                 )
+             except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
+                 pass
+-        await self._audio_queue.put((audio, sample_rate))
++        await self._audio_queue.put((audio, sample_rate, epoch))
+ 
+     async def run(self):
+         """Main recognition loop."""
+         log.info("Recognition loop started.")
+         while True:
+             try:
+-                audio, sample_rate = await asyncio.wait_for(
++                audio, sample_rate, epoch = await asyncio.wait_for(
+                     self._audio_queue.get(), timeout=self.poll_interval
+                 )
+                 result = await self.backend.recognize(audio, sample_rate)
+-                await self._handle_result(result)
++                await self._handle_result(result, epoch)
+             except asyncio.TimeoutError:
+                 pass  # No audio queued — fine
+             except Exception as e:
+@@ -253,8 +264,24 @@ class RecognitionLoop:
+             and a.artist.strip().lower() == b.artist.strip().lower()
+         )
+ 
+-    async def _handle_result(self, result: Optional[RawRecognitionResult]):
+-        """Apply confirmation logic, then resolve metadata and update state."""
++    async def _handle_result(self, result: Optional[RawRecognitionResult], epoch: int = 0):
++        """Apply confirmation logic, then resolve metadata and update state.
++
++        ``epoch`` is the session epoch bound to *this* chunk's audio at enqueue
++        time (PCONC-1).  On a real confirmation it is forwarded to
++        ``on_confirmed`` so the commit is validated against the session the
++        audio came from — not whichever session happens to be live when the
++        (possibly queue-delayed) commit finally runs.
++
++        The ``epoch=0`` default is a TEST-ONLY affordance: the many
++        confirmation-logic tests that drive ``_handle_result`` directly do not
++        care about epochs, and 0 is the initial epoch so they behave identically.
++        ⚠️  Any NEW production caller MUST pass the real bound epoch — ``run()``
++        is currently the only one, and it does.  A wrong/stale epoch here cannot
++        cause a phantom write: the commit boundary takes an explicit REQUIRED
++        ``audio_epoch`` and fails safe, so the worst case is the guard discarding
++        live commits (loud missed identifications), never a silent bad write.
++        """
+         if result is None:
+             self._pending_result = None
+             self._pending_count = 0
+@@ -276,10 +303,11 @@ class RecognitionLoop:
+             log.info(f"Track confirmed: {result.artist} — {result.title}")
+             self._miss_count = 0  # a real commit — recognition works (B-7)
+             self._churn_count = 0  # …and not churning (B-21)
+-            # Hand the confirmed result to the commit service (A-9).  We await
+-            # it so the next chunk isn't processed until current_raw has been
+-            # advanced (the dedup at the top depends on that ordering).
+-            await self.on_confirmed(result)
++            # Hand the confirmed result to the commit service (A-9), along with
++            # the epoch this audio was captured under (PCONC-1).  We await it so
++            # the next chunk isn't processed until current_raw has been advanced
++            # (the dedup at the top depends on that ordering).
++            await self.on_confirmed(result, epoch)
+             self._pending_result = None
+             self._pending_count = 0
+         else:
+diff --git a/tests/test_error_state.py b/tests/test_error_state.py
+index d0f0c20..85476ea 100644
+--- a/tests/test_error_state.py
++++ b/tests/test_error_state.py
+@@ -51,7 +51,7 @@ def make_loop(error_after_misses=3):
+     )
+     state = PlayerState()
+ 
+-    async def commit(r):
++    async def commit(r, audio_epoch=0):
+         # Stand in for TrackCommitService.commit: a confirmed track lands as
+         # PLAYING so any miss-streak-reset-on-commit assertions hold.
+         state.set_track(MagicMock())
+diff --git a/tests/test_recognizer.py b/tests/test_recognizer.py
+index 0e29613..06f4d80 100644
+--- a/tests/test_recognizer.py
++++ b/tests/test_recognizer.py
+@@ -112,7 +112,8 @@ async def test_two_matching_results_emit_confirmed_track():
+     await loop._handle_result(raw)
+     await loop._handle_result(raw)
+ 
+-    on_confirmed.assert_awaited_once_with(raw)
++    # epoch defaults to 0 when _handle_result is driven directly (PCONC-1).
++    on_confirmed.assert_awaited_once_with(raw, 0)
+ 
+ 
+ @pytest.mark.asyncio
+@@ -239,7 +240,7 @@ async def test_new_track_after_current_triggers_confirmation():
+     await loop._handle_result(new_raw)
+     await loop._handle_result(new_raw)
+ 
+-    on_confirmed.assert_awaited_once_with(new_raw)
++    on_confirmed.assert_awaited_once_with(new_raw, 0)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -327,11 +328,11 @@ async def test_enqueue_drops_oldest_when_full():
+     await loop_obj.enqueue(np.full(4, 99.0, dtype=np.float32), 44100)
+ 
+     assert loop_obj._audio_queue.qsize() == maxsize
+-    first_audio, _ = loop_obj._audio_queue.get_nowait()
++    first_audio, *_ = loop_obj._audio_queue.get_nowait()  # (audio, sr, epoch)
+     assert first_audio[0] == 1.0   # marker 0.0 was evicted
+     remaining = []
+     while not loop_obj._audio_queue.empty():
+-        audio, _ = loop_obj._audio_queue.get_nowait()
++        audio, *_ = loop_obj._audio_queue.get_nowait()
+         remaining.append(audio[0])
+     assert remaining[-1] == 99.0   # the newest chunk was admitted
+ 
+@@ -373,7 +374,8 @@ async def test_run_pulls_a_chunk_recognizes_it_and_emits(monkeypatch):
+         await task
+ 
+     loop.backend.recognize.assert_awaited_once()
+-    on_confirmed.assert_awaited_once_with(raw)  # confirmation_required=1 → immediate
++    # run() threads the epoch bound at enqueue through to on_confirmed (PCONC-1).
++    on_confirmed.assert_awaited_once_with(raw, state.session_epoch)  # confirmation_required=1 → immediate
+ 
+ 
+ @pytest.mark.asyncio
+@@ -410,4 +412,80 @@ async def test_run_swallows_a_backend_error_and_keeps_looping(monkeypatch):
+         await task
+ 
+     assert loop.backend.recognize.await_count == 2   # survived the first error
+-    on_confirmed.assert_awaited_once_with(raw)
++    on_confirmed.assert_awaited_once_with(raw, state.session_epoch)
++
++
++# ---------------------------------------------------------------------------
++# PCONC-1 (#80) — the session epoch is bound to the AUDIO at enqueue (capture)
++# time and threaded through recognition → confirmation → commit, so a chunk that
++# lagged in the queue past a needle-lift is committed against the session it came
++# from, not whichever one is live when the delayed commit runs.
++# ---------------------------------------------------------------------------
++
++@pytest.mark.asyncio
++async def test_enqueue_binds_the_current_epoch_to_the_chunk():
++    """The chunk carries the session epoch that was live when it was enqueued."""
++    loop, state, _ = make_loop()
++    state.session_epoch = 7
++    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
++
++    _audio, _sr, epoch = loop._audio_queue.get_nowait()
++    assert epoch == 7
++
++
++@pytest.mark.asyncio
++async def test_queued_epoch_is_frozen_at_enqueue_not_read_later():
++    """A chunk that sat in the queue while the needle lifted must still carry its
++    ORIGINAL (pre-lift) epoch — the epoch is sampled at enqueue, never re-read at
++    dequeue (dequeue-time would already be the post-lift epoch and defeat the
++    guard)."""
++    loop, state, _ = make_loop()
++    state.session_epoch = 3
++    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
++
++    state.session_epoch = 4          # needle lifts AFTER the chunk is queued
++
++    _audio, _sr, epoch = loop._audio_queue.get_nowait()
++    assert epoch == 3                # frozen at enqueue, not re-read as 4
++
++
++@pytest.mark.asyncio
++async def test_handle_result_forwards_the_audio_epoch_to_on_confirmed():
++    """On confirmation the loop hands the AUDIO's epoch to on_confirmed so the
++    commit is validated against the session the audio came from (PCONC-1)."""
++    loop, state, on_confirmed = make_loop(confirmation_required=2)
++    state.current_raw = None
++
++    raw = make_raw()
++    await loop._handle_result(raw, epoch=5)
++    await loop._handle_result(raw, epoch=5)
++
++    on_confirmed.assert_awaited_once_with(raw, 5)
++
++
++@pytest.mark.asyncio
++async def test_run_threads_the_enqueued_epoch_through_to_on_confirmed():
++    """End-to-end: a chunk enqueued under epoch 9 confirms and commits with
++    epoch 9 — even after the session moves on to 10 while the stale chunk waits
++    in the queue.  This is the PCONC-1 queue-lag race the commit-time epoch
++    sample could not see."""
++    loop, state, on_confirmed = make_loop(confirmation_required=1)
++    state.session_epoch = 9
++
++    raw = make_raw()
++    loop.backend.recognize = AsyncMock(return_value=raw)
++
++    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
++    state.session_epoch = 10   # needle lifts / new session AFTER capture
++
++    task = asyncio.create_task(loop.run())
++    for _ in range(10):
++        await asyncio.sleep(0)
++        if on_confirmed.await_count:
++            break
++
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++    on_confirmed.assert_awaited_once_with(raw, 9)   # the PRE-lift epoch, not 10
+diff --git a/tests/test_recognizer_progress.py b/tests/test_recognizer_progress.py
+index 2e74c4c..5131033 100644
+--- a/tests/test_recognizer_progress.py
++++ b/tests/test_recognizer_progress.py
+@@ -30,7 +30,7 @@ def make_loop(confirmation_required=2, error_after_misses=3):
+     )
+     state = PlayerState()
+ 
+-    async def commit(r):
++    async def commit(r, audio_epoch=0):
+         state.set_track(MagicMock())
+         state.set_raw(r)
+         return True
+diff --git a/tests/test_track_commit_service.py b/tests/test_track_commit_service.py
+index 7b0bef6..8afc8f9 100644
+--- a/tests/test_track_commit_service.py
++++ b/tests/test_track_commit_service.py
+@@ -5,6 +5,9 @@ RecognitionLoop._commit_track into an application-layer service.  These tests
+ own the invariants that used to live in the recognizer tests:
+ 
+   * B-1 — a commit whose session ends mid-resolve is discarded (epoch guard).
++  * PCONC-1 — a commit for audio captured in an already-ended session is
++    discarded, because the epoch is bound to the audio (passed as audio_epoch),
++    not re-sampled at commit entry.
+   * B-11 — current_raw is advanced only after set_track succeeds.
+ 
+ …plus the scrobble branch that was previously never exercised because the
+@@ -49,7 +52,7 @@ async def test_commit_sets_track_then_raw_and_notifies_tracker():
+     resolver.resolve = AsyncMock(return_value=meta)
+ 
+     r = make_raw()
+-    committed = await service.commit(r)
++    committed = await service.commit(r, state.session_epoch)
+ 
+     assert committed is True
+     assert state.current_track is meta
+@@ -70,7 +73,7 @@ async def test_current_raw_advanced_only_after_set_track():
+     state.set_track = lambda m: (order.append("track"), real_set_track(m))[1]
+     state.set_raw = lambda r: (order.append("raw"), real_set_raw(r))[1]
+ 
+-    await service.commit(make_raw())
++    await service.commit(make_raw(), state.session_epoch)
+ 
+     assert order == ["track", "raw"]
+ 
+@@ -84,7 +87,7 @@ async def test_current_raw_not_advanced_when_resolve_fails():
+     state.set_status(PlayerStatus.LISTENING)
+ 
+     with pytest.raises(RuntimeError):
+-        await service.commit(make_raw())
++        await service.commit(make_raw(), state.session_epoch)
+ 
+     assert state.current_raw is None
+     assert state.current_track is None
+@@ -107,7 +110,7 @@ async def test_commit_discarded_when_session_ends_during_resolve():
+ 
+     resolver.resolve = AsyncMock(side_effect=resolve_then_needle_lifts)
+ 
+-    committed = await service.commit(make_raw())
++    committed = await service.commit(make_raw(), state.session_epoch)
+ 
+     assert committed is False
+     # The dead track must NOT be resurrected onto the screen…
+@@ -124,7 +127,7 @@ async def test_commit_proceeds_when_session_stable():
+     meta = MagicMock()
+     resolver.resolve = AsyncMock(return_value=meta)
+ 
+-    committed = await service.commit(make_raw())
++    committed = await service.commit(make_raw(), state.session_epoch)
+ 
+     assert committed is True
+     assert state.current_track is meta
+@@ -132,6 +135,32 @@ async def test_commit_proceeds_when_session_stable():
+     tracker.on_track_identified.assert_awaited_once_with(meta)
+ 
+ 
++@pytest.mark.asyncio
++async def test_commit_discarded_when_audio_predates_the_current_session():
++    """PCONC-1 (#80): audio captured in an EARLIER session must be discarded when
++    the live session has already moved on — even though the epoch stays 'stable'
++    across the resolve.  This is the queue-lag stale-commit the commit-time epoch
++    sample (pre-fix) could NOT see: the needle lifted and a new session began
++    BEFORE this confirmed commit ran, so an entry-time sample would read the new
++    epoch, find it stable across the resolve, and commit the dead track into the
++    fresh session (polluting the display and, downstream, the Discogs write)."""
++    service, state, resolver, tracker = make_service()
++    state.set_status(PlayerStatus.LISTENING)
++    audio_epoch = state.session_epoch          # audio captured now (epoch 0)
++
++    state.clear()                              # needle lifts: session ends (epoch 1)
++    state.set_status(PlayerStatus.LISTENING)   # a NEW record starts a new session
++
++    meta = MagicMock()
++    resolver.resolve = AsyncMock(return_value=meta)   # epoch stays 1 across resolve
++
++    committed = await service.commit(make_raw(), audio_epoch)
++
++    assert committed is False                  # stale audio discarded, not committed
++    assert state.current_track is None         # the fresh session is NOT polluted
++    tracker.on_track_identified.assert_not_called()
++
++
+ # ---------------------------------------------------------------------------
+ # Last.fm scrobble branch (T-2 — previously never exercised)
+ # ---------------------------------------------------------------------------
+@@ -144,7 +173,7 @@ async def test_scrobble_called_with_metadata_and_timestamp():
+     meta = MagicMock()
+     resolver.resolve = AsyncMock(return_value=meta)
+ 
+-    await service.commit(make_raw())
++    await service.commit(make_raw(), state.session_epoch)
+ 
+     lastfm.scrobble.assert_called_once()
+     args = lastfm.scrobble.call_args[0]
+@@ -156,7 +185,7 @@ async def test_scrobble_called_with_metadata_and_timestamp():
+ async def test_no_scrobble_when_lastfm_absent():
+     service, state, resolver, tracker = make_service(lastfm=None)
+     # Must not raise despite no Last.fm client.
+-    committed = await service.commit(make_raw())
++    committed = await service.commit(make_raw(), state.session_epoch)
+     assert committed is True
+ 
+ 
+@@ -169,7 +198,7 @@ async def test_scrobble_failure_does_not_break_commit():
+     meta = MagicMock()
+     resolver.resolve = AsyncMock(return_value=meta)
+ 
+-    committed = await service.commit(make_raw())
++    committed = await service.commit(make_raw(), state.session_epoch)
+ 
+     assert committed is True
+     assert state.current_track is meta  # commit completed despite scrobble error
+@@ -192,7 +221,7 @@ async def test_scrobble_skipped_when_session_ends_during_tracker_tail():
+ 
+     tracker.on_track_identified = AsyncMock(side_effect=end_during_tail)
+ 
+-    await service.commit(make_raw())
++    await service.commit(make_raw(), state.session_epoch)
+ 
+     tracker.on_track_identified.assert_awaited_once()  # the tail did run...
+     lastfm.scrobble.assert_not_called()                # ...but the scrobble was skipped
+@@ -212,6 +241,6 @@ async def test_stale_commit_does_not_scrobble():
+ 
+     resolver.resolve = AsyncMock(side_effect=resolve_then_needle_lifts)
+ 
+-    await service.commit(make_raw())
++    await service.commit(make_raw(), state.session_epoch)
+ 
+     lastfm.scrobble.assert_not_called()

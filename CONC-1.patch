@@ -1,0 +1,325 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d250d8a..ab3019d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -71,6 +71,18 @@ same implement → RED test → mutation-check → cold-review discipline.
+   effect this also resolves the `title: null` half of REC-2 (a null title no
+   longer reaches — and crashes — the dedup comparison); the null-*artist* half
+   remains tracked separately under REC-2.
++- **Shutdown no longer tears an in-flight end-of-session credit in half
++  (CONC-1, #76 — HIGH).** The end-of-session Play Count / Last Played write runs
++  as a fire-and-forget task in the tracker's `_bg_tasks`; it is not one of the
++  three pipeline legs, so nothing awaited it. A SIGTERM or ESC a second or two
++  after a needle-lift let `asyncio.run` cancel it mid-write — `increment_play_count`
++  had run but `update_last_played` and the Last.fm love had not, and because
++  `_finalize_session` latches `credited` before the first await, nothing retried
++  it: the collection was left permanently half-updated, silently. `ListenTracker`
++  gained a bounded `drain()` that `run_pipeline` now awaits in its `finally`
++  (before stopping capture/display, and even when a leg faulted), so an in-flight
++  credit finishes. Bounded by `_SHUTDOWN_DRAIN_SECONDS` (10s) so a stuck write
++  can't hang shutdown past systemd's stop timeout.
+ - **A duplicated Discogs position string no longer credits a phantom play
+   (META-4, #78 — HIGH).** `SideIndex.is_last_track` — the sole gate on the
+   end-of-side Play Count / Last Played write — compared the current track's
+diff --git a/main.py b/main.py
+index f7c0f70..d0477a1 100644
+--- a/main.py
++++ b/main.py
+@@ -71,7 +71,7 @@ def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenT
+         state.clear()
+ 
+ 
+-async def run_pipeline(tasks, capture, display):
++async def run_pipeline(tasks, capture, display, tracker):
+     """Run the pipeline legs until the first one finishes, then shut down.
+ 
+     Extracted from main() (T-1) so the shutdown semantics are testable without
+@@ -79,7 +79,10 @@ async def run_pipeline(tasks, capture, display):
+       - the moment ANY leg exits, cancel the rest (FIRST_COMPLETED) — this is
+         the v1.3.5 "ESC zombie" fix;
+       - re-raise a faulted leg's exception after cleanup;
+-      - always stop capture and display in the finally.
++      - drain the tracker's in-flight end-of-session credit tasks (CONC-1) —
++        they are fire-and-forget, not pipeline legs, so nothing else awaits them
++        and ``asyncio.run`` would otherwise cancel a mid-write credit — then
++        always stop capture and display in the finally.
+     """
+     try:
+         done, pending = await asyncio.wait(
+@@ -104,6 +107,11 @@ async def run_pipeline(tasks, capture, display):
+             raise first_exc
+         log.info("Pipeline stopped.")
+     finally:
++        # Let an in-flight end-of-session Discogs credit finish before the loop
++        # tears it down (CONC-1); bounded so a stuck write can't hang shutdown.
++        # Runs even when a leg faulted — a crash must not abandon a half-written
++        # collection update.
++        await tracker.drain()
+         capture.stop()
+         display.stop()
+ 
+@@ -162,8 +170,9 @@ async def main():
+         loop.add_signal_handler(sig, _cancel_all)
+ 
+     # FIRST_COMPLETED shutdown + cleanup live in run_pipeline (extracted for
+-    # testability — T-1).
+-    await run_pipeline(tasks, capture, display)
++    # testability — T-1).  The tracker is passed so shutdown can drain its
++    # in-flight end-of-session credit before the loop closes (CONC-1).
++    await run_pipeline(tasks, capture, display, tracker)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/tracking/listen_tracker.py b/src/tracking/listen_tracker.py
+index 68d0beb..202c38e 100644
+--- a/src/tracking/listen_tracker.py
++++ b/src/tracking/listen_tracker.py
+@@ -47,6 +47,12 @@ log = logging.getLogger(__name__)
+ # as opposed to "end only if the current session is this specific one".
+ _CURRENT_SESSION = object()
+ 
++# Bounded window (seconds) that shutdown waits for an in-flight end-of-session
++# Discogs credit to finish before the event loop tears it down (CONC-1). Long
++# enough for the normal write pair to complete many times over, short enough to
++# stay well within systemd's default 90s stop timeout even on a stuck network.
++_SHUTDOWN_DRAIN_SECONDS = 10.0
++
+ 
+ class ListenTracker:
+     """Manages play sessions and triggers Discogs field updates on album completion."""
+@@ -87,6 +93,38 @@ class ListenTracker:
+             self._bg_tasks.add(task)
+             task.add_done_callback(self._bg_tasks.discard)
+ 
++    async def drain(self, timeout: float = _SHUTDOWN_DRAIN_SECONDS) -> None:
++        """Wait (bounded) for any in-flight end-of-session credit tasks to finish.
++
++        Called from the composition root's shutdown path (``run_pipeline``) so a
++        SESSION_ENDED credit that is mid-write — ``increment_play_count`` done but
++        ``update_last_played`` / the Last.fm love still pending — is not torn in
++        half by the event loop closing (CONC-1). The credit runs as a
++        fire-and-forget task in ``_bg_tasks``; it is NOT one of the pipeline
++        legs, so without this nothing awaits it and ``asyncio.run`` cancels it
++        mid-write, leaving the collection permanently half-updated (Play Count
++        incremented, Last Played stale) with ``credited`` latched so nothing
++        retries.
++
++        Bounded by ``timeout`` so a stuck write cannot hang shutdown past
++        systemd's stop timeout; a task still running afterwards is left for loop
++        teardown to cancel, with a warning. Never raises — shutdown must proceed.
++        """
++        pending = [t for t in self._bg_tasks if not t.done()]
++        if not pending:
++            return
++        log.info(
++            "Draining %d in-flight session-credit task(s) before shutdown…",
++            len(pending),
++        )
++        _, still_pending = await asyncio.wait(pending, timeout=timeout)
++        if still_pending:
++            log.warning(
++                "%d session-credit task(s) still running after a %.0fs drain "
++                "timeout; the Discogs update may be incomplete.",
++                len(still_pending), timeout,
++            )
++
+     def _start_session(self):
+         """Create a session if none is active.  Idempotent and create-only.
+ 
+diff --git a/tests/test_listen_tracker.py b/tests/test_listen_tracker.py
+index 770d6e9..43183b8 100644
+--- a/tests/test_listen_tracker.py
++++ b/tests/test_listen_tracker.py
+@@ -653,3 +653,92 @@ async def test_collection_then_db_record_still_splits():
+     # Record 1 was collection-owned and finished → credited by the split.
+     writer.increment_play_count.assert_called_once_with(111, 222)
+     assert tracker._session.last_release_id == 555
++
++
++# ---------------------------------------------------------------------------
++# CONC-1 — drain(): shutdown must wait for an in-flight end-of-session credit
++# so it is not torn in half (Play Count incremented, Last Played never written,
++# credited latched, no retry). These pin drain()'s three behaviours plus a
++# reproduction of the mid-write tear window.
++# ---------------------------------------------------------------------------
++
++@pytest.mark.asyncio
++async def test_drain_with_no_in_flight_tasks_is_a_noop():
++    tracker = ListenTracker(make_writer_mock(), None)
++    # No bg tasks; must return promptly without error.
++    await asyncio.wait_for(tracker.drain(timeout=5), timeout=1.0)
++
++
++@pytest.mark.asyncio
++async def test_drain_waits_for_an_in_flight_credit_to_finish():
++    tracker = ListenTracker(make_writer_mock(), None)
++    finished = []
++    gate = asyncio.Event()
++
++    async def credit():
++        await gate.wait()
++        finished.append("done")
++
++    t = asyncio.create_task(credit())
++    tracker._bg_tasks.add(t)
++    t.add_done_callback(tracker._bg_tasks.discard)
++
++    drainer = asyncio.create_task(tracker.drain(timeout=5))
++    await asyncio.sleep(0)
++    assert not drainer.done()          # drain is still waiting on the credit
++    assert finished == []
++
++    gate.set()
++    await drainer
++    assert finished == ["done"]        # the credit completed before drain returned
++
++
++@pytest.mark.asyncio
++async def test_drain_lets_a_two_phase_credit_complete_not_torn():
++    """The exact CONC-1 shape: a credit that has done its FIRST write and is
++    awaiting its SECOND. Without draining, shutdown cancels it here and the
++    second write is lost. drain() must let it finish both."""
++    tracker = ListenTracker(make_writer_mock(), None)
++    writes = []
++    between_writes = asyncio.Event()
++
++    async def credit():
++        writes.append("play_count")        # first Discogs write lands
++        await between_writes.wait()         # <-- the tear window
++        writes.append("last_played")        # second write
++
++    t = asyncio.create_task(credit())
++    tracker._bg_tasks.add(t)
++    t.add_done_callback(tracker._bg_tasks.discard)
++
++    await asyncio.sleep(0)
++    assert writes == ["play_count"]         # mid-write: this is where the old code tore it
++
++    drainer = asyncio.create_task(tracker.drain(timeout=5))
++    await asyncio.sleep(0)
++    assert not drainer.done()               # drain holds shutdown open for the credit
++    between_writes.set()
++    await drainer
++    assert writes == ["play_count", "last_played"]   # both writes landed
++
++
++@pytest.mark.asyncio
++async def test_drain_is_bounded_by_timeout_and_does_not_hang():
++    """A stuck credit must not hang shutdown forever — drain returns after the
++    timeout (the task is left for loop teardown to cancel)."""
++    tracker = ListenTracker(make_writer_mock(), None)
++    never = asyncio.Event()
++
++    async def stuck():
++        await never.wait()
++
++    t = asyncio.create_task(stuck())
++    tracker._bg_tasks.add(t)
++    t.add_done_callback(tracker._bg_tasks.discard)
++
++    # If drain ignored its timeout this would hang; wait_for bounds the test.
++    await asyncio.wait_for(tracker.drain(timeout=0.05), timeout=2.0)
++
++    t.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await t
+diff --git a/tests/test_main_wiring.py b/tests/test_main_wiring.py
+index 9e77a64..1aaee59 100644
+--- a/tests/test_main_wiring.py
++++ b/tests/test_main_wiring.py
+@@ -8,7 +8,7 @@ Covers the two pieces extracted from main() for testability:
+ """
+ import asyncio
+ import sys
+-from unittest.mock import MagicMock
++from unittest.mock import MagicMock, AsyncMock
+ 
+ import pytest
+ 
+@@ -64,6 +64,14 @@ def test_session_ended_clears_and_bumps_epoch():
+ # run_pipeline
+ # ---------------------------------------------------------------------------
+ 
++def _drainable_tracker():
++    """A tracker stub whose drain() is an awaitable no-op — run_pipeline awaits
++    it on shutdown so an in-flight end-of-session credit isn't torn (CONC-1)."""
++    t = MagicMock()
++    t.drain = AsyncMock()
++    return t
++
++
+ @pytest.mark.asyncio
+ async def test_run_pipeline_cancels_pending_and_stops():
+     capture, display = MagicMock(), MagicMock()
+@@ -77,13 +85,52 @@ async def test_run_pipeline_cancels_pending_and_stops():
+     done_leg = asyncio.create_task(quick())
+     pending_leg = asyncio.create_task(forever())
+ 
+-    await run_pipeline([done_leg, pending_leg], capture, display)
++    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker())
+ 
+     assert pending_leg.cancelled()
+     capture.stop.assert_called_once()
+     display.stop.assert_called_once()
+ 
+ 
++@pytest.mark.asyncio
++async def test_run_pipeline_drains_tracker_before_stopping_subsystems():
++    """CONC-1: shutdown must await the tracker's in-flight credit tasks (drain)
++    in the finally, and do so BEFORE tearing down capture/display."""
++    capture, display = MagicMock(), MagicMock()
++    tracker = _drainable_tracker()
++    order = []
++    tracker.drain.side_effect = lambda *a, **k: order.append("drain")
++    capture.stop.side_effect = lambda: order.append("capture.stop")
++    display.stop.side_effect = lambda: order.append("display.stop")
++
++    async def quick():
++        return
++
++    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker)
++
++    tracker.drain.assert_awaited_once()
++    assert order[0] == "drain"                 # credit finishes before subsystems stop
++    assert "capture.stop" in order and "display.stop" in order
++
++
++@pytest.mark.asyncio
++async def test_run_pipeline_still_drains_when_a_leg_faults():
++    """A faulted leg must not abandon an in-flight credit — drain still runs in
++    the finally before the exception propagates."""
++    capture, display = MagicMock(), MagicMock()
++    tracker = _drainable_tracker()
++
++    async def boom():
++        raise RuntimeError("leg died")
++
++    with pytest.raises(RuntimeError, match="leg died"):
++        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker)
++
++    tracker.drain.assert_awaited_once()
++    capture.stop.assert_called_once()
++    display.stop.assert_called_once()
++
++
+ @pytest.mark.asyncio
+ async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
+     capture, display = MagicMock(), MagicMock()
+@@ -98,7 +145,7 @@ async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
+     pending_leg = asyncio.create_task(forever())
+ 
+     with pytest.raises(RuntimeError, match="leg died"):
+-        await run_pipeline([boom_leg, pending_leg], capture, display)
++        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker())
+ 
+     # finally ran despite the re-raise…
+     capture.stop.assert_called_once()
+@@ -128,7 +175,7 @@ async def test_run_pipeline_logs_every_faulted_leg(caplog):
+ 
+     with caplog.at_level(logging.ERROR):
+         with pytest.raises((RuntimeError, ValueError)):
+-            await run_pipeline([leg_a, leg_b], capture, display)
++            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker())
+ 
+     logged = " ".join(r.getMessage() for r in caplog.records)
+     assert "leg A died" in logged

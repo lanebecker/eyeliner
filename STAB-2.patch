@@ -1,0 +1,409 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cebb221..7ac0101 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -160,6 +160,27 @@ same implement → RED test → mutation-check → cold-review discipline.
+   eliminating those mutants at the source, and the *reachable* duplicate-position
+   behavior (resolve by position AND title, not the first row at that position) is
+   now pinned by a real test. Behavior-preserving; no production behavior change.
++- **A pre-NTP clock no longer stamps a wrong Last Played date or scrobble
++  timestamp over real data (STAB-2, #86 — MEDIUM).** The Pi has no RTC; a boot
++  before NTP settles reads the Unix epoch or a stale `fake-hwclock` date.
++  `update_last_played` wrote `date.today().isoformat()` as an absolute set with no
++  clock check, so a pre-NTP side-completion POSTed e.g. `1970-01-01` over the
++  correct Last Played value in the real collection (and logged success), and the
++  scrobble submitted an epoch/stale timestamp that Last.fm silently drops or
++  mis-places. A new `src/util/clock.py` gate (`clock_is_trustworthy`, a
++  compiled-in 2026-01-01 floor) now guards both date-dependent writes: a pre-NTP
++  boot skips the Last Played write and the scrobble with a WARNING rather than
++  writing a wrong value, and re-attempts on the next play once the clock syncs.
++  Play Count is deliberately NOT gated — it writes a count, not a date, so a wrong
++  clock can't corrupt it. This is the code-level complement to the
++  deployment-level CRIT-4 (#83): the systemd unit already waits for
++  `time-sync.target`, so a correctly-deployed appliance never runs before sync;
++  this gate is defense-in-depth for the manual-run / mis-deployed case and the
++  catastrophic epoch reading. (The floor is a lower bound — a stale-but-post-floor
++  clock is a documented residual the deployment sync covers.) A deliberate
++  clock-skip is not mislabeled as a failure by the tracker's finalize log.
++  RED-reproduced (a 1970 POST over the real field); the gate and both call-site
++  guards are mutation-verified; cold review + a narrow second pass both PASS.
+ 
+ ---
+ 
+diff --git a/src/app/track_commit_service.py b/src/app/track_commit_service.py
+index 7ed9858..95dc601 100644
+--- a/src/app/track_commit_service.py
++++ b/src/app/track_commit_service.py
+@@ -34,6 +34,8 @@ import logging
+ import time
+ from typing import TYPE_CHECKING, Optional
+ 
++from src.util.clock import clock_is_trustworthy
++
+ if TYPE_CHECKING:
+     from src.audio.recognizer import RawRecognitionResult
+     from src.metadata.resolver import MetadataResolver
+@@ -134,11 +136,25 @@ class TrackCommitService:
+         # guard; apply it to the scrobble too so a track whose session has already
+         # ended is neither re-committed nor scrobbled.
+         if self.lastfm and self.state.session_epoch == audio_epoch:
+-            try:
+-                await asyncio.get_running_loop().run_in_executor(
+-                    None, self.lastfm.scrobble, metadata, timestamp
++            # Clock-sanity gate (STAB-2): validate the EXACT timestamp captured at
++            # the top of commit().  A pre-NTP boot (the Pi has no RTC) stamps an
++            # epoch/stale time; Last.fm silently drops a scrobble that is too old
++            # or in the future — or lands it at the wrong point in listening
++            # history — while reporting success either way.  Skip with one WARNING
++            # rather than submit a wrong time.
++            if not clock_is_trustworthy(timestamp):
++                log.warning(
++                    "Skipping Last.fm scrobble for %s — %s: the system clock is not yet "
++                    "trustworthy (pre-NTP boot?); a wrong timestamp would be dropped or land "
++                    "at the wrong point in listening history.",
++                    metadata.artist, metadata.title,
+                 )
+-            except Exception as e:
+-                log.warning(f"Last.fm scrobble error: {e}")
++            else:
++                try:
++                    await asyncio.get_running_loop().run_in_executor(
++                        None, self.lastfm.scrobble, metadata, timestamp
++                    )
++                except Exception as e:
++                    log.warning(f"Last.fm scrobble error: {e}")
+ 
+         return True
+diff --git a/src/metadata/discogs/writer.py b/src/metadata/discogs/writer.py
+index c7660da..d40c392 100644
+--- a/src/metadata/discogs/writer.py
++++ b/src/metadata/discogs/writer.py
+@@ -15,6 +15,7 @@ from datetime import date
+ from typing import Optional, Union, TYPE_CHECKING
+ 
+ from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _as_id
++from src.util.clock import clock_is_trustworthy
+ 
+ if TYPE_CHECKING:
+     from src.config import DiscogsConfig
+@@ -159,6 +160,22 @@ class DiscogsCollectionWriter:
+         if not self.last_played_field_name:
+             return True  # Not configured — graceful no-op
+ 
++        # Clock-sanity gate (STAB-2): the Pi has no RTC, so a pre-NTP boot makes
++        # date.today() read the Unix epoch or a stale fake-hwclock date. Writing
++        # that as an absolute set would stamp a wrong date over the correct Last
++        # Played value in the real collection. Skip the write (with one WARNING)
++        # rather than corrupt it; the next play re-attempts once the clock syncs.
++        # Play Count is deliberately NOT gated — it writes a count, not a date.
++        if not clock_is_trustworthy():
++            log.warning(
++                "Skipping Last Played update for release %s / instance %s: the system "
++                "clock is not yet trustworthy (pre-NTP boot?) — refusing to overwrite the "
++                "real value with a wrong date. It will update on the next play once the "
++                "clock has synchronized.",
++                release_id, instance_id,
++            )
++            return False
++
+         try:
+             fields = self._get_collection_fields()
+             field_id = fields.get(self.last_played_field_name)
+diff --git a/src/tracking/listen_tracker.py b/src/tracking/listen_tracker.py
+index 202c38e..09294a5 100644
+--- a/src/tracking/listen_tracker.py
++++ b/src/tracking/listen_tracker.py
+@@ -36,6 +36,7 @@ from typing import Optional, TYPE_CHECKING
+ 
+ from src.metadata.models import PlaySession, TrackMetadata
+ from src.audio.silence import AudioEvent
++from src.util.clock import clock_is_trustworthy
+ 
+ if TYPE_CHECKING:
+     from src.metadata.discogs.writer import DiscogsCollectionWriter
+@@ -237,6 +238,14 @@ class ListenTracker:
+                 )
+                 if last_played_success:
+                     log.info("✅ Discogs Last Played updated successfully.")
++                elif not clock_is_trustworthy():
++                    # A pre-NTP clock made update_last_played skip the write (it
++                    # already logged its own WARNING).  A deliberate skip is NOT a
++                    # failure, so don't ALSO report it as one (STAB-2).  A False
++                    # return with an untrustworthy clock is always the skip path —
++                    # the writer's gate short-circuits before the POST — never a
++                    # real write failure, so this can't mask a genuine error.
++                    pass
+                 else:
+                     log.warning("⚠ Failed to update Discogs Last Played.")
+ 
+diff --git a/src/util/clock.py b/src/util/clock.py
+new file mode 100644
+index 0000000..4fcf0d8
+--- /dev/null
++++ b/src/util/clock.py
+@@ -0,0 +1,56 @@
++"""Wall-clock trustworthiness gate (STAB-2).
++
++The Raspberry Pi 4 has no battery-backed real-time clock; at boot the clock is
++whatever ``fake-hwclock`` last saved — or the Unix epoch on a fresh SD card —
++until an NTP sync settles. Writing a **Last Played** date or a scrobble
++timestamp from such a clock stamps a wrong value over real, unrecoverable
++collection / listening-history data. Both date-dependent writes are gated on
++:func:`clock_is_trustworthy`; a pre-NTP boot skips them (with a WARNING) rather
++than corrupting the record.
++
++This is the CODE-level defense-in-depth complement to the DEPLOYMENT-level fix
++(CRIT-4 / #83): the systemd unit is ordered after ``time-sync.target`` with
++``systemd-time-wait-sync`` enabled, so a correctly-deployed appliance never
++starts before the clock syncs. This gate protects the manual-run and
++mis-deployed cases, and catches the catastrophic epoch/stale reading directly.
++
++Scope: this is a LOWER BOUND, not a sync check. It catches an unset / epoch /
++grossly-stale clock (the catastrophic data-corrupting case — the finding's
++`{'value': '1970-01-01'}`). It does NOT catch a clock that is stale but still
++reads *after* the floor: a ``fake-hwclock`` date anywhere between the floor and
++the true present passes, so a Pi last used months ago and booted offline can
++still write a wrong (but post-floor) date. Closing that residual gap needs the
++actual NTP-sync signal, which the deployment unit owns (CRIT-4/#83 orders after
++``time-sync.target`` with ``systemd-time-wait-sync``, so a correctly-deployed
++appliance never runs before sync); the on-device ``/run/systemd/timesync/
++synchronized`` check is a possible future tightening for the manual-run case.
++Play Count is intentionally NOT gated: it writes a count, not a date, so a wrong
++clock cannot corrupt it.
++"""
++import logging
++import time
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++# A live install's wall clock can never legitimately read earlier than this.
++# Chosen as the software's own era: this v1.x line was first released in 2026, so
++# a correctly NTP-synced clock is always well past this floor (it only moves
++# forward), meaning the gate can never reject a genuine clock — yet the floor sits
++# far above the Unix epoch and the manufacture-era timestamps a pre-NTP Pi
++# restores via fake-hwclock. A reading below it is provably an unset clock.
++# 2026-01-01T00:00:00Z.
++_CLOCK_SANITY_FLOOR_EPOCH = 1_767_225_600
++
++
++def clock_is_trustworthy(now: Optional[float] = None) -> bool:
++    """Return True iff the wall clock is recent enough to trust for date writes.
++
++    ``now`` is a Unix timestamp (seconds), injectable for testing and for
++    validating a *specific* already-captured timestamp (e.g. the scrobble time);
++    it defaults to :func:`time.time`. Returns False for an unset / epoch /
++    grossly-stale clock — the caller should then skip the date write with a
++    WARNING rather than corrupt the record.
++    """
++    t = time.time() if now is None else now
++    return t >= _CLOCK_SANITY_FLOOR_EPOCH
+diff --git a/tests/test_clock.py b/tests/test_clock.py
+new file mode 100644
+index 0000000..6970962
+--- /dev/null
++++ b/tests/test_clock.py
+@@ -0,0 +1,28 @@
++"""Unit tests for the STAB-2 wall-clock trustworthiness gate."""
++from datetime import datetime, timezone
++
++from src.util.clock import clock_is_trustworthy, _CLOCK_SANITY_FLOOR_EPOCH
++
++
++def test_floor_is_2026_01_01_utc():
++    """The floor is the documented 2026-01-01T00:00:00Z (the software's era)."""
++    assert _CLOCK_SANITY_FLOOR_EPOCH == int(
++        datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
++    )
++
++
++def test_epoch_and_stale_clocks_are_untrustworthy():
++    assert clock_is_trustworthy(0.0) is False            # 1970 — fresh SD card
++    assert clock_is_trustworthy(1_600_000_000) is False  # 2020 — stale fake-hwclock
++
++
++def test_boundary_at_the_floor():
++    """Pins the exact comparison: below the floor is untrusted, at/above is trusted."""
++    assert clock_is_trustworthy(_CLOCK_SANITY_FLOOR_EPOCH - 1) is False
++    assert clock_is_trustworthy(_CLOCK_SANITY_FLOOR_EPOCH) is True
++    assert clock_is_trustworthy(_CLOCK_SANITY_FLOOR_EPOCH + 1) is True
++
++
++def test_present_and_future_clocks_are_trustworthy():
++    assert clock_is_trustworthy(2_000_000_000) is True   # 2033
++    assert clock_is_trustworthy() is True                # the real (present-day) clock
+diff --git a/tests/test_discogs_client.py b/tests/test_discogs_client.py
+index a0547fe..1e94713 100644
+--- a/tests/test_discogs_client.py
++++ b/tests/test_discogs_client.py
+@@ -588,6 +588,74 @@ def test_update_last_played_date_is_iso_format():
+     assert str(parsed) == posted_value
+ 
+ 
++# ---------------------------------------------------------------------------
++# update_last_played — clock-sanity gate (STAB-2)
++#
++# The Pi has no RTC; a pre-NTP boot makes date.today() read the epoch or a stale
++# fake-hwclock date. Writing that would stamp a wrong date over the real Last
++# Played value. The write is gated on clock_is_trustworthy(); Play Count is NOT
++# gated (it writes a count, not a date).
++# ---------------------------------------------------------------------------
++
++def test_update_last_played_skips_when_clock_untrustworthy():
++    """A pre-NTP clock must NOT overwrite Last Played — skip the POST, return False."""
++    client = make_client_with_last_played()
++    client._http.session.post = MagicMock(return_value=make_post_response(204))
++
++    with patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=False):
++        result = client.update_last_played(release_id=111, instance_id=42)
++
++    assert result is False
++    client._http.session.post.assert_not_called()  # no wrong date written
++
++
++def test_update_last_played_writes_when_clock_trustworthy():
++    """The gate lets a good clock through — today's date still POSTs."""
++    client = make_client_with_last_played()
++    client._http.session.post = MagicMock(return_value=make_post_response(204))
++
++    with patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=True):
++        result = client.update_last_played(release_id=111, instance_id=42)
++
++    assert result is True
++    client._http.session.post.assert_called_once()
++
++
++def test_update_last_played_skip_logs_a_warning(caplog):
++    """The skip leaves a WARNING breadcrumb so a missed update is explained."""
++    import logging
++    client = make_client_with_last_played()
++    client._http.session.post = MagicMock(return_value=make_post_response(204))
++
++    with caplog.at_level(logging.WARNING), \
++         patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=False):
++        client.update_last_played(release_id=111, instance_id=42)
++
++    assert any("clock is not yet trustworthy" in r.message for r in caplog.records)
++
++
++def test_increment_play_count_is_not_gated_by_the_clock():
++    """Play Count writes a count, not a date, so a wrong clock can't corrupt it —
++    it is deliberately NOT gated and still increments even when the clock is
++    untrustworthy (STAB-2 scope)."""
++    writer = make_unseeded_writer()
++
++    def fake_request(method, url, **kwargs):
++        if url.endswith("/collection/fields"):
++            return _fields_response([{"name": "Play Count", "id": 3}])
++        if method == "GET":
++            return make_get_response(200, instance_response(42, 3, "5"))
++        return make_post_response(204)
++
++    writer._http.request = MagicMock(side_effect=fake_request)
++
++    with patch("src.metadata.discogs.writer.clock_is_trustworthy", return_value=False):
++        assert writer.increment_play_count(release_id=111, instance_id=42) is True
++
++    post_urls = [c.args[1] for c in writer._http.request.call_args_list if c.args[0] == "POST"]
++    assert post_urls, "Play Count POST was suppressed by the clock gate — it must not be"
++
++
+ # ---------------------------------------------------------------------------
+ # update_last_played — field not found
+ # ---------------------------------------------------------------------------
+diff --git a/tests/test_listen_tracker.py b/tests/test_listen_tracker.py
+index 43183b8..2358eac 100644
+--- a/tests/test_listen_tracker.py
++++ b/tests/test_listen_tracker.py
+@@ -17,7 +17,7 @@ Covers update_last_played integration:
+ No audio hardware, display, or Discogs account required. DiscogsClient is mocked.
+ """
+ import asyncio
+-from unittest.mock import MagicMock
++from unittest.mock import MagicMock, patch
+ import pytest
+ 
+ from src.audio.silence import AudioEvent
+@@ -396,6 +396,45 @@ async def test_update_last_played_returning_false_does_not_raise():
+     writer.update_last_played.assert_called_once()
+ 
+ 
++@pytest.mark.asyncio
++async def test_clock_skip_is_not_logged_as_a_failure(caplog):
++    """STAB-2: when update_last_played skips the write because the clock is
++    untrustworthy (pre-NTP), the finalize path must NOT ALSO report it as a
++    failure — a deliberate skip is not a failure (the writer already WARNed)."""
++    import logging
++    tracker, writer = make_tracker(
++        last_played_field_name="Last Played",
++        update_last_played_return=False,   # the writer's gate skipped → returns False
++    )
++    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
++    await tracker.on_track_identified(make_track("Master-Dik"))
++    with caplog.at_level(logging.WARNING), \
++         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=False):
++        await tracker._end_session()
++    assert not any(
++        "Failed to update Discogs Last Played" in r.message for r in caplog.records
++    )
++
++
++@pytest.mark.asyncio
++async def test_real_last_played_failure_is_still_logged(caplog):
++    """The STAB-2 skip suppression must NOT mask a genuine failure: update_last_played
++    returning False with a TRUSTWORTHY clock is a real error and is still logged."""
++    import logging
++    tracker, writer = make_tracker(
++        last_played_field_name="Last Played",
++        update_last_played_return=False,
++    )
++    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
++    await tracker.on_track_identified(make_track("Master-Dik"))
++    with caplog.at_level(logging.WARNING), \
++         patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
++        await tracker._end_session()
++    assert any(
++        "Failed to update Discogs Last Played" in r.message for r in caplog.records
++    )
++
++
+ # ---------------------------------------------------------------------------
+ # Background task management (v1.3.3)
+ #
+diff --git a/tests/test_track_commit_service.py b/tests/test_track_commit_service.py
+index d97e08b..72c913e 100644
+--- a/tests/test_track_commit_service.py
++++ b/tests/test_track_commit_service.py
+@@ -16,7 +16,7 @@ recognizer tests never passed a Last.fm client (T-2).
+ A real PlayerState is used so the epoch logic is live; resolver / tracker /
+ lastfm are mocks.
+ """
+-from unittest.mock import AsyncMock, MagicMock
++from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
+ 
+@@ -315,3 +315,23 @@ async def test_stale_commit_does_not_scrobble():
+     await service.commit(make_raw(), state.session_epoch)
+ 
+     lastfm.scrobble.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_scrobble_skipped_when_clock_untrustworthy():
++    """STAB-2: a pre-NTP clock captured an epoch/stale timestamp at the top of
++    commit(); the scrobble is skipped rather than submitting a wrong time that
++    Last.fm would silently drop or mis-place. The rest of the commit still runs."""
++    lastfm = MagicMock()
++    lastfm.scrobble = MagicMock()
++    service, state, resolver, tracker = make_service(lastfm=lastfm)
++    state.set_status(PlayerStatus.LISTENING)
++    meta = MagicMock()
++    resolver.resolve = AsyncMock(return_value=meta)
++
++    with patch("src.app.track_commit_service.clock_is_trustworthy", return_value=False):
++        committed = await service.commit(make_raw(), state.session_epoch)
++
++    assert committed is True              # commit still succeeds (display + tracker)
++    assert state.current_track is meta
++    lastfm.scrobble.assert_not_called()   # only the scrobble is skipped

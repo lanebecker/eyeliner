@@ -213,6 +213,23 @@ same implement → RED test → mutation-check → cold-review discipline.
   returns `_READ_FAILED` on 429, so META-1's abort is unaffected, and B-15 POST
   opt-in retry semantics are preserved. Mutation-verified (incl. the `>`/`>=`
   boundary); cold review SPEC / QUALITY PASS.
+- **A partial Discogs write now logs one explicit divergence line instead of two
+  unrelated warnings (META-7, #89 — LOW).** The end-of-album credit is two
+  independent POSTs — Play Count, then Last Played — against a 60 req/min API, and
+  the session is destroyed right after. If exactly one lands (a 429 on the second
+  POST is the obvious case), the collection item is left inconsistent — count
+  incremented but date stale, or the reverse — with nothing to retry it until the
+  record plays again. Each write already logged its own warning, but the two
+  didn't say they belonged together. `_finalize_session` now emits a single
+  `DIVERGED` warning naming the release/instance and stating which side landed and
+  which did not, in both directions. A deliberate STAB-2 clock-skip of Last Played
+  (a pre-NTP boot defers rather than fails, and has already WARNed) is excluded via
+  a trustworthy-clock gate so the line does not cry wolf on every album finished
+  before NTP sync; genuine post-sync failures (a 429, a dropped connection) run on
+  a trustworthy clock and still fire. Log-only — no new writes to the collection.
+  RED-first; both disagreement directions mutation-pinned (the XOR, the clock gate,
+  and each message operand); cold review SPEC / QUALITY PASS after adding the
+  reverse-direction `(F,T)` test the first pass flagged as an unpinned branch.
 
 ---
 

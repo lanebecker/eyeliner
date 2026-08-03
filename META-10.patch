@@ -1,0 +1,202 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 711bf3e..fd0a049 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -196,6 +196,23 @@ same implement → RED test → mutation-check → cold-review discipline.
+   it. No false-drop: an album-swap split isn't a silence event and doesn't bump the
+   epoch, so a live track is never dropped. Mutation-verified; a real-lock cold-review
+   reproduction confirmed the phantom forms pre-fix and is dropped after.
++- **A persistent Discogs 429 is now a distinct, loud outcome instead of a silent
++  lost credit (META-10, #88 — LOW).** The transport retried a 429 once after
++  sleeping the server's `Retry-After`, clamped to a 10s cap — so when Discogs
++  answers `Retry-After: 60` the retry landed back inside the same throttle window
++  and 429'd again, and the caller then logged a generic failure and returned
++  `False`, dropping the completed side's Play Count credit with nothing to
++  distinguish it from any other error. The cap stays (`request()` runs on the
++  shared executor pool; a long sleep starves cover fetches / scrobbles — P-2). Now
++  a `Retry-After` **beyond** the cap skips the futile retry entirely — no wasted
++  sleep, no second request hammering Discogs mid-backoff — and logs a distinct,
++  loud ERROR naming the lost-credit consequence; a retry that is **still** 429 logs
++  the same distinct ERROR rather than a generic failure. Actually waiting out a
++  long `Retry-After` so the write can still land (recovery) needs Discogs off the
++  shared pool and is deferred to the dedicated executor (#61). The read path still
++  returns `_READ_FAILED` on 429, so META-1's abort is unaffected, and B-15 POST
++  opt-in retry semantics are preserved. Mutation-verified (incl. the `>`/`>=`
++  boundary); cold review SPEC / QUALITY PASS.
+ 
+ ---
+ 
+diff --git a/src/metadata/discogs/transport.py b/src/metadata/discogs/transport.py
+index 32fc46c..b0dd9cb 100644
+--- a/src/metadata/discogs/transport.py
++++ b/src/metadata/discogs/transport.py
+@@ -27,16 +27,20 @@ _API_BASE = "https://api.discogs.com"
+ _HTTP_TIMEOUT = 15
+ 
+ # Discogs allows 60 requests/minute for authenticated callers and answers
+-# excess traffic with HTTP 429 + a Retry-After header (seconds).  When that
+-# happens we honour the header once per request, capped so a pathological
+-# header value can't park an executor thread for long.
++# excess traffic with HTTP 429 + a Retry-After header (seconds).  request()
++# honours the header for a single retry — but ONLY when the requested wait fits
++# within the cap below.
+ #
+-# The cap is 10s (was 30s): request() runs on the SHARED run_in_executor(None,…)
+-# pool, which also serves cover downloads and Last.fm scrobbles, so a long
+-# sleep here parks a worker those tasks could use (P-2).  10s still honours any
+-# realistic Retry-After (Discogs rarely asks for more than a few seconds) while
+-# bounding the worst-case stall — and the P-1 collection index slashed Discogs
+-# request volume, making 429 bursts far less likely in the first place.
++# The cap is 10s: request() runs on the SHARED run_in_executor(None,…) pool,
++# which also serves cover downloads and Last.fm scrobbles, so a long sleep here
++# parks a worker those tasks could use (P-2).  A Retry-After WITHIN the cap is
++# honoured and retried once.  A Retry-After BEYOND the cap is NOT retried — a
++# retry inside the cap would land in the same throttle window and 429 again
++# (META-10) — so the futile retry is skipped and a distinct, loud error is
++# logged instead.  Actually waiting out a long Retry-After (so the write still
++# lands) needs Discogs off the shared pool and is deferred to the dedicated
++# executor (#61).  The P-1 collection index slashed Discogs request volume,
++# making 429 bursts far less likely in the first place.
+ _RATE_LIMIT_MAX_WAIT = 10
+ _RATE_LIMIT_DEFAULT_WAIT = 2
+ 
+@@ -105,10 +109,12 @@ class DiscogsHttp:
+         """Issue a session request with rate-limit awareness (v1.3.3).
+ 
+         All direct REST calls go through here so that an HTTP 429 from Discogs
+-        is retried exactly once, after sleeping for the server-suggested
+-        Retry-After (clamped to _RATE_LIMIT_MAX_WAIT, with
+-        _RATE_LIMIT_DEFAULT_WAIT as the fallback when the header is missing or
+-        unparseable).
++        is retried at most once.  The retry sleeps for the server-suggested
++        Retry-After (with _RATE_LIMIT_DEFAULT_WAIT as the fallback when the
++        header is missing or unparseable) — but ONLY when that wait is within
++        _RATE_LIMIT_MAX_WAIT.  A Retry-After beyond the cap is NOT retried (the
++        retry would still be throttled); the futile retry is skipped and a
++        distinct, loud error is logged instead (META-10).
+ 
+         `retry_on_429` controls whether that one retry happens.  It defaults to
+         True for GET (always safe to repeat) and False for POST: a blind POST
+@@ -131,14 +137,45 @@ class DiscogsHttp:
+         resp = send(url, **kwargs)
+         if resp.status_code == 429 and retry_on_429:
+             try:
+-                wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_DEFAULT_WAIT))
++                retry_after = int(resp.headers.get("Retry-After", _RATE_LIMIT_DEFAULT_WAIT))
+             except (TypeError, ValueError):
+-                wait = _RATE_LIMIT_DEFAULT_WAIT
+-            wait = max(1, min(wait, _RATE_LIMIT_MAX_WAIT))
++                retry_after = _RATE_LIMIT_DEFAULT_WAIT
++
++            if retry_after > _RATE_LIMIT_MAX_WAIT:
++                # Discogs is asking us to back off LONGER than we are willing to
++                # park this shared executor thread (P-2).  A retry inside our cap
++                # would land in the same throttle window and 429 again, so skip the
++                # futile retry entirely — no wasted sleep, no second request
++                # hammering Discogs mid-backoff — and surface a DISTINCT, LOUD
++                # outcome (META-10) instead of a capped wait the caller can't tell
++                # apart from a generic failure.  Actually WAITING OUT a long
++                # Retry-After so the write can still land needs Discogs off the
++                # shared pool; that is deferred to the dedicated executor (#61).
++                log.error(
++                    "Discogs rate limit (429) for %s %s: server asked to wait %ss, "
++                    "beyond our %ss cap — NOT retrying (it would still be throttled). "
++                    "This request fails now and its caller has no further retry, so "
++                    "the write (e.g. a Play Count credit) may be lost.",
++                    method, _redact_url(url), retry_after, _RATE_LIMIT_MAX_WAIT,
++                )
++                return resp
++
++            wait = max(1, retry_after)
+             log.warning(
+-                f"Discogs rate limit hit (429) for {method} {_redact_url(url)}; "
+-                f"retrying once in {wait}s."
++                "Discogs rate limit (429) for %s %s; retrying once in %ss "
++                "(Retry-After=%ss).",
++                method, _redact_url(url), wait, retry_after,
+             )
+             time.sleep(wait)
+             resp = send(url, **kwargs)
++            if resp.status_code == 429:
++                # Still throttled after our one retry: a DISTINCT, LOUD outcome so
++                # a lost credit is not silently conflated with a generic failure
++                # (META-10).  Recovery (deferring the credit) is out of scope here.
++                log.error(
++                    "Discogs STILL rate-limiting (429) after the retry for %s %s — "
++                    "this request cannot complete and its caller has no further "
++                    "retry, so the write (e.g. a Play Count credit) may be lost.",
++                    method, _redact_url(url),
++                )
+         return resp
+diff --git a/tests/test_discogs_client.py b/tests/test_discogs_client.py
+index 1e94713..7e0b709 100644
+--- a/tests/test_discogs_client.py
++++ b/tests/test_discogs_client.py
+@@ -767,17 +767,63 @@ def test_request_429_uses_default_wait_when_header_unparseable():
+     mock_sleep.assert_called_once_with(_RATE_LIMIT_DEFAULT_WAIT)
+ 
+ 
+-def test_request_429_wait_is_capped():
++def test_request_429_over_cap_skips_the_futile_retry(caplog):
++    """META-10: when Discogs asks to wait LONGER than our cap, a retry inside the
++    cap would still be throttled — so skip it (no wasted sleep, no second request,
++    no pool parking) and surface a distinct, loud error."""
++    import logging
+     from src.metadata.discogs.transport import _RATE_LIMIT_MAX_WAIT
+     client = make_client()
++    over_cap = str(_RATE_LIMIT_MAX_WAIT + 50)   # e.g. "60" — beyond our cap
++    client._http.session.get = MagicMock(return_value=make_429_response(over_cap))
++
++    with caplog.at_level(logging.ERROR), \
++         patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
++        resp = client._http.request("GET", "https://api.discogs.com/anything")
++
++    assert resp.status_code == 429
++    assert client._http.session.get.call_count == 1    # NO futile retry
++    mock_sleep.assert_not_called()                      # no pool parking
++    assert any("NOT retrying" in r.getMessage() for r in caplog.records)
++
++
++def test_persistent_429_after_retry_logs_a_distinct_error(caplog):
++    """META-10: a 429 whose Retry-After is within the cap IS retried once; if it
++    is STILL rate-limited, surface a distinct, loud error so a lost credit is not
++    silently conflated with a generic failure."""
++    import logging
++    client = make_client()
+     client._http.session.get = MagicMock(
+-        side_effect=[make_429_response("9999"), make_get_response(200, {})]
++        side_effect=[make_429_response("3"), make_429_response("3")]
++    )
++
++    with caplog.at_level(logging.ERROR), \
++         patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
++        resp = client._http.request("GET", "https://api.discogs.com/anything")
++
++    assert resp.status_code == 429
++    assert client._http.session.get.call_count == 2    # retried once
++    mock_sleep.assert_called_once_with(3)               # honored the in-cap wait
++    assert any("STILL rate-limiting" in r.getMessage() for r in caplog.records)
++
++
++def test_request_429_at_exactly_the_cap_still_retries():
++    """META-10 boundary: a Retry-After equal to the cap is WITHIN budget — it must
++    retry (honoring the wait), not be treated as over-cap and skipped. Pins the
++    `>` vs `>=` boundary against a future off-by-one."""
++    from src.metadata.discogs.transport import _RATE_LIMIT_MAX_WAIT
++    client = make_client()
++    ok = make_get_response(200, {})
++    client._http.session.get = MagicMock(
++        side_effect=[make_429_response(str(_RATE_LIMIT_MAX_WAIT)), ok]
+     )
+ 
+     with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+-        client._http.request("GET", "https://api.discogs.com/anything")
++        resp = client._http.request("GET", "https://api.discogs.com/anything")
+ 
+-    mock_sleep.assert_called_once_with(_RATE_LIMIT_MAX_WAIT)
++    assert resp is ok
++    assert client._http.session.get.call_count == 2         # retried, not skipped
++    mock_sleep.assert_called_once_with(_RATE_LIMIT_MAX_WAIT)  # waited exactly the cap
+ 
+ 
+ def test_request_does_not_retry_on_success():
