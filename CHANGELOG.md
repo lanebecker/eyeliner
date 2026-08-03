@@ -194,6 +194,28 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   execution-verified. The owned pool is sized to the interpreter default's width
   (8) rather than narrower, so the recognition-hot-path WAV encode is never queued
   behind a burst of slow network I/O.
+- **A tracker fault on SESSION_ENDED can no longer strand the now-playing card
+  (CRIT-5, #99 — MEDIUM).** The silence-event handler was a SINGLE Signal listener
+  doing two independent effects — `tracker.on_silence_event(event)` then, for
+  SESSION_ENDED, `state.clear()`. `Signal.emit` is log-and-continue, which
+  protects listeners from EACH OTHER but not the second half of one listener from
+  the first: a raise in `tracker.on_silence_event` skipped `state.clear()`, so the
+  B-1 session epoch never bumped and the now-playing card stayed on screen with
+  only a log line in a journal nobody reads. It is now split into two separately
+  registered listeners (via a new `wire_silence_listeners`, extracted for
+  testability) — the player-state effect (`apply_state_silence_effect`) and the
+  tracker's `on_silence_event` — so the Signal's log-and-continue applies BETWEEN
+  them: a fault in either half can't skip the other. The state listener is
+  registered first, honoring the finding's "clear before scheduling the tracker
+  end"; that ordering is otherwise a no-op (post-CONC-2 the tracker's session
+  detach runs in the `_end_session` task it schedules, which fires only after the
+  synchronous emit unwinds, so the epoch bump is synchronous in either order) — a
+  comment that over-claimed a concurrency benefit here was corrected after cold
+  review. RED-first (the stranded-card fault reproduced); the split, the
+  listener order, and the state effect are each mutation-pinned (reverting to the
+  single combined listener is killed by the fault test); cold review SPEC / QUALITY
+  PASS, verifying fault isolation both directions, every AudioEvent still reaching
+  the tracker, and no new race with CONC-2/CONC-6.
 
 ## [1.5.2] — 2026-08-03
 

@@ -1,8 +1,10 @@
 """Regression tests for T-1 — main.py wiring + shutdown had zero coverage.
 
-Covers the two pieces extracted from main() for testability:
-  - handle_silence_event: the IDLE/ERROR → LISTENING transition and
+Covers the pieces extracted from main() for testability:
+  - apply_state_silence_effect: the IDLE/ERROR → LISTENING transition and
     SESSION_ENDED → clear() (the exact paths the B-1 epoch guard relies on).
+  - wire_silence_listeners: the two-listener split (CRIT-5) — state and tracker
+    are separate Signal listeners (log-and-continue between them), state first.
   - run_pipeline: FIRST_COMPLETED shutdown — pending legs cancelled, a faulted
     leg's exception re-raised, capture/display stopped in the finally.
 """
@@ -18,34 +20,51 @@ import pytest
 # real sounddevice untouched where it exists.
 sys.modules.setdefault("sounddevice", MagicMock())
 
-from main import handle_silence_event, run_pipeline, install_io_executor, _IO_EXECUTOR_MAX_WORKERS
+from main import (
+    apply_state_silence_effect, wire_silence_listeners, run_pipeline,
+    install_io_executor, _IO_EXECUTOR_MAX_WORKERS,
+)
 from src.audio.silence import AudioEvent
 from src.state.player_state import PlayerState, PlayerStatus
+from src.util.signal import Signal
+
+
+class _SignalSilence:
+    """Stand-in for SilenceDetector exposing the same on_event/emit over a REAL
+    Signal, so the two-listener wiring (CRIT-5) is exercised through the actual
+    log-and-continue delivery path rather than a mock."""
+
+    def __init__(self):
+        self._sig = Signal("test-silence")
+
+    def on_event(self, cb):
+        self._sig.connect(cb)
+
+    def emit(self, event):
+        self._sig.emit(event)
 
 
 # ---------------------------------------------------------------------------
-# handle_silence_event
+# apply_state_silence_effect — the player-state half (CRIT-5)
 # ---------------------------------------------------------------------------
 
 def test_music_started_from_idle_enters_listening():
     state = PlayerState()
-    tracker = MagicMock()
-    handle_silence_event(AudioEvent.MUSIC_STARTED, state, tracker)
+    apply_state_silence_effect(AudioEvent.MUSIC_STARTED, state)
     assert state.status == PlayerStatus.LISTENING
-    tracker.on_silence_event.assert_called_once_with(AudioEvent.MUSIC_STARTED)
 
 
 def test_music_started_from_error_enters_listening():
     state = PlayerState()
     state.set_status(PlayerStatus.ERROR)
-    handle_silence_event(AudioEvent.MUSIC_STARTED, state, MagicMock())
+    apply_state_silence_effect(AudioEvent.MUSIC_STARTED, state)
     assert state.status == PlayerStatus.LISTENING
 
 
 def test_music_started_during_playing_keeps_now_playing_card():
     state = PlayerState()
     state.set_status(PlayerStatus.PLAYING)
-    handle_silence_event(AudioEvent.MUSIC_STARTED, state, MagicMock())
+    apply_state_silence_effect(AudioEvent.MUSIC_STARTED, state)
     assert state.status == PlayerStatus.PLAYING  # not dropped to LISTENING
 
 
@@ -53,10 +72,75 @@ def test_session_ended_clears_and_bumps_epoch():
     state = PlayerState()
     state.set_status(PlayerStatus.PLAYING)
     epoch0 = state.session_epoch
-    tracker = MagicMock()
-    handle_silence_event(AudioEvent.SESSION_ENDED, state, tracker)
+    apply_state_silence_effect(AudioEvent.SESSION_ENDED, state)
     assert state.status == PlayerStatus.IDLE
     assert state.session_epoch == epoch0 + 1  # B-1 epoch advances on clear()
+
+
+# ---------------------------------------------------------------------------
+# wire_silence_listeners — the two-listener split (CRIT-5)
+# ---------------------------------------------------------------------------
+
+def test_wire_silence_listeners_registers_two_separate_listeners():
+    """The state and tracker effects are TWO separately-registered Signal
+    listeners, so log-and-continue applies between them."""
+    sig = Signal("s")
+    silence = MagicMock()
+    silence.on_event.side_effect = sig.connect
+    wire_silence_listeners(silence, PlayerState(), MagicMock())
+    assert len(sig) == 2
+
+
+def test_state_cleared_before_tracker_end_is_scheduled_on_session_ended():
+    """CRIT-5: on SESSION_ENDED the player state is cleared (epoch bump) BEFORE
+    the tracker's end runs, so the epoch bump precedes the session detach."""
+    order = []
+    state = MagicMock()
+    state.status = PlayerStatus.PLAYING
+    state.clear.side_effect = lambda: order.append("state.clear")
+    tracker = MagicMock()
+    tracker.on_silence_event.side_effect = lambda e: order.append("tracker")
+
+    silence = _SignalSilence()
+    wire_silence_listeners(silence, state, tracker)
+    silence.emit(AudioEvent.SESSION_ENDED)
+
+    assert order == ["state.clear", "tracker"]        # state first, then tracker
+    tracker.on_silence_event.assert_called_once_with(AudioEvent.SESSION_ENDED)
+
+
+def test_tracker_fault_on_session_ended_still_clears_state():
+    """CRIT-5: a raise in the tracker's SESSION_ENDED handler must NOT prevent the
+    player state from clearing — otherwise the B-1 epoch never bumps and the
+    now-playing card is stranded. The split + Signal log-and-continue guarantees
+    it. (On the old single combined listener the raise skipped state.clear().)"""
+    state = PlayerState()
+    state.set_status(PlayerStatus.PLAYING)             # a now-playing card is on screen
+    epoch0 = state.session_epoch
+    tracker = MagicMock()
+    tracker.on_silence_event.side_effect = RuntimeError("tracker blew up")
+
+    silence = _SignalSilence()
+    wire_silence_listeners(silence, state, tracker)
+    silence.emit(AudioEvent.SESSION_ENDED)             # log-and-continue swallows the raise
+
+    assert state.status == PlayerStatus.IDLE           # cleared DESPITE the tracker fault
+    assert state.session_epoch == epoch0 + 1           # B-1 epoch advanced
+    tracker.on_silence_event.assert_called_once_with(AudioEvent.SESSION_ENDED)
+
+
+def test_state_fault_does_not_skip_the_tracker():
+    """The converse: a fault in the state half must not skip the tracker half —
+    Signal log-and-continue protects each listener from the other."""
+    state = MagicMock()
+    state.status = PlayerStatus.PLAYING
+    state.clear.side_effect = RuntimeError("state blew up")
+    tracker = MagicMock()
+
+    silence = _SignalSilence()
+    wire_silence_listeners(silence, state, tracker)
+    silence.emit(AudioEvent.SESSION_ENDED)
+
     tracker.on_silence_event.assert_called_once_with(AudioEvent.SESSION_ENDED)
 
 
