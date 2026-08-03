@@ -100,6 +100,27 @@ def _field(data: dict, key: str, kind, default, *, section: str, errors: list):
     return coerced
 
 
+def _check(ok: bool, message: str, errors: list) -> None:
+    """Record a value-domain error unless *ok* (CRIT-1).
+
+    :func:`_field` validates a field's TYPE; this validates its VALUE, run AFTER
+    the fields are extracted so a bad value — a zero sample rate, a negative
+    overlap — is reported in the SAME aggregated :class:`ConfigError` as any type
+    error, honouring config.py's "single source of truth" / "one friendly startup
+    failure" promise. Without it a type-valid but out-of-domain value sailed
+    through here and crashed the capture leg deep in a constructor (a
+    ``ChunkAssembler`` ``ValueError``), which systemd's ``Restart=on-failure``
+    turns into a permanent crash loop with a raw traceback.
+
+    Each caller guards its condition on the field being a usable value first
+    (``x is None or x > 0``), because a missing/type error already left ``None``
+    and recorded its own message — so a domain check never itself raises on that
+    ``None`` (``None > 0`` would be a ``TypeError``).
+    """
+    if not ok:
+        errors.append(message)
+
+
 # ---------------------------------------------------------------------------
 # Section schemas
 # ---------------------------------------------------------------------------
@@ -117,13 +138,37 @@ class AudioConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "AudioConfig":
         s = "audio"
+        device_name = _field(data, "device_name", str, _REQUIRED, section=s, errors=errors)
+        sample_rate = _field(data, "sample_rate", int, _REQUIRED, section=s, errors=errors)
+        chunk_seconds = _field(data, "chunk_seconds", int, _REQUIRED, section=s, errors=errors)
+        silence_threshold_rms = _field(data, "silence_threshold_rms", float, _REQUIRED, section=s, errors=errors)
+        session_end_silence_seconds = _field(data, "session_end_silence_seconds", int, _REQUIRED, section=s, errors=errors)
+        overlap_seconds = _field(data, "overlap_seconds", int, 5, section=s, errors=errors)
+
+        # CRIT-1: value-domain checks. sample_rate/chunk_seconds <= 0 make
+        # chunk_frames <= 0; a NEGATIVE overlap makes hop = chunk - overlap >
+        # chunk_frames — both are rejected by ChunkAssembler and would otherwise
+        # crash the capture leg into a systemd crash loop.
+        _check(sample_rate is None or sample_rate > 0,
+               f"  • {s}.sample_rate: must be > 0, got {sample_rate!r}", errors)
+        _check(chunk_seconds is None or chunk_seconds > 0,
+               f"  • {s}.chunk_seconds: must be > 0, got {chunk_seconds!r}", errors)
+        # NOTE (deliberate deviation from CRIT-1's `0 <= overlap < chunk`): only
+        # `overlap >= 0` is enforced here. `overlap >= chunk` is NOT a config
+        # error — it is a benign degradation that AudioCapture handles by
+        # disabling overlap (the appliance keeps running), so rejecting it here
+        # would crash-loop an otherwise-functional appliance. The finding's claim
+        # that overlap >= chunk crashes is incorrect: that path is guarded.
+        _check(overlap_seconds is None or overlap_seconds >= 0,
+               f"  • {s}.overlap_seconds: must be >= 0, got {overlap_seconds!r}", errors)
+
         return cls(
-            device_name=_field(data, "device_name", str, _REQUIRED, section=s, errors=errors),
-            sample_rate=_field(data, "sample_rate", int, _REQUIRED, section=s, errors=errors),
-            chunk_seconds=_field(data, "chunk_seconds", int, _REQUIRED, section=s, errors=errors),
-            silence_threshold_rms=_field(data, "silence_threshold_rms", float, _REQUIRED, section=s, errors=errors),
-            session_end_silence_seconds=_field(data, "session_end_silence_seconds", int, _REQUIRED, section=s, errors=errors),
-            overlap_seconds=_field(data, "overlap_seconds", int, 5, section=s, errors=errors),
+            device_name=device_name,
+            sample_rate=sample_rate,
+            chunk_seconds=chunk_seconds,
+            silence_threshold_rms=silence_threshold_rms,
+            session_end_silence_seconds=session_end_silence_seconds,
+            overlap_seconds=overlap_seconds,
         )
 
 
@@ -159,13 +204,26 @@ class DisplayConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "DisplayConfig":
         s = "display"
+        width = _field(data, "width", int, _REQUIRED, section=s, errors=errors)
+        height = _field(data, "height", int, _REQUIRED, section=s, errors=errors)
+        fullscreen = _field(data, "fullscreen", bool, True, section=s, errors=errors)
+        dynamic_theming = _field(data, "dynamic_theming", bool, True, section=s, errors=errors)
+        reduced_motion = _field(data, "reduced_motion", bool, False, section=s, errors=errors)
+        cover_art_cache_dir = _field(data, "cover_art_cache_dir", str, "src/display/assets/cache", section=s, errors=errors)
+
+        # CRIT-1: a zero/negative screen dimension can't render (the renderer
+        # scales every constant by min(width/1024, height/600) and builds a
+        # width×height surface).
+        _check(width is None or width > 0, f"  • {s}.width: must be > 0, got {width!r}", errors)
+        _check(height is None or height > 0, f"  • {s}.height: must be > 0, got {height!r}", errors)
+
         return cls(
-            width=_field(data, "width", int, _REQUIRED, section=s, errors=errors),
-            height=_field(data, "height", int, _REQUIRED, section=s, errors=errors),
-            fullscreen=_field(data, "fullscreen", bool, True, section=s, errors=errors),
-            dynamic_theming=_field(data, "dynamic_theming", bool, True, section=s, errors=errors),
-            reduced_motion=_field(data, "reduced_motion", bool, False, section=s, errors=errors),
-            cover_art_cache_dir=_field(data, "cover_art_cache_dir", str, "src/display/assets/cache", section=s, errors=errors),
+            width=width,
+            height=height,
+            fullscreen=fullscreen,
+            dynamic_theming=dynamic_theming,
+            reduced_motion=reduced_motion,
+            cover_art_cache_dir=cover_art_cache_dir,
         )
 
 
@@ -202,11 +260,25 @@ class RecognitionConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "RecognitionConfig":
         s = "recognition"
+        poll_interval_seconds = _field(data, "poll_interval_seconds", int, _REQUIRED, section=s, errors=errors)
+        backend = _field(data, "backend", str, "shazamio", section=s, errors=errors)
+        confirmation_required = _field(data, "confirmation_required", int, 2, section=s, errors=errors)
+        error_after_misses = _field(data, "error_after_misses", int, 6, section=s, errors=errors)
+
+        # CRIT-1: a zero poll interval busy-loops the recognition leg; fewer than
+        # one confirmation or one miss-to-error is nonsensical thresholding.
+        _check(poll_interval_seconds is None or poll_interval_seconds > 0,
+               f"  • {s}.poll_interval_seconds: must be > 0, got {poll_interval_seconds!r}", errors)
+        _check(confirmation_required is None or confirmation_required >= 1,
+               f"  • {s}.confirmation_required: must be >= 1, got {confirmation_required!r}", errors)
+        _check(error_after_misses is None or error_after_misses >= 1,
+               f"  • {s}.error_after_misses: must be >= 1, got {error_after_misses!r}", errors)
+
         return cls(
-            poll_interval_seconds=_field(data, "poll_interval_seconds", int, _REQUIRED, section=s, errors=errors),
-            backend=_field(data, "backend", str, "shazamio", section=s, errors=errors),
-            confirmation_required=_field(data, "confirmation_required", int, 2, section=s, errors=errors),
-            error_after_misses=_field(data, "error_after_misses", int, 6, section=s, errors=errors),
+            poll_interval_seconds=poll_interval_seconds,
+            backend=backend,
+            confirmation_required=confirmation_required,
+            error_after_misses=error_after_misses,
         )
 
 

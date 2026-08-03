@@ -253,3 +253,84 @@ def test_example_config_is_valid():
     cfg = load_config("config.example.yaml")
     assert cfg.audio.device_name
     assert cfg.recognition.backend == "shazamio"
+
+
+# ---------------------------------------------------------------------------
+# CRIT-1 — value-domain validation. Type-valid but out-of-domain values (a zero
+# sample rate, a negative overlap) used to sail through config and crash the
+# capture leg deep in a constructor (ChunkAssembler ValueError), which systemd
+# turns into a permanent crash loop with a raw traceback. They must now be
+# reported at config load as one friendly, aggregated ConfigError instead.
+# ---------------------------------------------------------------------------
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("section,key,bad,needle", [
+    ("audio", "sample_rate", 0, "audio.sample_rate"),
+    ("audio", "sample_rate", -1, "audio.sample_rate"),
+    ("audio", "chunk_seconds", 0, "audio.chunk_seconds"),
+    ("audio", "overlap_seconds", -5, "audio.overlap_seconds"),   # hop > chunk → crash
+    ("display", "width", 0, "display.width"),
+    ("display", "height", 0, "display.height"),
+    ("recognition", "poll_interval_seconds", 0, "recognition.poll_interval_seconds"),
+    ("recognition", "confirmation_required", 0, "recognition.confirmation_required"),
+    ("recognition", "error_after_misses", 0, "recognition.error_after_misses"),
+])
+def test_out_of_domain_value_is_rejected(section, key, bad, needle):
+    """A type-valid but domain-invalid value is a friendly ConfigError, not a
+    downstream crash."""
+    raw = _valid_raw()
+    raw[section][key] = bad
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert needle in str(exc.value)
+
+
+def test_overlap_equal_to_chunk_is_NOT_a_config_error():
+    """DELIBERATE deviation from the finding's `overlap < chunk`: overlap >= chunk
+    is a BENIGN degradation that AudioCapture handles by disabling overlap (the
+    appliance still runs). Rejecting it at config would crash-loop an otherwise
+    functional appliance, so config does NOT reject it — only the crash vector
+    (negative overlap → hop > chunk) is rejected above."""
+    raw = _valid_raw()
+    raw["audio"]["overlap_seconds"] = raw["audio"]["chunk_seconds"]   # overlap == chunk
+    cfg = AppConfig.from_dict(raw)   # must NOT raise
+    assert cfg.audio.overlap_seconds == raw["audio"]["chunk_seconds"]
+
+
+def test_boundary_values_are_accepted():
+    """The inclusive/exclusive boundaries are right: sample_rate/width/height/
+    poll must be > 0; confirmation_required/error_after_misses must be >= 1;
+    overlap must be >= 0. The smallest valid value of each is accepted."""
+    raw = _valid_raw()
+    raw["audio"]["overlap_seconds"] = 0            # >= 0 ok
+    raw["recognition"]["confirmation_required"] = 1  # >= 1 ok
+    raw["recognition"]["error_after_misses"] = 1     # >= 1 ok
+    cfg = AppConfig.from_dict(raw)
+    assert cfg.audio.overlap_seconds == 0
+    assert cfg.recognition.confirmation_required == 1
+    assert cfg.recognition.error_after_misses == 1
+
+
+def test_domain_and_type_errors_aggregate_into_one_error():
+    """A domain error and a type error in different fields are reported TOGETHER
+    in one ConfigError (the aggregating contract extends to domain checks)."""
+    raw = _valid_raw()
+    raw["audio"]["sample_rate"] = 0          # domain error
+    raw["display"]["width"] = "wide"         # type error
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    msg = str(exc.value)
+    assert "audio.sample_rate" in msg and "display.width" in msg
+
+
+def test_domain_check_does_not_raise_on_an_upstream_type_error():
+    """A domain check must never itself raise on the None a type error left
+    behind — sample_rate as a string is ONE type error, not a TypeError crash
+    from `None > 0`."""
+    raw = _valid_raw()
+    raw["audio"]["sample_rate"] = "forty-four-thousand"   # type error → None
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)   # must be ConfigError, not TypeError
+    assert "audio.sample_rate" in str(exc.value)

@@ -32,6 +32,28 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   rebuild-on-stall, and the callback guard are mutation-pinned; cold review SPEC /
   QUALITY PASS — buffered blocks win the `wait_for` race so a legitimate event-loop
   stall can't false-trip it, and the rebuild cycle is bounded (~0.2 Hz).
+- **A domain-invalid config value is now one friendly startup error instead of a
+  crash loop (CRIT-1, #92 — HIGH).** `config.py` validated field TYPES but never
+  their value DOMAINS, so a plausible hand-edit — `sample_rate: 0`, a negative
+  `overlap_seconds` — passed validation and then crashed the capture leg deep in
+  `ChunkAssembler` (a `ValueError` on `chunk_frames <= 0` or `hop > chunk_frames`)
+  with a raw traceback, which systemd's `Restart=on-failure` turned into a
+  permanent 10-second crash loop and a black screen the owner finds hours later.
+  Each section now runs value-domain checks accumulated into the SAME
+  `ConfigError` as any type error — honoring config.py's "single source of truth"
+  / "one friendly startup failure" promise: `sample_rate > 0`, `chunk_seconds > 0`,
+  `overlap_seconds >= 0`, `width/height > 0`, `poll_interval_seconds > 0`,
+  `confirmation_required >= 1`, `error_after_misses >= 1`. The finding's
+  `overlap < chunk` upper bound is deliberately NOT enforced at config: an
+  `overlap >= chunk` is a benign degradation `AudioCapture` already handles by
+  disabling overlap (the appliance keeps running), so rejecting it would
+  crash-loop an otherwise-functional appliance — only the genuinely-crashing
+  `overlap >= 0` bound is enforced (a negative overlap makes `hop > chunk_frames`,
+  which ChunkAssembler rejects, and AudioCapture's guard does not catch it).
+  RED-first (the accepted-then-crashed value reproduced); every domain boundary
+  and the type-error None-guard are mutation-pinned; cold review SPEC / QUALITY
+  PASS — the overlap deviation independently execution-verified as more correct
+  than the finding.
 
 ## [1.5.2] — 2026-08-03
 
