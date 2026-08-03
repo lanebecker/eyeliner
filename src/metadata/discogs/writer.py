@@ -64,6 +64,18 @@ class DiscogsCollectionWriter:
 
         self._collection_fields: Optional[dict] = None  # Lazily fetched, then cached
 
+    async def run(self, fn, *args):
+        """Dispatch one of this writer's blocking methods on the shared,
+        dedicated Discogs executor (#61) rather than the default pool.
+
+        Thin delegate to :meth:`DiscogsHttp.run`; the transport owns the one pool
+        both halves (reader + writer) share. The listen tracker calls
+        ``await writer.run(writer.increment_play_count, release_id, instance_id)``
+        in place of ``loop.run_in_executor(None, …)``, so the Play Count / Last
+        Played writes — and any 429 backoff sleep — never touch the shared pool.
+        """
+        return await self._http.run(fn, *args)
+
     # -------------------------------------------------------------------------
     # Public interface
     # -------------------------------------------------------------------------

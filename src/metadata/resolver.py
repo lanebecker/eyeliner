@@ -123,8 +123,8 @@ class MetadataResolver:
         # the album uncached/retryable (B-4); anything else is an unexpected bug
         # and is logged loudly so it isn't mistaken for a routine miss.
         try:
-            result = await loop.run_in_executor(
-                None, self.reader.search_collection, raw.artist, raw.album
+            result = await self.reader.run(
+                self.reader.search_collection, raw.artist, raw.album
             )
             if result:
                 log.debug(f"Resolved from Discogs collection: {raw.artist} / {raw.album}")
@@ -139,8 +139,8 @@ class MetadataResolver:
 
         # Step 2: Discogs database
         try:
-            result = await loop.run_in_executor(
-                None, self.reader.search_database, raw.artist, raw.album
+            result = await self.reader.run(
+                self.reader.search_database, raw.artist, raw.album
             )
             if result:
                 log.debug(f"Resolved from Discogs database: {raw.artist} / {raw.album}")

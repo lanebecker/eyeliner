@@ -55,6 +55,17 @@ class DiscogsReader:
         # matching locally replaces the per-candidate N+1 membership GETs (P-1).
         self._collection_index: Optional[dict] = None
 
+    async def run(self, fn, *args):
+        """Dispatch one of this reader's blocking methods on the shared,
+        dedicated Discogs executor (#61) rather than the default pool.
+
+        Thin delegate to :meth:`DiscogsHttp.run`; the transport owns the one
+        pool both halves (reader + writer) share. The resolver calls
+        ``await reader.run(reader.search_collection, artist, album)`` in place of
+        ``loop.run_in_executor(None, …)``.
+        """
+        return await self._http.run(fn, *args)
+
     # -------------------------------------------------------------------------
     # Public interface
     # -------------------------------------------------------------------------
