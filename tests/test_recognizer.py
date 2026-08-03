@@ -115,6 +115,69 @@ async def test_titleless_shazam_responses_never_confirm():
     assert loop._pending_count == 0
 
 
+# ---------------------------------------------------------------------------
+# REC-2 — a Shazam JSON null in a string field must not crash the parser or the
+#         dedup comparison (which stalled the loop with no miss counted)
+# ---------------------------------------------------------------------------
+
+def test_rec2_null_subtitle_is_coerced_to_empty_artist():
+    """A JSON-null subtitle must coerce to "" (was None) — else _same_track's
+    a.artist.strip() raises AttributeError inside _handle_result (REC-2)."""
+    r = ShazamIOBackend._parse_shazam({"track": {"title": "So What", "subtitle": None}})
+    assert r is not None
+    assert r.artist == ""
+
+
+def test_rec2_null_metadata_title_does_not_crash_parse():
+    """A JSON-null metadata `title` must not crash _parse_shazam (was
+    None.lower()), which would discard an otherwise-valid response as a miss."""
+    r = ShazamIOBackend._parse_shazam({"track": {
+        "title": "So What", "subtitle": "Miles Davis",
+        "sections": [{"metadata": [{"title": None, "text": "Kind of Blue"}]}],
+    }})
+    assert r is not None and r.title == "So What"
+
+
+def test_rec2_null_metadata_text_is_coerced_to_empty_album():
+    """A JSON-null album `text` must coerce to "" (was None)."""
+    r = ShazamIOBackend._parse_shazam({"track": {
+        "title": "So What", "subtitle": "Miles Davis",
+        "sections": [{"metadata": [{"title": "Album", "text": None}]}],
+    }})
+    assert r.album == ""
+
+
+def test_rec2_same_track_is_null_safe():
+    """_same_track must not raise on a None title OR artist on EITHER side (REC-2
+    defense-in-depth); a None compares as empty, never crashes the dedup. A None
+    title short-circuits the `and`; a None artist is reached only when titles
+    MATCH — so cover both fields on both sides with a matching title."""
+    ok = make_raw(title="So What", artist="Miles Davis")
+
+    def with_none(field):
+        r = make_raw(title="So What", artist="Miles Davis")
+        setattr(r, field, None)
+        return r
+
+    # None of these may raise (was a.title/a.artist/b.title/b.artist .strip() on None).
+    assert RecognitionLoop._same_track(with_none("title"), ok) is False    # a.title
+    assert RecognitionLoop._same_track(with_none("artist"), ok) is False   # a.artist (titles match)
+    assert RecognitionLoop._same_track(ok, with_none("title")) is False    # b.title
+    assert RecognitionLoop._same_track(ok, with_none("artist")) is False   # b.artist (titles match)
+
+
+@pytest.mark.asyncio
+async def test_rec2_null_subtitle_does_not_stall_handle_result():
+    """End-to-end: a null-subtitle response reaching _handle_result while a
+    same-titled track is current must NOT raise — the pre-fix AttributeError
+    escaped to run()'s handler, counting no miss and leaving the display stuck on
+    IDENTIFYING forever while the journal filled once per chunk (REC-2)."""
+    loop, state, on_confirmed = make_loop()
+    state.current_raw = make_raw(title="So What", artist="Miles Davis")   # a current track
+    result = ShazamIOBackend._parse_shazam({"track": {"title": "So What", "subtitle": None}})
+    await loop._handle_result(result, epoch=0)   # must not raise AttributeError
+
+
 @pytest.mark.asyncio
 async def test_two_matching_results_emit_confirmed_track():
     loop, state, on_confirmed = make_loop(confirmation_required=2)

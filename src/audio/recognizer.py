@@ -156,18 +156,27 @@ class ShazamIOBackend(RecognizerBackend):
         # Pull album from the metadata section if present.  Break BOTH loops as
         # soon as the album is found — without the outer break the inner break
         # only exits the metadata loop and a later section could overwrite it.
+        # REC-2: every string read is `… or ""` so a JSON null (key present, value
+        # null) coerces to "" instead of None — a null metadata `title` would
+        # otherwise crash `.lower()` here, and a null `text` would put None into
+        # `album`.
         album = ""
         for section in track.get("sections", []):
             for meta in section.get("metadata", []):
-                if meta.get("title", "").lower() == "album":
-                    album = meta.get("text", "")
+                if (meta.get("title") or "").lower() == "album":
+                    album = meta.get("text") or ""
                     break
             if album:
                 break
 
+        # REC-2: coerce a JSON-null subtitle to "" (was None) — otherwise
+        # _same_track's `artist.strip()` raises AttributeError inside
+        # _handle_result, which escapes to run()'s handler so NO miss is counted
+        # and the display sits on IDENTIFYING forever.  (title is already coerced +
+        # emptiness-guarded above, REC-3.)
         return RawRecognitionResult(
             title=title,
-            artist=track.get("subtitle", ""),
+            artist=track.get("subtitle") or "",
             album=album,
             isrc=track.get("isrc"),
         )
@@ -344,9 +353,12 @@ class RecognitionLoop:
         """
         if a is None or b is None:
             return False
+        # REC-2: `… or ""` guards a None title/artist defensively — the parser now
+        # coerces both (title via REC-3, artist here), but a None slipping in from
+        # any future source must compare as empty, never crash the dedup.
         return (
-            a.title.strip().lower() == b.title.strip().lower()
-            and a.artist.strip().lower() == b.artist.strip().lower()
+            (a.title or "").strip().lower() == (b.title or "").strip().lower()
+            and (a.artist or "").strip().lower() == (b.artist or "").strip().lower()
         )
 
     async def _handle_result(self, result: Optional[RawRecognitionResult], epoch: int = 0):
