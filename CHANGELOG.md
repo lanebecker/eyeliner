@@ -239,6 +239,27 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   mutation-pinned; cold review SPEC / QUALITY PASS and a narrow second pass over
   the reviewer-prompted rework verified the decoupling, cancellation cleanup, and
   no session leak (shazamio builds its aiohttp session per-request).
+- **A Shazam JSON null in a string field no longer stalls the display forever
+  (REC-2, #101 — MEDIUM).** `_parse_shazam` read `subtitle`/album metadata with
+  `.get(key, "")`, which returns `None` (not the default) when the key is present
+  with a JSON null — Python's `dict.get` only falls back to the default on a
+  MISSING key. So a `{"title": "…", "subtitle": null}` response parsed cleanly to
+  `artist=None`; `_same_track` then called `artist.strip()` and raised
+  `AttributeError` inside `_handle_result` — OUTSIDE `recognize()`'s try, so it
+  escaped to `run()`'s handler (log.error + sleep) with NO miss counted, leaving
+  the display stuck on the IDENTIFYING spinner indefinitely while the journal
+  filled once per chunk. (REC-3 had already coerced the title read, closing that
+  half.) Every string field the parser reads and later feeds to a string method
+  is now coerced with `… or ""` — `subtitle`→artist, the album-metadata `title`
+  (a null would crash `.lower()`) and `text` — and `_same_track` guards all four
+  of its reads (`(a.title or "").strip()…`) as defense-in-depth. RED-first (the
+  stall and both null crash paths reproduced); each coercion and each `_same_track`
+  guard is mutation-pinned; cold review SPEC / QUALITY PASS, confirming the stall
+  is closed (a miss is now counted) with no behavior change on non-null values and
+  REC-3's titleless rejection intact. A sibling, safe-degrading class the review
+  surfaced — JSON-null CONTAINERS (`sections`/`metadata`) that crash the parser's
+  iteration but are caught by `recognize()` and degrade to a miss, not the stall —
+  was filed separately (#167) rather than folded in.
 
 ## [1.5.2] — 2026-08-03
 
