@@ -82,12 +82,15 @@ def install_io_executor(loop) -> ThreadPoolExecutor:
     return io_executor
 
 
-def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenTracker):
-    """Route a silence event to the tracker and the player state.
+def apply_state_silence_effect(event: AudioEvent, state: PlayerState):
+    """The player-state half of a silence event (CRIT-5).
 
-    Extracted from main() (T-1) so the wiring is unit-testable — in particular
-    the IDLE/ERROR → LISTENING transition and SESSION_ENDED → clear(), the exact
-    paths the B-1 epoch guard depends on.
+    Registered as its OWN Signal listener, separate from the tracker's (see
+    wire_silence_listeners), so the Signal's log-and-continue (A-11) applies
+    BETWEEN them: a fault in ``tracker.on_silence_event`` can no longer skip this
+    half. In the old single-listener handler a raise in the tracker call left
+    ``state.clear()`` unrun — the B-1 epoch never bumped and the now-playing card
+    was stranded on screen with only a log line. That split is the fix.
 
       - MUSIC_STARTED: only enter LISTENING from IDLE or ERROR.  During an
         active session (e.g. a side flip) keep the now-playing card on screen
@@ -95,12 +98,30 @@ def handle_silence_event(event: AudioEvent, state: PlayerState, tracker: ListenT
         "REPOSITION NEEDLE TO RETRY" recovers when music returns.
       - SESSION_ENDED: clear() → IDLE (and bumps the session epoch, B-1).
     """
-    tracker.on_silence_event(event)
     if event == AudioEvent.MUSIC_STARTED:
         if state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR):
             state.set_status(PlayerStatus.LISTENING)
     elif event == AudioEvent.SESSION_ENDED:
         state.clear()
+
+
+def wire_silence_listeners(silence, state: PlayerState, tracker: ListenTracker):
+    """Register the silence-event handlers as TWO separate Signal listeners
+    (CRIT-5), the player-state effect FIRST and the tracker effect SECOND.
+
+    Extracted from main() (like run_pipeline / install_io_executor, T-1) so the
+    wiring is unit-testable. The load-bearing fix is the SPLIT: two separate
+    listeners mean the Signal's log-and-continue (A-11) applies between them — a
+    fault in the tracker half no longer skips the state half (a stranded card),
+    and vice versa. State is registered first to honor the finding's "clear the
+    player state before scheduling the tracker end", but that ordering is
+    otherwise a no-op: the tracker's actual session detach happens in the
+    ``_end_session`` task it schedules (which runs only after this synchronous
+    Signal.emit unwinds), so the epoch bump is synchronous and lands before the
+    detach in EITHER listener order.
+    """
+    silence.on_event(lambda event: apply_state_silence_effect(event, state))
+    silence.on_event(tracker.on_silence_event)
 
 
 async def run_pipeline(tasks, capture, display, tracker, discogs_http, io_executor):
@@ -202,9 +223,12 @@ async def main():
     recognizer = RecognitionLoop(config.recognition, state, commit_service.commit)
     capture = AudioCapture(config.audio, silence, recognizer)
 
-    # Wire silence events into state and tracker (logic in handle_silence_event,
-    # extracted for testability — T-1).
-    silence.on_event(lambda event: handle_silence_event(event, state, tracker))
+    # Wire silence events into state and tracker as TWO separate Signal listeners
+    # (CRIT-5, in wire_silence_listeners): splitting them lets the Signal's
+    # log-and-continue isolate a fault in one from the other (the stranded-card
+    # bug); state is registered first to match the finding's clear-before-the-end
+    # ordering.
+    wire_silence_listeners(silence, state, tracker)
 
     log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
     display.start()
