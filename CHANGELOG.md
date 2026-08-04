@@ -322,6 +322,36 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   stale/corrupt on-disk `instance_id` as a new write-target vector — exactly the
   class Wave 1 spent 16 issues closing — so it is filed as its own efficiency issue
   (#169) rather than ridden in on a hardening fix.
+- **A first-boot display or cache-dir failure now prints an actionable remedy
+  instead of a bare traceback (ARCH-10, #104 — LOW).** `main()` guarded only
+  `load_config()`; component construction and `display.start()` were bare. On the
+  Pi's first power-on — the app has never run on real hardware — the two most
+  probable failures surfaced as stack traces naming no fix: `display.start()` →
+  `pygame.error` ("No available video device") when HDMI isn't detected or X isn't
+  up on `:0`, and construction → `OSError` from `CoverArtCache.__init__`'s
+  `mkdir` when `display.cover_art_cache_dir` isn't writable. Both are now wrapped:
+  construction moved into `build_components(config, state)` and the display init
+  into `start_display(display)` (extracted, like the T-1 helpers, so both are
+  unit-testable), each logging one concrete operator message — the cache-dir
+  setting to check, or the HDMI/`DISPLAY`/X checks and the `Environment=` lines in
+  the systemd unit — pointing at a new "Display / startup won't initialize" section
+  in `docs/first-boot-checklist.md`, then **re-raising** so the process still exits
+  non-zero (systemd handles it, bounded by STAB-4's `StartLimitBurst`). Both
+  failure modes reproduced first (a `NotADirectoryError` from the mkdir and a
+  `pygame.error` from `set_mode`, neither carrying any remedy); RED-first; six
+  mutants — each guard's re-raise and log-level, plus a dropped and a mis-wired
+  bundle field — all killed; cold review SPEC / QUALITY PASS, which independently
+  re-verified that the extraction preserved every wiring identity (the shared A-4
+  `discogs_http`, `commit_service.commit` reaching the recognizer, the tracker
+  wired into the silence listeners equalling the one handed to `run_pipeline`), that
+  both guards re-raise the original exception (never swallow), that
+  `KeyboardInterrupt`/`SystemExit` still propagate uncaught, and that the I/O
+  executor is not leaked on the abort path. Two LOW nits it raised were fixed in
+  place: an inaccurate "missing parent directory" hint (an auto-created parent is
+  not a failure cause) and a non-None-only bundle assertion tightened to per-field
+  type checks. A pre-existing, benign resource nit it surfaced — `discogs_http`'s
+  dedicated pool isn't explicitly closed when startup aborts before `run_pipeline`
+  (atexit still joins the idle threads; no hang) — was filed separately (#170).
 
 ## [1.5.2] — 2026-08-03
 
