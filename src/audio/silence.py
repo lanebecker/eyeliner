@@ -19,6 +19,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# SIL-4: hysteresis ratio for the RMS music/silence classifier.  Music is ENTERED
+# at `silence_threshold_rms` (the configured threshold) but only LEFT once the RMS
+# drops below `threshold * _MUSIC_EXIT_RATIO`.  The dead band between the two stops
+# an RMS hovering at a single threshold from flapping MUSIC_STARTED/MUSIC_STOPPED
+# every chunk — each flap re-armed the end-of-session timer, so a fade-out or a
+# locked groove sitting at the boundary could hold SESSION_ENDED off indefinitely
+# and never credit the finished side.  0.5 = the exit bar sits an octave below entry.
+_MUSIC_EXIT_RATIO = 0.5
+
 
 class AudioEvent(Enum):
     MUSIC_STARTED = auto()
@@ -37,6 +46,11 @@ class SilenceDetector:
 
     def __init__(self, config: "AudioConfig"):
         self.threshold: float = config.silence_threshold_rms
+        # SIL-4: leave music only below a LOWER exit threshold (hysteresis), so an
+        # RMS hovering right at `threshold` can't flap MUSIC_STARTED/MUSIC_STOPPED.
+        # Enter at `threshold`; exit below `threshold * _MUSIC_EXIT_RATIO`; the dead
+        # band [exit_threshold, threshold) holds whichever state is current.
+        self.exit_threshold: float = self.threshold * _MUSIC_EXIT_RATIO
         self.session_end_seconds: int = config.session_end_silence_seconds
         # SIL-1: a chunk is a `chunk_seconds`-long *trailing* window, so the
         # silence it reports began chunk_seconds ago, not "now".  Needed to
@@ -81,16 +95,13 @@ class SilenceDetector:
 
         now = time.monotonic()
 
-        if rms >= self.threshold:
-            # Music is playing
-            if not self._is_music:
-                self._is_music = True
-                self._silence_since = None
-                self._session_ended = False
-                self._emit(AudioEvent.MUSIC_STARTED)
-        else:
-            # Silence
-            if self._is_music:
+        # SIL-4: hysteresis — which threshold applies depends on the CURRENT
+        # state.  Enter music at `threshold`; leave it only once the RMS falls
+        # below the lower `exit_threshold`.  An RMS hovering in the dead band
+        # [exit_threshold, threshold) holds the current state instead of flapping.
+        if self._is_music:
+            if rms < self.exit_threshold:
+                # Music → silence: dropped below the lower exit threshold.
                 self._is_music = False
                 # SIL-1: back-date to the START of this trailing window.  The
                 # chunk we just judged silent covers [now - chunk_seconds, now],
@@ -104,6 +115,14 @@ class SilenceDetector:
                 # require sub-chunk RMS sampling, out of scope here.
                 self._silence_since = now - self.chunk_seconds
                 self._emit(AudioEvent.MUSIC_STOPPED)
+            # else: still music (at or above exit_threshold, incl. the dead band).
+        else:
+            if rms >= self.threshold:
+                # Silence → music: rose to the enter threshold.
+                self._is_music = True
+                self._silence_since = None
+                self._session_ended = False
+                self._emit(AudioEvent.MUSIC_STARTED)
             else:
                 self._check_session_end(now)
 

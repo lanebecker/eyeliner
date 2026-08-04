@@ -69,6 +69,18 @@ display dropping to IDLE after `session_end_silence_seconds`). With the platter
 spinning silently (no record), you should sit in IDLE, not flicker to LISTENING.
 Nudge the threshold until both hold. Note the value you land on.
 
+The detector uses **hysteresis** (SIL-4): music is *entered* at
+`silence_threshold_rms` but only *left* once the RMS falls below **half** that
+value, so an RMS hovering right at the threshold can't flap MUSIC_STARTED /
+MUSIC_STOPPED every chunk. The practical consequence for tuning: your run-out /
+room noise floor must sit **below half** the threshold for `SESSION_ENDED` to
+fire — so set `silence_threshold_rms` to comfortably **more than 2×** your
+measured noise floor (keep the floor clearly under the half-threshold line), not
+just a hair above the floor. If the card lingers and never drops to IDLE at side end even
+though the log shows no `MUSIC_STOPPED`, the run-out noise is sitting in the
+hysteresis dead band `[½·threshold, threshold)`; raise the threshold so the dead
+band clears it.
+
 ## 3. Cover-art download works over the real network (S-7 smoke test)
 
 The SSRF-hardened, **IP-pinned HTTPS** cover fetch (resolve once → connect to the
