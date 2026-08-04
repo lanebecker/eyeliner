@@ -21,6 +21,7 @@ no display.
 import io
 import os
 import time
+import warnings
 from urllib.parse import urlsplit
 
 import pytest
@@ -288,11 +289,61 @@ def test_image_validation_rejects_non_image(tmp_path):
 
 
 def test_image_validation_rejects_oversized(tmp_path, monkeypatch):
+    # 4096 px against a cap of 100 is 40x — well past Pillow's own 2x
+    # DecompressionBomb *error* threshold, so Pillow raises inside Image.open()
+    # and this is caught by the generic `except` branch (message: "not a
+    # decodable image: …"). This exercises the >2x backstop path, NOT the
+    # explicit dimension guard — see the 1x-2x band test below (MUT-2).
     monkeypatch.setattr(palette, "MAX_IMAGE_PIXELS", 100)
     p = tmp_path / "big.png"
     p.write_bytes(_png_bytes(64, 64))  # 4096 px > 100
     with pytest.raises(ValueError):
         palette.validate_image_file(str(p))
+
+
+def test_image_validation_accepts_jpeg(tmp_path):
+    # A valid, small JPEG (an allowed non-PNG format) passes cleanly. Guards the
+    # format allow-list against a mutant that drops JPEG from the accepted set,
+    # and exercises the accept path for a second real format (MUT-2).
+    p = tmp_path / "ok.jpg"
+    buf = io.BytesIO()
+    Image.new("RGB", (48, 48), (120, 60, 30)).save(buf, format="JPEG")
+    p.write_bytes(buf.getvalue())
+    palette.validate_image_file(str(p))  # should not raise
+
+
+def test_image_validation_rejects_disallowed_format(tmp_path):
+    # A valid, fully decodable image in a format outside the allow-list (TIFF).
+    # verify() succeeds, so control reaches the format check — the guard line
+    # that had zero test executions before MUT-2 (palette.py format allow-list).
+    # A plain `pytest.raises(ValueError)` would also pass via other branches, so
+    # match the specific message to pin THIS branch.
+    p = tmp_path / "cover.tiff"
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(buf, format="TIFF")
+    p.write_bytes(buf.getvalue())
+    with pytest.raises(ValueError, match="unexpected image format"):
+        palette.validate_image_file(str(p))
+
+
+def test_image_validation_rejects_dimension_bomb_below_pillow_backstop(tmp_path, monkeypatch):
+    # The 1x-2x "bomb" band MUT-2 flags: an image whose pixel count exceeds our
+    # MAX_IMAGE_PIXELS but stays under Pillow's own 2x DecompressionBomb *error*
+    # threshold. Pillow only *warns* (verify() passes), so the explicit
+    # `width * height > MAX_IMAGE_PIXELS` guard is the SOLE line of defense.
+    # 64*64 = 4096 px; cap = 3000 -> 1.37x: over our cap, under Pillow's 2x=6000.
+    # Match the specific message to pin the explicit guard (not the generic
+    # except branch, whose message is "not a decodable image: …").
+    monkeypatch.setattr(palette, "MAX_IMAGE_PIXELS", 3000)
+    p = tmp_path / "band.png"
+    p.write_bytes(_png_bytes(64, 64))
+    with warnings.catch_warnings():
+        # Keep the (expected) DecompressionBombWarning out of the report, and
+        # stay robust if the suite ever flips warnings-into-errors: without this
+        # the warning would divert into the except branch and mask the guard.
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        with pytest.raises(ValueError, match="dimensions out of bounds"):
+            palette.validate_image_file(str(p))
 
 
 # ---------------------------------------------------------------------------
