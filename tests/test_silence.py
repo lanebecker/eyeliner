@@ -147,28 +147,49 @@ def test_event_order_for_music_gap_music():
 # SESSION_ENDED timing (time.monotonic patched)
 # ---------------------------------------------------------------------------
 
+def test_sil1_silence_timer_armed_at_when_silence_began():
+    """SIL-1: on the music→silence transition the timer is armed at when the
+    silence GENUINELY began — `now - chunk_seconds`.  A chunk is a chunk_seconds
+    trailing window, so a fully-below-threshold chunk means the silence started at
+    least chunk_seconds ago; arming at the (late) chunk-processing moment made the
+    configured 45s fire ~chunk_seconds late (~60–70s)."""
+    config = make_config(session_end_seconds=45)
+    detector = SilenceDetector(config)
+    detector.process(music_chunk(), SAMPLE_RATE)
+    base = 1000.0
+    with patch("src.audio.silence.time.monotonic") as t:
+        t.return_value = base
+        detector.process(silence_chunk(), SAMPLE_RATE)  # MUSIC_STOPPED
+    assert detector._silence_since == base - config.chunk_seconds
+
+
 def test_session_ended_fires_after_sustained_silence():
-    detector = SilenceDetector(make_config(session_end_seconds=45))
+    config = make_config(session_end_seconds=45)
+    detector = SilenceDetector(config)
     events = collect(detector)
     detector.process(music_chunk(), SAMPLE_RATE)
 
     base = 1000.0
+    # SIL-1: the timer is armed at base - chunk_seconds, so SESSION_ENDED fires at
+    # base + session_end - chunk_seconds (measured from the real needle-lift).
+    deadline = base + 45 - config.chunk_seconds
     with patch("src.audio.silence.time.monotonic") as t:
         t.return_value = base
-        detector.process(silence_chunk(), SAMPLE_RATE)  # MUSIC_STOPPED; _silence_since = base
+        detector.process(silence_chunk(), SAMPLE_RATE)  # MUSIC_STOPPED
 
-        t.return_value = base + 44.9
+        t.return_value = deadline - 0.1
         detector.process(silence_chunk(), SAMPLE_RATE)
         assert AudioEvent.SESSION_ENDED not in events  # Not yet
 
-        t.return_value = base + 45.0
+        t.return_value = deadline + 0.1
         detector.process(silence_chunk(), SAMPLE_RATE)
 
     assert AudioEvent.SESSION_ENDED in events
 
 
 def test_session_ended_not_fired_before_threshold():
-    detector = SilenceDetector(make_config(session_end_seconds=45))
+    config = make_config(session_end_seconds=45)
+    detector = SilenceDetector(config)
     events = collect(detector)
     detector.process(music_chunk(), SAMPLE_RATE)
 
@@ -177,7 +198,8 @@ def test_session_ended_not_fired_before_threshold():
         t.return_value = base
         detector.process(silence_chunk(), SAMPLE_RATE)
 
-        t.return_value = base + 40.0
+        # Well before the corrected deadline (base + session_end - chunk_seconds).
+        t.return_value = base + 45 - config.chunk_seconds - 5.0
         detector.process(silence_chunk(), SAMPLE_RATE)
 
     assert AudioEvent.SESSION_ENDED not in events
