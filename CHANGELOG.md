@@ -9,6 +9,32 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Code-review hardening, round 3 (Wave 3 — untrusted input & credential
+hardening).** Wave 3 of the same audit (`CODE_REVIEW_2026-07-30.md`): the gaps
+around untrusted-input handling and credential safety, plus the guard paths the
+suite never executed — the checks that stand between a stranger-editable Discogs
+field and the appliance.
+
+### Tests
+
+- **Pinned both rejection paths of `validate_image_file` — the cover-art format
+  allow-list and the decompression-bomb dimension bound (MUT-2, #109 — HIGH).**
+  `cover_cache.download()` calls this as the last check before a stranger-editable
+  Discogs image URI is written into the on-disk cache, yet both `raise` branches
+  had zero test executions. The only "oversized" test fed a 40× image, which
+  trips Pillow's *own* 2× `DecompressionBombError` and is caught by the generic
+  `except` — so the explicit `width * height > MAX_IMAGE_PIXELS` guard (the sole
+  defense in the 1×–2× "bomb" band Pillow only *warns* about) and the format
+  allow-list could each be deleted with the suite still green. Added three tests:
+  a valid JPEG accepted; a valid-but-disallowed format (TIFF) rejected by the
+  allow-list; and an image in the 1×–2× band rejected by the explicit dimension
+  guard — each message-matched so it pins its own branch rather than Pillow's
+  backstop. The four previously-surviving guard mutants ('condition → False' and
+  'delete raise' on each guard) are now killed, along with a JPEG-allow-list
+  mutant; the existing >2× "oversized" test gained a comment clarifying it
+  exercises Pillow's backstop, not the explicit guard. Cold review SPEC / QUALITY
+  PASS. Test-only; no production behavior change.
+
 ## [1.5.3] — 2026-08-04
 
 **Code-review hardening, round 3 (Wave 2 — keep the appliance alive).** Wave 2 of
