@@ -425,7 +425,25 @@ class DisplayRenderer:
         self.state.on_change(self._on_state_change)
 
     def _spawn(self, coro):
-        """create_task() with a strong reference held until the task completes."""
+        """create_task() with a strong reference held until the task completes.
+
+        DISP-8: guard the running-loop requirement HERE — the single place a
+        display background task is scheduled — so every caller is protected once.
+        `_on_state_change` reaches this from a SYNCHRONOUS PlayerState callback
+        that may run without a running loop (an off-loop unit test, or a state
+        change delivered before the loop starts). Without the guard,
+        ``create_task`` raises ``RuntimeError('no running event loop')`` out of the
+        display callback and back into the notifying recognition pipeline, which
+        does not expect the display layer to raise. Degrade to a no-op instead,
+        closing the un-started coroutine so it doesn't warn about never being
+        awaited.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            coro.close()
+            log.debug("No running event loop — skipping display background task (DISP-8).")
+            return None
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -1566,15 +1584,11 @@ class DisplayRenderer:
         log.warning(f"Failed to load cached cover art (attempt {failures}): {error}")
         cache_path.unlink(missing_ok=True)
         # Re-fetch so the cover can recover within the track (B-18), but only if
-        # a download for this URL isn't already in flight (STAB-1 dedup) and we
-        # are on the event loop (an off-loop unit-test call degrades to no-op).
+        # a download for this URL isn't already in flight (STAB-1 dedup).  `_spawn`
+        # now owns the running-loop guard (DISP-8), so an off-loop unit-test call
+        # degrades to a no-op there rather than needing a duplicate guard here.
         if url not in self._cover_prefetch_inflight:
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                pass  # No running loop (e.g. unit test) — nothing to schedule
-            else:
-                self._spawn(self._prefetch_cover(url))
+            self._spawn(self._prefetch_cover(url))
         return None
 
     def stop(self):

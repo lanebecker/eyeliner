@@ -414,6 +414,78 @@ def test_stab1_new_cover_state_change_lifts_blacklist(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# DISP-8 — _spawn guards the running-loop requirement, so a synchronous
+# PlayerState callback that runs without a loop degrades to a no-op instead of
+# raising RuntimeError out of the display layer into the notifying pipeline
+# ---------------------------------------------------------------------------
+
+def test_disp8_spawn_without_a_running_loop_is_a_noop():
+    """`_spawn` is reached from `_on_state_change`, a SYNCHRONOUS PlayerState
+    callback that may run with no running event loop (an off-loop unit-test call,
+    or a state change delivered before the loop starts). It must degrade to a
+    no-op, not let `create_task` raise RuntimeError('no running event loop')."""
+    import inspect
+
+    r = make_renderer()
+    r._bg_tasks = set()
+
+    async def coro():
+        return None
+
+    c = coro()
+    result = r._spawn(c)               # NO running loop here
+
+    assert result is None              # nothing scheduled
+    assert r._bg_tasks == set()
+    # The un-started coroutine is closed, so it can't leak a "never awaited" warning.
+    assert inspect.getcoroutinestate(c) == inspect.CORO_CLOSED
+
+
+def test_disp8_on_state_change_off_loop_does_not_raise(tmp_path):
+    """The integration: a PLAYING state change with a cover URL, delivered with NO
+    running loop, must not raise out of the renderer's callback (DISP-8).  On the
+    unguarded code create_task raised RuntimeError straight back into the caller."""
+    from src.state.player_state import PlayerState, PlayerStatus
+    from src.metadata.models import TrackMetadata, MetadataSource
+
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._bg_tasks = set()
+    r._wanted_cover_url = None
+    r._queue_palette = lambda u: None          # isolate the _spawn path
+    r._listening_since = None
+
+    st = PlayerState()
+    st.current_track = TrackMetadata(
+        title="t", artist="a", album="al", source=MetadataSource.FALLBACK,
+        cover_art_url="https://i.discogs.com/x.jpg", tracklist=[],
+    )
+    st.status = PlayerStatus.PLAYING
+
+    r._on_state_change(st)                      # must NOT raise (no running loop)
+    assert r._bg_tasks == set()                # nothing scheduled off-loop
+
+
+@pytest.mark.asyncio
+async def test_disp8_spawn_under_a_running_loop_still_schedules():
+    """The guard must not break the normal path: with a running loop, `_spawn`
+    still schedules the task and tracks/reaps it (DISP-8)."""
+    r = make_renderer()
+    r._bg_tasks = set()
+    ran = []
+
+    async def coro():
+        ran.append(True)
+
+    task = r._spawn(coro())
+    assert task is not None
+    assert task in r._bg_tasks                 # tracked while running
+    await task
+    assert ran == [True]                       # actually scheduled + ran
+    assert r._bg_tasks == set()                # done-callback reaped it
+
+
+# ---------------------------------------------------------------------------
 # P-10 — boot-arc rotation is cached by angle bucket (not re-rotated per frame)
 # ---------------------------------------------------------------------------
 
