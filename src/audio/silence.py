@@ -5,6 +5,7 @@ Emits AudioEvents when music starts, stops, or a full session ends.
 """
 
 import logging
+import math
 import time
 from enum import Enum, auto
 from typing import Callable, Optional, TYPE_CHECKING
@@ -60,6 +61,24 @@ class SilenceDetector:
     def process(self, audio: np.ndarray, sample_rate: int):
         """Process one audio chunk. Called synchronously from AudioCapture."""
         rms = float(np.sqrt(np.mean(audio ** 2)))
+
+        # SIL-2: a NaN or inf anywhere in the window makes `rms` non-finite (one
+        # bad sample out of ~661,500 poisons np.mean, so this must guard the
+        # aggregate, not assume the input is finite).  `nan >= threshold` is False
+        # in IEEE-754, so an unguarded NaN falls through to the silence branch and
+        # FAKES a needle lift — arming the end-of-session timer and, via the
+        # wall-clock ticker, possibly firing SESSION_ENDED early; an `inf` is the
+        # mirror (`inf >= threshold` is True) and would fake MUSIC_STARTED.  A
+        # corrupt chunk is evidence of neither, so skip it and leave detection
+        # state untouched; the next clean chunk drives it.
+        if not math.isfinite(rms):
+            log.warning(
+                "Non-finite RMS (%r) in an audio chunk — ignoring it as corrupt "
+                "rather than treating it as silence (SIL-2).",
+                rms,
+            )
+            return
+
         now = time.monotonic()
 
         if rms >= self.threshold:

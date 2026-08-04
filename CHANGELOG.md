@@ -381,6 +381,33 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   "love runs independently of a Discogs failure" comment holds when a write returns
   False but not when it RAISES (the raise short-circuits the love block) — was filed
   separately (#171) rather than folded in.
+- **A NaN (or inf) in an audio window no longer fakes a needle lift mid-record
+  (SIL-2, #106 — LOW).** `process()` computed `rms = √mean(audio²)` and compared
+  `rms >= threshold` with no finiteness guard. A single NaN sample out of the
+  ~661,500 in a 15s window poisons `np.mean`, making `rms` NaN — and `nan >= x` is
+  False in IEEE-754, so the whole chunk fell through to the SILENCE branch: it
+  flipped `_is_music` to False, armed `_silence_since`, and emitted a false
+  MUSIC_STOPPED. Because the wall-clock ticker evaluates the end-of-session timer
+  independently of chunk flow, a NaN burst ~45s before a side ends could fire
+  SESSION_ENDED early — clearing the now-playing card and (downstream) crediting an
+  unfinished side. An `inf` is the mirror (`inf >= threshold` is True) and would
+  fake MUSIC_STARTED. The fix guards the aggregate: `if not math.isfinite(rms)`,
+  log a warning and RETURN before any state change or `time.monotonic()` read — a
+  corrupt chunk is evidence of neither silence nor music, so it is skipped and the
+  next clean chunk drives detection. RED-first (a one-sample NaN reproduced the
+  fake silence; an inf the fake music start); three mutants — disable the guard,
+  invert it, log-without-return — all killed (the cold review additionally verified
+  an `isnan`-only and an `isinf`-only partial guard each fail one test, so both
+  finiteness directions are pinned); cold review SPEC / QUALITY PASS, which
+  confirmed the skip leaves `_is_music` / `_silence_since` / `_session_ended`
+  untouched, that a genuine end-of-session still fires via the ticker and the
+  level-triggered `_check_session_end` (a NaN coinciding with a real needle lift
+  costs at most the already-documented SIL-1 one-hop latency, never a lost
+  transition), and that an overflow-to-`inf` cannot arise from normalized float32
+  capture. A persistently all-NaN stream — a severe driver fault, not a stall — now
+  stays in the music state rather than firing a false SESSION_ENDED (the intended
+  consequence); a permanently corrupt input is a hardware fault outside the
+  detector's remit.
 
 ## [1.5.2] — 2026-08-03
 

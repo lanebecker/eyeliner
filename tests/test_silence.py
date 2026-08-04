@@ -60,6 +60,48 @@ def test_silence_chunk_rms_is_zero():
 
 
 # ---------------------------------------------------------------------------
+# SIL-2 — a non-finite RMS (NaN / inf) is a corrupt chunk, not evidence of
+# silence OR music: skip it, leaving detection state untouched
+# ---------------------------------------------------------------------------
+
+def test_sil2_nan_chunk_does_not_fake_a_needle_lift():
+    """One NaN sample poisons np.mean over the whole window, making rms NaN.
+    Since `nan >= threshold` is False in IEEE-754, an unguarded chunk falls to the
+    silence branch and fakes a MUSIC_STOPPED mid-record (arming the end-of-session
+    timer). The corrupt chunk must instead leave music state untouched (SIL-2)."""
+    detector = SilenceDetector(make_config())
+    events = collect(detector)
+    detector.process(music_chunk(), SAMPLE_RATE)          # establish music
+    assert detector.is_music_playing
+    assert AudioEvent.MUSIC_STARTED in events
+
+    nan_chunk = music_chunk().copy()
+    nan_chunk[0] = np.nan                                  # a single bad sample
+    detector.process(nan_chunk, SAMPLE_RATE)
+
+    assert detector.is_music_playing                       # still music — no fake lift
+    assert detector._silence_since is None                 # timer NOT armed
+    assert AudioEvent.MUSIC_STOPPED not in events          # no false MUSIC_STOPPED
+
+
+def test_sil2_inf_chunk_does_not_fake_a_music_start():
+    """An inf sample makes rms +inf, and `inf >= threshold` is True — so an
+    unguarded corrupt chunk during silence would fake a MUSIC_STARTED.
+    `math.isfinite` catches inf as well as NaN, so the chunk is skipped and the
+    (silent) state is untouched (SIL-2)."""
+    detector = SilenceDetector(make_config())
+    events = collect(detector)
+    assert not detector.is_music_playing                   # start in silence
+
+    inf_chunk = music_chunk().copy()
+    inf_chunk[0] = np.inf
+    detector.process(inf_chunk, SAMPLE_RATE)
+
+    assert not detector.is_music_playing                   # no fake music start
+    assert AudioEvent.MUSIC_STARTED not in events
+
+
+# ---------------------------------------------------------------------------
 # MUSIC_STARTED
 # ---------------------------------------------------------------------------
 
