@@ -25,6 +25,17 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# STAB-4: absolute ceiling on the collection-index paging loop.  The loop's
+# natural exits are an empty page or ``page >= pagination.pages``; a malformed or
+# hostile pagination response (a huge ``pages`` value with never-empty pages) or a
+# logic bug would otherwise page WITHOUT BOUND.  Under the documented systemd crash
+# loop (Restart=on-failure / RestartSec=10, and StartLimitBurst added by this same
+# fix) each restart re-pages from zero, so an unbounded build pins the appliance at
+# the authenticated 60-request/minute rate limit.  At 100 releases/page this cap is
+# 100,000 records — several times the most extreme personal vinyl collection, so it
+# never clips a real one; it only bounds the pathological case.
+_MAX_COLLECTION_PAGES = 1000
+
 
 class DiscogsReader:
     """Database/collection search, tracklist + original-year, result assembly."""
@@ -291,6 +302,22 @@ class DiscogsReader:
 
             pagination = data.get("pagination", {})
             if page >= pagination.get("pages", 1):
+                break
+            if page >= _MAX_COLLECTION_PAGES:
+                # STAB-4: absolute safety ceiling.  Reaching it means the
+                # pagination response is malformed (no real personal collection
+                # has 100,000+ records), so stop with the partial index rather
+                # than paging without bound and hammering the rate limit.  The
+                # partial index is still cached below, so this build is not
+                # re-attempted per track.  A partial index can only cause
+                # false-negatives (an album beyond the cap resolves via the
+                # database tier with no instance_id) — never a wrong write target.
+                log.warning(
+                    "Collection paging hit the absolute cap of %d pages "
+                    "(%d releases indexed); stopping with a partial index. "
+                    "Suspect a malformed Discogs pagination response.",
+                    _MAX_COLLECTION_PAGES, len(index),
+                )
                 break
             page += 1
 
