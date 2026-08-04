@@ -289,6 +289,39 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   a *pre-existing* gap it labeled out of scope — `session_end_silence_seconds`
   accepts `0`/negative because CRIT-1's value-domain sweep missed it — filed
   separately (#168) rather than folded into this fix.
+- **A crash loop can no longer pin the Discogs API in 429 territory by re-paging
+  the whole collection every 10 seconds (STAB-4, #103 — MEDIUM).**
+  `_get_collection_index` walked the collection in an unbounded `while True` whose
+  only exits were an empty page or `page >= pagination.pages`, and cached the
+  result in memory only — so every process start rebuilds it from zero. Paired with
+  the documented unit's `Restart=on-failure` / `RestartSec=10`, a persistent crash
+  (a config that survives validation, a wedged dependency) becomes a permanent
+  hammer: a 1,000-record collection re-pages ~10 GETs every 10s = 60 GETs/min,
+  which *is* the authenticated rate limit, so the appliance sits permanently at
+  429 — each 429 also sleeping up to 10s in a shared executor worker. Two bounded,
+  low-risk brakes (the disk-cache remedy was deliberately deferred — see below):
+  an **absolute page cap** (`_MAX_COLLECTION_PAGES = 1000` = 100,000 releases, far
+  above any real personal collection) stops a malformed/hostile `pagination.pages`
+  (or a logic bug) from paging without end — it breaks with the partial index and
+  still caches it, so it is not re-hammered per track, and a partial index can only
+  cause false-negatives, never a wrong write target (the truncated entries still
+  pair each `release_id` with its own `instance_id`); and
+  **`StartLimitIntervalSec=300` / `StartLimitBurst=5`** on the systemd `[Unit]`
+  tells systemd to stop retrying after more than 5 starts in 300s, dropping the
+  unit into a `failed` state (`start-limit-hit`) so a genuinely broken boot goes
+  quietly dark instead of pinning the API. Both mechanisms reproduced first (the
+  unbounded loop ran past 5,000 pages; a fresh reader re-paged the full 10 GETs on
+  every simulated restart); RED-first; five mutants — disable the cap, off-by-one,
+  cap-too-low, cap-too-high, fire-but-never-terminate — all killed; cold review
+  SPEC / QUALITY PASS, which independently verified end-to-end that a partial index
+  reaches the writer only as `instance_id=None` (no wrong write) and that the
+  `[Unit]` placement is valid for every Raspberry Pi OS systemd (≥ v229). The
+  finding's third remedy — **disk-persisting the index with a TTL** — was
+  deliberately NOT taken here: it does not stop the crash loop (a crash before the
+  build never touches the cache; the loop still hammers systemd) and it would add a
+  stale/corrupt on-disk `instance_id` as a new write-target vector — exactly the
+  class Wave 1 spent 16 issues closing — so it is filed as its own efficiency issue
+  (#169) rather than ridden in on a hardening fix.
 
 ## [1.5.2] — 2026-08-03
 

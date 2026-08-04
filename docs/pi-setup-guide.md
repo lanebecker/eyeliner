@@ -341,6 +341,8 @@ Paste this (adjust the username if you're not using `pi`):
 Description=vinyl-now-playing
 Wants=network-online.target
 After=network-online.target time-sync.target graphical.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -366,6 +368,24 @@ deadline (a slow cover download, a hung Last.fm POST) could otherwise hold the
 process open until systemd's 90s default. `TimeoutStopSec=30` SIGKILLs at 30s
 instead: comfortably above the normal clean shutdown (drain + a ~15s socket
 timeout), far below the point where a power-cut owner assumes the Pi has wedged.
+
+`StartLimitIntervalSec=300` / `StartLimitBurst=5` (STAB-4) is the backstop for
+*startup*. `Restart=on-failure` will otherwise restart a crashing process every
+`RestartSec=10` **forever**, and each cold start rebuilds the Discogs collection
+index from scratch — one GET per 100 records — so a persistent crash (a bad config
+that survives validation, a wedged dependency) turns into a permanent hammering of
+the collection API: a 1,000-record collection re-pages 60 GETs/minute, which is
+exactly the authenticated rate limit. These two directives tell systemd to stop
+retrying once the service has been started **more than 5 times within 300
+seconds**: it refuses the next start, drops the unit into a `failed` state
+(`journalctl` shows `start-limit-hit`), and stops trying — so a genuinely broken
+boot goes quietly dark instead of pinning the API in 429 territory. An occasional one-off crash still
+recovers normally — only a *sustained* loop trips the limit. To bring a limited-out
+unit back after fixing the cause: `sudo systemctl reset-failed vinyl-now-playing`
+then `sudo systemctl start vinyl-now-playing` (a reboot also clears it). This pairs
+with the in-process absolute page cap (`_MAX_COLLECTION_PAGES`, `reader.py`) that
+bounds any *single* index build; the two together mean neither a runaway build nor
+a runaway restart can sit on the rate limit.
 
 **Why the `[Unit]` ordering matters — read this before enabling.** The Raspberry
 Pi has no battery-backed real-time clock, so at boot its clock is whatever
