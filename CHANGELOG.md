@@ -434,6 +434,28 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   `reset_music_state`, and measured the dead-band tradeoff (judged acceptable and
   documented). A doc-precision nit it caught — the tuning target had landed exactly
   on the strict-`<` exit boundary — was fixed in the checklist wording.
+- **A state change delivered without a running event loop can no longer raise out
+  of the display layer (DISP-8, #108 — NIT).** `_on_state_change` is a synchronous
+  `PlayerState` callback that scheduled a cover-art prefetch via
+  `self._spawn(self._prefetch_cover(url))` → `asyncio.create_task` — UNGUARDED —
+  while the corrupt-cover re-fetch path (`_handle_corrupt_cover`) wrapped the
+  identical call in an explicit `asyncio.get_running_loop()` / `except RuntimeError`
+  guard precisely because it can run without a loop. The two call sites disagreed;
+  if a state change is ever delivered from an executor thread or before the loop
+  starts, `create_task` raises `RuntimeError('no running event loop')` out of the
+  renderer's callback and back into the notifying recognition pipeline, which does
+  not expect the display layer to raise. The guard now lives in `_spawn` — the
+  single `create_task` site — so every caller is protected once: off-loop it closes
+  the un-started coroutine (so it can't warn about never being awaited) and returns
+  None, on-loop it schedules and tracks the task exactly as before. The redundant
+  duplicate guard at `_handle_corrupt_cover` was removed. RED-first (an off-loop
+  `_on_state_change` reproduced the `RuntimeError` leaking into the caller); three
+  mutants — disable the guard, drop the `coro.close()`, drop the early return —
+  all killed; cold review SPEC / QUALITY PASS, which verified both directions,
+  that constructing-then-closing the coroutine is behaviorally identical to never
+  constructing it (an `async def` body runs nothing until awaited), that the two
+  `_spawn` sites are the only schedulers and both pass a fresh coroutine, and that
+  the STAB-1 / B-18 bounded-refetch behavior is unchanged.
 
 ## [1.5.2] — 2026-08-03
 
