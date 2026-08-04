@@ -23,10 +23,29 @@ sys.modules.setdefault("sounddevice", MagicMock())
 from main import (
     apply_state_silence_effect, wire_silence_listeners, run_pipeline,
     install_io_executor, _IO_EXECUTOR_MAX_WORKERS,
+    build_components, start_display,
 )
 from src.audio.silence import AudioEvent
 from src.state.player_state import PlayerState, PlayerStatus
 from src.util.signal import Signal
+from tests.factories import (
+    make_audio_config, make_discogs_config, make_display_config,
+    make_recognition_config, make_lastfm_config,
+)
+
+
+def _app_config(**display_overrides):
+    """Assemble a full AppConfig from the section factories (there is no
+    make_app_config).  display_overrides let a test point cover_art_cache_dir at
+    a writable temp dir (happy path) or an uncreatable one (failure path)."""
+    from src.config import AppConfig
+    return AppConfig(
+        audio=make_audio_config(),
+        discogs=make_discogs_config(),
+        display=make_display_config(**display_overrides),
+        recognition=make_recognition_config(),
+        lastfm=make_lastfm_config(),
+    )
 
 
 class _SignalSilence:
@@ -327,6 +346,79 @@ async def test_run_pipeline_shuts_down_the_io_executor_dropping_queued_work():
     release.set()
     time.sleep(0.1)
     assert ran_queued == [], "queued blocking work was NOT cancelled at shutdown"
+
+
+# ---------------------------------------------------------------------------
+# ARCH-10 — construction + display.start() are guarded with an actionable
+# first-boot message instead of a bare traceback
+# ---------------------------------------------------------------------------
+
+def test_start_display_reraises_with_actionable_operator_message(caplog):
+    """A pygame display-init failure (no HDMI / X down on :0) must be logged with
+    a concrete remedy pointing at the checklist BEFORE it re-raises — not surface
+    as a bare pygame.error traceback naming no fix (ARCH-10)."""
+    import logging
+
+    class BoomDisplay:
+        def start(self):
+            raise RuntimeError("No available video device")
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="No available video device"):
+            start_display(BoomDisplay())
+
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "HDMI" in msg
+    assert "first-boot-checklist.md" in msg
+
+
+def test_start_display_happy_path_calls_start():
+    display = MagicMock()
+    start_display(display)
+    display.start.assert_called_once()
+
+
+def test_build_components_reraises_with_actionable_message_on_unwritable_cache_dir(caplog, tmp_path):
+    """The most concrete first-boot construction failure: cover_art_cache_dir is
+    not creatable (read-only path, or — here — a file where a directory must go),
+    so CoverArtCache.__init__ mkdir raises OSError. build_components must log an
+    actionable message naming the setting + checklist, then re-raise (ARCH-10)."""
+    import logging
+
+    blocker = tmp_path / "afile"
+    blocker.write_text("")                      # a FILE where a directory must go
+    bad_dir = str(blocker / "cache")            # mkdir under a file -> OSError
+    cfg = _app_config(cover_art_cache_dir=bad_dir)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(OSError):
+            build_components(cfg, PlayerState())
+
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "cover_art_cache_dir" in msg
+    assert "first-boot-checklist.md" in msg
+
+
+def test_build_components_returns_wired_bundle(tmp_path):
+    """Happy path: with a writable cache dir every component is constructed and
+    returned in the bundle main() consumes.  Assert the TYPE of each field, not
+    merely non-None, so a mis-wire to another constructed object (e.g.
+    capture=display) can't slip through."""
+    from src.metadata.discogs import DiscogsHttp
+    from src.display.renderer import DisplayRenderer
+    from src.audio.silence import SilenceDetector
+    from src.audio.recognizer import RecognitionLoop
+    from src.audio.capture import AudioCapture
+    from src.tracking.listen_tracker import ListenTracker
+
+    cfg = _app_config(cover_art_cache_dir=str(tmp_path / "cache"))
+    components = build_components(cfg, PlayerState())
+    assert isinstance(components.discogs_http, DiscogsHttp)
+    assert isinstance(components.display, DisplayRenderer)
+    assert isinstance(components.silence, SilenceDetector)
+    assert isinstance(components.recognizer, RecognitionLoop)
+    assert isinstance(components.capture, AudioCapture)
+    assert isinstance(components.tracker, ListenTracker)
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,33 @@ Work top to bottom; each item says how to verify it and what "good" looks like.
 
 ---
 
+## 0. Display / startup won't initialize (black screen, service won't stay up)
+
+If the first thing you get is a black screen and `journalctl -u vinyl-now-playing`
+shows the app exiting at startup, the log now names the cause on the line just
+above the traceback (ARCH-10). Two failure modes:
+
+- **"Display initialization failed — the screen will stay black."** `pygame`
+  could not open a video device. Check, in order: (1) the HDMI cable is seated and
+  the panel was powered on **before** the Pi booted (HDMI hot-plug is unreliable on
+  the Pi); (2) a desktop / X server is actually running on the target `DISPLAY`
+  (default `:0`) — the systemd unit sets `Environment="DISPLAY=:0"` and
+  `Environment="XAUTHORITY=/home/pi/.Xauthority"`, so those must match your logged-in
+  session; `echo $DISPLAY` in the Pi's desktop terminal confirms the value.
+- **"Failed to construct the application components … cover_art_cache_dir … not
+  writable."** The on-disk cover cache directory can't be created. Check that
+  `display.cover_art_cache_dir` in `config.yaml` points at a path the service
+  `User=` (default `pi`) can write — the directory itself is created automatically
+  (parents and all), so the failure is a **read-only location** or a **file sitting
+  where a directory must go**, not a missing folder. The default is
+  `src/display/assets/cache` under the app's working directory.
+
+Because the systemd unit uses `Restart=on-failure` (bounded by
+`StartLimitBurst`, STAB-4), a genuinely broken display config will retry a few
+times and then drop to a `failed` state rather than loop forever — so `systemctl
+status vinyl-now-playing` showing `failed`/`start-limit-hit` here means "fix the
+above and `systemctl reset-failed`", not "the Pi is wedged".
+
 ## 1. Audio input is the right device
 
 The config matches `audio.device_name` as a **case-insensitive substring** against

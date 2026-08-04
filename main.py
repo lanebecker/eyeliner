@@ -21,6 +21,7 @@ import asyncio
 import logging
 import signal
 import sys
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -80,6 +81,91 @@ def install_io_executor(loop) -> ThreadPoolExecutor:
     )
     loop.set_default_executor(io_executor)
     return io_executor
+
+
+# ARCH-10: the runtime components main() needs AFTER construction.  Bundling them
+# lets build_components own the construction (and its failure message) while main()
+# stays a thin wiring/lifecycle body.
+Components = namedtuple(
+    "Components", "discogs_http display silence recognizer capture tracker"
+)
+
+
+def build_components(config, state: PlayerState) -> "Components":
+    """Construct and return every runtime component (ARCH-10, T-1 style).
+
+    Extracted from main() so the construction path is GUARDED and unit-testable.
+    Component construction is not pure — most concretely, ``DisplayRenderer`` builds
+    a ``CoverArtCache`` whose ``__init__`` does ``cache_dir.mkdir(...)``, which
+    raises ``OSError`` when ``display.cover_art_cache_dir`` is not writable (a
+    read-only location, or a file where a directory must go — the directory itself
+    is created automatically).  Before
+    this, such a failure reached the operator as a bare traceback naming no remedy
+    (the finding). Now it is one actionable log line pointing at the checklist,
+    then a re-raise — the process still exits non-zero, so systemd handles it
+    (bounded by STAB-4's StartLimitBurst).
+    """
+    try:
+        # A-4: one shared Discogs transport; the read half goes to the resolver,
+        # the write half to the tracker — each depends only on the slice it uses.
+        discogs_http = DiscogsHttp(config.discogs.user_token)
+        resolver = MetadataResolver(DiscogsReader(discogs_http, config.discogs))
+        lastfm = LastFmClient(config.lastfm)
+        tracker = ListenTracker(
+            DiscogsCollectionWriter(discogs_http, config.discogs), lastfm
+        )
+        # A-9: the application-layer commit service owns resolve → state → track →
+        # scrobble; the recognition loop just confirms a result and hands it off.
+        commit_service = TrackCommitService(state, resolver, tracker, lastfm)
+        display = DisplayRenderer(config.display, state)
+        silence = SilenceDetector(config.audio)
+        recognizer = RecognitionLoop(config.recognition, state, commit_service.commit)
+        capture = AudioCapture(config.audio, silence, recognizer)
+    except Exception:
+        log.error(
+            "Failed to construct the application components. The most common "
+            "first-boot cause is that display.cover_art_cache_dir (%r) is not "
+            "writable — a read-only location, or a file sitting where a directory "
+            "must go (the directory itself is created automatically). See "
+            "docs/first-boot-checklist.md ('Display / startup won't initialize'). "
+            "Re-raising the underlying error below.",
+            config.display.cover_art_cache_dir,
+        )
+        raise
+    return Components(
+        discogs_http=discogs_http,
+        display=display,
+        silence=silence,
+        recognizer=recognizer,
+        capture=capture,
+        tracker=tracker,
+    )
+
+
+def start_display(display) -> None:
+    """Initialize the display, turning a first-boot failure into ACTIONABLE log
+    output before re-raising (ARCH-10).
+
+    ``display.start()`` calls ``pygame.display.set_mode(...)``, which raises
+    ``pygame.error`` ("No available video device") when there is no HDMI/console
+    or no X server on the target ``DISPLAY``.  Unguarded, that reached the operator
+    as a bare traceback naming no remedy — the single most probable first-power-on
+    failure per the brief.  Log the concrete checks first, then re-raise so the
+    process still exits non-zero (systemd Restart handles it, bounded by STAB-4).
+    """
+    try:
+        display.start()
+    except Exception:
+        log.error(
+            "Display initialization failed — the screen will stay black. Check, "
+            "in order: (1) the HDMI cable is seated and the monitor/panel was "
+            "powered on BEFORE the Pi booted; (2) a desktop / X server is running "
+            "on the target DISPLAY (default :0 — see the Environment=DISPLAY and "
+            "XAUTHORITY lines in the systemd unit); (3) docs/first-boot-checklist.md "
+            "('Display / startup won't initialize'). Re-raising the underlying "
+            "error below."
+        )
+        raise
 
 
 def apply_state_silence_effect(event: AudioEvent, state: PlayerState):
@@ -208,36 +294,28 @@ async def main():
     io_executor = install_io_executor(loop)
 
     state = PlayerState()
-    # A-4: one shared Discogs transport; the read half goes to the resolver, the
-    # write half to the tracker — each depends only on the slice it uses (no more
-    # God client, no resolver.discogs back-channel).
-    discogs_http = DiscogsHttp(config.discogs.user_token)
-    resolver = MetadataResolver(DiscogsReader(discogs_http, config.discogs))
-    lastfm = LastFmClient(config.lastfm)
-    tracker = ListenTracker(DiscogsCollectionWriter(discogs_http, config.discogs), lastfm)
-    # A-9: the application-layer commit service owns resolve → state → track →
-    # scrobble; the recognition loop just confirms a result and hands it off.
-    commit_service = TrackCommitService(state, resolver, tracker, lastfm)
-    display = DisplayRenderer(config.display, state)
-    silence = SilenceDetector(config.audio)
-    recognizer = RecognitionLoop(config.recognition, state, commit_service.commit)
-    capture = AudioCapture(config.audio, silence, recognizer)
+    # ARCH-10: construction is guarded + testable in build_components — a failure
+    # (most concretely an unwritable cover_art_cache_dir) is now an actionable log
+    # line pointing at the checklist, then a re-raise, not a bare traceback.
+    components = build_components(config, state)
 
     # Wire silence events into state and tracker as TWO separate Signal listeners
     # (CRIT-5, in wire_silence_listeners): splitting them lets the Signal's
     # log-and-continue isolate a fault in one from the other (the stranded-card
     # bug); state is registered first to match the finding's clear-before-the-end
     # ordering.
-    wire_silence_listeners(silence, state, tracker)
+    wire_silence_listeners(components.silence, state, components.tracker)
 
     log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
-    display.start()
+    # ARCH-10: guard the display init too — the single most probable first-boot
+    # failure (no HDMI / X down) is now an actionable message before the re-raise.
+    start_display(components.display)
 
     # The three long-running pipeline coroutines as named tasks.
     tasks = [
-        asyncio.create_task(capture.run(), name="capture"),
-        asyncio.create_task(recognizer.run(), name="recognizer"),
-        asyncio.create_task(display.run(), name="display"),
+        asyncio.create_task(components.capture.run(), name="capture"),
+        asyncio.create_task(components.recognizer.run(), name="recognizer"),
+        asyncio.create_task(components.display.run(), name="display"),
     ]
 
     # Graceful shutdown on Ctrl+C or SIGTERM: cancel every leg.  Task.cancel
@@ -257,7 +335,10 @@ async def main():
     # DiscogsHttp and the owned I/O executor are passed so run_pipeline's finally
     # can close BOTH pools LAST, after that credit has drained off them (#61 /
     # CRIT-3).
-    await run_pipeline(tasks, capture, display, tracker, discogs_http, io_executor)
+    await run_pipeline(
+        tasks, components.capture, components.display, components.tracker,
+        components.discogs_http, io_executor,
+    )
 
 
 if __name__ == "__main__":
