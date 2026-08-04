@@ -408,6 +408,32 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   stays in the music state rather than firing a false SESSION_ENDED (the intended
   consequence); a permanently corrupt input is a hardware fault outside the
   detector's remit.
+- **The silence detector no longer flaps when the RMS hovers at the threshold
+  (SIL-4, #107 — LOW).** A single threshold with no dead band meant an RMS
+  oscillating right at the boundary produced an unbounded MUSIC_STARTED/MUSIC_STOPPED
+  alternation — the finding measured eight events from a 0.000002 amplitude swing
+  (0.010001 / 0.009999). Each return to music cleared `_session_ended` and each drop
+  re-armed `_silence_since` from scratch, so a signal sitting at the boundary could
+  churn indefinitely and hold SESSION_ENDED off, never crediting the finished side.
+  The fix adds **hysteresis**: `process()` now branches on the current state —
+  music is *entered* at `silence_threshold_rms` but only *left* once the RMS falls
+  below `_MUSIC_EXIT_RATIO` (0.5) × that threshold. An RMS in the dead band
+  `[½·threshold, threshold)` holds whichever state is current instead of flapping,
+  with no added transition latency. The tradeoff, documented in
+  `docs/first-boot-checklist.md` §2: hysteresis lowers the *effective* silence bar
+  to half the threshold, so the run-out / room noise floor must sit below that for
+  SESSION_ENDED to fire — the operator tunes `silence_threshold_rms` to comfortably
+  more than 2× the noise floor. (This is a first-boot tuning note, not an upgrade
+  hazard: the appliance has never run on the Pi, so the threshold is tuned for the
+  first time with this guidance present.) RED-first (the flap reproduced, plus the
+  dead-band hold); five mutants — ratio 1.0 (dead band collapses), ratio 0.0 (music
+  never left), leave-on-the-enter-threshold, enter-on-the-exit-threshold, inverted
+  comparison — all killed; cold review SPEC / QUALITY PASS, which independently
+  reproduced the flap now gone, confirmed the restructure preserved the SIL-1
+  back-date, the SIL-2 non-finite guard, the wall-clock ticker, and
+  `reset_music_state`, and measured the dead-band tradeoff (judged acceptable and
+  documented). A doc-precision nit it caught — the tuning target had landed exactly
+  on the strict-`<` exit boundary — was fixed in the checklist wording.
 
 ## [1.5.2] — 2026-08-03
 

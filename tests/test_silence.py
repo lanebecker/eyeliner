@@ -102,6 +102,58 @@ def test_sil2_inf_chunk_does_not_fake_a_music_start():
 
 
 # ---------------------------------------------------------------------------
+# SIL-4 — hysteresis: enter music at the threshold, leave it only below a lower
+# exit threshold, so an RMS hovering at the boundary can't flap the detector
+# ---------------------------------------------------------------------------
+
+def test_sil4_hovering_at_the_threshold_does_not_flap():
+    """An RMS that straddles the single (enter) threshold chunk-to-chunk must NOT
+    produce an unbounded MUSIC_STARTED/MUSIC_STOPPED alternation — each flap
+    re-arms the end-of-session timer, so a fade-out or locked groove hovering at
+    the boundary could hold SESSION_ENDED off forever (SIL-4).  With hysteresis,
+    once music is entered, dips that don't cross the lower exit threshold (0.5x)
+    stay music."""
+    detector = SilenceDetector(make_config(threshold=0.01))
+    events = collect(detector)
+    detector.process(music_chunk(rms=0.05), SAMPLE_RATE)          # solidly music
+    for _ in range(4):
+        detector.process(music_chunk(rms=0.011), SAMPLE_RATE)     # just above enter
+        detector.process(music_chunk(rms=0.009), SAMPLE_RATE)     # below enter, above exit
+
+    assert events.count(AudioEvent.MUSIC_STARTED) == 1            # only the initial one
+    assert AudioEvent.MUSIC_STOPPED not in events                # no flapping
+
+
+def test_sil4_music_persists_in_the_dead_band():
+    """While in music, an RMS in the dead band [exit, enter) does NOT drop to
+    silence — only a drop below the exit threshold (0.5x the enter threshold)
+    does (SIL-4)."""
+    detector = SilenceDetector(make_config(threshold=0.01))
+    events = collect(detector)
+    detector.process(music_chunk(rms=0.05), SAMPLE_RATE)          # music
+
+    detector.process(music_chunk(rms=0.007), SAMPLE_RATE)         # dead band (0.005..0.01)
+    assert detector.is_music_playing                             # still music
+    assert AudioEvent.MUSIC_STOPPED not in events
+
+    detector.process(music_chunk(rms=0.004), SAMPLE_RATE)         # below exit (0.005)
+    assert not detector.is_music_playing                         # now silence
+    assert AudioEvent.MUSIC_STOPPED in events
+
+
+def test_sil4_dead_band_chunk_does_not_start_music_from_silence():
+    """The ENTER threshold is unchanged: from silence, an RMS in the dead band
+    [exit, enter) is NOT enough to start music (SIL-4 doesn't lower the entry
+    bar, only adds a lower exit bar)."""
+    detector = SilenceDetector(make_config(threshold=0.01))
+    events = collect(detector)
+    detector.process(music_chunk(rms=0.007), SAMPLE_RATE)         # dead band, from silence
+
+    assert not detector.is_music_playing                         # no music start
+    assert AudioEvent.MUSIC_STARTED not in events
+
+
+# ---------------------------------------------------------------------------
 # MUSIC_STARTED
 # ---------------------------------------------------------------------------
 
