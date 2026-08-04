@@ -119,7 +119,42 @@ class ListenTracker:
             target = self._session
             task = asyncio.create_task(self._end_session(expected=target))
             self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            task.add_done_callback(self._on_end_session_done)
+
+    def _on_end_session_done(self, task: "asyncio.Task"):
+        """Done-callback for the fire-and-forget SESSION_ENDED task (CONC-3).
+
+        Drops the strong reference AND retrieves the task's exception, so a raise
+        inside ``_end_session`` is LOGGED here — at completion, attached to the
+        SESSION_ENDED that caused it — instead of surfacing as asyncio's detached
+        ``Task exception was never retrieved`` warning from the GC at an arbitrary
+        later time (or, if the task object is collected quietly, nothing at all).
+
+        Most write failures inside the credit path are already handled gracefully
+        (``_finalize_write_with_retry`` catches and bounded-retries the Play Count
+        increment and the Last.fm love, #163). This callback is the backstop for
+        the paths that still raise rather than return False — most concretely a
+        raising ``update_last_played`` — and for any unexpected error, so the
+        operator sees the failure in the same log that records every other write
+        outcome, rather than a silent half-credited session.
+
+        ``task.cancelled()`` is checked first: shutdown / loop teardown can cancel
+        an in-flight credit (``drain`` already warns about that), and calling
+        ``.exception()`` on a cancelled task raises ``CancelledError`` — so a
+        cancelled task is discarded without being reported as a credit failure.
+        """
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error(
+                "End-of-session credit task failed and could not complete: %r — "
+                "this session's Discogs Play Count / Last Played and any Last.fm "
+                "love may be incomplete, and nothing will retry it until the record "
+                "is played again.",
+                exc,
+            )
 
     async def drain(self, timeout: float = _SHUTDOWN_DRAIN_SECONDS) -> None:
         """Wait (bounded) for any in-flight end-of-session credit tasks to finish.
