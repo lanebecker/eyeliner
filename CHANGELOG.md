@@ -352,6 +352,35 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   type checks. A pre-existing, benign resource nit it surfaced — `discogs_http`'s
   dedicated pool isn't explicitly closed when startup aborts before `run_pipeline`
   (atexit still joins the idle threads; no hang) — was filed separately (#170).
+- **A crash in the fire-and-forget end-of-session credit is now logged, not
+  swallowed into a detached GC warning (CONC-3, #105 — LOW).** The SESSION_ENDED
+  credit runs as a fire-and-forget `asyncio` task, and its done-callback was a bare
+  `self._bg_tasks.discard` — it dropped the strong reference but never retrieved
+  `task.exception()`. Most write failures inside the credit path are already caught
+  and bounded-retried (`_finalize_write_with_retry`, #163), but a path that RAISES
+  rather than returning False — most concretely a raising `update_last_played`, or
+  any unexpected error — propagated out of `_end_session` into nothing: the only
+  trace was asyncio's `Task exception was never retrieved`, emitted from the garbage
+  collector at an arbitrary later time and detached from the SESSION_ENDED that
+  caused it, so the operator saw no error in the same log that records every other
+  write outcome. The callback is now `_on_end_session_done`, which discards the
+  reference AND retrieves the exception, logging one ERROR naming the failure when
+  the task raised — guarding `task.cancelled()` first, because shutdown/loop
+  teardown can cancel an in-flight credit (which `drain` already warns about) and
+  calling `.exception()` on a cancelled task itself raises `CancelledError`.
+  RED-first (a raising `update_last_played` reproduced the swallow — a detached GC
+  warning, no operator-visible ERROR); five mutants — revert to the bare discard,
+  downgrade the log level, drop the reference-cleanup, drop the cancelled guard,
+  invert the has-exception check — all killed; cold review SPEC / QUALITY PASS,
+  which empirically confirmed the `.exception()` retrieval suppresses the detached
+  GC warning (1 → 0), that the success path is unchanged (unconditional discard,
+  silent), and that there is no double-log against `drain`. This is a VISIBILITY
+  fix: the finding explicitly accepts that the session's Last Played / Last.fm love
+  are skipped when a write raises after the Play Count landed, and asks only that
+  the failure be surfaced. A pre-existing seam the review noted in passing — the
+  "love runs independently of a Discogs failure" comment holds when a write returns
+  False but not when it RAISES (the raise short-circuits the love block) — was filed
+  separately (#171) rather than folded in.
 
 ## [1.5.2] — 2026-08-03
 

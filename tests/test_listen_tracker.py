@@ -17,6 +17,7 @@ Covers update_last_played integration:
 No audio hardware, display, or Discogs account required. DiscogsClient is mocked.
 """
 import asyncio
+import logging
 from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 
@@ -745,6 +746,69 @@ async def test_partial_album_via_public_session_ended_path_does_not_increment():
 
     writer.increment_play_count.assert_not_called()
     assert tracker._session is None
+
+
+# ---------------------------------------------------------------------------
+# CONC-3 — the fire-and-forget SESSION_ENDED task's failure is LOGGED by its
+# done-callback, not swallowed into asyncio's GC "never retrieved" warning
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_conc3_raising_end_session_task_logs_the_failure(caplog):
+    """If the fire-and-forget SESSION_ENDED task raises, its done-callback must
+    LOG the failure (CONC-3).  Reproduced via an unwrapped write: the Play Count
+    increment lands (credited) but ``update_last_played`` RAISES rather than
+    returning False, so the exception propagates out of ``_end_session`` — where,
+    before the fix, the bare ``_bg_tasks.discard`` callback dropped it and only
+    asyncio's detached GC warning ever mentioned it, at an arbitrary later time.
+    """
+    tracker, writer = make_tracker(last_played_field_name="Last Played")
+    writer.update_last_played.side_effect = RuntimeError("discogs 500 on last-played")
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))   # the album closer
+
+    with caplog.at_level(logging.ERROR):
+        tracker.on_silence_event(AudioEvent.SESSION_ENDED)
+        task = next(iter(tracker._bg_tasks))        # capture before the callback discards it
+        for _ in range(5):                          # let the task + its done-callback run
+            await asyncio.sleep(0)
+
+    assert task.done()
+    assert any(
+        "End-of-session credit task failed" in r.getMessage() for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+    # Retrieve so today's bare-discard path can't leak an unretrieved-exception
+    # warning into later tests (the fix already retrieves it in the callback).
+    if not task.cancelled():
+        task.exception()
+
+
+@pytest.mark.asyncio
+async def test_conc3_cancelled_end_session_task_is_not_logged_as_error(caplog):
+    """A task cancelled by shutdown / loop teardown must NOT be reported as a
+    credit failure — and the callback must not call ``.exception()`` on it, which
+    would raise ``CancelledError`` inside the callback (surfacing as an
+    'Exception in callback' ERROR).  Pins the ``task.cancelled()`` guard."""
+    tracker = ListenTracker(make_writer_mock())
+    started = asyncio.Event()
+
+    async def slow(expected=None):
+        started.set()
+        await asyncio.sleep(3600)
+
+    tracker._end_session = slow
+
+    with caplog.at_level(logging.ERROR):
+        tracker.on_silence_event(AudioEvent.SESSION_ENDED)
+        task = next(iter(tracker._bg_tasks))
+        await started.wait()
+        task.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    assert task.cancelled()
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == [], errors
 
 
 # ---------------------------------------------------------------------------
