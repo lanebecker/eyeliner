@@ -11,7 +11,12 @@ audio:
   overlap_seconds: 5
   # RMS energy below this = silence (tune to your room noise floor)
   silence_threshold_rms: 0.01
-  # Seconds of continuous silence before we consider the session ended
+  # Seconds of continuous silence before we consider the session ended.
+  # Measured from when the silence genuinely began: SIL-1 back-dates the timer
+  # to the start of the first fully-silent window rather than the (late) moment
+  # that window is processed.  Detection is still sampled on the chunk grid, so
+  # SESSION_ENDED lands up to one hop (chunk_seconds - overlap_seconds = 10s
+  # here) after this threshold — expect ~45-55s of real silence, not exactly 45s.
   session_end_silence_seconds: 45
 
 discogs:

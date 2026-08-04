@@ -260,6 +260,35 @@ irreversible-data issues (that was Wave 1), but the ones that keep it running.
   surfaced — JSON-null CONTAINERS (`sections`/`metadata`) that crash the parser's
   iteration but are caught by `recognize()` and degrade to a miss, not the stall —
   was filed separately (#167) rather than folded in.
+- **The `session_end_silence_seconds` knob now measures from when the silence
+  actually began, so 45s no longer means 60-70s (SIL-1, #102 — MEDIUM).** A chunk
+  is a `chunk_seconds` (15s) *trailing* RMS window emitted every hop
+  (`chunk_seconds - overlap_seconds` = 10s), so the first fully-below-threshold
+  chunk lands 15-25s after the needle actually lifted — yet `_silence_since` was
+  armed at the moment that late chunk was *processed*. The configured 45s was
+  therefore measured from a point ~15-25s too late: a needle lift at t=60.25s
+  fired SESSION_ENDED at t=130.0s (69.75s latency, 55% over the documented value),
+  delaying the Discogs play-count credit and the return to IDLE, and making the
+  knob impossible to tune meaningfully. The music→silence transition now back-dates
+  the timer to `now - chunk_seconds` — the start of the trailing window, where the
+  silence genuinely began. This removes the whole `chunk_seconds` component; an
+  up-to-one-hop residual remains because detection is still sampled on the chunk
+  grid (so a 45s threshold now fires at ~45-55s, not exactly 45s) — that residual
+  is documented honestly in `config.example.yaml` and in-code rather than papered
+  over, since removing it would require sub-chunk RMS sampling (out of scope). The
+  `reset_music_state` (B-6 outage-recovery) arming is deliberately left at bare
+  `now`: after a stall of unknown duration there is no window to back-date to, and
+  a cold-review attack on that asymmetry confirmed the two sites model different
+  physics and cannot corrupt each other. RED-first (a white-box test pinning the
+  armed value plus a corrected-deadline SESSION_ENDED test, both red on today's
+  code); four mutants — revert the back-date, flip its sign, zero the window,
+  swap in the wrong attribute — all killed, the white-box test firing on every
+  one; cold review SPEC / QUALITY PASS with an executed reproduction confirming the
+  latency drop (130.0s → 115.0s in the finding's own scenario) and no premature or
+  wrong-chunk fire even when `session_end < chunk_seconds`. The review also surfaced
+  a *pre-existing* gap it labeled out of scope — `session_end_silence_seconds`
+  accepts `0`/negative because CRIT-1's value-domain sweep missed it — filed
+  separately (#168) rather than folded into this fix.
 
 ## [1.5.2] — 2026-08-03
 

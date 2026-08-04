@@ -37,6 +37,11 @@ class SilenceDetector:
     def __init__(self, config: "AudioConfig"):
         self.threshold: float = config.silence_threshold_rms
         self.session_end_seconds: int = config.session_end_silence_seconds
+        # SIL-1: a chunk is a `chunk_seconds`-long *trailing* window, so the
+        # silence it reports began chunk_seconds ago, not "now".  Needed to
+        # back-date _silence_since so the session-end timer measures real
+        # wall-clock silence rather than silence + one window's latency.
+        self.chunk_seconds: int = config.chunk_seconds
         self._is_music = False
         self._silence_since: Optional[float] = None
         self._session_ended = False
@@ -68,7 +73,17 @@ class SilenceDetector:
             # Silence
             if self._is_music:
                 self._is_music = False
-                self._silence_since = now
+                # SIL-1: back-date to the START of this trailing window.  The
+                # chunk we just judged silent covers [now - chunk_seconds, now],
+                # so the silence has in truth lasted a full window already; arming
+                # at `now` would make SESSION_ENDED fire one chunk_seconds late.
+                # This removes the chunk_seconds component only — because the
+                # first fully-silent window still lands on the hop grid, an
+                # up-to-one-hop (chunk_seconds - overlap_seconds) residual
+                # remains, so a 45s threshold fires at ~45-55s, not exactly 45s
+                # (documented in config.example.yaml).  Fully removing it would
+                # require sub-chunk RMS sampling, out of scope here.
+                self._silence_since = now - self.chunk_seconds
                 self._emit(AudioEvent.MUSIC_STOPPED)
             else:
                 self._check_session_end(now)
