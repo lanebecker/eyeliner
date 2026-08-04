@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.3] — 2026-08-04
+
 **Code-review hardening, round 3 (Wave 2 — keep the appliance alive).** Wave 2 of
 the same audit (`CODE_REVIEW_2026-07-30.md`): the liveness and crash-loop findings
 that decide whether the unattended appliance recovers on its own — through a device
