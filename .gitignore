@@ -44,3 +44,7 @@ htmlcov/
 
 # Local-only code review reports (findings live in GitHub issues; see MEMORY)
 CODE_REVIEW_*.md
+
+# Local-only handoff/review patch artifacts (delivered per-finding, applied on
+# the Mac, then discarded — never committed; keeps `git add -A` from re-polluting)
+*.patch
