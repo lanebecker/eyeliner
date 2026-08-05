@@ -269,7 +269,16 @@ def test_open_cover_stream_dials_ip_but_tls_for_hostname(monkeypatch):
     assert captured["kwargs"]["cert_reqs"] == "CERT_REQUIRED"
     assert captured["path"] == "/a/b.png?x=1"                        # path + query preserved
     assert captured["method"] == "GET"
+    # Pin the WHOLE streaming-kwarg contract, not just redirect (MUT-8): each of
+    # these was independently mutable with the suite green.
     assert captured["urlopen_kwargs"]["redirect"] is False           # we walk redirects ourselves
+    assert captured["urlopen_kwargs"]["retries"] is False            # no implicit urllib3 retries
+    # preload_content=False is the load-bearing one: with True, urllib3 reads the
+    # ENTIRE body into RAM before download() can apply its _MAX_COVER_BYTES chunk
+    # cap — a few-hundred-MB cover URL would then exhaust memory on a 2 GB Pi even
+    # though the on-disk file stays bounded. Stream, never preload.
+    assert captured["urlopen_kwargs"]["preload_content"] is False
+    assert captured["urlopen_kwargs"]["decode_content"] is False     # raw bytes, no re-inflation
 
 
 # ---------------------------------------------------------------------------
