@@ -39,6 +39,25 @@ field and the appliance.
   the `load()` gate is mutation-pinned (delete-`load` and `load`→`verify` both
   killed); cold review SPEC / QUALITY PASS. The misleading docstring/comment were
   corrected to describe what `verify()` actually does per format.
+- **A malformed MusicBrainz release no longer discards cover art from a later
+  release, and `get_cover_art_url` gained its first test file (TQ-3, #115 —
+  MEDIUM).** `src/metadata/coverart.py` parses untrusted MusicBrainz payloads
+  into a URL the fetcher then dials, but had **no tests at all** and a latent
+  bug: when MusicBrainz returned a release's images as a list of strings (not
+  dicts), `img.get('front')` raised `AttributeError`, which escaped the inner
+  `except ResponseError` and aborted the *whole* candidate loop — so a later
+  release that had valid art was never tried (a `ResponseError` on the same
+  release would have skipped to it correctly). The per-release body is now
+  fully guarded: a non-dict image, a non-dict payload, a non-iterable image
+  list, or a release without an `id` skips that release and tries the next,
+  and the return value is guaranteed to be a `str` (or `None`) so a mistyped
+  payload can't hand a non-string to the fetcher. URL scheme/host validation is
+  deliberately left to the SSRF-hardened fetcher (`cover_cache`), not
+  duplicated. New `tests/test_coverart.py` (musicbrainzngs patched) covers the
+  happy path, empty/missing lists, `ResponseError`-then-success, four malformed
+  payloads (incl. non-dict images and a `file://` URL), and the return-type
+  contract. RED-first (the four negative cases fail on the old code); the fix is
+  mutation-pinned in every element; cold review SPEC / QUALITY PASS.
 
 ### Security
 
