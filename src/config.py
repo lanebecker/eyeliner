@@ -46,6 +46,22 @@ class ConfigError(Exception):
 # legitimately is ``None``, e.g. discogs.last_played_field_name).
 _REQUIRED = object()
 
+# (section, key) pairs whose value is a credential and must NEVER be echoed into
+# an error message or log (SEC-3).  A wrong-typed credential in config.yaml — an
+# all-digit token YAML reads as int, a ``1e5``-shaped value, ``yes``/``no``, a
+# mis-pasted list — would otherwise be interpolated verbatim into the aggregated
+# ConfigError that main.py logs to the systemd journal, where it persists across
+# reboots.  For these fields we report the observed type but redact the value.
+# NOTE: if a future backend adds validated credential fields (e.g. an
+# ``acrcloud``/``audd`` api_token, currently unparsed), add its (section, key)
+# here — anything routed through ``_field`` echoes its value unless listed.
+_SECRET_FIELDS = frozenset({
+    ("discogs", "user_token"),
+    ("lastfm", "api_key"),
+    ("lastfm", "api_secret"),
+    ("lastfm", "session_key"),
+})
+
 
 def _coerce(value, kind):
     """Return ``(ok, coerced_value)`` for *value* against the expected *kind*.
@@ -92,9 +108,12 @@ def _field(data: dict, key: str, kind, default, *, section: str, errors: list):
 
     ok, coerced = _coerce(data[key], kind)
     if not ok:
+        # SEC-3: the observed type is what the operator needs; never echo a
+        # secret's raw value (it would land in the logged ConfigError).
+        shown = "<redacted>" if (section, key) in _SECRET_FIELDS else f"{data[key]!r}"
         errors.append(
             f"  • {section}.{key}: expected {kind.__name__}, got "
-            f"{type(data[key]).__name__} ({data[key]!r})"
+            f"{type(data[key]).__name__} ({shown})"
         )
         return None if default is _REQUIRED else default
     return coerced

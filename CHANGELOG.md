@@ -40,6 +40,24 @@ field and the appliance.
   killed); cold review SPEC / QUALITY PASS. The misleading docstring/comment were
   corrected to describe what `verify()` actually does per format.
 
+### Security
+
+- **A wrong-typed credential in `config.yaml` no longer leaks into the logged
+  startup error (SEC-3, #114 — MEDIUM).** The aggregated `ConfigError` from
+  `config.py` interpolated every wrong-typed field's raw value with `!r` —
+  including `discogs.user_token` and the Last.fm `api_key` / `api_secret` /
+  `session_key` — and `main.py` logs that error in full to the systemd journal.
+  So a credential YAML doesn't read as a string (an all-digit token read as int,
+  a `1e5`-shaped value, `yes`/`no`, a mis-pasted list) failed startup loudly
+  *and* wrote the secret verbatim to a log that persists across reboots. The
+  type-mismatch message now emits `<redacted>` for a known set of secret fields
+  while still reporting the path and observed type; non-secret fields keep their
+  value (the operator needs `got 44100.0` to fix a config). RED-first (the four
+  credentials reproduced leaking on the old code); the redaction is
+  mutation-pinned in all four directions; cold review SPEC / QUALITY PASS across
+  int/float/bool/list/dict secret shapes and the aggregated / non-mapping error
+  paths.
+
 ### Tests
 
 - **Pinned both rejection paths of `validate_image_file` — the cover-art format
