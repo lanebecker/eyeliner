@@ -15,6 +15,31 @@ around untrusted-input handling and credential safety, plus the guard paths the
 suite never executed — the checks that stand between a stranger-editable Discogs
 field and the appliance.
 
+### Fixed
+
+- **A truncated or corrupt cover download is now rejected instead of cached and
+  displayed forever (DISP-3 / SEC-6, #110 — MEDIUM).** `validate_image_file` is
+  the only gate between the network and the on-disk cover cache
+  (`cover_cache.download()`), and the download loop never reconciles bytes
+  against `Content-Length`. Its docstring claimed Pillow's `verify()` rejects
+  truncated files — but `verify()` does no structural check for JPEG (the format
+  the cache is named for: `path_for` returns `<md5>.jpg`); only
+  `PngImageFile.verify()` actually validates. So a cover whose download was cut
+  off mid-scan by a dropped connection passed validation, was `os.replace`'d into
+  the cache, and — since `exists()` never re-validates — was shown for every
+  future play of that album, with `extract_palette` deriving the whole five-colour
+  scheme from the garbage half. Both failures were silent. The validator now
+  reads the header and applies the format + pixel-count gates first (so a
+  decompression bomb is still rejected before any decode), then forces a real
+  `Image.open(path).load()` — the only structural check that bites for JPEG —
+  with `LOAD_TRUNCATED_IMAGES` left False so a short read raises. Verified against
+  truncated JPEG/PNG/WEBP/GIF/BMP (and a corrupt-mid-scan JPEG); the caller
+  already unlinks the rejected `.part` file and retries within a bounded limit.
+  RED-first (the truncated JPEG reproduced passing validation on the old code);
+  the `load()` gate is mutation-pinned (delete-`load` and `load`→`verify` both
+  killed); cold review SPEC / QUALITY PASS. The misleading docstring/comment were
+  corrected to describe what `verify()` actually does per format.
+
 ### Tests
 
 - **Pinned both rejection paths of `validate_image_file` — the cover-art format

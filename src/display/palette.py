@@ -26,22 +26,34 @@ MAX_IMAGE_PIXELS = 6000 * 6000
 # ---------------------------------------------------------------------------
 
 def validate_image_file(path: str) -> None:
-    """Verify a file is a sane, bounded image before it is decoded/cached.
+    """Validate that a file is a sane, bounded, fully-decodable image before it
+    is cached.
 
-    Uses Pillow's `verify()` to reject truncated / malformed files and caps the
-    pixel count to guard against decompression bombs (S-2).  Raises ValueError
-    on anything suspicious.
+    Reads the header to enforce a format allow-list and a pixel-count bound
+    (decompression-bomb guard, S-2), then forces a **full decode** to reject
+    truncated or corrupt payloads (DISP-3) — e.g. a cover whose download was cut
+    off mid-scan by a dropped connection.  Raises ValueError on anything
+    suspicious.
+
+    Note: Pillow's ``verify()`` is deliberately NOT used.  Only
+    ``PngImageFile.verify()`` performs a real structural (CRC) check; the JPEG /
+    WEBP / GIF / BMP readers inherit ``ImageFile.verify()``, which closes the
+    file object without inspecting the pixel stream.  So a half-written JPEG
+    (the format this cache is named for) passes ``verify()`` while failing a
+    real ``load()``.  ``ImageFile.LOAD_TRUNCATED_IMAGES`` is left at its default
+    (False) so that a short read raises instead of being silently zero-filled.
     """
     from PIL import Image
 
     # Belt-and-suspenders: bound Pillow's own decompression-bomb threshold too.
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
+    # 1. Open and read the header only — no pixel decode yet, so a bomb is
+    #    rejected below (step 2) before it is ever decoded.
     try:
         with Image.open(path) as probe:
             fmt = probe.format
             width, height = probe.size
-            probe.verify()  # structural integrity check; consumes the file object
     except Exception as e:
         raise ValueError(f"not a decodable image: {e}")
 
@@ -49,6 +61,16 @@ def validate_image_file(path: str) -> None:
         raise ValueError(f"unexpected image format: {fmt!r}")
     if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
         raise ValueError(f"image dimensions out of bounds: {width}x{height}")
+
+    # 2. Force a real decode.  This is the only structural check that actually
+    #    bites for JPEG (verify() does not), and it is the last gate before the
+    #    file is os.replace'd into the on-disk cover cache.  Bounded above by the
+    #    pixel check, so we never fully decode an oversized image.
+    try:
+        with Image.open(path) as probe:
+            probe.load()
+    except Exception as e:
+        raise ValueError(f"not a decodable image: {e}")
 
 
 # ---------------------------------------------------------------------------
