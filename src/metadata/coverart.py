@@ -34,22 +34,38 @@ class CoverArtFallback:
             if not releases:
                 return None
 
-            # Try each result until we find one with cover art
+            # Try each result until we find one with cover art.  The payload is
+            # untrusted (TQ-3): a single malformed release must NOT abort the
+            # whole loop — skip it and try the next, exactly as we already do for
+            # a ResponseError.  A non-dict image entry, a non-dict `art`, a
+            # non-iterable `images`, or a release without an ``id`` are all
+            # tolerated by skipping that release.
             for release in releases:
-                mbid = release["id"]
                 try:
+                    mbid = release["id"]
                     art = musicbrainzngs.get_image_list(mbid)
                     images = art.get("images", [])
                     front = next(
-                        (img for img in images if img.get("front")), None
+                        (
+                            img
+                            for img in images
+                            if isinstance(img, dict) and img.get("front")
+                        ),
+                        None,
                     )
                     if front:
-                        return (
+                        url = (
                             front.get("thumbnails", {}).get("large")
                             or front.get("image")
                         )
-                except musicbrainzngs.ResponseError:
-                    continue  # This release has no cover art, try next
+                        # The fetcher (cover_cache) is the URL/SSRF gate; here we
+                        # only guarantee a str is handed downstream (else fall
+                        # through and try the next release).
+                        if isinstance(url, str):
+                            return url
+                except (musicbrainzngs.ResponseError, AttributeError, TypeError, KeyError) as e:
+                    log.debug("skipping release with no usable cover art: %s", e)
+                    continue  # try the next release
 
             return None
 
