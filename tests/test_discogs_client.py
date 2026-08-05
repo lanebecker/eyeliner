@@ -826,6 +826,31 @@ def test_request_429_at_exactly_the_cap_still_retries():
     mock_sleep.assert_called_once_with(_RATE_LIMIT_MAX_WAIT)  # waited exactly the cap
 
 
+def test_request_429_retry_after_zero_still_sleeps_at_least_one():
+    """MUT-9: the retry sleep floor is `max(1, retry_after)`.  A `Retry-After: 0`
+    must NOT collapse into an instant retry against an API that just throttled the
+    device — the `max(1, ...)` -> `max(0, ...)` mutant.  Assert the sleep is 1."""
+    client = make_client()
+    ok = make_get_response(200, {})
+    client._http.session.get = MagicMock(side_effect=[make_429_response("0"), ok])
+
+    with patch("src.metadata.discogs.transport.time.sleep") as mock_sleep:
+        resp = client._http.request("GET", "https://api.discogs.com/anything")
+
+    assert resp is ok
+    assert client._http.session.get.call_count == 2
+    mock_sleep.assert_called_once_with(1)   # floored to 1, never 0
+
+
+def test_transport_rate_limit_constants_are_the_shipped_values():
+    """MUT-9: the HTTP timeout and 429 wait bounds are asserted nowhere else, so a
+    units slip shipped green.  Pin the shipped values directly."""
+    from src.metadata.discogs import transport
+    assert transport._HTTP_TIMEOUT == 15
+    assert transport._RATE_LIMIT_MAX_WAIT == 10
+    assert transport._RATE_LIMIT_DEFAULT_WAIT == 2
+
+
 def test_request_does_not_retry_on_success():
     client = make_client()
     client._http.session.get = MagicMock(return_value=make_get_response(200, {}))
