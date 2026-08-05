@@ -155,6 +155,34 @@ field and the appliance.
   genuine survivors of the pre-change suite and are now killed (kwarg *deletion*
   is caught too, since urllib3 defaults `preload_content` to `True`). Cold review
   SPEC / QUALITY PASS. Test-only; no production behavior change.
+- **Individually pinned each `download()` failure guard, so a dropped check
+  can't hide behind a later one (MUT-10, #118 — LOW).** The five guards
+  (redirect cap, no-response, HTTP-status `>= 400`, Content-Type allow-list,
+  byte cap) were interchangeable in the suite: every failure still terminated in
+  *some* downstream exception, so deleting the Content-Type check stayed green
+  because a non-image body later failed image validation — while a valid image
+  served as `text/html`, or a 400 carrying an image body, would flow into the
+  cache. Each guard's test now uses `pytest.raises(match=...)` to pin its own
+  branch, plus a new `status == 400` boundary case (valid PNG body, so bypassing
+  the `>=` guard would otherwise succeed) and a redirect-overflow case. All
+  reachable guard mutants are killed (`>=`→`>`, check-disable, and — verified via
+  a message-only mutation — the `match=` strings pin the intended branch). The
+  `if resp is None` guard is unreachable through the public `download()` (the
+  loop only `break`s with a response set, and exhaustion raises "too many
+  redirects" first), so it is a documented equivalent mutant, not black-box
+  testable. Test-only; no production behavior change.
+- **Pinned every numeric limit in the fetch and rate-limit paths to its shipped
+  value (MUT-9, #119 — LOW).** `_MAX_COVER_BYTES`, `_MAX_COVER_REDIRECTS` (5),
+  `_COVER_CONNECT_READ_TIMEOUT` (15), and transport's `_HTTP_TIMEOUT` (15),
+  `_RATE_LIMIT_MAX_WAIT` (10), `_RATE_LIMIT_DEFAULT_WAIT` (2) were all mutable
+  with the suite green — tests proved a cap *existed*, never *which*, so a
+  redirect cap raised to 500 or a units slip would ship silently. Added a
+  constants assertion per module, a redirect chain driven to exactly
+  `_MAX_COVER_REDIRECTS + 1` hops (into the "too many redirects" raise), and a
+  `Retry-After: 0` case asserting the retry still sleeps `1` — pinning the
+  `wait = max(1, retry_after)` floor against the `max(0, …)` mutant that would
+  fire an instant retry at an API that just throttled the device. All named
+  mutants killed. Test-only; no production behavior change.
 
 ## [1.5.3] — 2026-08-04
 

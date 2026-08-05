@@ -469,7 +469,7 @@ def test_download_rejects_non_image_content_type(tmp_path, monkeypatch):
 
     store = _make_store(tmp_path)
     url = "https://i.discogs.com/x"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unexpected Content-Type"):  # pin THIS guard (MUT-10)
         store.download(url)
     assert not store.exists(url)
 
@@ -482,7 +482,7 @@ def test_download_rejects_http_error_status(tmp_path, monkeypatch):
 
     store = _make_store(tmp_path)
     url = "https://i.discogs.com/x"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="HTTP 404"):  # pin THIS guard (MUT-10)
         store.download(url)
     assert not store.exists(url)
 
@@ -497,7 +497,7 @@ def test_download_aborts_past_size_cap(tmp_path, monkeypatch):
 
     store = _make_store(tmp_path)
     url = "https://i.discogs.com/x"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="byte cap"):  # pin THIS guard (MUT-10)
         store.download(url)
     assert not store.exists(url)
     assert not any(n.startswith(".cover-") for n in os.listdir(tmp_path))
@@ -512,7 +512,7 @@ def test_download_rejects_malicious_image_bytes(tmp_path, monkeypatch):
 
     store = _make_store(tmp_path)
     url = "https://i.discogs.com/x"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not a decodable image"):  # pin THIS guard (MUT-10)
         store.download(url)
     assert not store.exists(url)
 
@@ -545,6 +545,57 @@ def test_download_follows_and_repins_validated_redirect(tmp_path, monkeypatch):
     assert any("coverartarchive.org" in h for h in hosts)
     assert any("archive.org" in h for h in hosts)
     assert all(ip == "93.184.216.34" for _, ip in seen)
+
+
+def test_download_rejects_http_status_400_boundary(tmp_path, monkeypatch):
+    # The status guard is `>= 400`; a `>` mutation would let HTTP 400 through.
+    # Serve a 400 with a VALID png body + image Content-Type so that, if the guard
+    # were bypassed, the download would otherwise SUCCEED — proving the guard is
+    # what stopped it (the >= boundary, MUT-10).
+    monkeypatch.setattr(cc, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
+    resp = _FakeResp(status=400, headers={"Content-Type": "image/png"}, body=_png_bytes())
+    monkeypatch.setattr(cc, "_open_cover_stream", lambda *a, **k: resp)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/x"
+    with pytest.raises(ValueError, match="HTTP 400"):
+        store.download(url)
+    assert not store.exists(url)
+
+
+def test_download_rejects_too_many_redirects(tmp_path, monkeypatch):
+    # Drive a redirect chain that never terminates: every hop returns a 307 to
+    # another allow-listed URL.  The loop caps at _MAX_COVER_REDIRECTS + 1 hops,
+    # then raises.  Pins the `too many redirects` guard (MUT-10) AND that the cap
+    # is actually _MAX_COVER_REDIRECTS, exercised to MAX+1 hops (MUT-9).
+    monkeypatch.setattr(cc, "_validate_cover_url",
+                        lambda u: (u, urlsplit(u).hostname or "i.discogs.com", "1.2.3.4"))
+    calls = {"n": 0}
+
+    def always_redirect(fetch_url, host, pinned_ip, timeout):
+        calls["n"] += 1
+        return _FakeResp(status=307,
+                         headers={"Location": f"https://i.discogs.com/hop{calls['n']}"})
+
+    monkeypatch.setattr(cc, "_open_cover_stream", always_redirect)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/start"
+    with pytest.raises(ValueError, match="too many redirects"):
+        store.download(url)
+    # Exactly MAX+1 hops were attempted before giving up (pins the cap value).
+    assert calls["n"] == cc._MAX_COVER_REDIRECTS + 1
+    assert not store.exists(url)
+
+
+def test_cover_fetch_constants_are_the_shipped_values(monkeypatch):
+    # The fetch/redirect/timeout caps are asserted nowhere else, so a units slip
+    # or a refactor that loosened them shipped green (MUT-9).  Pin the shipped
+    # values directly.
+    assert cc._MAX_COVER_BYTES == 10 * 1024 * 1024   # 10 MB
+    assert cc._MAX_COVER_REDIRECTS == 5
+    assert cc._COVER_CONNECT_READ_TIMEOUT == 15
 
 
 # ---------------------------------------------------------------------------
