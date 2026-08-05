@@ -82,7 +82,10 @@ def _redact_url(url: str) -> str:
             if seg == "users" and i + 1 < len(segments) and segments[i + 1]:
                 segments[i + 1] = "{user}"
                 break
-        return "/".join(segments) or url
+        # Never fall back to the raw `url` (SEC-2): when parts.path is empty,
+        # "/".join([""]) is "" — returning `url` there would leak the query
+        # string the redaction exists to drop.  A bare "/" is the safe default.
+        return "/".join(segments) or "/"
     except Exception:
         return "<unparseable-url>"
 
@@ -140,14 +143,23 @@ class DiscogsHttp:
         This runs on an executor thread (every caller is dispatched via
         run_in_executor), so the time.sleep() here never blocks the event loop.
 
-        Dispatches via self.session.get / self.session.post (rather than
-        session.request) so tests can keep mocking those two methods as the
-        single HTTP seam.
+        The method is normalised to upper-case and dispatched via
+        self.session.get / self.session.post (rather than session.request) so
+        tests can keep mocking those two methods as the single HTTP seam.  Only
+        GET and POST are supported — any other verb raises rather than silently
+        falling through to a POST (LB-2); this is the transport that WRITES to
+        the real collection, so a wrong verb must fail loudly.
         """
         kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+        method = method.upper()
         if retry_on_429 is None:
             retry_on_429 = (method == "GET")
-        send = self.session.get if method == "GET" else self.session.post
+        if method == "GET":
+            send = self.session.get
+        elif method == "POST":
+            send = self.session.post
+        else:
+            raise ValueError(f"unsupported HTTP method: {method!r}")
         resp = send(url, **kwargs)
         if resp.status_code == 429 and retry_on_429:
             try:

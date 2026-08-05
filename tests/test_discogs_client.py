@@ -851,6 +851,39 @@ def test_transport_rate_limit_constants_are_the_shipped_values():
     assert transport._RATE_LIMIT_DEFAULT_WAIT == 2
 
 
+def test_request_normalizes_lowercase_get(tmp_path):
+    """LB-2: a lowercase 'get' must dispatch via session.get AND retry on 429 like
+    GET (both keyed off `method == "GET"`).  Before, `"get" == "GET"` failed
+    twice — it POSTed and silently lost the 429 retry."""
+    client = make_client()
+    client._http.session.get = MagicMock(
+        side_effect=[make_429_response("1"), make_get_response(200, {})]
+    )
+    client._http.session.post = MagicMock()
+
+    with patch("src.metadata.discogs.transport.time.sleep"):
+        resp = client._http.request("get", "https://api.discogs.com/x")
+
+    assert resp.status_code == 200
+    client._http.session.post.assert_not_called()      # dispatched as GET, not POST
+    assert client._http.session.get.call_count == 2     # retried once (GET default)
+
+
+def test_request_rejects_unsupported_verb_instead_of_posting():
+    """LB-2: DELETE/PUT/PATCH/etc. must raise loudly, not silently issue a POST
+    (this transport is the one that WRITES to the real collection)."""
+    client = make_client()
+    client._http.session.get = MagicMock()
+    client._http.session.post = MagicMock()
+
+    for verb in ("DELETE", "PUT", "PATCH", "HEAD", "delete"):
+        with pytest.raises(ValueError, match="unsupported HTTP method"):
+            client._http.request(verb, "https://api.discogs.com/x")
+
+    client._http.session.get.assert_not_called()
+    client._http.session.post.assert_not_called()       # never silently POSTs
+
+
 def test_request_does_not_retry_on_success():
     client = make_client()
     client._http.session.get = MagicMock(return_value=make_get_response(200, {}))

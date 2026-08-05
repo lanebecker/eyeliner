@@ -58,6 +58,18 @@ field and the appliance.
   payloads (incl. non-dict images and a `file://` URL), and the return-type
   contract. RED-first (the four negative cases fail on the old code); the fix is
   mutation-pinned in every element; cold review SPEC / QUALITY PASS.
+- **The Discogs transport no longer silently turns a non-GET/POST verb into a
+  POST (LB-2, #117 — LOW).** `request()` dispatched `session.get if method ==
+  "GET" else session.post`, so `request("DELETE", …)` / `("PUT", …)` silently
+  issued POSTs, and a lowercase `request("get", …)` failed the `== "GET"` test
+  twice — it POSTed *and* lost its 429 retry. Latent today (only GET/POST are
+  used), but a silent-wrong-verb footgun on the one transport that WRITES to the
+  real collection. `request()` now upper-cases the method, dispatches GET/POST
+  explicitly, and raises `ValueError` on any other verb. (Kept the
+  `session.get`/`session.post` seam the docstring documents for test mocking
+  rather than the finding's `session.request` suggestion; all six in-tree callers
+  pass uppercase `"GET"`/`"POST"` literals, so nothing breaks.) RED-first;
+  mutation-pinned; cold review SPEC / QUALITY PASS.
 
 ### Security
 
@@ -91,6 +103,17 @@ field and the appliance.
   SPEC / QUALITY PASS. The hashed lockfile and broader version ceilings the
   finding also suggested were deliberately deferred (a hashed lock is
   platform/Python-specific and best generated on the Pi).
+- **`_redact_url` no longer leaks the raw URL (query string included) on an
+  empty-path URL (SEC-2, #120 — LOW).** The `return "/".join(segments) or url`
+  fallback returned the original URL verbatim whenever `parts.path` was empty,
+  because `"/".join([""])` is falsy — exactly defeating the redaction's promise
+  to drop the query string (where a future query-string credential would land in
+  the 429 log). Latent today (the token rides in a header), but the log path is
+  the whole point of the function. It now returns the masked path or a bare `/`,
+  never the raw URL. Verified across 12 adversarial URLs (origin-only, userinfo,
+  protocol-relative, `?`-only, root path) — no query/credential/host leaks; the
+  username-masking + query-drop still hold on a normal path. RED-first;
+  mutation-pinned; cold review SPEC / QUALITY PASS.
 
 ### Tests
 
