@@ -88,6 +88,21 @@ field and the appliance.
   mutants — verified genuine survivors of the pre-change suite — are now killed
   (`i += 0` by non-termination, `-= 2` by the post-eviction count). Cold review
   SPEC / QUALITY PASS. Test-only; no production behavior change.
+- **Pinned the *whole* streaming-kwarg contract of the cover fetch, not just
+  `redirect` (MUT-8, #113 — MEDIUM).** `_open_cover_stream` passes four booleans
+  to `pool.urlopen` — `redirect=False`, `retries=False`, `preload_content=False`,
+  `decode_content=False` — but the test asserted only `redirect`, leaving the
+  other three mutable with the suite green. The load-bearing one is
+  `preload_content`: flipped to `True`, urllib3 reads the *entire* response body
+  into RAM before `download()` can apply its `_MAX_COVER_BYTES` chunk cap, so a
+  few-hundred-MB (attacker-influenced or merely broken) cover URL becomes a RAM
+  exhaustion on a 2 GB Pi even though the on-disk file stays bounded;
+  `decode_content=True` would likewise let a gzip-inflated body dodge the
+  pre-inflation byte count. The `_open_cover_stream` test now asserts all four
+  kwargs. `retries`, `preload_content`, and `decode_content` were each verified
+  genuine survivors of the pre-change suite and are now killed (kwarg *deletion*
+  is caught too, since urllib3 defaults `preload_content` to `True`). Cold review
+  SPEC / QUALITY PASS. Test-only; no production behavior change.
 
 ## [1.5.3] — 2026-08-04
 
