@@ -19,8 +19,15 @@ Pillow>=10.0.0
 # Cover-art fetch pins the connection to a vetted IP (S-7); these are imported
 # directly by src/display/cover_cache.py, not just transitively via requests.
 # urllib3>=2.0 is required: the IP-pinned HTTPSConnectionPool relies on the
-# server_hostname kwarg being forwarded to the connection (TLS SNI).
-urllib3>=2.0.0
+# server_hostname + assert_hostname kwargs being forwarded to the connection
+# (TLS SNI + certificate hostname check).  Capped <3 because those kwargs are an
+# API contract a major bump could drop: removing assert_hostname (an explicit
+# pool param) or server_hostname (forwarded via conn_kw to a connection that
+# rejects unknown kwargs) would raise a TypeError when the connection is built —
+# fail-closed, but the suite's MOCKED pool would still pass, so
+# test_cover_cache.py builds a real HTTPSConnectionPool to catch it in CI, not
+# on the Pi (TQ-4, #116).
+urllib3>=2.0.0,<3.0.0
 certifi>=2023.7.22
 
 # HTTP / async

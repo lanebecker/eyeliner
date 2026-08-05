@@ -76,6 +76,21 @@ field and the appliance.
   mutation-pinned in all four directions; cold review SPEC / QUALITY PASS across
   int/float/bool/list/dict secret shapes and the aggregated / non-mapping error
   paths.
+- **Capped `urllib3 <3` and added a real-pool guard so a breaking upgrade can't
+  silently drop the S-7 IP pin (TQ-4, #116 — MEDIUM).** The cover fetcher's
+  SSRF pin (`cover_cache._open_cover_stream`) relies on urllib3 forwarding the
+  `server_hostname` (TLS SNI) and `assert_hostname` (cert hostname) kwargs to
+  the connection, but `requirements.txt` pinned `urllib3>=2.0.0` floor-only and
+  the existing test *mocks* the pool — so a future `pip install` resolving a
+  urllib3 that removed those kwargs would only surface on the Pi. Pinned
+  `urllib3>=2.0.0,<3.0.0` (that major is the one dep with a documented
+  API-contract risk; other floors left as-is) and added a test that builds a
+  **genuine** `HTTPSConnectionPool` + connection (no socket) and asserts both
+  kwargs actually reach the connection, so a breaking urllib3 fails in CI
+  instead. Non-vacuity shown (dropping a kwarg reddens the test); cold review
+  SPEC / QUALITY PASS. The hashed lockfile and broader version ceilings the
+  finding also suggested were deliberately deferred (a hashed lock is
+  platform/Python-specific and best generated on the Pi).
 
 ### Tests
 
