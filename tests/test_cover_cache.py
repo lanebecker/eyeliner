@@ -22,6 +22,7 @@ import io
 import os
 import time
 import warnings
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -684,3 +685,70 @@ def test_cover_cache_default_max_files_prunes_to_limit(tmp_path):
         if p.is_file() and p.suffix == ".jpg" and not p.name.startswith(".cover-")
     )
     assert remaining == 500
+
+
+# ---------------------------------------------------------------------------
+# _prune eviction loop runs MANY times (MUT-7) — the whole suite otherwise
+# never evicts more than one file, so 'i += 1' -> 'i += 0' (infinite loop in
+# __init__) and 'file_count -= 1' -> '-= 2' (silent under-evict) both survive.
+# ---------------------------------------------------------------------------
+
+def _survivor_names(tmp_path):
+    return sorted(
+        p.name for p in tmp_path.iterdir()
+        if p.is_file() and p.suffix == ".jpg" and not p.name.startswith(".cover-")
+    )
+
+
+def _seed_covers(tmp_path, count, size=1):
+    # count *.jpg covers with strictly increasing mtimes so eviction order is
+    # deterministic (oldest = c00, newest = c{count-1}).
+    base = time.time() - 10_000
+    for i in range(count):
+        p = tmp_path / f"c{i:02d}.jpg"
+        p.write_bytes(b"x" * size)
+        os.utime(p, (base + i, base + i))
+
+
+def test_prune_evicts_many_over_file_bound_keeping_newest(tmp_path):
+    # Seed 10 covers, prune to max_files=3: the loop must evict SEVEN files and
+    # exactly the 3 newest survive, by name. Kills 'i += 0' (which re-picks the
+    # same victim forever -> hang) and 'file_count -= 2' (which stops early and
+    # leaves 6 files). (MUT-7 / #112)
+    store = _make_store(tmp_path, max_files=3, max_bytes=10**9)
+    _seed_covers(tmp_path, 10)
+    store._prune()
+    assert _survivor_names(tmp_path) == ["c07.jpg", "c08.jpg", "c09.jpg"]
+
+
+def test_prune_evicts_many_over_byte_bound_keeping_newest(tmp_path):
+    # Same, but the BYTE bound drives eviction: 10 covers × 100 B = 1000 B,
+    # max_bytes=300 keeps the 3 newest (300 B; the bound is '>' so 300 is OK).
+    # File bound is effectively disabled. (MUT-7 / #112)
+    store = _make_store(tmp_path, max_files=10**6, max_bytes=300)
+    _seed_covers(tmp_path, 10, size=100)
+    store._prune()
+    assert _survivor_names(tmp_path) == ["c07.jpg", "c08.jpg", "c09.jpg"]
+
+
+def test_prune_terminates_and_skips_when_a_victim_unlink_raises(tmp_path, monkeypatch):
+    # A victim that can't be unlinked (OSError) must be SKIPPED and the loop must
+    # keep going — never spin on it. Seed 5 over a file bound of 1 and make the
+    # oldest victim's unlink raise: prune must terminate, leave the un-evictable
+    # file, and evict the other four. Directly exercises the 'except OSError:
+    # continue' path together with the 'i += 1' advance. (MUT-7 / #112)
+    store = _make_store(tmp_path, max_files=1, max_bytes=10**9)
+    _seed_covers(tmp_path, 5)
+
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self, *a, **k):
+        if self.name == "c00.jpg":
+            raise OSError("cannot unlink")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    store._prune()  # must RETURN, not hang
+
+    # c00 raised so it survives; c01..c04 were evicted down to the bound.
+    assert _survivor_names(tmp_path) == ["c00.jpg"]

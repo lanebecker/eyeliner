@@ -74,6 +74,20 @@ field and the appliance.
   survivors and the count-value mutants (each verified a genuine survivor of the
   pre-change suite) are now killed. Cold review SPEC / QUALITY PASS. Test-only; no
   production behavior change.
+- **Pinned the cover-cache eviction loop across *many* evictions (MUT-7, #112 —
+  MEDIUM).** No test anywhere ran `_prune()`'s eviction while-loop body more than
+  once, so two mutants survived: `i += 1` → `i += 0` (which, on a second
+  iteration, re-picks the already-unlinked victim, `unlink` raises `OSError`, the
+  `continue` skips the decrement, and it **spins forever** — an infinite loop
+  inside `CoverArtCache.__init__`, so the appliance never finishes booting) and
+  `file_count -= 1` → `-= 2` (a silent under-evict that lets the cache grow past
+  its bound and fill the SD card). Added three tests: seed 10 covers with distinct
+  mtimes and prune to `max_files=3`, asserting the 3 newest survive by name (a
+  7-file eviction); the same driven by the byte bound; and a case where a victim's
+  `unlink` raises `OSError`, asserting `_prune()` skips it and terminates. Both
+  mutants — verified genuine survivors of the pre-change suite — are now killed
+  (`i += 0` by non-termination, `-= 2` by the post-eviction count). Cold review
+  SPEC / QUALITY PASS. Test-only; no production behavior change.
 
 ## [1.5.3] — 2026-08-04
 
