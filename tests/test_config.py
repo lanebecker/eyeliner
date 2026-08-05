@@ -150,6 +150,48 @@ def test_non_mapping_root_is_reported():
 
 
 # ---------------------------------------------------------------------------
+# SEC-3: a wrong-typed credential must fail loudly but never leak into the
+# ConfigError text that main.py logs to the systemd journal.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("section, key", [
+    ("discogs", "user_token"),
+    ("lastfm", "api_key"),
+    ("lastfm", "api_secret"),
+    ("lastfm", "session_key"),
+])
+def test_wrong_typed_secret_is_redacted_not_leaked(section, key):
+    # A credential YAML doesn't read as a string (here an all-digit token read as
+    # int) must still fail loudly BY PATH, but its raw value must NOT appear in
+    # the aggregated ConfigError — that error is logged to the journal, where it
+    # would persist across reboots. (SEC-3 / #114)
+    secret = 9012345678  # a distinctive all-digit "token" YAML reads as an int
+    raw = _valid_raw()
+    raw.setdefault(section, {})[key] = secret
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    msg = str(exc.value)
+    assert f"{section}.{key}" in msg     # still fails loudly, by path
+    assert "expected str" in msg         # the observed type is still reported
+    assert "<redacted>" in msg           # value replaced with a marker
+    assert str(secret) not in msg        # the raw secret never appears
+
+
+def test_non_secret_wrong_type_still_shows_its_value():
+    # Redaction is surgical: a NON-secret field keeps its value in the error so
+    # the operator can see 'got 123' and fix it. Guards against over-redacting
+    # every field. (SEC-3 / #114)
+    raw = _valid_raw()
+    raw["discogs"]["username"] = 123  # non-secret, wrong type
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    msg = str(exc.value)
+    assert "discogs.username" in msg
+    assert "123" in msg               # value preserved for non-secret fields
+    assert "<redacted>" not in msg
+
+
+# ---------------------------------------------------------------------------
 # Type coercion
 # ---------------------------------------------------------------------------
 
