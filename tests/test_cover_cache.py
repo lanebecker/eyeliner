@@ -281,6 +281,36 @@ def test_open_cover_stream_dials_ip_but_tls_for_hostname(monkeypatch):
     assert captured["urlopen_kwargs"]["decode_content"] is False     # raw bytes, no re-inflation
 
 
+def test_real_https_pool_forwards_the_s7_pinning_kwargs():
+    # The test above MOCKS urllib3, so it proves only that our code PASSES the
+    # pinning kwargs — it can never notice a urllib3 upgrade that stops honouring
+    # them.  Build a GENUINE HTTPSConnectionPool + connection (no socket is opened
+    # by _new_conn) and assert both kwargs actually reach the connection: a major
+    # bump that removed/renamed them would raise here (assert_hostname is an
+    # explicit pool param; server_hostname is forwarded via conn_kw to a
+    # connection that rejects unknown kwargs), and one that silently stopped
+    # forwarding them would trip the attribute asserts below.  Either way it
+    # fails HERE in CI, not on the Pi.  requirements.txt caps urllib3 <3 for the
+    # same reason. (TQ-4 / #116)
+    pool = cc.urllib3.HTTPSConnectionPool(
+        "93.184.216.34",
+        port=443,
+        server_hostname="i.discogs.com",
+        assert_hostname="i.discogs.com",
+        cert_reqs="CERT_REQUIRED",
+        ca_certs=cc.certifi.where(),
+        timeout=cc.urllib3.Timeout(connect=1, read=1),
+    )
+    conn = pool._new_conn()  # constructs the HTTPSConnection; opens NO socket
+    try:
+        assert conn.server_hostname == "i.discogs.com", \
+            "urllib3 no longer forwards server_hostname — S-7 SNI pin is broken"
+        assert conn.assert_hostname == "i.discogs.com", \
+            "urllib3 no longer honours assert_hostname — S-7 cert-hostname pin is broken"
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # validate_image_file (S-2) — lives in src.display.palette (A-8)
 # ---------------------------------------------------------------------------
