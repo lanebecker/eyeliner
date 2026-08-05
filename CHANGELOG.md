@@ -59,6 +59,21 @@ field and the appliance.
   mutant; the existing >2× "oversized" test gained a comment clarifying it
   exercises Pillow's backstop, not the explicit guard. Cold review SPEC / QUALITY
   PASS. Test-only; no production behavior change.
+- **Pinned the cover-cache's *default* disk bounds — the `max_files` / `max_bytes`
+  the real appliance actually runs with (MUT-6, #111 — MEDIUM).** Every existing
+  test constructs `CoverArtCache` with explicit bounds, so the module defaults
+  (`_DEFAULT_MAX_CACHE_FILES = 500`, `_DEFAULT_MAX_CACHE_BYTES = 256 * 1024 * 1024`)
+  and their arithmetic were asserted nowhere — ten mutants survived, including
+  either single `*` → `/` on the byte constant (both collapse 256 MB to 256
+  *bytes*). A units slip would ship green and, on the Pi, prune the entire cover
+  cache to zero every boot: every album re-downloads, meaning SD-card write
+  amplification and a coverless display when offline. Added two tests: one asserts
+  `CoverArtCache(dir)` built with no bounds has `max_files == 500` and
+  `max_bytes == 256 * 1024 * 1024`; one seeds 501 covers and confirms `_prune()`
+  returns to exactly 500 via the default file-count bound. Both `*` → `/`
+  survivors and the count-value mutants (each verified a genuine survivor of the
+  pre-change suite) are now killed. Cold review SPEC / QUALITY PASS. Test-only; no
+  production behavior change.
 
 ## [1.5.3] — 2026-08-04
 

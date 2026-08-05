@@ -652,3 +652,35 @@ def test_download_protects_fresh_cover_even_on_mtime_tie(tmp_path, monkeypatch):
 
     assert out.exists()       # the fresh cover is protected from its own prune
     assert not old.exists()   # the older (tied) cover was the eviction victim
+
+
+# ---------------------------------------------------------------------------
+# R-2 default disk-cache bounds (MUT-6) — the values the real appliance uses
+# ---------------------------------------------------------------------------
+
+def test_cover_cache_default_bounds(tmp_path):
+    # The appliance builds CoverArtCache(cache_dir) with NO explicit bounds, so
+    # the live max_files / max_bytes are the module defaults — yet every other
+    # test passes explicit bounds, leaving the default values (and the
+    # 256*1024*1024 arithmetic on cover_cache.py) asserted nowhere. A units slip
+    # (MB read as bytes) or a `*` -> `/` typo would ship green and, on the Pi,
+    # prune the whole cover cache to zero every boot. (MUT-6 / #111)
+    store = cc.CoverArtCache(tmp_path)
+    assert store.max_files == 500
+    assert store.max_bytes == 256 * 1024 * 1024  # 256 MB
+
+
+def test_cover_cache_default_max_files_prunes_to_limit(tmp_path):
+    # Exercise the DEFAULT file-count bound inside _prune (not an explicit
+    # override): seed one cover over the limit and confirm the prune returns to
+    # exactly the default. Counts are hard-coded (not read from store.max_files)
+    # so a mutation of the 500 default is caught behaviourally here too. (MUT-6)
+    store = cc.CoverArtCache(tmp_path)  # default max_files = 500
+    for i in range(501):                # one *.jpg cover over the default limit
+        (tmp_path / f"cover{i:04d}.jpg").write_bytes(b"x")
+    store._prune()
+    remaining = sum(
+        1 for p in tmp_path.iterdir()
+        if p.is_file() and p.suffix == ".jpg" and not p.name.startswith(".cover-")
+    )
+    assert remaining == 500
