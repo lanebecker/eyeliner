@@ -346,6 +346,23 @@ def test_image_validation_rejects_dimension_bomb_below_pillow_backstop(tmp_path,
             palette.validate_image_file(str(p))
 
 
+def test_image_validation_rejects_truncated_jpeg(tmp_path):
+    # A JPEG cut off mid-scan (a Wi-Fi drop mid-download) still opens and reports
+    # its header dimensions fine, and PIL's verify() is a per-format no-op for
+    # JPEG — so before DISP-3 this sailed through validation and the half-decoded
+    # cover was os.replace'd into the cache and displayed forever, with
+    # extract_palette deriving the whole 5-colour scheme from the garbage half.
+    # The validator now forces a real decode (load()), which raises on the short
+    # read (LOAD_TRUNCATED_IMAGES stays False). (DISP-3 / #110)
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 200), (120, 60, 30)).save(buf, format="JPEG")
+    full = buf.getvalue()
+    p = tmp_path / "half.jpg"
+    p.write_bytes(full[: len(full) // 2])  # ~50%: header intact, scan data cut
+    with pytest.raises(ValueError, match="not a decodable image"):
+        palette.validate_image_file(str(p))
+
+
 # ---------------------------------------------------------------------------
 # CoverArtCache.path_for / exists
 # ---------------------------------------------------------------------------
