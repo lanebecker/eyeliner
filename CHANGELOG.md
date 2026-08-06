@@ -9,6 +9,70 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Code-review hardening, round 3 (Wave 4 — display correctness & the contrast
+guarantee).** Wave 4 of the same audit (`CODE_REVIEW_2026-07-30.md`): making the
+"4.5:1 on all text" promise actually true on the panel nobody has switched on
+yet.
+
+### Fixed
+
+- **The album title is now guaranteed readable — the accent it's drawn in is
+  contrast-clamped, and every text role is clamped against the gradient it
+  actually sits on, not flat bg (DISP-1 #125 + DISP-2 #126 — MEDIUM).** The
+  album title, divider and genre-chip borders are all drawn in `accent`, but
+  `accent` only passed through `clamp_luminance` — a perceived-brightness clamp
+  that cannot brighten a pure-black or already-saturated color at all — while
+  the real WCAG `ensure_contrast` was applied to `muted` alone. A matte-black
+  sleeve gave `accent (0,0,0)` vs `bg (8,8,8)` = **1.05:1**; 34/62 covers
+  measured below 4.5:1. Compounding it, *all* clamping was computed against flat
+  `bg`, but text is blitted on a radial gradient whose brightest pixel is
+  `lerp(bg, surface, 0.55)` ≈ `bg×1.33`, so even `muted` (clamped to 4.5:1 vs
+  `bg`) measured **3.99:1** on the gradient. Now a single `text_background(bg,
+  surface)` — the gradient's brightest pixel, via the new shared
+  `GRADIENT_TEXT_PEAK` constant the gradient itself draws with — is the clamp
+  target for both text roles, in `extract_palette` and in the per-frame
+  re-clamp during the 1s lerp. `accent` is lifted to 4.5:1 by a new
+  `ensure_contrast_hue_preserving` that raises HLS lightness while keeping the
+  cover's hue (the smallest move that reaches the floor, so a red title stays
+  red instead of washing pink) — chosen over blend-to-white for the artwork
+  color; `muted` (a neutral grey) keeps blend-to-white. Scope covers the single
+  `accent` role, so the divider and chips — also invisible on dark sleeves —
+  become legible in the same move. Verified on the reproduced covers (black
+  album, saturated blue/yellow, deep red) plus a low-contrast dark-blue; all
+  clear 4.5:1 on the gradient after, none before. DESIGN.md and the CLAUDE.md
+  "4.5:1 on all text" wording corrected to match (resolving the contradiction
+  the finding named). RED-first; cold review SPEC / QUALITY PASS.
+- **Cover images decode once instead of twice on first render (#173 — LOW,
+  DISP-3 follow-up).** `validate_image_file` gained an opt-in `return_image`;
+  `extract_palette` reuses the image the validator already decoded rather than
+  re-opening and decoding the same file, halving the per-cover decode cost
+  (once per unique album; the palette is memoized by URL). The validate-only
+  download path is unchanged.
+
+### Security
+
+- **`validate_image_file` no longer leaks a lowered `Image.MAX_IMAGE_PIXELS`
+  process-global (#172 — LOW, test-hygiene).** It now saves and restores the
+  Pillow global around the call, so a test that lowered the cap can't have that
+  small value persist into a later test. (The restore is per-value-identity, not
+  thread-isolated — concurrent validations on the shared executor may leave the
+  global at the module cap — but every caller writes that identical safe
+  *lowering*, so the residual is always the bound we want; strictly better than
+  the old unconditional write.)
+
+### Tests
+
+- **The 4.5:1 guarantee is now mutation-proof (MUT-3 #127 — MEDIUM).** New
+  assertions pin the contrast floor on the **output** of `extract_palette` over
+  a battery of covers (including a deliberately low-contrast dark-blue), and
+  that each clamp lifts a below-floor input above it while the hue-preserving
+  lift keeps the hue. Mutating the 4.5 threshold, the clamp target (gradient →
+  flat bg), the accent clamp itself, or the lift loop all now fail loudly — the
+  suite previously only exercised covers that satisfied the guarantee for free.
+  A new perf test proves the per-frame accent re-clamp keeps the palette-lerp
+  cache-key count bounded (P-4 intact: 36 distinct palettes across a transition,
+  flat as frame count rises).
+
 ## [1.5.4] — 2026-08-06
 
 **Code-review hardening, round 3 (Wave 3 — untrusted input & credential

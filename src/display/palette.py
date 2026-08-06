@@ -9,6 +9,7 @@ bg) by construction, so the renderer never builds an invalid palette by hand.
 Pillow / numpy imports are kept lazy (inside the functions that need them) so
 the module stays importable on machines without the image stack.
 """
+import colorsys
 import logging
 from pathlib import Path
 
@@ -25,7 +26,7 @@ MAX_IMAGE_PIXELS = 6000 * 6000
 # Image validation (S-2)
 # ---------------------------------------------------------------------------
 
-def validate_image_file(path: str) -> None:
+def validate_image_file(path: str, *, return_image=False):
     """Validate that a file is a sane, bounded, fully-decodable image before it
     is cached.
 
@@ -34,6 +35,12 @@ def validate_image_file(path: str) -> None:
     truncated or corrupt payloads (DISP-3) — e.g. a cover whose download was cut
     off mid-scan by a dropped connection.  Raises ValueError on anything
     suspicious.
+
+    When *return_image* is True the decoded (post-``load()``) ``Image`` is
+    returned so a caller such as ``extract_palette`` can sample its pixels
+    without decoding the same file a second time (#173); the caller then owns
+    that image and must close it.  The validate-only callers (e.g.
+    ``cover_cache.download``) leave it False and get ``None``.
 
     Note: Pillow's ``verify()`` is deliberately NOT used.  Only
     ``PngImageFile.verify()`` performs a real structural (CRC) check; the JPEG /
@@ -45,32 +52,53 @@ def validate_image_file(path: str) -> None:
     """
     from PIL import Image
 
-    # Belt-and-suspenders: bound Pillow's own decompression-bomb threshold too.
+    # Belt-and-suspenders: bound Pillow's own decompression-bomb threshold for
+    # the duration of this call, then restore the prior value.  This fixes the
+    # test-isolation leak (#172): a test that lowered MAX_IMAGE_PIXELS no longer
+    # sees that small cap persist into a later test.  The restore is NOT
+    # thread-isolated — concurrent validations on the shared executor can race
+    # and leave the global at MAX_IMAGE_PIXELS — but that is harmless: every
+    # caller writes the identical bound, the value seen *during* any call is
+    # always that intended bound, and MAX_IMAGE_PIXELS only ever *lowers*
+    # Pillow's default, so the worst possible residual is the safe cap we want.
+    _prev_max = Image.MAX_IMAGE_PIXELS
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-
-    # 1. Open and read the header only — no pixel decode yet, so a bomb is
-    #    rejected below (step 2) before it is ever decoded.
     try:
-        with Image.open(path) as probe:
-            fmt = probe.format
-            width, height = probe.size
-    except Exception as e:
-        raise ValueError(f"not a decodable image: {e}")
+        # 1. Open and read the header only — no pixel decode yet, so a bomb is
+        #    rejected below (step 2) before it is ever decoded.
+        try:
+            with Image.open(path) as probe:
+                fmt = probe.format
+                width, height = probe.size
+        except Exception as e:
+            raise ValueError(f"not a decodable image: {e}")
 
-    if fmt not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
-        raise ValueError(f"unexpected image format: {fmt!r}")
-    if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
-        raise ValueError(f"image dimensions out of bounds: {width}x{height}")
+        if fmt not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
+            raise ValueError(f"unexpected image format: {fmt!r}")
+        if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
+            raise ValueError(f"image dimensions out of bounds: {width}x{height}")
 
-    # 2. Force a real decode.  This is the only structural check that actually
-    #    bites for JPEG (verify() does not), and it is the last gate before the
-    #    file is os.replace'd into the on-disk cover cache.  Bounded above by the
-    #    pixel check, so we never fully decode an oversized image.
-    try:
-        with Image.open(path) as probe:
-            probe.load()
-    except Exception as e:
-        raise ValueError(f"not a decodable image: {e}")
+        # 2. Force a real decode.  This is the only structural check that
+        #    actually bites for JPEG (verify() does not), and it is the last
+        #    gate before the file is os.replace'd into the on-disk cover cache.
+        #    Bounded above by the pixel check, so we never fully decode an
+        #    oversized image.  No `with`: when return_image is True the caller
+        #    needs the still-usable decoded image.
+        decoded = None
+        try:
+            decoded = Image.open(path)
+            decoded.load()
+        except Exception as e:
+            if decoded is not None:
+                decoded.close()
+            raise ValueError(f"not a decodable image: {e}")
+
+        if return_image:
+            return decoded          # caller owns it and must close it
+        decoded.close()
+        return None
+    finally:
+        Image.MAX_IMAGE_PIXELS = _prev_max
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +156,54 @@ def ensure_contrast(color: tuple, bg: tuple, min_ratio: float = 4.5) -> tuple:
     return (235, 235, 235)
 
 
+# The card background is a radial gradient from `bg` at the edges to a peak of
+# ``_lerp(bg, surface, GRADIENT_TEXT_PEAK)`` at the centre (see
+# renderer._draw_gradient_bg, which uses THIS SAME constant).  Text can land on
+# any pixel up to that peak, so contrast for text roles is clamped against the
+# peak — not flat `bg` — otherwise the guarantee is optimistic wherever the
+# gradient is brightest (DISP-2, #126).  Keep this the single source of truth:
+# if the gradient's blend factor ever changes, the clamp target follows.
+GRADIENT_TEXT_PEAK = 0.55
+
+
+def text_background(bg: tuple, surface: tuple) -> tuple:
+    """Brightest colour the card gradient can put under text (DISP-2).
+
+    Text roles are contrast-clamped against this rather than flat ``bg`` so the
+    Full-Opacity Rule holds at the gradient's bright centre, not just its dark
+    edges.
+    """
+    return tuple(
+        int(bg[i] + (surface[i] - bg[i]) * GRADIENT_TEXT_PEAK) for i in range(3)
+    )
+
+
+def ensure_contrast_hue_preserving(color: tuple, bg: tuple, min_ratio: float = 4.5) -> tuple:
+    """Raise *color*'s lightness until it reaches min_ratio against *bg*, keeping
+    the cover's hue.
+
+    Used for the ``accent`` role — the album title (DISP-1, #125).  Unlike
+    ``ensure_contrast`` (which blends toward white and desaturates a neutral
+    ``muted`` grey, where that is harmless), accent carries the artwork's colour,
+    so we lift only HLS *lightness* and preserve hue + saturation — the smallest
+    perceptual move that reaches 4.5:1, keeping it as faithful to the cover as
+    the physics of a near-black background allow (Lane, 2026-07-30).  Falls back
+    to near-white only if even full lightness cannot reach the ratio, which
+    cannot happen for the dark backgrounds this product produces.
+    """
+    if contrast_ratio(color, bg) >= min_ratio:
+        return color
+    r, g, b = (c / 255.0 for c in color)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    for step in range(1, 101):
+        cand_l = min(1.0, l + (1.0 - l) * (step / 100.0))
+        rr, gg, bb = colorsys.hls_to_rgb(h, cand_l, s)
+        candidate = tuple(round(x * 255) for x in (rr, gg, bb))
+        if contrast_ratio(candidate, bg) >= min_ratio:
+            return candidate
+    return (235, 235, 235)
+
+
 # ---------------------------------------------------------------------------
 # Palette factory
 # ---------------------------------------------------------------------------
@@ -136,18 +212,23 @@ def extract_palette(image_path: Path) -> DisplayPalette:
     """Extract a 5-color DisplayPalette from a cached cover image.
 
     Quantizes the cover, derives (bg, surface, accent, text, muted), and
-    GUARANTEES the muted role passes the Full-Opacity Rule (≥4.5:1 vs bg).
-    Falls back to FALLBACK_PALETTE on any error.
+    GUARANTEES both text roles pass the Full-Opacity Rule (≥4.5:1) against the
+    gradient's brightest pixel: `muted` (secondary text) and `accent` (the album
+    title, DISP-1).  Falls back to FALLBACK_PALETTE on any error.
     """
     try:
         from PIL import Image
 
         # Validate before decoding (S-2): the download path already checks, but
         # palette extraction can also run against pre-existing cache files, so
-        # guard here too against malformed images / decompression bombs.
-        validate_image_file(str(image_path))
-
-        img = Image.open(image_path).convert("RGB")
+        # guard here too against malformed images / decompression bombs.  Reuse
+        # the image the validator already decoded rather than opening and
+        # decoding the same file a second time (#173).
+        decoded = validate_image_file(str(image_path), return_image=True)
+        try:
+            img = decoded.convert("RGB")
+        finally:
+            decoded.close()
         img = img.resize((80, 80), Image.LANCZOS)
 
         # Quantize to up to 8 colors; getpalette returns a flat R,G,B,R,G,B,...
@@ -185,7 +266,6 @@ def extract_palette(image_path: Path) -> DisplayPalette:
             return (mx - mn) / mx if mx > 0 else 0
 
         accent_raw = max(colors, key=saturation)
-        accent = clamp_luminance(accent_raw, min_lum=0.30)
 
         # bg: darken dominant significantly (target ~15% brightness)
         scale_bg = 0.18
@@ -193,6 +273,18 @@ def extract_palette(image_path: Path) -> DisplayPalette:
 
         # surface: slightly lighter than bg
         surface = tuple(min(255, int(c * 1.6)) for c in bg)
+
+        # Brightest colour the gradient puts under text — clamp all text roles
+        # against THIS, not flat bg, so the guarantee holds at the gradient's
+        # bright centre too (DISP-2, #126).
+        tb = text_background(bg, surface)
+
+        # accent: the album title is drawn in accent (DISP-1, #125), so it is a
+        # TEXT role and must meet 4.5:1.  Lifted hue-preserving — keeps the
+        # artwork's colour — rather than the old perceived-brightness clamp,
+        # which could not brighten a pure-black or already-saturated accent at
+        # all (34/62 covers measured below 4.5:1 before this).
+        accent = ensure_contrast_hue_preserving(accent_raw, tb, min_ratio=4.5)
 
         # text: near-white with a slight warm tint from dominant
         text = (
@@ -202,13 +294,13 @@ def extract_palette(image_path: Path) -> DisplayPalette:
         )
 
         # muted: medium gray, slightly tinted — then contrast-clamped to ≥4.5:1
-        # against this album's bg (Full-Opacity Rule guarantee).
+        # against the gradient's brightest pixel (Full-Opacity Rule guarantee).
         muted = (
             min(200, 120 + int(dominant[0] * 0.08)),
             min(200, 118 + int(dominant[1] * 0.07)),
             min(200, 115 + int(dominant[2] * 0.06)),
         )
-        muted = ensure_contrast(muted, bg, min_ratio=4.5)
+        muted = ensure_contrast(muted, tb, min_ratio=4.5)
 
         return DisplayPalette(bg=bg, surface=surface, accent=accent, text=text, muted=muted)
 

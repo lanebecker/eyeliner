@@ -409,6 +409,59 @@ def test_image_validation_rejects_oversized(tmp_path, monkeypatch):
         palette.validate_image_file(str(p))
 
 
+def test_validate_restores_max_image_pixels_global(tmp_path, monkeypatch):
+    # #172: validate_image_file bounds Pillow's process-global MAX_IMAGE_PIXELS
+    # for the duration of the call, then must RESTORE the prior value — else a
+    # test that lowered it (or any caller) leaks the cap into unrelated code.
+    p = tmp_path / "ok.png"
+    p.write_bytes(_png_bytes())
+    sentinel = 4242
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", sentinel)
+    palette.validate_image_file(str(p))
+    assert Image.MAX_IMAGE_PIXELS == sentinel  # restored, not left lowered
+
+
+def test_validate_returns_decoded_image_when_requested(tmp_path):
+    # #173: return_image=True hands back the already-decoded, usable image so a
+    # caller can sample it without a second decode.
+    p = tmp_path / "ok.png"
+    p.write_bytes(_png_bytes(48, 48))
+    img = palette.validate_image_file(str(p), return_image=True)
+    try:
+        assert isinstance(img, Image.Image)
+        assert img.size == (48, 48)
+        assert img.getpixel((0, 0)) is not None  # pixels are loaded/usable
+    finally:
+        img.close()
+
+
+def test_validate_default_returns_none(tmp_path):
+    # The validate-only path (e.g. cover_cache.download) gets None and leaves no
+    # image open.
+    p = tmp_path / "ok.png"
+    p.write_bytes(_png_bytes())
+    assert palette.validate_image_file(str(p)) is None
+
+
+def test_extract_palette_decodes_cover_once(tmp_path, monkeypatch):
+    # #173: extract_palette used to decode each new cover twice — once in the
+    # validator's load() gate, once in its own convert().  It now reuses the
+    # validator's decoded image, so the file is opened exactly twice total (the
+    # header probe + the single decode), never three times.
+    p = tmp_path / "ok.png"
+    p.write_bytes(_png_bytes(60, 60))
+    opens = {"n": 0}
+    real_open = Image.open
+
+    def counting_open(*a, **k):
+        opens["n"] += 1
+        return real_open(*a, **k)
+
+    monkeypatch.setattr(Image, "open", counting_open)
+    palette.extract_palette(p)
+    assert opens["n"] == 2, f"expected 2 Image.open calls (header + one decode), got {opens['n']}"
+
+
 def test_image_validation_accepts_jpeg(tmp_path):
     # A valid, small JPEG (an allowed non-PNG format) passes cleanly. Guards the
     # format allow-list against a mutant that drops JPEG from the accepted set,
