@@ -141,6 +141,32 @@ field and the appliance.
   ≥3.11.9 the generic battery short-circuits the embedded check, so it is
   belt-and-suspenders there). Cold review SPEC / QUALITY PASS; no encoding
   (IPv4-mapped v6, NAT64, 6to4, mixed answer sets) pins an internal IP.
+- **A slow-drip cover response can no longer park a shared executor worker
+  forever; the whole fetch now has a wall-clock deadline, and an oversized
+  declared body is rejected up front (SEC-4, #121 — LOW).** `cover_cache.download()`
+  ran on the default executor that Discogs requests and Last.fm scrobbles also
+  share, and its `urllib3.Timeout(read=15)` bounds each *socket read*, not the
+  transfer — so an allow-listed but flaky/hostile host emitting one byte per
+  <15s keeps every read inside the timeout while the download runs effectively
+  forever, starving that pool. The fix adds a monotonic `_DOWNLOAD_DEADLINE_SECONDS`
+  (45s) budget spanning the whole call — checked before each redirect hop and
+  before each body read — plus an early reject when a response *declares* a
+  `Content-Length` over the 10 MB cap. Critically, the body is now read with
+  `resp.read1(64*1024)` rather than `resp.stream(64*1024)`: `stream` delegates to
+  a buffered read that blocks until a full 64 KB chunk accumulates, so under a
+  drip a single read never returns and the deadline check never gets a turn —
+  the first cut of this fix (and its mock-`stream` test) hid exactly that live
+  hang, caught by adversarial review and reproduced against real urllib3. `read1`
+  returns after one underlying socket read, so control returns to the deadline
+  check after each recv and the drip is bounded. RED-first; a **real-socket**
+  integration test drips bytes through live urllib3 and proves `download()`
+  aborts at the deadline (and fails fast, not hangs, if the code ever regresses
+  to a buffering read); all five guards mutation-pinned (both deadline checks,
+  the declared-size `>`-vs-`>=` boundary and its flip, the garbage-header
+  try/except). Cold review then narrow second-pass: SPEC / QUALITY PASS. A
+  distinct, pre-existing header-drip vector the review surfaced (a hop dripping
+  response *headers* inside `urlopen`, which the between-hop deadline can't
+  interrupt) is filed as follow-up #176, not folded into this fix.
 
 ### Tests
 
