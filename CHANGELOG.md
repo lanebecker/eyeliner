@@ -72,6 +72,20 @@ yet.
   truth shared by drawing and measurement, so they can't disagree. Verified no
   character is lost, duplicated, or reordered, and the wrap terminates even on a
   degenerate zero/negative width. RED-first; cold review SPEC / QUALITY PASS.
+- **The accent divider scales uniformly, and the docs stop over-claiming pure
+  proportional scaling (DISP-6 #130 — LOW).** `layouts.py` scaled
+  `divider_width` by the horizontal `sx` while every font uses the uniform `s =
+  min(sx, sy)`, so on a wide/ultrawide panel the fixed-size "punctuation-mark"
+  divider stretched far past its proportional size (215px at 3440×1440); it now
+  tracks `s` like the fonts. Separately, `CLAUDE.md`/`DESIGN.md` claimed the
+  renderer "scales every constant proportionally" with "no hard-coded
+  breakpoints," but `layouts.py` has seven `max(floor, …)` font-size floors, so
+  below ≈`s=0.33` fonts hold their minimum while rects keep shrinking. Decision
+  (Lane, 2026-08-06): **keep the floors** as a legibility guard and correct the
+  docs — they now state that scaling is proportional down to the floors, name
+  1024×600 (`s=1.0`, floors inactive) as the supported reference, and stop
+  claiming pure proportionality. No behavior change at the shipped resolution.
+  The `sx`→`s` fix and the floors are pinned by new `test_layouts.py` cases.
 
 ### Security
 
