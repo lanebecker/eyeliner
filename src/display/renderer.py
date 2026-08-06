@@ -1187,6 +1187,19 @@ class DisplayRenderer:
             return cached
 
         font = self._font("mono", size)
+
+        # DISP-5: per-glyph tracking assumes every codepoint is an independent
+        # glyph — true for the ASCII metadata/labels this is designed for, but it
+        # destroys shaping for complex scripts (Arabic joining, Devanagari
+        # conjuncts, floating combining marks, emoji ZWJ) that arrive in
+        # free-text Discogs fields.  For any non-ASCII string, render it as ONE
+        # shaped run and skip the manual tracking, rather than reverse/mis-space
+        # it a glyph at a time.  ASCII keeps its designed letter-spacing below.
+        if not text.isascii():
+            surf = font.render(text, True, color)
+            self._label_cache.put(key, surf)
+            return surf
+
         extra = tracking * size
         glyphs = [font.render(ch, True, color) for ch in text]
         # Total width: glyph advances + tracking between characters (CSS adds
@@ -1201,11 +1214,34 @@ class DisplayRenderer:
         self._label_cache.put(key, surf)
         return surf
 
+    @staticmethod
+    def _break_long_token(token: str, font, max_width: int) -> list:
+        """Character-break a single token too wide for max_width into chunks that
+        each fit (DISP-7).
+
+        Greedy: accumulate characters until the next would overflow, then start a
+        new chunk.  A single glyph wider than max_width is emitted alone (it can't
+        be broken further; the blit clip in _draw_wrapped_text is the backstop).
+        """
+        chunks = []
+        current = ""
+        for ch in token:
+            if current and font.size(current + ch)[0] > max_width:
+                chunks.append(current)
+                current = ch
+            else:
+                current += ch
+        if current:
+            chunks.append(current)
+        return chunks
+
     def _wrap_lines(self, text: str, font, max_width: int) -> list:
         """Greedy word-wrap; the single source of truth for line breaking.
 
         Used by both measurement and drawing so they can never disagree
-        (previously duplicated in _draw_wrapped_text/_measure_wrapped_text).
+        (previously duplicated in _draw_wrapped_text/_measure_wrapped_text).  A
+        token wider than max_width on its own is character-broken (DISP-7) rather
+        than emitted whole, which used to run off the right edge of the column.
         """
         words = text.split()
         lines = []
@@ -1214,10 +1250,20 @@ class DisplayRenderer:
             test = (current + " " + word).strip()
             if font.size(test)[0] <= max_width:
                 current = test
-            else:
-                if current:
-                    lines.append(current)
+                continue
+            # `test` overflows: flush the line in progress, then place `word`.
+            if current:
+                lines.append(current)
+                current = ""
+            if font.size(word)[0] <= max_width:
                 current = word
+            else:
+                # A run-on wider than the column: hard-break it.  Full chunks
+                # become their own lines; the trailing partial stays `current`
+                # so the next word can continue on the same line (greedy).
+                chunks = self._break_long_token(word, font, max_width)
+                lines.extend(chunks[:-1])
+                current = chunks[-1] if chunks else ""
         if current:
             lines.append(current)
         return lines
@@ -1342,6 +1388,8 @@ class DisplayRenderer:
         pixels (distance from rect.y to the bottom of the last drawn line);
         0 if nothing was drawn.
         """
+        import pygame
+
         font = self._font(role, size)
         if not text:
             return 0
@@ -1353,7 +1401,11 @@ class DisplayRenderer:
             if y + line_h > rect.y + rect.h:
                 break
             surf = font.render(line, True, color)
-            target.blit(surf, (rect.x, y))
+            # DISP-7 backstop: clip the blit to the column width so a line that
+            # still exceeds rect.w (e.g. a single glyph wider than the column)
+            # can never paint past the right edge / off-screen.
+            target.blit(surf, (rect.x, y),
+                        area=pygame.Rect(0, 0, rect.w, surf.get_height()))
             last_bottom = y + line_h
             y += line_h + 2
 
