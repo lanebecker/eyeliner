@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.5] — 2026-08-06
+
 **Code-review hardening, round 3 (Wave 4 — display correctness & the contrast
 guarantee).** Wave 4 of the same audit (`CODE_REVIEW_2026-07-30.md`): making the
 "4.5:1 on all text" promise actually true on the panel nobody has switched on
