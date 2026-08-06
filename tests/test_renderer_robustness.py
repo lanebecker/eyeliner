@@ -42,7 +42,9 @@ def make_renderer():
     r._cover_load_failures = {}
     r._cover_bad_urls = set()
     r._cover_prefetch_inflight = set()
+    r._cover_decode_inflight = set()
     r._cover_decode_deferred = False
+    r._cover_version = 0
     return r
 
 
@@ -130,9 +132,9 @@ async def test_corrupt_cached_cover_triggers_refetch(tmp_path):
 
     r._prefetch_cover = fake_prefetch
 
-    result = r._load_cover(url, 100, 100)
+    await r._decode_cover_async(url, 100, 100)
 
-    assert result is None
+    assert r._cover_cache.get((url, 100, 100)) is None   # nothing cached (corrupt)
     assert not cache_path.exists()        # the corrupt file was unlinked
     await asyncio.sleep(0)                 # let the spawned re-fetch run
     assert refetched == [url]              # a re-fetch was scheduled in-track
@@ -140,8 +142,9 @@ async def test_corrupt_cached_cover_triggers_refetch(tmp_path):
 
 @pytest.mark.asyncio
 async def test_missing_cover_does_not_refetch(tmp_path):
-    """A simply-absent cover (not yet downloaded) must NOT spawn a re-fetch from
-    _load_cover — that path is owned by the state-change prefetch."""
+    """A simply-absent cover (not yet downloaded) must NOT trigger a re-fetch —
+    the off-loop decode early-returns on a missing file; the download path is
+    owned by the state-change prefetch."""
     r = make_renderer()
     r._cover_store = CoverArtCache(tmp_path)
     r._cover_cache = _BoundedCache(8)
@@ -149,9 +152,11 @@ async def test_missing_cover_does_not_refetch(tmp_path):
     refetched = []
     r._prefetch_cover = lambda u: refetched.append(u)  # noqa: E731
 
-    result = r._load_cover("https://i.discogs.com/missing.jpg", 100, 100)
+    url = "https://i.discogs.com/missing.jpg"
+    assert r._load_cover(url, 100, 100) is None   # cache miss → placeholder
+    await r._decode_cover_async(url, 100, 100)    # missing file → early return
+    await asyncio.sleep(0)
 
-    assert result is None
     assert refetched == []
 
 
@@ -182,9 +187,9 @@ async def test_stab1_undecodable_cover_stops_after_one_refetch(tmp_path):
 
     r._prefetch_cover = relanding_prefetch
 
-    # Drive the render hot-path repeatedly, as the loop would at frame rate.
+    # Drive the off-loop decode repeatedly, as render-path cache misses would.
     for _ in range(6):
-        assert r._load_cover(url, 100, 100) is None
+        await r._decode_cover_async(url, 100, 100)
         await asyncio.sleep(0)      # let the spawned refetch re-land the file
 
     assert len(spawns) <= 1, f"unbounded refetch loop: {len(spawns)} spawns"
@@ -215,10 +220,10 @@ async def test_stab1_display_fault_does_not_delete_a_good_cover(tmp_path):
 
     r._prefetch_cover = fake_prefetch
 
-    pygame.display.quit()   # ensure no video mode → .convert() raises, whatever the test order
-    result = r._load_cover(url, 100, 100)
+    pygame.display.quit()   # no video mode → .convert() raises, whatever the test order
+    await r._decode_cover_async(url, 100, 100)
 
-    assert result is None
+    assert r._cover_cache.get((url, 100, 100)) is None
     assert cache_path.exists()             # a display fault must NOT delete a good file
     assert r._cover_decode_deferred is True   # …the defer flag latched (rate-limits the log)
     await asyncio.sleep(0)
@@ -276,10 +281,10 @@ async def test_stab1_transient_decode_failure_still_recovers(tmp_path):
 
     pygame.display.set_mode((64, 64))    # a video mode so a good cover can .convert()
     try:
-        assert r._load_cover(url, 100, 100) is None   # first decode fails → one refetch
-        await asyncio.sleep(0)                          # good bytes land
-        surface = r._load_cover(url, 100, 100)          # now decodes cleanly
-        assert surface is not None
+        await r._decode_cover_async(url, 100, 100)      # first: corrupt → unlink + one refetch
+        await asyncio.sleep(0)                          # healing refetch lands good bytes
+        await r._decode_cover_async(url, 100, 100)      # now decodes cleanly
+        assert r._cover_cache.get((url, 100, 100)) is not None
         assert url not in r._cover_bad_urls             # a transient glitch is NOT permanent
         assert url not in r._cover_load_failures        # tally cleared on a clean load
     finally:
@@ -300,13 +305,13 @@ async def test_stab1_deferred_flag_clears_when_display_returns(tmp_path):
     Image.new("RGB", (100, 100), (10, 20, 30)).save(cache_path)   # a VALID cover
 
     pygame.display.quit()                          # no video mode → .convert() fails
-    assert r._load_cover(url, 100, 100) is None
+    await r._decode_cover_async(url, 100, 100)
     assert r._cover_decode_deferred is True        # latched (log emitted once)
 
     pygame.display.set_mode((64, 64))              # video mode returns
     try:
-        surface = r._load_cover(url, 100, 100)
-        assert surface is not None                 # decodes cleanly now
+        await r._decode_cover_async(url, 100, 100)
+        assert r._cover_cache.get((url, 100, 100)) is not None   # decodes cleanly now
         assert r._cover_decode_deferred is False    # …and the defer flag cleared
     finally:
         pygame.display.quit()
@@ -339,8 +344,8 @@ async def test_stab1_unexpected_scale_error_fails_safe(tmp_path, monkeypatch):
 
     pygame.display.set_mode((64, 64))    # video mode so convert() succeeds → reach smoothscale
     try:
-        result = r._load_cover(url, 100, 100)   # must NOT raise
-        assert result is None
+        await r._decode_cover_async(url, 100, 100)   # must NOT raise
+        assert r._cover_cache.get((url, 100, 100)) is None
         assert cache_path.exists()               # good file preserved
         await asyncio.sleep(0)
         assert spawns == []                      # no refetch
@@ -372,13 +377,79 @@ async def test_stab1_persistent_scale_error_is_log_bounded(tmp_path, monkeypatch
 
     pygame.display.set_mode((64, 64))    # video mode so convert() succeeds → reach smoothscale
     try:
-        for _ in range(10):              # 10 render frames on the same persistent fault
-            assert r._load_cover(url, 100, 100) is None
+        for _ in range(10):              # 10 decode attempts on the same persistent fault
+            await r._decode_cover_async(url, 100, 100)
     finally:
         pygame.display.quit()
 
     assert len(errors) == 1, f"unbounded ERROR log loop: {len(errors)} logs in 10 frames"
-    assert r._cover_decode_deferred is True   # latched after the first frame
+    assert r._cover_decode_deferred is True   # latched after the first attempt
+
+
+# ---------------------------------------------------------------------------
+# STAB-5 — the render-path _load_cover does NO blocking work; the decode is
+#          moved off the event loop into _decode_cover_async.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_load_cover_does_not_decode_on_the_render_path(tmp_path, monkeypatch):
+    """STAB-5: the per-frame _load_cover must NOT do the blocking SD read +
+    decode itself (a worn card can stall pygame.image.load for seconds and
+    freeze the whole event loop) — it returns the cache or None and defers the
+    decode to an executor.  Proven by spying on pygame.image.load: it is NOT
+    called on the calling thread during _load_cover, only later off-loop."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/x.jpg"
+    Image.new("RGB", (80, 80), (40, 40, 40)).save(r._cover_store.path_for(url))
+
+    import threading
+    main_thread = threading.current_thread()
+    load_threads = []
+    real_load = pygame.image.load
+
+    def spy(p):
+        load_threads.append(threading.current_thread())
+        return real_load(p)
+
+    monkeypatch.setattr(pygame.image, "load", spy)
+
+    pygame.display.set_mode((64, 64))
+    try:
+        result = r._load_cover(url, 100, 100)      # render-path call
+        assert result is None                       # placeholder while it decodes
+        assert load_threads == []                   # NO decode ran during _load_cover
+        await asyncio.gather(*list(r._bg_tasks))    # run the off-loop decode
+        assert len(load_threads) == 1
+        assert load_threads[0] is not main_thread   # SD read ran OFF the event-loop thread
+        assert r._cover_cache.get((url, 100, 100)) is not None
+    finally:
+        pygame.display.quit()
+
+
+def test_load_cover_returns_cached_surface_without_scheduling(tmp_path):
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/cached.jpg"
+    surf = pygame.Surface((10, 10))
+    r._cover_cache.put((url, 100, 100), surf)
+    assert r._load_cover(url, 100, 100) is surf     # cache hit
+    assert r._bg_tasks == set()                     # …no decode scheduled
+
+
+def test_load_cover_blacklisted_returns_none_without_scheduling(tmp_path):
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/bad.jpg"
+    r._cover_bad_urls.add(url)
+    assert r._load_cover(url, 100, 100) is None
+    assert r._bg_tasks == set()                     # blacklisted → no decode scheduled
 
 
 def test_stab1_new_cover_state_change_lifts_blacklist(tmp_path):
@@ -600,6 +671,7 @@ def test_static_frame_recomposes_when_cover_version_bumps(tmp_path):
     r._cover_load_failures = {}          # STAB-1 cover-loop state
     r._cover_bad_urls = set()
     r._cover_prefetch_inflight = set()
+    r._cover_decode_inflight = set()
     r._cover_decode_deferred = False
     r._dirty = False
 

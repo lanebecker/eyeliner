@@ -404,6 +404,10 @@ class DisplayRenderer:
         # Dedupe concurrent downloads for one URL: a state-change prefetch and a
         # load-failure refetch must not both hit the network for the same cover.
         self._cover_prefetch_inflight: set = set()
+        # STAB-5: dedupe concurrent off-loop cover DECODES for one (url, w, h),
+        # so the render path (which spawns a decode on each cache miss) can't
+        # stack up duplicate load+scale tasks for the same cover.
+        self._cover_decode_inflight: set = set()
         # True while the display surface is unavailable (video-mode loss);
         # suppresses per-frame "decode deferred" logging until a cover decodes.
         self._cover_decode_deferred: bool = False
@@ -1557,79 +1561,101 @@ class DisplayRenderer:
             self._queue_palette(url)
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
-        """Load and scale cover art from the local file cache.
+        """Return the scaled cover for *url* from the in-memory cache, or None.
 
-        Returns None if the URL is absent or the file hasn't been downloaded
-        yet — _prefetch_cover() handles the async download and will set
-        self._dirty = True once the file arrives.
+        STAB-5: this runs on the event loop every render frame, so it does NO
+        blocking work — no SD read, no decode.  On a cache miss it schedules an
+        OFF-loop decode (`_decode_cover_async`) and returns None so the caller
+        shows the placeholder; that task caches the scaled Surface and bumps
+        `_cover_version` to trigger a repaint once it lands.  Returns None for an
+        absent, blacklisted, or not-yet-decoded cover.
 
-        The scaled Surface is cached keyed by (url, w, h) (v1.3.3): the render
-        loop calls this every frame, and re-decoding + smoothscaling a JPEG at
-        10 fps was the largest constant CPU cost on the Pi.  Disk load and
-        scaling now happen exactly once per cover per resolution.
+        The scaled Surface is cached keyed by (url, w, h) (v1.3.3): decode +
+        smoothscale then happen exactly once per cover per resolution, off the
+        loop.
         """
-        import pygame
-
-        if not url:
+        if not url or url in self._cover_bad_urls:
+            # STAB-1: a blacklisted URL gets no disk read, no decode, no refetch,
+            # no log.  A state change to a NEW cover clears the blacklist (see
+            # _on_state_change), giving a fresh play a clean try.
             return None
 
         cached = self._cover_cache.get((url, w, h))
         if cached is not None:
             return cached
 
-        if url in self._cover_bad_urls:
-            # STAB-1: already gave up on this URL — no disk read, no unlink, no
-            # refetch, no log.  A state change to a NEW cover clears the
-            # blacklist (see _on_state_change), giving a fresh play a clean try.
-            return None
+        # Not decoded yet — kick off the off-loop load+scale (deduped inside
+        # _decode_cover_async and via the inflight guard here) and show the
+        # placeholder until it lands.  _spawn no-ops without a running loop.
+        if (url, w, h) not in self._cover_decode_inflight:
+            self._spawn(self._decode_cover_async(url, w, h))
+        return None
 
+    async def _decode_cover_async(self, url: str, w: int, h: int):
+        """Load + scale a cached cover OFF the event loop, cache it, repaint (STAB-5).
+
+        The SD read + decode (`pygame.image.load`) is the step that can stall for
+        SECONDS on a worn card, so it runs in the default executor.  `.convert()`
+        + `smoothscale` stay ON the loop: they act on already-decoded bytes (fast
+        CPU), `.convert()` needs the display's pixel format, and SDL video ops
+        belong on the main thread.  This split also separates STAB-1's two failure
+        classes by WHERE they raise:
+          * `pygame.image.load()` failing (off-loop) → corrupt/partial bytes:
+            one bounded unlink + refetch, then blacklist.
+          * `.convert()` failing (on-loop) → no video mode (transient display
+            fault, e.g. HDMI hotplug) on GOOD bytes: never delete or refetch;
+            latch so the warning logs once per episode, not ~10×/second.
+        """
+        import pygame
+
+        if not url or url in self._cover_bad_urls:
+            return
+        key = (url, w, h)
+        if self._cover_cache.get(key) is not None:
+            return                              # already decoded (raced with another spawn)
+        if key in self._cover_decode_inflight:
+            return                              # a decode for this cover is already running
         cache_path = self._cover_store.path_for(url)
         if not cache_path.exists():
-            return None
+            return                              # not downloaded yet — prefetch lands it + repaints
 
-        # STAB-1: DECODE and CONVERT are distinct failure classes that must be
-        # handled differently — and both raise pygame.error, so they can only be
-        # told apart by WHICH call failed, not by exception type.
-        #   * pygame.image.load() failing → the bytes are corrupt/unreadable
-        #     (partial write, SD read error, codec gap): worth ONE bounded
-        #     unlink + refetch, then blacklist.
-        #   * .convert() failing → no video mode (a transient display fault, e.g.
-        #     HDMI hotplug) on PERFECTLY GOOD bytes: must NOT delete the file or
-        #     hit the network — just show the placeholder until the surface
-        #     returns.  (The old single-try except Exception conflated the two:
-        #     a display glitch deleted a good cover and started hammering.)
+        self._cover_decode_inflight.add(key)
         try:
-            raw = pygame.image.load(str(cache_path))
-        except Exception as e:
-            return self._handle_corrupt_cover(url, cache_path, e)
+            try:
+                loop = asyncio.get_running_loop()
+                raw = await loop.run_in_executor(None, pygame.image.load, str(cache_path))
+            except Exception as e:
+                # Corrupt/partial bytes (the SD read is off-loop, so its failure
+                # surfaces here): STAB-1 bounded unlink + refetch, then blacklist.
+                self._handle_corrupt_cover(url, cache_path, e)
+                self._dirty = True
+                return
 
-        try:
-            scaled = pygame.transform.smoothscale(raw.convert(), (w, h))
-        except Exception as e:
-            # convert()/scale failed on ALREADY-decoded bytes.  The FILE is fine —
-            # corrupt bytes fail at load() above, not here — so never delete or
-            # refetch (that would just relocate the STAB-1 loop to the scale path).
-            # A pygame.error is the expected display fault (no video mode after an
-            # HDMI hotplug); anything else is unexpected.  Either way show the
-            # placeholder and LATCH: _load_cover runs every frame and the render
-            # loop re-arms _dirty each frame (reduced_motion off), so a PERSISTENT
-            # fault must log ONCE per episode, not ~10×/second.  The latch clears
-            # on the next clean decode (below), so a fresh episode logs again.
-            # Catching Exception (not just pygame.error) also stops a stray
-            # non-pygame error from escaping into run(), which does not guard
-            # _render() — fail safe to the placeholder rather than crash the task.
-            if not self._cover_decode_deferred:
-                if isinstance(e, pygame.error):
-                    log.warning(f"Cover decode deferred — display not ready: {e}")
-                else:
-                    log.error(f"Unexpected error scaling cover art for {url}: {e}")
-                self._cover_decode_deferred = True
-            return None
+            try:
+                scaled = pygame.transform.smoothscale(raw.convert(), (w, h))
+            except Exception as e:
+                # convert()/scale failed on ALREADY-decoded, good bytes — a
+                # display fault (no video mode), NOT a corrupt file, so never
+                # delete or refetch.  Latch so a persistent fault logs ONCE per
+                # episode; the latch clears on the next clean decode.  Catch
+                # Exception (not just pygame.error) so a stray non-pygame error
+                # fails safe to the placeholder instead of escaping the task.
+                if not self._cover_decode_deferred:
+                    if isinstance(e, pygame.error):
+                        log.warning(f"Cover decode deferred — display not ready: {e}")
+                    else:
+                        log.error(f"Unexpected error scaling cover art for {url}: {e}")
+                    self._cover_decode_deferred = True
+                self._dirty = True
+                return
 
-        self._cover_cache.put((url, w, h), scaled)
-        self._cover_load_failures.pop(url, None)   # a clean load clears the tally
-        self._cover_decode_deferred = False         # display is back
-        return scaled
+            self._cover_cache.put(key, scaled)
+            self._cover_load_failures.pop(url, None)   # a clean load clears the tally
+            self._cover_decode_deferred = False         # display is back
+            self._cover_version += 1                    # recompose the static frame with the cover
+            self._dirty = True
+        finally:
+            self._cover_decode_inflight.discard(key)
 
     def _handle_corrupt_cover(self, url: str, cache_path, error) -> None:
         """STAB-1: a cached cover failed to DECODE (corrupt/partial bytes).
