@@ -94,6 +94,46 @@ def _host_is_allowed(host: Optional[str]) -> bool:
     )
 
 
+# NAT64 (RFC 6052 well-known prefix) and 6to4 wrap an IPv4 address inside an
+# IPv6 one.  Modern CPython (≥3.11.9 / ≥3.9.19, via gh-113171) already flags
+# these as is_reserved / is_private so the battery below rejects them — but a
+# security boundary must not DEPEND on the stdlib's version-specific handling of
+# exotic ranges, so we also decode the embedded IPv4 and re-classify it (SEC-5).
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+_6TO4_PREFIX = ipaddress.ip_network("2002::/16")
+
+
+def _is_disallowed_ip(ip) -> bool:
+    """The maximal 'not safe to pin' classification (S-7).
+
+    is_global alone is not enough — multicast (224/4) reports is_global=True —
+    so the rest are belt-and-suspenders for private / loopback / link-local /
+    multicast / reserved / unspecified space.
+    """
+    return (
+        not ip.is_global
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _embedded_ipv4(ip):
+    """Return the IPv4 address embedded in a NAT64 (64:ff9b::/96) or 6to4
+    (2002::/16) IPv6 address, else None.  Lets the classifier reject an internal
+    IPv4 hidden inside such an address on ANY Python version (SEC-5)."""
+    if ip.version != 6:
+        return None
+    if ip in _NAT64_PREFIX:                       # last 32 bits are the IPv4
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    if ip in _6TO4_PREFIX:                         # bits 16..48 are the IPv4
+        return ipaddress.IPv4Address((int(ip) >> 80) & 0xFFFFFFFF)
+    return None
+
+
 def _validated_public_ip(host: str) -> Optional[str]:
     """Resolve `host` ONCE and return a single public IP to pin to, else None.
 
@@ -122,18 +162,13 @@ def _validated_public_ip(host: str) -> Optional[str]:
         # classification dressed up in v6 clothing.
         if ip.version == 6 and ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
-        # The classifier IS the security boundary, so be maximal: is_global alone
-        # lets multicast (224/4 reports is_global=True) through, and the rest are
-        # belt-and-suspenders for unspecified/reserved/loopback/link-local space.
-        if (
-            not ip.is_global
-            or ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
+        if _is_disallowed_ip(ip):
+            return None
+        # SEC-5: also re-classify the IPv4 embedded in a NAT64 / 6to4 address, so
+        # an internal IPv4 hidden inside one is rejected even on a Python whose
+        # stdlib does not (yet) flag these prefixes.
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None and _is_disallowed_ip(embedded):
             return None
         if pinned is None:
             pinned = str(ip)
@@ -195,7 +230,12 @@ def _open_cover_stream(fetch_url: str, host: str, pinned_ip: str, timeout: int):
     path = parts.path or "/"
     if parts.query:
         path = f"{path}?{parts.query}"
-    pool = urllib3.HTTPSConnectionPool(
+    # STAB-3: the pool is single-use — one freshly-pinned IP per hop, never
+    # reused — so close it as soon as the streaming response is checked out.
+    # The already-opened response keeps its own connection and streams fine
+    # after the pool closes; download()'s later release_conn() then simply
+    # closes that socket instead of returning it to a pool nobody reuses.
+    with urllib3.HTTPSConnectionPool(
         pinned_ip,
         port=port,
         server_hostname=host,   # TLS SNI presented to the server
@@ -203,16 +243,16 @@ def _open_cover_stream(fetch_url: str, host: str, pinned_ip: str, timeout: int):
         cert_reqs="CERT_REQUIRED",
         ca_certs=certifi.where(),
         timeout=urllib3.Timeout(connect=timeout, read=timeout),
-    )
-    return pool.urlopen(
-        "GET",
-        path,
-        headers={"Host": host, "User-Agent": "vinyl-now-playing/1.0"},
-        redirect=False,
-        retries=False,
-        preload_content=False,
-        decode_content=False,
-    )
+    ) as pool:
+        return pool.urlopen(
+            "GET",
+            path,
+            headers={"Host": host, "User-Agent": "vinyl-now-playing/1.0"},
+            redirect=False,
+            retries=False,
+            preload_content=False,
+            decode_content=False,
+        )
 
 
 class CoverArtCache:
