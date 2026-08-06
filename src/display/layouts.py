@@ -166,7 +166,7 @@ def get_now_playing_layout(width: int, height: int) -> NowPlayingLayout:
         font_size_header=max(9, int(11 * s)),
         font_size_adjacent=max(10, int(14 * s)),
 
-        divider_width=int(DIVIDER_W * sx),
+        divider_width=int(DIVIDER_W * s),   # uniform scale like the fonts, not sx (DISP-6)
         chip_padding_x=max(6, int(12 * s)),
         chip_padding_y=max(3, int(5 * s)),
         chip_gap=max(4, int(6 * s)),

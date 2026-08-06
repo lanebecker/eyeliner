@@ -48,6 +48,25 @@ def test_tracking_is_resolution_independent():
     assert a.chip_border_alpha == b.chip_border_alpha
 
 
+def test_divider_width_uses_uniform_scale_not_horizontal_only():
+    # DISP-6: the accent divider is a fixed-size "punctuation mark", so it must
+    # scale by the uniform s = min(sx, sy) like the fonts — NOT by sx alone,
+    # which stretches it far past its proportional size on a wide panel.
+    # At 2048x600: sx=2.0, sy=1.0, s=1.0 → divider tracks s (64px), not sx (128px).
+    layout = get_now_playing_layout(2048, 600)
+    assert layout.divider_width == 64          # DIVIDER_W * s(=1.0); old sx code = 128
+
+
+def test_font_sizes_hold_their_legibility_floors():
+    # DISP-6 decision (Lane, keep the floors): fonts must not shrink below their
+    # minimum sizes at small resolutions.  At 320x240, s≈0.3125, so the raw
+    # 72*s≈22 would fall under the 24px track floor — the floor must win.
+    layout = get_now_playing_layout(320, 240)
+    assert layout.font_size_track == 24        # floor, not int(72*0.3125)=22
+    assert layout.font_size_header == 9        # floor, not int(11*0.3125)=3
+    assert layout.font_size_album == 14        # floor, not int(32*0.3125)=10
+
+
 def all_rects(layout):
     return {name: getattr(layout, name) for name in ALL_RECT_NAMES}
 

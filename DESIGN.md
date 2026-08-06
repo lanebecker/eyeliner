@@ -69,7 +69,7 @@ Typography carries the same logic. The track name is large and tight because it 
 
 This system explicitly rejects the streaming-app aesthetic (Spotify, Apple Music): no rounded album tiles, no soft gradient scrubbers, no "Now Playing" headers with shuffle icons. The display is not a player. It has no controls and no chrome that implies it might. It is also not a timeline — no progress bars, no elapsed time, no duration. Vinyl is not an experience you track; it is one you inhabit.
 
-The target device is the Waveshare 7" HDMI LCD (H) at exactly 1024×600, driven by a Raspberry Pi — a fixed deployment. Note, however, that the **production renderer is implemented resolution-independently**: it reads width/height from config and scales every geometry constant by `s = min(width/1024, height/600)` off a 1024×600 reference, rather than hard-coding the artboard. The 1024×600 figures below are that reference, not a hard constraint in the code. (A-10)
+The target device is the Waveshare 7" HDMI LCD (H) at exactly 1024×600, driven by a Raspberry Pi — a fixed deployment. Note, however, that the **production renderer is implemented largely resolution-independently**: it reads width/height from config and scales geometry off a 1024×600 reference — rects by `(sx, sy)`, fonts and fixed-size elements by the uniform `s = min(width/1024, height/600)` — rather than hard-coding the artboard. Scaling is not *purely* proportional: font sizes carry minimum legibility floors, so they scale down to roughly `s≈0.33` and then hold (DISP-6). 1024×600 (where `s=1.0`, floors inactive) is the supported reference; the figures below are that reference, not a hard constraint in the code. (A-10)
 
 **Key Characteristics:**
 - Per-album palette theming: every record tints its own display
@@ -185,7 +185,7 @@ The `stroke-dasharray: "50 200"` produces roughly a quarter-circle arc at any ro
 A 64×2px horizontal rule in `p.accent` at full opacity. Appears between the track name and the artist name. Its width is fixed, not responsive to the column — a deliberate punctuation mark, not a divider that spans the full width.
 
 ### Display Layout (DirectionA)
-The core artboard: 1024×600px **reference** dimensions (the production renderer scales these proportionally — see the resolution-independence note above; this is not a hard-fixed artboard in code). Cover on the left (440×440px), metadata on the right (1fr). Top status strip (30px, suppressed in compact variant). Inset: 60px top, 50px sides, 40px bottom. Grid gap: 44px.
+The core artboard: 1024×600px **reference** dimensions (the production renderer scales these off the reference — proportionally down to the font legibility floors; see the resolution-independence note above; this is not a hard-fixed artboard in code). Cover on the left (440×440px), metadata on the right (1fr). Top status strip (30px, suppressed in compact variant). Inset: 60px top, 50px sides, 40px bottom. Grid gap: 44px.
 
 **Status strip background:** The strip uses `p.surface` as a solid background color, visually distinguishing it from the main artboard without a visible border. This grounds the status information at the top edge and provides a natural anchor for the status dot and side/position counter.
 
