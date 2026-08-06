@@ -20,7 +20,7 @@ from src.display.renderer import (  # noqa: E402
     DisplayRenderer, _BoundedCache, _DOT_CACHE_MAX, _FONT_CACHE_MAX,
     _quantize_palette, _PALETTE_LERP_QUANTIZE, _TRANSITION_SECS,
 )
-from src.display.palette import contrast_ratio
+from src.display.palette import contrast_ratio, text_background
 from src.display.layouts import get_now_playing_layout  # noqa: E402
 from src.metadata.models import DisplayPalette  # noqa: E402
 
@@ -123,11 +123,53 @@ def test_animated_palette_is_quantized_mid_transition(monkeypatch):
                         lambda: _TRANSITION_SECS * 0.5)  # t = 0.5
 
     pal = r._animated_palette()
-    for channel in (pal.bg, pal.surface, pal.accent, pal.text):
+    # bg/surface/text lerp raw and are quantized so per-frame cache keys stay
+    # stable (P-4).  accent and muted are clamped TEXT roles (DISP-1/DISP-2):
+    # like muted, accent is now a deterministic function of the quantized inputs
+    # rather than a multiple of the step, so it is checked for readability, not
+    # quantization.
+    for channel in (pal.bg, pal.surface, pal.text):
         for v in channel:
             assert v % _PALETTE_LERP_QUANTIZE == 0       # raw lerp would be odd
     assert pal.bg != a.bg and pal.bg != b.bg             # genuinely mid-transition
-    assert contrast_ratio(pal.muted, pal.bg) >= 4.5     # invariant held
+    tb = text_background(pal.bg, pal.surface)
+    assert contrast_ratio(pal.accent, tb) >= 4.5         # DISP-1 held mid-lerp
+    assert contrast_ratio(pal.muted, tb) >= 4.5          # DISP-2 held mid-lerp
+
+
+def _distinct_palettes_over_transition(monkeypatch, n_frames):
+    # Fresh renderer each call: _animated_palette() rewrites _current_palette to
+    # the target once t>=1.0, so a reused renderer would poison a later sweep.
+    # Sample frac in [0,1) so every frame is genuinely mid-transition.
+    r = DisplayRenderer.__new__(DisplayRenderer)
+    r._current_palette = DisplayPalette((0, 0, 0), (40, 40, 40), (255, 0, 0), (250, 250, 250), (200, 200, 200))
+    r._target_palette = DisplayPalette((48, 48, 48), (80, 80, 80), (0, 0, 255), (240, 240, 240), (210, 210, 210))
+    r._transition_start = 0.0
+    seen = set()
+    for i in range(n_frames):
+        frac = i / n_frames
+        monkeypatch.setattr("src.display.renderer.time.monotonic",
+                            lambda f=frac: _TRANSITION_SECS * f)
+        p = r._animated_palette()
+        seen.add((p.bg, p.surface, p.accent, p.text, p.muted))
+    return len(seen)
+
+
+def test_animated_palette_distinct_count_stays_bounded(monkeypatch):
+    """P-4 preserved under DISP-1/DISP-2: re-clamping accent + muted after
+    quantization must NOT reintroduce per-frame cache thrash.  Each clamp is a
+    deterministic function of the already-quantized (bg, surface, role) inputs,
+    so the number of DISTINCT palettes over a transition is bounded by the
+    quantization steps, NOT the frame count — rendering 10x more frames does not
+    add 10x more cache keys.  Measured ~36 for this extreme red→blue sweep."""
+    d_1200 = _distinct_palettes_over_transition(monkeypatch, 1200)
+    d_2400 = _distinct_palettes_over_transition(monkeypatch, 2400)
+    # Bounded well below the frame count → the glyph/gradient caches still hit
+    # (measured 36 for this extreme red→blue sweep; real track changes are less).
+    assert d_1200 <= 40, f"{d_1200} distinct palettes over 1200 frames — cache would thrash"
+    # Fully converged: doubling the frames adds ZERO new palettes, proving the
+    # count tracks the quantization steps, not the frame rate (P-4 intact).
+    assert d_2400 == d_1200
 
 
 def test_animated_palette_settles_to_exact_target(monkeypatch):

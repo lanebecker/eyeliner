@@ -94,7 +94,13 @@ from typing import Callable, Optional, Tuple, TYPE_CHECKING
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
 from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
-from src.display.palette import extract_palette, ensure_contrast
+from src.display.palette import (
+    extract_palette,
+    ensure_contrast,
+    ensure_contrast_hue_preserving,
+    text_background,
+    GRADIENT_TEXT_PEAK,
+)
 from src.display.cover_cache import CoverArtCache
 
 if TYPE_CHECKING:
@@ -330,13 +336,19 @@ def _quantize_palette(p: DisplayPalette) -> DisplayPalette:
         return tuple((c // q) * q for c in color)
 
     bg = snap(p.bg)
-    # Re-assert the Full-Opacity Rule after quantizing: flooring `muted` toward
-    # black could otherwise transiently drop it below the 4.5:1 WCAG floor vs
-    # `bg` during the lerp.  ensure_contrast is deterministic in its (quantized)
-    # inputs, so the cache key stays stable while readability is preserved.
-    muted = ensure_contrast(snap(p.muted), bg, min_ratio=4.5)
+    surface = snap(p.surface)
+    # Re-assert the Full-Opacity Rule after quantizing: flooring a text role
+    # toward black could otherwise transiently drop it below the 4.5:1 WCAG
+    # floor during the lerp.  Clamp against the gradient's brightest pixel
+    # (DISP-2), not flat bg; accent (the album title) is lifted hue-preserving
+    # exactly as extract_palette does (DISP-1), muted blends toward white.  Both
+    # are deterministic in their (quantized) inputs, so the cache key stays
+    # stable while readability is preserved.
+    tb = text_background(bg, surface)
+    muted = ensure_contrast(snap(p.muted), tb, min_ratio=4.5)
+    accent = ensure_contrast_hue_preserving(snap(p.accent), tb, min_ratio=4.5)
     return DisplayPalette(
-        bg=bg, surface=snap(p.surface), accent=snap(p.accent),
+        bg=bg, surface=surface, accent=accent,
         text=snap(p.text), muted=muted,
     )
 
@@ -1276,8 +1288,12 @@ class DisplayRenderer:
 
             for i in range(steps, 0, -1):
                 t = i / steps
-                # Blend from surface (centre) toward bg (edge)
-                color = _lerp_color(p.bg, p.surface, t * 0.55)
+                # Blend from surface (centre) toward bg (edge).  The 0.55 peak
+                # is GRADIENT_TEXT_PEAK — the SAME constant text roles are
+                # contrast-clamped against (palette.text_background), so the
+                # brightest pixel we draw is exactly the one we guarantee
+                # against (DISP-2).
+                color = _lerp_color(p.bg, p.surface, t * GRADIENT_TEXT_PEAK)
                 r = int(max_r * t)
                 pygame.draw.circle(surface, color, (cx, cy), r)
 

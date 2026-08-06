@@ -91,11 +91,11 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 - **Surface Lift** (`#161616`): The second layer — slightly lighter than bg, used as the radial gradient endpoint to create depth without a visible edge. Each album replaces this with its own surface tone.
 
 ### Secondary
-- **Extract Accent** (`#c8c8c8`): The accent role: track name glow color, status dot color, genre chip border. Every album fills this from the brightest extracted hue in the cover. The fallback is light silver.
+- **Extract Accent** (`#c8c8c8`): The accent role: album-title text, track-name glow, status-dot color, divider rule, genre-chip border. Every album fills this from the most-saturated extracted color in the cover. The fallback is light silver. **Because the production renderer draws the album title in `accent`, it is a text role and is contrast-clamped to ≥4.5:1 against the gradient background (DISP-1) — lifting HLS lightness while preserving the cover's hue (the smallest move that reaches the floor), since the raw most-saturated color is frequently unreadable on a dark sleeve (a matte-black cover measured 1.05:1). A single `accent` role drives the title, divider, chips and dot together, so all become legible in one clamp.**
 
 ### Neutral
 - **Near-White Text** (`#ebe6dc`): Primary text. Warm off-white; slight warmth prevents harshness. Each album replaces this with a tinted near-white matching the cover's dominant hue.
-- **Muted Secondary** (`#8a857c`): Secondary text. Status labels, catalog text, PREV/NEXT labels, genre chip text. Must pass 4.5:1 contrast against its album bg at full opacity — never stack with additional opacity reductions. When extracting a muted value for a new album, verify the ratio; cool-dark backgrounds (e.g., Cavetown `#0e1a2a`) pull contrast down faster than neutral darks.
+- **Muted Secondary** (`#8a857c`): Secondary text. Status labels, catalog text, PREV/NEXT labels, genre chip text. Must pass 4.5:1 contrast against the gradient's brightest pixel — the centre of the bg→surface radial, **not flat bg** (DISP-2) — at full opacity — never stack with additional opacity reductions. When extracting a muted value for a new album, verify the ratio; cool-dark backgrounds (e.g., Cavetown `#0e1a2a`) pull contrast down faster than neutral darks.
 
 **Canvas Chrome** (`#f0eee9`): The design-tool background. Never part of the now-playing display.
 
@@ -103,7 +103,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 
 **Palette transitions** are smooth: all five roles lerp simultaneously over ~1 second when a track change triggers a new palette. This is a production feature, not a design enhancement — design work should treat the transition as a given and not work around it.
 
-**The Full-Opacity Rule.** Secondary text (`muted`) already conveys its subdued role through hue. Never compound with opacity. `p.muted` at `opacity: 0.65` over a dark bg fails contrast. Use the color as-is; reduce saturation or lightness in the palette if it reads too heavy.
+**The Full-Opacity Rule.** Secondary text (`muted`) already conveys its subdued role through hue. Never compound with opacity. `p.muted` at `opacity: 0.65` over a dark bg fails contrast. Use the color as-is; reduce saturation or lightness in the palette if it reads too heavy. Both text roles — `muted` and, in production, `accent` (the album title) — are contrast-clamped to ≥4.5:1 against the **gradient's brightest pixel** (the bg→surface radial centre), not flat `bg`, since that is the brightest surface text can land on (DISP-1 / DISP-2). The clamp is re-asserted per-frame during the 1s palette lerp so readability holds mid-transition too.
 
 **The Per-Album Rule.** The five palette roles (`bg`, `surface`, `accent`, `text`, `muted`) are architecture, not values. Treat the fallback palette as the null state; treat each album's extraction as the real design. New album additions require a new palette entry in `design/src/data.js`, not a design change.
 
@@ -120,7 +120,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 ### Hierarchy
 - **Display** (Inter Tight 600, 72px, lh 0.98, ls -0.03em): Track name. The single most important piece of information. `textWrap: balance` to prevent awkward orphans. Set in `p.text`.
 - **Headline** (Inter Tight 500, 48px, lh 1.04, ls -0.022em): Artist name. Large but lighter weight than the track name to establish clear subordination. Set in `p.text`.
-- **Title** (Newsreader italic 400, 32px, lh 1.12): Album title only. The one serif-italic moment. Set in `p.accent` — the color contrast ties the album name to the cover.
+- **Title** (Newsreader italic 400, 32px, lh 1.12): Album title only. The one serif-italic moment. Set in `p.accent` — the color ties the album name to the cover. Because the title is text, `accent` is contrast-clamped to ≥4.5:1 (hue-preserving) at extraction time, so that tie survives even a near-black or fully-saturated sleeve (DISP-1).
 - **Chip** (JetBrains Mono 400, 12px, ls 0.1em): Genre chip labels. Technical classification, not editorial copy.
 - **Catalog** (JetBrains Mono 400, 13px, ls 0.08em): Catalog footer line only (`{year} · {label} · {catalog}`). Slightly larger than Label for room-monitor legibility at 6–10ft — the catalog line is dense metadata that benefits from one step of breathing room above 11px.
 - **Label** (JetBrains Mono 400, 11px, ls 0.16em, uppercase): Status strip, PREV/NEXT labels, side/position counter, status indicator. All instrumental metadata. Set in `p.muted`.
