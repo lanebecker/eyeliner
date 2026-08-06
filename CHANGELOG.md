@@ -9,6 +9,61 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Code-review hardening, round 3 (Wave 5 — metadata & tracklist correctness).**
+Wave 5 of the same audit (`CODE_REVIEW_2026-07-30.md`), tightening how a track's
+position within its album is parsed and ranked.
+
+### Fixed
+
+- **The side ordinal now follows the pressing's track *numbers*, not the order
+  Discogs happens to list the rows in (META-8 #150 — LOW).** `side_position`
+  was the 1-indexed *row* position of the track among its side-mates as they
+  appear in the tracklist array. Discogs rows are community-edited and not
+  guaranteed to be in sequence, so a release whose A-side is listed `[A2, A1]`
+  rendered `A1` as **"02 OF 02"** — a position greater than its own track
+  number, and the wrong number outright. `side_position` is now the rank of the
+  track after sorting its side by the parsed track number, so `A1` reads
+  **"01 OF 02"** regardless of row order and the `NN OF MM` caption stays
+  coherent (N ≤ M) for out-of-sequence and gapped sides alike. `side_total`
+  (the side's length) is unchanged.
+- **Separated and space-padded vinyl positions now parse (META-9 #151 —
+  LOW).** `_SIDE_RE` matched only the tight `A1` / `B12` / `AA3` forms, so the
+  common Discogs variants `A-1`, `A.1`, `A 1` (and a stray-whitespace `A1 `)
+  fell through to a bare raw-position display with no side letter, ordinal, or
+  total — no `SIDE A · …` caption at all. The pattern now tolerates a single
+  `-`/`.`/space separator and surrounding whitespace, and `track_display` is
+  stripped so a padded row renders a clean caption. The side-letter run is
+  bounded to one or two letters (`A`..`Z`, doubled `AA`/`BB`), so — crucially —
+  word-label rows a release may carry (`Video 1`, `Bonus 2`, `Disc 1`) do **not**
+  fabricate a `SIDE VIDEO` caption: like a bare letter `A` (no number) or a
+  CD-style `1-01` (leading digit), they degrade gracefully to a raw-position
+  display with no fabricated side. `is_last_track` — the sole gate on the
+  Discogs Play Count write — is derived from the position+title `global_index`
+  and never touched `_SIDE_RE`, so it is unaffected by the relaxed parsing.
+  (The word-label bound was added in the adversarial cold-review pass, which
+  caught that the whitespace tolerance alone would have newly matched
+  `Video 1`.)
+
+### Changed
+
+- **Removed a redundant, provably-inert re-scan in `SideIndex.from_tracklist`
+  (MUT-16 #136 — MEDIUM).** The factory recomputed the global-index anchor
+  (`target_position`) with a second side-filtered loop over the tracklist, then
+  fell back to the current entry's own position. Because the current entry is
+  the first row matching the title and is by construction the first title match
+  within its own side group, that loop *always* yielded exactly the fallback —
+  a 120,000-case fuzz over relaxed-format and duplicate-position tracklists
+  found 0 divergence. It is replaced by the single expression it always equalled
+  (`target_position = current.position if current else None`). Behavior is
+  identical, including the deliberately conservative reprise handling: a title
+  repeated across sides resolves to its *first* occurrence, so a genuine closer
+  that duplicates an earlier title stays `is_last_track = False` (a missed play
+  count, never a phantom one). The `from_tracklist` docstring, which had
+  credited a "side filter disambiguates" mechanism that no longer exists, is
+  corrected to describe the actual first-occurrence logic. RED-first; adversarial
+  cold review (no crash / no data-integrity defect; one introduced regression
+  found and fixed, one degenerate nit declined).
+
 ## [1.5.5] — 2026-08-06
 
 **Code-review hardening, round 3 (Wave 4 — display correctness & the contrast
