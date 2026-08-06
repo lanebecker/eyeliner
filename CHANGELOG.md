@@ -86,6 +86,26 @@ yet.
   1024×600 (`s=1.0`, floors inactive) as the supported reference, and stop
   claiming pure proportionality. No behavior change at the shipped resolution.
   The `sx`→`s` fix and the floors are pinned by new `test_layouts.py` cases.
+- **A stalled SD read while loading cover art no longer freezes the whole event
+  loop (STAB-5 #132 — LOW).** `_load_cover` ran `pygame.image.load` (an SD read),
+  `.convert()` and `smoothscale` synchronously on the single asyncio loop, up to
+  ~10×/s on a cache miss — so a worn card stalling a read for several seconds
+  (normal wear-levelling / ECC-retry) blocked the audio-block drain, the
+  silence ticker, and recognition along with it. The per-frame `_load_cover` is
+  now non-blocking: it returns the cached scaled Surface or None (placeholder)
+  and, on a cache miss, schedules an off-loop decode (`_decode_cover_async`,
+  deduped by `(url, w, h)`). That task runs the SD read + decode
+  (`pygame.image.load`) in the default executor — the actual stall — then does
+  `.convert()` + `smoothscale` back on the loop (fast CPU on already-decoded
+  bytes; `.convert()` needs the display's pixel format and SDL video ops belong
+  on the main thread), caches the surface, and bumps `_cover_version` to
+  repaint. The intricate STAB-1 machinery moved with it and its split got
+  *cleaner*: corrupt/partial bytes fail in the off-loop `load()` → bounded
+  unlink + refetch → blacklist; a display fault fails in the on-loop `.convert()`
+  → log-once latch, never deleting the good file. RED-first (a spy proves the
+  SD read now runs off the event-loop thread); the STAB-1 tests were moved to
+  the async path and all failure classes stay mutation-pinned; full cold review
+  SPEC / QUALITY PASS (dedup/leak/threading all reproduced clean).
 
 ### Security
 
