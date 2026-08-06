@@ -44,17 +44,28 @@ def _png_bytes(width=64, height=64, color=(180, 90, 40)):
 
 
 class _FakeResp:
-    """Minimal stand-in for a streamed urllib3 HTTPResponse."""
+    """Minimal stand-in for a urllib3 HTTPResponse read via read1().
+
+    download() reads the body with ``read1(amt)`` (NOT ``stream()``): read1
+    returns whatever a single underlying socket read yields, up to ``amt``,
+    which is what lets the wall-clock deadline fire under a slow drip.  This
+    fake mirrors that contract — successive calls walk the body and return b""
+    at EOF.
+    """
 
     def __init__(self, *, status=200, headers=None, body=b""):
         self.status = status
         self.headers = headers or {}
         self._body = body
+        self._pos = 0
         self.released = False
 
-    def stream(self, amt=65536, decode_content=False):
-        for i in range(0, len(self._body), amt):
-            yield self._body[i:i + amt]
+    def read1(self, amt=65536, decode_content=False):
+        if self._pos >= len(self._body):
+            return b""
+        chunk = self._body[self._pos:self._pos + amt]
+        self._pos += len(chunk)
+        return chunk
 
     def release_conn(self):
         self.released = True
@@ -619,6 +630,228 @@ def test_download_rejects_http_status_400_boundary(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="HTTP 400"):
         store.download(url)
     assert not store.exists(url)
+
+
+# ---------------------------------------------------------------------------
+# SEC-4 (#121) — a total wall-clock deadline + early Content-Length reject.
+# The per-read socket timeout (_COVER_CONNECT_READ_TIMEOUT) bounds each single
+# read, NOT the whole transfer: a server that dribbles a byte just inside the
+# read timeout, forever, parks an executor worker indefinitely.  These pin the
+# total-download budget (checked across redirect hops AND per streamed chunk)
+# and the "server DECLARES an oversized body" fast-reject.
+# ---------------------------------------------------------------------------
+
+def test_download_aborts_on_slow_drip(tmp_path, monkeypatch):
+    # A slow-drip body: every chunk arrives under the per-read timeout, so the
+    # socket never trips, but the aggregate wall-clock blows the total budget.
+    # Byte cap can't save us — the chunks are tiny — so only the deadline does.
+    monkeypatch.setattr(cc, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
+    monkeypatch.setattr(cc, "_DOWNLOAD_DEADLINE_SECONDS", 45)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cc.time, "monotonic", lambda: clock["t"])
+
+    class _DripResp(_FakeResp):
+        # read1() returns the few bytes one recv yielded — faithful to how
+        # download() reads — while wall-clock advances 20s per (tiny) read.
+        def read1(self, amt=65536, decode_content=False):
+            clock["t"] += 20.0              # each tiny read costs 20s
+            return b"\x00" * 8              # far under any byte cap; never EOFs
+
+    resp = _DripResp(headers={"Content-Type": "image/png"})
+    monkeypatch.setattr(cc, "_open_cover_stream", lambda *a, **k: resp)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/x"
+    with pytest.raises(ValueError, match="deadline"):
+        store.download(url)
+    assert not store.exists(url)
+    # No partial tempfile left behind on the abort.
+    assert not any(n.startswith(".cover-") for n in os.listdir(tmp_path))
+
+
+def test_download_aborts_real_drip_over_real_socket(tmp_path, monkeypatch):
+    # INTEGRATION PROOF (no mock of the read path): a REAL urllib3 response over
+    # a REAL socket that dribbles one byte at a time, faster than the per-read
+    # socket timeout.  This is the exact production path SEC-4 must bound — and
+    # the one a fake stream() previously hid a live hang behind.  If download()
+    # ever regresses to a buffering read() that blocks until a full chunk, this
+    # test's runner thread stays alive and the assert fails FAST rather than
+    # hanging the suite.
+    import socket as _socket
+    import threading
+    import urllib3
+
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(65536)  # consume the request line/headers
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: image/png\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            while not stop.is_set():
+                conn.sendall(b"\x00")   # one byte...
+                time.sleep(0.05)        # ...every 50ms, well under the read timeout
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+
+    pool = urllib3.HTTPConnectionPool(
+        "127.0.0.1", port,
+        timeout=urllib3.Timeout(connect=5, read=5),   # per-read >> deadline
+    )
+
+    def fake_open(fetch_url, host, pinned_ip, timeout):
+        return pool.urlopen("GET", "/", preload_content=False, retries=False)
+
+    monkeypatch.setattr(cc, "_open_cover_stream", fake_open)
+    monkeypatch.setattr(cc, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "127.0.0.1"))
+    monkeypatch.setattr(cc, "_DOWNLOAD_DEADLINE_SECONDS", 1)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/x"
+
+    result = {}
+
+    def run():
+        try:
+            store.download(url)
+            result["ok"] = True
+        except BaseException as exc:      # noqa: BLE001 - capture for assertion
+            result["exc"] = exc
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    runner.join(8)          # the fix aborts at ~1s; 8s is a generous ceiling
+    stop.set()
+    try:
+        srv.close()
+    except OSError:
+        pass
+
+    assert not runner.is_alive(), \
+        "download() hung past its wall-clock deadline — SEC-4 slow-drip regression"
+    assert isinstance(result.get("exc"), ValueError)
+    assert "deadline" in str(result["exc"])
+    assert not store.exists(url)
+    assert not any(n.startswith(".cover-") for n in os.listdir(tmp_path))
+
+
+def test_download_aborts_when_redirects_exceed_deadline(tmp_path, monkeypatch):
+    # The deadline spans the WHOLE fetch, redirect hops included: a chain that
+    # stays under the hop count but burns the clock must still be cut off with
+    # the deadline error — NOT the "too many redirects" error.
+    monkeypatch.setattr(
+        cc, "_validate_cover_url",
+        lambda u: (u, urlsplit(u).hostname or "i.discogs.com", "93.184.216.34"),
+    )
+    monkeypatch.setattr(cc, "_DOWNLOAD_DEADLINE_SECONDS", 45)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cc.time, "monotonic", lambda: clock["t"])
+
+    def fake_open(fetch_url, host, pinned_ip, timeout):
+        clock["t"] += 20.0                  # each hop burns 20s
+        return _FakeResp(
+            status=307,
+            headers={"Location": "https://i.discogs.com/next"},
+        )
+    monkeypatch.setattr(cc, "_open_cover_stream", fake_open)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/start"
+    with pytest.raises(ValueError, match="deadline"):
+        store.download(url)
+
+
+def test_download_rejects_oversized_declared_content_length(tmp_path, monkeypatch):
+    # If the server DECLARES a body over the cap, reject before streaming a
+    # single byte.  Serve a small VALID png with a lying, oversized
+    # Content-Length: on today's code the header is ignored, the valid png
+    # streams and the download SUCCEEDS — so the declared-size guard is the only
+    # thing that can stop it, and it must stop it BEFORE any streaming.
+    monkeypatch.setattr(cc, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
+    monkeypatch.setattr(cc, "_MAX_COVER_BYTES", 1024)
+
+    streamed = {"called": False}
+
+    class _DeclaredResp(_FakeResp):
+        def read1(self, amt=65536, decode_content=False):
+            streamed["called"] = True
+            return super().read1(amt, decode_content)
+
+    resp = _DeclaredResp(
+        headers={"Content-Type": "image/png", "Content-Length": "1048576"},
+        body=_png_bytes(),
+    )
+    monkeypatch.setattr(cc, "_open_cover_stream", lambda *a, **k: resp)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/x"
+    with pytest.raises(ValueError, match="declared"):
+        store.download(url)
+    assert not store.exists(url)
+    assert streamed["called"] is False      # rejected before ANY body read
+
+
+def test_download_accepts_content_length_exactly_at_cap(tmp_path, monkeypatch):
+    # A body declared at EXACTLY the cap is allowed — the guard is strictly
+    # `> cap`, not `>= cap`.  Pin the boundary: pull the cap down to this body's
+    # own length so declared == cap, and a `>=` mutation would wrongly reject it.
+    monkeypatch.setattr(cc, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
+    body = _png_bytes()
+    monkeypatch.setattr(cc, "_MAX_COVER_BYTES", len(body))
+    resp = _FakeResp(
+        headers={"Content-Type": "image/png", "Content-Length": str(len(body))},
+        body=body,
+    )
+    monkeypatch.setattr(cc, "_open_cover_stream", lambda *a, **k: resp)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/x"
+    store.download(url)
+    assert store.exists(url)
+
+
+def test_download_tolerates_garbage_content_length(tmp_path, monkeypatch):
+    # A non-numeric Content-Length must never raise from the declared-size guard
+    # — it just falls through to "stream and count".  Pins the int-parse
+    # try/except: without it, int("banana") would crash the whole download.
+    monkeypatch.setattr(cc, "_validate_cover_url",
+                        lambda u: (u, "i.discogs.com", "1.2.3.4"))
+    resp = _FakeResp(
+        headers={"Content-Type": "image/png", "Content-Length": "banana"},
+        body=_png_bytes(),
+    )
+    monkeypatch.setattr(cc, "_open_cover_stream", lambda *a, **k: resp)
+
+    store = _make_store(tmp_path)
+    url = "https://i.discogs.com/x"
+    store.download(url)                     # must NOT raise
+    assert store.exists(url)
 
 
 def test_download_rejects_too_many_redirects(tmp_path, monkeypatch):

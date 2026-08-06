@@ -24,7 +24,11 @@ that exploits a stale decoder.  :meth:`CoverArtCache.download` therefore:
     against the original hostname (SNI + assert_hostname), so pinning to an IP
     does not weaken authentication.
   * follows redirects manually so every hop is re-validated and re-pinned,
-  * aborts after ``_MAX_COVER_BYTES``,
+  * aborts after ``_MAX_COVER_BYTES`` on the wire, and rejects up front if the
+    server DECLARES a Content-Length over that cap,
+  * enforces a total wall-clock ``_DOWNLOAD_DEADLINE_SECONDS`` budget across all
+    redirect hops and the body stream, so a slow-drip response is cut off
+    instead of parking an executor worker indefinitely (SEC-4),
   * requires an image/* Content-Type, and
   * verifies the decoded image (type + pixel bounds) before it is cached.
 
@@ -44,6 +48,7 @@ import logging
 import os
 import socket
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urljoin, urlsplit
@@ -70,6 +75,14 @@ _ALLOWED_COVER_APEX_DOMAINS = (
 _MAX_COVER_BYTES = 10 * 1024 * 1024   # 10 MB ceiling on a downloaded cover
 _MAX_COVER_REDIRECTS = 5              # cap redirect chains
 _COVER_CONNECT_READ_TIMEOUT = 15     # seconds, per HTTP request
+# _COVER_CONNECT_READ_TIMEOUT bounds a SINGLE socket read; it does nothing
+# against a server that dribbles one byte just inside that window forever.
+# _DOWNLOAD_DEADLINE_SECONDS is the total wall-clock budget for one cover —
+# spanning every redirect hop AND the body stream — so a slow-drip fetch is
+# aborted instead of parking an executor worker indefinitely (SEC-4).  45s is
+# generous: a 10 MB cover on a 1 Mbit/s link is ~80s, but real covers are a few
+# hundred KB, so this only ever bites a stall, never an honest slow link.
+_DOWNLOAD_DEADLINE_SECONDS = 45
 
 # R-2 disk-cache bounds.  A serious collection touches hundreds of covers; at
 # ~50-400 KB each these defaults (≈ a few hundred MB) hold a very large library
@@ -374,8 +387,16 @@ class CoverArtCache:
         cache_path = self.path_for(url)
         current_url = url
         resp = None
+        # SEC-4: one wall-clock budget for the entire fetch — redirect hops and
+        # body stream alike — so a slow-drip response cannot park us forever.
+        deadline = time.monotonic() + _DOWNLOAD_DEADLINE_SECONDS
         try:
             for _ in range(_MAX_COVER_REDIRECTS + 1):
+                if time.monotonic() > deadline:
+                    raise ValueError(
+                        f"cover art download exceeded "
+                        f"{_DOWNLOAD_DEADLINE_SECONDS}s deadline"
+                    )
                 fetch_url, host, pinned_ip = _validate_cover_url(current_url)
                 resp = _open_cover_stream(
                     fetch_url, host, pinned_ip, _COVER_CONNECT_READ_TIMEOUT
@@ -402,6 +423,22 @@ class CoverArtCache:
             if not content_type.startswith("image/"):
                 raise ValueError(f"unexpected Content-Type for cover art: {content_type!r}")
 
+            # SEC-4: if the server DECLARES a body over the cap, reject up front
+            # rather than streaming to the cap to find out.  A missing or
+            # non-numeric header just means "stream and count" (the loop below
+            # still enforces the true byte cap on the wire).
+            declared = resp.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    declared_len = int(declared)
+                except (TypeError, ValueError):
+                    declared_len = None
+                if declared_len is not None and declared_len > _MAX_COVER_BYTES:
+                    raise ValueError(
+                        f"cover art declared Content-Length {declared_len} "
+                        f"exceeds {_MAX_COVER_BYTES} byte cap"
+                    )
+
             # delete=False so we can rename after closing; we clean up manually on error
             tmp = tempfile.NamedTemporaryFile(
                 dir=str(self.cache_dir),
@@ -412,9 +449,25 @@ class CoverArtCache:
             try:
                 total = 0
                 with tmp as f:
-                    for chunk in resp.stream(64 * 1024):
+                    # SEC-4: read with read1(), NOT stream().  stream(amt) delegates
+                    # to a buffered read() that blocks until `amt` bytes accumulate
+                    # or the connection closes, so a peer dripping one byte per
+                    # sub-timeout interval keeps a SINGLE read() running effectively
+                    # forever and the deadline check below never gets a turn.
+                    # read1() returns as soon as one underlying socket read yields
+                    # data (up to amt), so control returns here after each recv and
+                    # the wall-clock deadline can actually fire.  Do NOT "optimise"
+                    # this back to stream() — that silently re-opens the slow-drip
+                    # DoS this guard exists to close.
+                    while True:
+                        if time.monotonic() > deadline:
+                            raise ValueError(
+                                f"cover art download exceeded "
+                                f"{_DOWNLOAD_DEADLINE_SECONDS}s deadline"
+                            )
+                        chunk = resp.read1(64 * 1024)
                         if not chunk:
-                            continue
+                            break
                         total += len(chunk)
                         if total > _MAX_COVER_BYTES:
                             raise ValueError(
