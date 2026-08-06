@@ -46,7 +46,7 @@ htmlcov/
 CODE_REVIEW_*.md
 
 # Local-only handoff/review patch artifacts (delivered per-finding, applied on
-# the Mac, then discarded — never committed; keeps `git add -A` from re-polluting)
+# the Mac, then parked in docs/archive/ — never committed; keeps `git add -A` from re-polluting)
 *.patch
 
 # Local audit archive (handoffs, reviews, patches) - never committed
