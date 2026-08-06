@@ -14,9 +14,19 @@ class MetadataSource(Enum):
     FALLBACK = auto()             # Shazam metadata + MusicBrainz cover art
 
 
-# Matches Discogs position strings like "A1", "B12", "AA3".
-# Group 1 = side letter(s), Group 2 = track number within the side.
-_SIDE_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+# Matches Discogs vinyl position strings like "A1", "B12", "AA3", and the
+# common separated / spaced variants "A-1", "A.1", "A 1", "A - 1", plus any
+# surrounding whitespace ("A1 ").  Group 1 = side letter(s), Group 2 = track
+# number within the side (META-9).
+#
+# A position must START with a letter to count as a vinyl side, and the side
+# label is bounded to ONE or TWO letters — real vinyl sides are "A".."Z" and
+# the doubled "AA"/"BB" of multi-disc pressings, never a word.  Bounding the run
+# is what stops the whitespace tolerance below from turning bonus/video/disc
+# rows ("Video 1", "Bonus 2", "Disc 1") into a fabricated ``SIDE VIDEO`` caption;
+# such rows now degrade gracefully to a raw-position display, like the bare
+# letter "A" (no number) and CD-style "1-01" (leading digit) already do.
+_SIDE_RE = re.compile(r"^\s*([A-Za-z]{1,2})\s*[.\-]?\s*(\d+)\s*$")
 
 
 @dataclass
@@ -94,18 +104,21 @@ class SideIndex:
     def from_tracklist(cls, tracklist: list["TracklistEntry"], title: str) -> "SideIndex":
         """Compute the full positional picture for *title* within *tracklist*.
 
-        The current entry is located by title; its position string yields the
-        side letter and the within-side ordinal.  Prev/next neighbours are pure
-        global-tracklist adjacency (vinyl sides are contiguous), resolved via
-        the entry's unique ``position`` string rather than re-scanning by title.
-        That position-anchoring is what fixes two historical bugs:
+        The current entry is located by title (first occurrence); its position
+        string yields the side letter and — after a numeric sort of the side by
+        track number (META-8) — the within-side ordinal.  Prev/next neighbours
+        are pure global-tracklist adjacency (vinyl sides are contiguous),
+        resolved via the entry's ``position`` string paired with its title:
 
-          - **B-5**: a title repeated across sides (e.g. a reprise) no longer
-            returns the wrong side's neighbour — the side filter disambiguates
-            the occurrence, and its position then pins the exact global index.
+          - **B-5 / reprise**: a title repeated across sides resolves to its
+            FIRST occurrence and its neighbours come from THAT row, never a
+            later same-titled row's side.  (The current entry is the first
+            title match, so this is inherent in how ``current`` is chosen — an
+            earlier side-filtered re-scan that appeared to do this work was
+            proven inert and removed, MUT-16.)
           - **B-10**: a numbered tracklist ('1'..'10') has no side letter, so
-            the side filter is empty; the logic falls back to the title match
-            and still yields correct adjacency.
+            the anchor is simply ``current``'s own position and adjacency still
+            resolves correctly by the plain title match.
 
         ``is_last_track`` is derived from the disambiguated ``global_index``
         (matched by position AND title), NOT from a bare position-string
@@ -128,7 +141,9 @@ class SideIndex:
             (e for e in tracklist if e.title.lower().strip() == title_key), None
         )
 
-        track_display = current.position if current else ""
+        # Strip surrounding whitespace so a padded Discogs row ("A1 ") renders
+        # a clean caption rather than a trailing-space artifact (META-9).
+        track_display = current.position.strip() if current else ""
 
         # Side letter from the position prefix (None for numbered tracklists).
         side_letter = None
@@ -144,23 +159,30 @@ class SideIndex:
                 if (m := _SIDE_RE.match(e.position)) and m.group(1).upper() == side_letter
             ]
 
-        # 1-indexed ordinal within the side (by title), and the side's length.
+        # 1-indexed ordinal within the side, and the side's length.  The ordinal
+        # follows the parsed track NUMBER, not the tracklist ROW order (META-8):
+        # a release that lists its rows out of sequence ([A2, A1]) must still
+        # rank A1 as "01 OF 02", keeping the "NN OF MM" caption coherent (N<=M).
+        # Every side entry matched _SIDE_RE by construction, so group(2) is safe.
+        sorted_side = sorted(
+            side_entries, key=lambda e: int(_SIDE_RE.match(e.position).group(2))
+        )
         side_position = None
-        for i, entry in enumerate(side_entries):
+        for i, entry in enumerate(sorted_side):
             if entry.title.lower().strip() == title_key:
                 side_position = i + 1
                 break
         side_total = len(side_entries) if side_entries else None
 
-        # Global index — prefer the side-disambiguated occurrence (B-5); fall
-        # back to the plain title match for numbered tracklists (B-10).
-        target_position = None
-        for entry in side_entries:
-            if entry.title.lower().strip() == title_key:
-                target_position = entry.position
-                break
-        if target_position is None and current is not None:
-            target_position = current.position
+        # Global index anchor.  ``current`` is already the first tracklist row
+        # whose title matches, and it is itself a member of ``side_entries`` (its
+        # own side letter is what defined that set), so the first side entry that
+        # matches the title is ALWAYS ``current`` — a fuzz over 96,800 tracklists
+        # found 0 divergence.  The redundant re-scan that recomputed this from
+        # ``side_entries`` was therefore inert and is removed (MUT-16).  For a
+        # numbered tracklist (no side letter) ``side_entries`` is empty and this
+        # is simply ``current``'s position — the B-10 fallback, unchanged.
+        target_position = current.position if current else None
 
         global_index = None
         if target_position is not None:

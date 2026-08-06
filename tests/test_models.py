@@ -695,3 +695,131 @@ def test_side_index_is_frozen():
     si = SideIndex.from_tracklist([TracklistEntry("A1", "Only")], "Only")
     with pytest.raises(Exception):
         si.track_display = "B2"  # frozen dataclass → FrozenInstanceError
+
+
+# ---------------------------------------------------------------------------
+# Wave 5 Unit 1 — META-8 / META-9 / MUT-16 (v1.5.6)
+#
+# META-8: side_position is a NUMERIC-SORT ordinal within the side, not the
+#         tracklist ROW order — so "NN OF MM" stays coherent (N <= M) even when
+#         a Discogs release lists its rows out of sequence.
+# META-9: _SIDE_RE tolerates common separators (A-1, A.1, A 1) and surrounding
+#         whitespace ("A1 "); bare letters ("A") and CD-style ("1-01") do NOT
+#         fabricate a vinyl side — they fall back to raw-position display.
+# MUT-16: the redundant side-loop that recomputed target_position is deleted;
+#         a repeated title still resolves to its FIRST occurrence (conservative).
+# ---------------------------------------------------------------------------
+
+# --- META-8: numeric-sort ordinal --------------------------------------------
+
+def test_side_position_uses_numeric_sort_not_row_order():
+    """Rows listed out of sequence ([A2, A1]) must still rank A1 as 01 and A2
+    as 02 — the ordinal follows the parsed track NUMBER, not the row index."""
+    tl = [TracklistEntry("A2", "Two"), TracklistEntry("A1", "One")]
+    assert make_side_track("One", tl).side_position == 1
+    assert make_side_track("Two", tl).side_position == 2
+
+def test_side_position_numeric_sort_multi_digit():
+    """Numeric (not lexical) ordering: A2 precedes A10, so A10 is the 3rd of 3."""
+    tl = [
+        TracklistEntry("A1", "First"),
+        TracklistEntry("A10", "Tenth"),
+        TracklistEntry("A2", "Second"),
+    ]
+    assert make_side_track("First", tl).side_position == 1
+    assert make_side_track("Second", tl).side_position == 2
+    assert make_side_track("Tenth", tl).side_position == 3
+
+def test_side_position_out_of_order_keeps_caption_coherent():
+    """The bug META-8 fixes end-to-end: out-of-order rows must never yield a
+    position greater than the side total (N <= M in 'NN OF MM')."""
+    tl = [TracklistEntry("B3", "Gamma"), TracklistEntry("B1", "Alpha"),
+          TracklistEntry("B2", "Beta")]
+    for title in ("Alpha", "Beta", "Gamma"):
+        t = make_side_track(title, tl)
+        assert t.side_position <= t.side_total
+
+
+# --- META-9: relaxed separators + whitespace ---------------------------------
+
+def test_side_re_matches_separated_positions():
+    for raw, num in (("A-1", "1"), ("A.1", "1"), ("A 1", "1"), ("A - 1", "1")):
+        m = _SIDE_RE.match(raw)
+        assert m and m.group(1) == "A" and m.group(2) == num, raw
+
+def test_side_re_tolerates_surrounding_whitespace():
+    m = _SIDE_RE.match(" A1 ")
+    assert m and m.group(1) == "A" and m.group(2) == "1"
+
+def test_side_re_still_rejects_bare_letter_and_cd_style():
+    assert _SIDE_RE.match("A") is None          # no track number → no fabricated side
+    assert _SIDE_RE.match("1-01") is None        # CD-style, leading digit → not a vinyl side
+    assert _SIDE_RE.match("1") is None
+
+def test_side_letter_and_position_for_separated_format():
+    tl = [TracklistEntry("A-1", "One"), TracklistEntry("A-2", "Two"),
+          TracklistEntry("B-1", "Three")]
+    a1 = make_side_track("One", tl)
+    assert a1.side_letter == "A"
+    assert a1.side_position == 1
+    assert a1.side_total == 2
+    assert make_side_track("Three", tl).side_letter == "B"
+
+def test_track_display_strips_surrounding_whitespace():
+    tl = [TracklistEntry("A1 ", "One"), TracklistEntry("A2", "Two")]
+    t = make_side_track("One", tl)
+    assert t.track_display == "A1"        # stripped, no trailing space in caption
+    assert t.side_letter == "A"
+    assert t.side_position == 1
+
+def test_cd_style_position_falls_back_gracefully():
+    """CD-style '1-01' has no vinyl side: no side_letter, no side ordinal, but
+    the raw position is still available for display."""
+    tl = [TracklistEntry("1-01", "One"), TracklistEntry("1-02", "Two")]
+    t = make_side_track("One", tl)
+    assert t.side_letter is None
+    assert t.side_position is None
+    assert t.side_total is None
+    assert t.track_display == "1-01"      # graceful raw-position fallback
+    # global adjacency still works via the plain title match (B-10 path)
+    assert t.next_track_title == "Two"
+
+
+# --- MUT-16: repeated title resolves to first occurrence (guard) -------------
+
+def test_reprise_resolves_to_first_occurrence():
+    """A title repeated across sides resolves to its FIRST occurrence — the
+    conservative failure mode (is_last_track stays False for a genuine closer
+    that duplicates an earlier title).  Guards MUT-16's simplification."""
+    tl = [TracklistEntry("A1", "Reprise"), TracklistEntry("A2", "X"),
+          TracklistEntry("B1", "Reprise")]
+    r = SideIndex.from_tracklist(tl, "Reprise")
+    assert r.global_index == 0            # first occurrence (A1), not the B1 closer
+    assert r.is_last_track is False
+    assert r.next_track_title == "X"
+    assert r.prev_track_title is None
+
+
+# --- META-9 hardening: word-label rows must NOT fabricate a vinyl side -------
+# (2nd-pass rework: bounding the side letter run to {1,2} keeps A/AA parsing but
+#  stops the relaxed whitespace tolerance from matching "Video 1"/"Bonus 2".)
+
+def test_side_re_rejects_word_label_rows():
+    for raw in ("Video 1", "Bonus 2", "Disc 1", "DVD 1", "Making 1", "VIDEO1"):
+        assert _SIDE_RE.match(raw) is None, raw
+
+def test_side_re_still_matches_doubled_side_letters():
+    for raw, letter, num in (("AA3", "AA", "3"), ("BB1", "BB", "1"),
+                             ("AA-3", "AA", "3"), ("AA 3", "AA", "3")):
+        m = _SIDE_RE.match(raw)
+        assert m and m.group(1) == letter and m.group(2) == num, raw
+
+def test_word_label_row_falls_back_gracefully():
+    tl = [TracklistEntry("A1", "Real Song"), TracklistEntry("Video 1", "Bonus Clip")]
+    v = make_side_track("Bonus Clip", tl)
+    assert v.side_letter is None
+    assert v.side_position is None
+    assert v.side_total is None
+    assert v.track_display == "Video 1"
+    # and it must not have contaminated the real A-side total
+    assert make_side_track("Real Song", tl).side_total == 1
