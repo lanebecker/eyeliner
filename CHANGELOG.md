@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.4] — 2026-08-06
+
 **Code-review hardening, round 3 (Wave 3 — untrusted input & credential
 hardening).** Wave 3 of the same audit (`CODE_REVIEW_2026-07-30.md`): the gaps
 around untrusted-input handling and credential safety, plus the guard paths the
