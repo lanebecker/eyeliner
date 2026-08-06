@@ -48,6 +48,30 @@ yet.
   re-opening and decoding the same file, halving the per-cover decode cost
   (once per unique album; the palette is memoized by URL). The validate-only
   download path is unchanged.
+- **Non-Latin metadata no longer renders as reversed / mis-spaced glyphs
+  (DISP-5 #129 — LOW).** `_render_tracked` drew every label one codepoint at a
+  time with a manual advance to apply letter-spacing — which silently destroys
+  text shaping for complex scripts (Arabic joining, Devanagari conjuncts,
+  floating combining marks, emoji ZWJ clusters). It draws the meta footer
+  (year · label · catalog) and the genre chips, both fed by stranger-editable
+  Discogs free text, so a Japanese/Arabic/Cyrillic label name came out as
+  unshaped, mis-spaced, possibly reversed glyphs. ASCII labels keep their exact
+  designed tracking; any non-ASCII string is now rendered as a single shaped run
+  (letting SDL_ttf shape it) with no manual tracking. RED-first; cold review
+  SPEC / QUALITY PASS.
+- **A run-on title or artist name no longer runs off the right edge of the
+  screen (DISP-7 #131 — LOW).** `_wrap_lines` emitted any single token wider
+  than the column as one un-broken line (and `_fit_wrapped` can't shrink a
+  one-token line below the point it fits), while `_draw_wrapped_text` blitted
+  with no horizontal clip — so a 120-character unbroken Discogs title was
+  truncated by the display edge rather than the layout. Over-wide tokens are now
+  character-broken into fitting chunks (consistent with the existing
+  shrink-not-ellipsis product decision — the whole string still shows, wrapped),
+  and the blit is clipped to the column width as a backstop for the residual
+  single-glyph-wider-than-column case. `_wrap_lines` stays the single source of
+  truth shared by drawing and measurement, so they can't disagree. Verified no
+  character is lost, duplicated, or reordered, and the wrap terminates even on a
+  degenerate zero/negative width. RED-first; cold review SPEC / QUALITY PASS.
 
 ### Security
 
