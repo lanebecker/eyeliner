@@ -72,6 +72,21 @@ yet.
   A new perf test proves the per-frame accent re-clamp keeps the palette-lerp
   cache-key count bounded (P-4 intact: 36 distinct palettes across a transition,
   flat as frame count rises).
+- **The real `DisplayRenderer` is now constructed and exercised in tests, not
+  just `__new__`'d around (TQ-1 #128 — MEDIUM).** Every renderer test built its
+  subject with `DisplayRenderer.__new__(...)` and hand-assigned attributes, so
+  `__init__`, `start()`, `_on_state_change` and the `_render()` status dispatch
+  were **0% executed** — an `__init__` refactor that dropped
+  `self.state.on_change(self._on_state_change)` would ship green while the Pi
+  showed the boot card and then froze forever. New `test_renderer_lifecycle.py`
+  builds the real object under `SDL_VIDEODRIVER=dummy`: it asserts (behaviorally,
+  through a real `set_status` → Signal → handler) that construction wires the
+  state subscription; table-drives `_render()` across every `PlayerStatus`
+  (IDLE / LISTENING / ERROR / PLAYING-with-track / PLAYING-without-track →
+  boot); and smoke-tests `start()` creating a headless surface. Proven by
+  mutation: dropping the subscription, or misrouting a dispatch arm, fails the
+  new tests while the entire prior renderer suite (59 tests) stays green — the
+  exact blind spot the finding named. Test-only; no production change.
 
 ## [1.5.4] — 2026-08-06
 
