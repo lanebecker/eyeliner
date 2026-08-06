@@ -19,6 +19,7 @@ no display.
 """
 
 import io
+import ipaddress
 import os
 import time
 import warnings
@@ -162,6 +163,48 @@ def test_validated_public_ip_fails_closed_on_empty(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# SEC-5 — NAT64 / 6to4 embedded-IPv4 re-classification (version-independent)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("v6", ["64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::"])
+def test_validated_public_ip_rejects_nat64_and_6to4_of_internal(monkeypatch, v6):
+    # A NAT64 (64:ff9b::/96) or 6to4 (2002::/16) address wrapping 169.254.169.254
+    # (the cloud metadata IP) must be rejected. On Python ≥3.11.9 the generic
+    # battery already rejects these prefixes (is_reserved / is_private); this pins
+    # the security OUTCOME regardless of which check fires. (SEC-5 / #122)
+    monkeypatch.setattr(
+        cc.socket, "getaddrinfo",
+        lambda *a, **k: [(10, 1, 6, "", (v6, 0, 0, 0))],
+    )
+    assert cc._validated_public_ip("i.discogs.com") is None
+
+
+def test_embedded_ipv4_decodes_nat64_and_6to4():
+    # The embedded-IPv4 decoder is what makes the guard version-INDEPENDENT: it
+    # re-classifies the wrapped IPv4 even on a Python that does not flag the
+    # prefix. Pinned directly, because on ≥3.11.9 the generic battery rejects the
+    # prefix first and the end-to-end path never reaches the embedded check.
+    nat64 = ipaddress.ip_address("64:ff9b::a9fe:a9fe")
+    sixto4 = ipaddress.ip_address("2002:a9fe:a9fe::")
+    assert cc._embedded_ipv4(nat64) == ipaddress.IPv4Address("169.254.169.254")
+    assert cc._embedded_ipv4(sixto4) == ipaddress.IPv4Address("169.254.169.254")
+    # NAT64 wrapping a PUBLIC v4 decodes to it (the re-classifier would allow it);
+    # a plain global v6 or any v4 has nothing embedded.
+    assert cc._embedded_ipv4(ipaddress.ip_address("64:ff9b::8.8.8.8")) == \
+        ipaddress.IPv4Address("8.8.8.8")
+    assert cc._embedded_ipv4(ipaddress.ip_address("2606:4700::1111")) is None
+    assert cc._embedded_ipv4(ipaddress.ip_address("93.184.216.34")) is None
+
+
+def test_is_disallowed_ip_matches_the_battery():
+    # Guards the refactor that extracted the inline classification into a helper:
+    # it must reject internal/dangerous space and accept a genuine global address.
+    for bad in ["169.254.169.254", "127.0.0.1", "10.0.0.1", "224.0.0.1", "::1", "0.0.0.0"]:
+        assert cc._is_disallowed_ip(ipaddress.ip_address(bad)) is True
+    assert cc._is_disallowed_ip(ipaddress.ip_address("93.184.216.34")) is False
+
+
+# ---------------------------------------------------------------------------
 # _host_resolves_to_public_ip — thin yes/no predicate over the above
 # ---------------------------------------------------------------------------
 
@@ -249,12 +292,23 @@ def test_open_cover_stream_dials_ip_but_tls_for_hostname(monkeypatch):
         def __init__(self, host, **kwargs):
             captured["host"] = host
             captured["kwargs"] = kwargs
+            captured["closed"] = False
 
         def urlopen(self, method, path, **kwargs):
             captured["method"] = method
             captured["path"] = path
             captured["urlopen_kwargs"] = kwargs
             return "SENTINEL_RESPONSE"
+
+        def close(self):
+            captured["closed"] = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
 
     monkeypatch.setattr(cc.urllib3, "HTTPSConnectionPool", _FakePool)
 
@@ -279,6 +333,9 @@ def test_open_cover_stream_dials_ip_but_tls_for_hostname(monkeypatch):
     # though the on-disk file stays bounded. Stream, never preload.
     assert captured["urlopen_kwargs"]["preload_content"] is False
     assert captured["urlopen_kwargs"]["decode_content"] is False     # raw bytes, no re-inflation
+    # STAB-3: the single-use pool is closed (context-managed), not leaked — a
+    # streaming response keeps its own connection and survives pool.close().
+    assert captured["closed"] is True
 
 
 def test_real_https_pool_forwards_the_s7_pinning_kwargs():

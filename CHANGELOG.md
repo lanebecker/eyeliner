@@ -70,6 +70,18 @@ field and the appliance.
   rather than the finding's `session.request` suggestion; all six in-tree callers
   pass uppercase `"GET"`/`"POST"` literals, so nothing breaks.) RED-first;
   mutation-pinned; cold review SPEC / QUALITY PASS.
+- **The per-hop cover-art connection pool is closed instead of leaked (STAB-3,
+  #123 — LOW).** `_open_cover_stream` built a fresh `urllib3.HTTPSConnectionPool`
+  per redirect hop as a local and never closed it; `download()`'s `finally` only
+  released the connection back to a pool nobody would reuse. No fd leak was
+  measured, but every cover paid a full TCP+TLS handshake and pool objects
+  churned. The pool is now context-managed (`with … as pool:`) and closed as
+  soon as the streaming response is checked out — the response keeps its own
+  connection and streams fine after close (verified end-to-end against a real
+  localhost server: 300 KB streamed post-close, and `release_conn()` is safe
+  against the closed pool). RED-first (a `closed` assertion fails on the old
+  code); cold review SPEC / QUALITY PASS. The finding's optional keyed-pool cache
+  (connection reuse) was deliberately deferred.
 
 ### Security
 
@@ -114,6 +126,21 @@ field and the appliance.
   protocol-relative, `?`-only, root path) — no query/credential/host leaks; the
   username-masking + query-drop still hold on a normal path. RED-first;
   mutation-pinned; cold review SPEC / QUALITY PASS.
+- **The SSRF IP classifier decodes and re-checks the IPv4 embedded in NAT64 /
+  6to4 addresses, independent of the Python version (SEC-5, #122 — LOW).** A
+  NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) address can wrap an internal IPv4
+  (e.g. `169.254.169.254`). Modern CPython (≥3.11.9 / ≥3.9.19, via gh-113171)
+  already flags these prefixes as `is_reserved` / `is_private`, so the existing
+  battery rejects them on the app's runtime (Python 3.11) — the finding's
+  "classifies as global and would be pinned" premise was measured false there,
+  so this was not a live hole. But a security boundary should not depend on the
+  stdlib's version-specific handling of exotic ranges, so the classifier now also
+  decodes the embedded IPv4 (`_embedded_ipv4`) and re-runs the same battery
+  (`_is_disallowed_ip`, extracted verbatim from the inline checks) on it —
+  rejecting an internal wrap on ANY Python. The decoder is pinned directly (on
+  ≥3.11.9 the generic battery short-circuits the embedded check, so it is
+  belt-and-suspenders there). Cold review SPEC / QUALITY PASS; no encoding
+  (IPv4-mapped v6, NAT64, 6to4, mixed answer sets) pins an internal IP.
 
 ### Tests
 
