@@ -28,35 +28,9 @@ class MetadataSource(Enum):
 # letter "A" (no number) and CD-style "1-01" (leading digit) already do.
 _SIDE_RE = re.compile(r"^\s*([A-Za-z]{1,2})\s*[.\-]?\s*(\d+)\s*$")
 
-
-@dataclass
-class DisplayPalette:
-    """5-color palette for dynamic theming, extracted from album art.
-
-    All values are (R, G, B) tuples in 0-255 range.
-
-    Matches the palette schema from the Claude Design mockups:
-      bg      — main background tint (very dark, ~15-22% lightness)
-      surface — slightly lighter card/panel tone for radial gradient
-      accent  — vibrant extracted color (divider line, album name, badge borders)
-      text    — primary text color (near-white, slightly tinted)
-      muted   — secondary/meta text color (medium gray, slightly tinted)
-    """
-    bg: tuple
-    surface: tuple
-    accent: tuple
-    text: tuple
-    muted: tuple
-
-
-# Used when no cover art is available or palette extraction fails.
-FALLBACK_PALETTE = DisplayPalette(
-    bg=(10, 10, 10),
-    surface=(22, 22, 22),
-    accent=(200, 200, 200),
-    text=(235, 230, 220),
-    muted=(138, 133, 124),
-)
+# NOTE: DisplayPalette + FALLBACK_PALETTE moved to src/display/palette.py (ARCH-7)
+# — they are pure display types with no consumer in src/metadata, so they belong
+# in the display layer beside extract_palette(), not up here in the model layer.
 
 
 @dataclass(frozen=True)

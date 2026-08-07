@@ -57,12 +57,14 @@ _ALBUM_CACHE_MAX = 64
 class MetadataResolver:
     """Resolves a RawRecognitionResult into a full TrackMetadata."""
 
-    def __init__(self, reader: "DiscogsReader"):
+    def __init__(self, reader: "DiscogsReader", coverart=None):
         # A-4: the resolver depends only on the read half of Discogs, injected
         # at the composition root (main.py) — it no longer owns a God client the
         # tracker has to reach into (the old A-3 `resolver.discogs` back-channel).
         self.reader = reader
-        self.coverart = CoverArtFallback()
+        # ARCH-8: optional injection seam — defaults to the real CoverArtFallback,
+        # but a test can pass a substitute instead of overwriting the attribute.
+        self.coverart = coverart if coverart is not None else CoverArtFallback()
         # (artist_lower, album_lower) → (MetadataSource, payload)
         #   payload is the Discogs result dict for Discogs tiers,
         #   or the cover art URL (Optional[str]) for FALLBACK.

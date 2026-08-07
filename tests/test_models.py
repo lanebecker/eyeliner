@@ -7,8 +7,9 @@ import pytest
 
 from src.metadata.models import (
     MetadataSource, TracklistEntry, TrackMetadata, PlaySession,
-    DisplayPalette, FALLBACK_PALETTE, SideIndex, _SIDE_RE,
+    SideIndex, _SIDE_RE,
 )
+from src.display.palette import DisplayPalette, FALLBACK_PALETTE  # moved out of models (ARCH-7)
 
 
 # ---------------------------------------------------------------------------

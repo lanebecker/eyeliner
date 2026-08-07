@@ -87,3 +87,13 @@ def test_start_creates_a_headless_surface(tmp_path):
         assert r._screen.get_size() == (1024, 600)
     finally:
         pygame.display.quit()
+
+
+def test_cover_store_can_be_injected(tmp_path):
+    """ARCH-8: an injected cover store is used verbatim, so tests/composition
+    root can substitute one without monkeypatching the private attribute."""
+    from unittest.mock import MagicMock
+    state = PlayerState()
+    sentinel = MagicMock(name="fake-cover-store")
+    r = DisplayRenderer(_config(tmp_path), state, cover_store=sentinel)
+    assert r._cover_store is sentinel

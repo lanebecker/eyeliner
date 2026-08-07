@@ -470,3 +470,11 @@ async def test_cache_is_bounded(resolver, mock_discogs):
         await resolver.resolve(make_raw(album=f"Album {i}"))
 
     assert len(resolver._album_cache) == _ALBUM_CACHE_MAX
+
+
+def test_coverart_can_be_injected():
+    """ARCH-8: an injected CoverArtFallback is used verbatim."""
+    from src.metadata.resolver import MetadataResolver
+    sentinel = MagicMock(name="fake-coverart")
+    resolver = MetadataResolver(MagicMock(), coverart=sentinel)
+    assert resolver.coverart is sentinel

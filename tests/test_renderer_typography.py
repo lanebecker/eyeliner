@@ -32,7 +32,7 @@ from src.display.renderer import (  # noqa: E402
 )
 from src.display.palette import contrast_ratio, ensure_contrast
 from src.display.layouts import get_now_playing_layout  # noqa: E402
-from src.metadata.models import FALLBACK_PALETTE  # noqa: E402
+from src.display.palette import FALLBACK_PALETTE  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

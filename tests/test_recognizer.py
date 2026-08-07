@@ -822,3 +822,16 @@ def test_same_track_still_distinguishes_different_titles():
     a = make_raw(title="Song One", artist="X")
     b = make_raw(title="Song Two", artist="X")
     assert RecognitionLoop._same_track(a, b) is False
+
+
+def test_backend_can_be_injected():
+    """ARCH-8: an injected backend is used verbatim and _init_backend is not
+    consulted (the caller owns the choice)."""
+    from unittest.mock import MagicMock, patch
+    config = make_recognition_config()
+    state = MagicMock()
+    fake_backend = MagicMock(name="fake-backend")
+    with patch.object(RecognitionLoop, "_init_backend",
+                      side_effect=AssertionError("_init_backend must not run when a backend is injected")):
+        loop = RecognitionLoop(config, state, AsyncMock(), backend=fake_backend)
+    assert loop.backend is fake_backend

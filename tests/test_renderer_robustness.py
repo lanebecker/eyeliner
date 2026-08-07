@@ -24,7 +24,7 @@ from src.display.renderer import (  # noqa: E402
 from src.display.cover_cache import CoverArtCache  # noqa: E402
 from src.display.palette import extract_palette  # noqa: E402
 from src.display.layouts import get_now_playing_layout, Rect  # noqa: E402
-from src.metadata.models import DisplayPalette, FALLBACK_PALETTE  # noqa: E402
+from src.display.palette import DisplayPalette, FALLBACK_PALETTE  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -694,3 +694,15 @@ def test_static_frame_recomposes_when_cover_version_bumps(tmp_path):
     key_after = r._static_key
 
     assert key_before != key_after  # the static frame recomposed (B-22)
+
+
+def test_draw_genre_chips_requires_chips_rect():
+    """ARCH-9: chips_rect is a REQUIRED parameter now — the dead
+    layout.genre_chips fallback (never taken; the sole caller always passes a
+    rect) was removed. Omitting it must fail loudly, not silently fall back."""
+    import pygame
+    r = make_renderer()
+    layout = get_now_playing_layout(1024, 600)
+    target = pygame.Surface((1024, 600), pygame.SRCALPHA)
+    with pytest.raises(TypeError):
+        r._draw_genre_chips(target, ["Rock"], layout, FALLBACK_PALETTE)
