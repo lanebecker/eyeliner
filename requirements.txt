@@ -43,3 +43,4 @@ pylast>=5.1.0
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 pytest-cov>=4.1.0  # used by the documented `pytest --cov` coverage command (TQ-9)
+pytest-timeout>=2.1.0  # global per-test timeout so an infinite-loop regression fails fast, not hangs CI (#174)
