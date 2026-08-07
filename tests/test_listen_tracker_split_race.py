@@ -140,3 +140,37 @@ async def test_real_session_ended_for_current_session_credits_once():
 
     assert tracker._session is None
     writer.increment_play_count.assert_called_once_with(111, 222)
+
+
+@pytest.mark.asyncio
+async def test_non_creditable_split_skips_finalize_and_the_lock(monkeypatch):
+    """#166: a mid-album swap whose split-off session never reached its last track
+    has nothing to credit or love (potential_last_track is a necessary condition
+    for BOTH in _finalize_session), so it must NOT take _finalize_lock — that lock
+    is awaited inline on the recognition pipeline and could briefly stall the queue
+    behind an unrelated in-flight credit. The non-creditable split must skip
+    finalize entirely; a creditable split (covered elsewhere) still finalizes."""
+    tracker, writer = make_tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    finalized = []
+    orig = tracker._finalize_detached
+
+    async def spy(session):
+        finalized.append(session)
+        await orig(session)
+    monkeypatch.setattr(tracker, "_finalize_detached", spy)
+
+    # Record A: a NON-last track → the A session never reaches potential_last_track.
+    await tracker.on_track_identified(
+        make_track("Catholic Block", release_id=111, instance_id=222)
+    )
+    assert tracker._session.potential_last_track is False
+    # Record B dropped → album change → split. The detached A session is
+    # non-creditable, so finalize (and its lock) must be skipped.
+    await tracker.on_track_identified(
+        make_track("So What", release_id=999, instance_id=888)
+    )
+
+    assert finalized == []                       # non-creditable split → no finalize, no lock
+    writer.increment_play_count.assert_not_called()

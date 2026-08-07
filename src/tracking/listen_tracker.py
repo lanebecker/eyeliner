@@ -576,10 +576,22 @@ class ListenTracker:
         # CONC-2: credit the split-off session OUTSIDE the lifecycle lock, so the
         # NEXT record's session start (under the lock above) is never blocked by a
         # slow write.  This is still awaited inline by the recognition pipeline and
-        # takes `_finalize_lock` UNCONDITIONALLY, so a split commit can briefly wait
-        # here behind an unrelated in-flight credit — bounded by the retry window,
-        # far smaller and rarer than the pre-CONC-2 whole-pipeline stall, but not
-        # zero even for a non-creditable mid-album swap (which does no write yet
-        # still takes the lock).  #166 tracks skipping the lock in that case.
-        if detached is not None:
+        # `_finalize_detached` takes `_finalize_lock`, so a creditable split can
+        # briefly wait here behind an unrelated in-flight credit — bounded by the
+        # retry window, far smaller and rarer than the pre-CONC-2 whole-pipeline
+        # stall.
+        #
+        # #166: but the COMMON mid-album swap detaches a session that never reached
+        # its last track — nothing to credit or love — and finalizing it would
+        # still take the lock (and could stall the queue) to do only logging.
+        # `potential_last_track` is a NECESSARY condition for BOTH the Play Count
+        # credit and the Last.fm love in `_finalize_session`, so short-circuit the
+        # non-creditable case here and never touch the lock. A creditable split
+        # (its closer played right before the swap — rare) still finalizes below.
+        if detached is not None and detached.potential_last_track:
             await self._finalize_detached(detached)
+        elif detached is not None:
+            log.debug(
+                "Split-off session reached no last track — nothing to credit; "
+                "skipping finalize and its lock (#166)."
+            )
