@@ -180,6 +180,13 @@ class AudioConfig:
         # that overlap >= chunk crashes is incorrect: that path is guarded.
         _check(overlap_seconds is None or overlap_seconds >= 0,
                f"  • {s}.overlap_seconds: must be >= 0, got {overlap_seconds!r}", errors)
+        # #168 (CRIT-1 domain-sweep sibling): a 0 or negative end-of-session timer
+        # makes SESSION_ENDED fire on the FIRST silence tick after any
+        # MUSIC_STOPPED — ending the session (and crediting the Play Count)
+        # essentially the instant the music pauses. Reject it here, in the same
+        # aggregated block, rather than letting it silently mis-behave at runtime.
+        _check(session_end_silence_seconds is None or session_end_silence_seconds > 0,
+               f"  • {s}.session_end_silence_seconds: must be > 0, got {session_end_silence_seconds!r}", errors)
 
         return cls(
             device_name=device_name,

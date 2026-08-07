@@ -313,6 +313,10 @@ import pytest as _pytest
     ("audio", "sample_rate", -1, "audio.sample_rate"),
     ("audio", "chunk_seconds", 0, "audio.chunk_seconds"),
     ("audio", "overlap_seconds", -5, "audio.overlap_seconds"),   # hop > chunk → crash
+    # #168 (CRIT-1 domain-sweep sibling): a 0/negative session-end timer fires
+    # SESSION_ENDED on the first tick after any MUSIC_STOPPED.
+    ("audio", "session_end_silence_seconds", 0, "audio.session_end_silence_seconds"),
+    ("audio", "session_end_silence_seconds", -3, "audio.session_end_silence_seconds"),
     ("display", "width", 0, "display.width"),
     ("display", "height", 0, "display.height"),
     ("recognition", "poll_interval_seconds", 0, "recognition.poll_interval_seconds"),
