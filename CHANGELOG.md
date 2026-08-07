@@ -10,10 +10,11 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 ## [Unreleased]
 
 **Code-review hardening, round 3 (Wave 5 — metadata, Discogs reliability &
-audio-capture coverage).** Wave 5 of the same audit
-(`CODE_REVIEW_2026-07-30.md`): tightening how a track's position within its
-album is parsed and ranked, closing gaps in the Discogs read/write layer, and
-covering the audio-capture safety net that has never run on real hardware.
+the audio pipeline).** Wave 5 of the same audit (`CODE_REVIEW_2026-07-30.md`):
+tightening how a track's position within its album is parsed and ranked,
+closing gaps in the Discogs read/write layer, covering the audio-capture safety
+net that has never run on real hardware, and hardening the recognizer/silence
+path against malformed Shazam responses and cross-session state bleed.
 
 ### Fixed
 
@@ -166,6 +167,53 @@ The audio-capture cluster (Unit 3a):
   `pytest_sessionfinish` hook that removes only a stub it planted. Consequence,
   by design: the two test modules are no longer bare-`import`-able outside a
   pytest run (they were only ever run under pytest).
+
+The recognizer/silence cluster (Unit 3b):
+
+### Fixed
+
+- **A JSON-null album section no longer discards an otherwise-valid track
+  identification (REC-5 #154 — LOW).** Shazam returns the album under an
+  optional `sections`/`metadata` structure, and a response with `"sections":
+  null` (or `"metadata": null`) made `_parse_shazam`'s album lookup raise
+  `TypeError` — which `recognize()`'s broad except then swallowed, discarding a
+  correct title AND artist as a plain miss (six such chunks in a row would show
+  "NO MATCH FOUND" for a track Shazam identified every time). The lookup now
+  guards `track.get("sections") or []` / `section.get("metadata") or []` (a
+  present-but-null key returns `None`, not the `.get` default) and is wrapped in
+  its own try/except so any other malformed album shape logs and leaves the
+  album blank rather than sinking the match. RED-first; mutation-verified
+  (the clean null-guard path and the last-resort try/except are pinned
+  separately).
+- **A track's confirmation health counters no longer carry across a needle lift
+  (PCONC-3 #152 — LOW).** `_miss_count` (which gates the LISTENING "NO MATCH
+  FOUND" screen) and `_churn_count` (the churn breadcrumb) persisted across a
+  session boundary, so a fresh side inherited the previous side's streak and
+  could surface ERROR on fewer of its own chunks. They now reset when a chunk's
+  session epoch differs from the last (a `_last_epoch` check); epochs only
+  increase and chunks are handled oldest-first, so it fires once per real
+  boundary. (The *pending* candidate was already voided across a boundary by
+  the earlier REC-1-review logic — measured — so this closes the remaining
+  miss/churn half.) RED-first; mutation-verified.
+
+### Changed
+
+- **`_same_track` is now genuinely whitespace-insensitive, as its docstring
+  always claimed (REC-4 #159 — NIT).** It normalized only leading/trailing
+  whitespace, so Shazam's subtly different internal spacing for the same track
+  ("My  Song" vs "My Song") compared unequal and forced a needless
+  re-resolve / re-scrobble — the exact churn the docstring said it prevented.
+  It now normalizes with `" ".join(s.split()).casefold()`, collapsing internal
+  whitespace runs and folding case Unicode-aware. RED-first; mutation-verified.
+- **Corrected the `AudioEvent.MUSIC_STOPPED` documentation (SIL-3 #155 — LOW).**
+  Its comment called it an "inter-track gap," but RMS is computed over the whole
+  ~15s window, so a 2–6s gap between tracks stays far above threshold and can
+  never trip it — the event only fires when the entire window goes quiet, which
+  arms the end-of-session timer. The inline comment and the class docstring now
+  describe that accurately (and note the member currently has no external
+  consumer — it is the internal music→silence transition marker). Kept over
+  deleting the member (Lane's call): zero test churn and it remains a semantic
+  hook. Comment-only, no behaviour change.
 
 ## [1.5.5] — 2026-08-06
 

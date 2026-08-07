@@ -31,7 +31,7 @@ _MUSIC_EXIT_RATIO = 0.5
 
 class AudioEvent(Enum):
     MUSIC_STARTED = auto()
-    MUSIC_STOPPED = auto()   # Short silence — inter-track gap
+    MUSIC_STOPPED = auto()   # Whole window went quiet → end-of-session timer armed (SIL-3)
     SESSION_ENDED = auto()   # Long silence — side/album finished
 
 
@@ -40,7 +40,13 @@ class SilenceDetector:
 
     Events:
         MUSIC_STARTED  — first music chunk after silence
-        MUSIC_STOPPED  — RMS drops below threshold
+        MUSIC_STOPPED  — the whole trailing chunk_seconds window dropped below
+                         the exit threshold (music → silence); this arms the
+                         end-of-session timer.  NOT an inter-track gap: the RMS
+                         is computed over the ENTIRE window, so a short 2–6s gap
+                         between tracks stays well above threshold and cannot
+                         trip it (SIL-3).  Has no external consumer today — it is
+                         the internal music→silence transition marker.
         SESSION_ENDED  — silence persists beyond session_end_silence_seconds
     """
 

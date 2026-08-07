@@ -160,14 +160,25 @@ class ShazamIOBackend(RecognizerBackend):
         # null) coerces to "" instead of None — a null metadata `title` would
         # otherwise crash `.lower()` here, and a null `text` would put None into
         # `album`.
+        # REC-5: album is OPTIONAL, so its parse must never sink an otherwise-valid
+        # title/artist match. `… or []` handles a JSON-null `sections`/`metadata`
+        # (key present, value null → `.get(k, [])` returns None, not the default,
+        # so `for … in None` would raise TypeError and recognize()'s broad except
+        # would discard the whole response as a miss). The try/except is a second
+        # line of defence against any other malformed album shape: on failure we
+        # log and leave `album == ""` rather than losing the match.
         album = ""
-        for section in track.get("sections", []):
-            for meta in section.get("metadata", []):
-                if (meta.get("title") or "").lower() == "album":
-                    album = meta.get("text") or ""
+        try:
+            for section in track.get("sections") or []:
+                for meta in section.get("metadata") or []:
+                    if (meta.get("title") or "").lower() == "album":
+                        album = meta.get("text") or ""
+                        break
+                if album:
                     break
-            if album:
-                break
+        except Exception as e:
+            log.warning(f"Shazam album parse failed; keeping title/artist match: {e!r}")
+            album = ""
 
         # REC-2: coerce a JSON-null subtitle to "" (was None) — otherwise
         # _same_track's `artist.strip()` raises AttributeError inside
@@ -232,6 +243,11 @@ class RecognitionLoop:
         # session_epoch via clear()), so a leftover count can't let a single
         # spurious hit confirm a stale track into the NEXT record's session.
         self._pending_epoch: int = 0
+        # PCONC-3: the epoch of the last chunk _handle_result saw, so a session
+        # boundary (needle lift → session_epoch bump) can reset the per-session
+        # health counters below. Epochs only increase and chunks are handled
+        # oldest-first, so this changes once per real boundary, not on churn.
+        self._last_epoch: int = 0
         self._miss_count: int = 0
         # Consecutive unconfirmable non-None results (alternating matches that
         # never reach confirmation_required).  Purely diagnostic — it leaves a
@@ -353,12 +369,23 @@ class RecognitionLoop:
         """
         if a is None or b is None:
             return False
+
+        # REC-4: normalize whitespace-insensitively (as the docstring promises),
+        # not just at the ends. Shazam returns subtly different INTERNAL spacing
+        # for the same track between chunks ("My  Song" vs "My Song"); `.strip()`
+        # alone left those comparing unequal, forcing a needless re-resolve /
+        # re-scrobble. `" ".join(s.split())` collapses every run of whitespace
+        # (and trims the ends), and `.casefold()` is the Unicode-aware
+        # case-fold (stronger than `.lower()`) for the comparison.
         # REC-2: `… or ""` guards a None title/artist defensively — the parser now
         # coerces both (title via REC-3, artist here), but a None slipping in from
         # any future source must compare as empty, never crash the dedup.
+        def _norm(s: Optional[str]) -> str:
+            return " ".join((s or "").split()).casefold()
+
         return (
-            (a.title or "").strip().lower() == (b.title or "").strip().lower()
-            and (a.artist or "").strip().lower() == (b.artist or "").strip().lower()
+            _norm(a.title) == _norm(b.title)
+            and _norm(a.artist) == _norm(b.artist)
         )
 
     async def _handle_result(self, result: Optional[RawRecognitionResult], epoch: int = 0):
@@ -379,6 +406,20 @@ class RecognitionLoop:
         ``audio_epoch`` and fails safe, so the worst case is the guard discarding
         live commits (loud missed identifications), never a silent bad write.
         """
+        # PCONC-3: on a session boundary (the epoch changed since the last chunk),
+        # reset the per-session HEALTH counters. `_miss_count` gates the LISTENING
+        # "NO MATCH FOUND" screen and `_churn_count` the churn breadcrumb; both are
+        # about THIS side's recognition, so a streak inherited from the previous
+        # side would surface ERROR (or log churn) on fewer of the new side's own
+        # chunks. The pending candidate is voided separately just below (REC-1),
+        # which also handles a stale SAME-epoch pending; this only adds the health
+        # counters. REC-1's accumulate-across-misses is WITHIN a session (constant
+        # epoch), so it is untouched.
+        if epoch != self._last_epoch:
+            self._miss_count = 0
+            self._churn_count = 0
+            self._last_epoch = epoch
+
         # REC-1 review: void the pending candidate across a SESSION boundary. The
         # pending (result + count) lives on this loop, not the session; a needle
         # lift ends the session and bumps `session_epoch` (clear()), and — now that

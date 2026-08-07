@@ -79,3 +79,48 @@ def test_parse_null_title_is_none():
     # the value is None; parse must treat it as a no-match, not build a result
     # with title=None that later crashes _same_track (null-title half of REC-2).
     assert ShazamIOBackend._parse_shazam({"track": {"title": None, "subtitle": "A"}}) is None
+
+
+# ---------------------------------------------------------------------------
+# REC-5 — a null in the optional album metadata must not sink a valid match.
+# ---------------------------------------------------------------------------
+
+def test_parse_null_sections_keeps_valid_title_artist(caplog):
+    """A JSON-null `sections` is a KNOWN Shazam shape → handled CLEANLY by the
+    `or []` guard (no warning), not swallowed by the album try/except."""
+    import logging
+    r = {"track": {"title": "Real Title", "subtitle": "Real Artist", "sections": None}}
+    with caplog.at_level(logging.WARNING, logger="src.audio.recognizer"):
+        out = ShazamIOBackend._parse_shazam(r)
+    assert out is not None
+    assert out.title == "Real Title"
+    assert out.artist == "Real Artist"
+    assert out.album == ""
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+
+
+def test_parse_null_metadata_keeps_valid_title_artist(caplog):
+    """A JSON-null `metadata` is likewise handled cleanly by the `or []` guard."""
+    import logging
+    r = {"track": {"title": "T", "subtitle": "A", "sections": [{"metadata": None}]}}
+    with caplog.at_level(logging.WARNING, logger="src.audio.recognizer"):
+        out = ShazamIOBackend._parse_shazam(r)
+    assert out is not None
+    assert out.title == "T"
+    assert out.album == ""
+    assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+
+
+def test_parse_malformed_album_section_does_not_sink_match(caplog):
+    """The album try/except is the LAST-resort guard for a genuinely malformed
+    album shape (here a section that isn't a dict): the valid title/artist still
+    return with album="", and a warning is logged (distinguishing it from the
+    clean null-guard path above)."""
+    import logging
+    r = {"track": {"title": "T", "subtitle": "A", "sections": [42]}}
+    with caplog.at_level(logging.WARNING, logger="src.audio.recognizer"):
+        out = ShazamIOBackend._parse_shazam(r)
+    assert out is not None
+    assert out.title == "T"
+    assert out.album == ""
+    assert any("album parse failed" in rec.message for rec in caplog.records)
