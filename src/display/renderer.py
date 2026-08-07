@@ -88,8 +88,9 @@ import os
 import time
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Callable, Optional, Tuple, TYPE_CHECKING
+# NOTE: pathlib.Path is no longer imported here — the only user was the font
+# constants, which moved to typography.py with TextRenderer (ARCH-3).
 
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
@@ -102,6 +103,7 @@ from src.display.palette import (
     GRADIENT_TEXT_PEAK,
 )
 from src.display.cover_cache import CoverArtCache
+from src.display.typography import TextRenderer
 
 if TYPE_CHECKING:
     import pygame
@@ -250,20 +252,8 @@ _EMPTY_STATES = {
 # "display" = hero track (Inter Tight 600), "text" = artist + adjacent names
 # (Inter Tight 500), "title" = album (Newsreader italic 400), "mono" = all
 # labels/metadata (JetBrains Mono 400).
-_FONT_DIR = Path(__file__).parent / "assets" / "fonts"
-_FONT_FILES = {
-    "display": "InterTight-SemiBold.ttf",
-    "text": "InterTight-Medium.ttf",
-    "title": "Newsreader-Italic.ttf",
-    "mono": "JetBrainsMono-Regular.ttf",
-}
-# SysFont fallbacks if a bundled file is missing (name, bold, italic).
-_SYSFONT_FALLBACKS = {
-    "display": ("dejavu sans", True, False),
-    "text": ("dejavu sans", False, False),
-    "title": ("dejavu sans", False, True),
-    "mono": ("dejavu sans mono", False, False),
-}
+# Font files + SysFont fallbacks moved to src/display/typography.py with the
+# TextRenderer that uses them (ARCH-3).
 
 # Letter-spacing (em) per label context now lives on NowPlayingLayout
 # (layouts.py) so a restyle is "edit layouts.py" — see tracking_* fields (A-14).
@@ -486,31 +476,37 @@ class DisplayRenderer:
         pygame.mouse.set_visible(False)
         log.info(f"Display initialized: {self.width}x{self.height} fullscreen={self.fullscreen}")
 
-    def _font(self, role: str, size: int):
-        """Return the bundled font for a role at a pixel size, cached.
+    @property
+    def _text(self) -> TextRenderer:
+        """The typography engine (ARCH-3), composed lazily over THIS renderer's
+        own font/label caches.
 
-        Roles map to the DESIGN.md type hierarchy (see _FONT_FILES).  Loading
-        is lazy and cached per (role, size) in a bounded LRU (`_FONT_CACHE_MAX`);
-        eviction is rare because the working set is small (a fixed handful of
-        sizes).  Falls back to the DejaVu SysFont family if the bundled file is
-        missing, so dev machines and CI without the assets still render.
+        Lazy and built from ``self._font_cache`` / ``self._label_cache`` so the
+        many ``__new__``-skeleton tests that set those two caches and then call
+        the ``_font`` / ``_render_tracked`` / ``_wrap_lines`` … shims below keep
+        working without constructing a TextRenderer themselves.  In normal use
+        ``__init__`` has already set both caches, so the first typography call
+        binds the engine to the real caches (and the same objects the renderer
+        holds, so cache bounds/eviction are unchanged).
         """
-        import pygame
+        impl = self.__dict__.get("_text_impl")
+        # Rebuild if never built OR if either cache object was swapped since
+        # (a __new__-skeleton test may assign a fresh _font_cache/_label_cache
+        # after the engine was first bound) — so the engine always uses THIS
+        # renderer's current caches, never a stale memoized pair.
+        if (
+            impl is None
+            or impl._font_cache is not self._font_cache
+            or impl._label_cache is not self._label_cache
+        ):
+            impl = TextRenderer(self._font_cache, self._label_cache)
+            self.__dict__["_text_impl"] = impl
+        return impl
 
-        key = (role, size)
-        font = self._font_cache.get(key)
-        if font is not None:
-            return font
-
-        path = _FONT_DIR / _FONT_FILES[role]
-        try:
-            font = pygame.font.Font(str(path), size)
-        except (FileNotFoundError, OSError, pygame.error):
-            name, bold, italic = _SYSFONT_FALLBACKS[role]
-            font = pygame.font.SysFont(name, size, bold=bold, italic=italic)
-            log.warning(f"Bundled font missing ({path.name}); using SysFont fallback")
-        self._font_cache.put(key, font)
-        return font
+    # ---- Typography shims: the logic lives in TextRenderer (ARCH-3); these
+    # keep the renderer's existing (role, size) → Surface method surface. ----
+    def _font(self, role: str, size: int):
+        return self._text.font(role, size)
 
     def _on_state_change(self, state: PlayerState):
         """Called by PlayerState whenever anything changes."""
@@ -1184,140 +1180,25 @@ class DisplayRenderer:
     # -----------------------------------------------------------------------
 
     def _render_tracked(self, text: str, size: int, color: tuple, tracking: float):
-        """Render a mono label with letter-spacing, returning a Surface.
-
-        pygame/SDL_ttf has no tracking support, so each character is rendered
-        individually and blitted with an extra advance of (tracking × size)
-        pixels — the same arithmetic as CSS letter-spacing in em.  Surfaces
-        are cached (labels are small and mostly static per track).
-        """
-        import pygame
-
-        key = (text, size, color, tracking)
-        cached = self._label_cache.get(key)
-        if cached is not None:
-            return cached
-
-        font = self._font("mono", size)
-
-        # DISP-5: per-glyph tracking assumes every codepoint is an independent
-        # glyph — true for the ASCII metadata/labels this is designed for, but it
-        # destroys shaping for complex scripts (Arabic joining, Devanagari
-        # conjuncts, floating combining marks, emoji ZWJ) that arrive in
-        # free-text Discogs fields.  For any non-ASCII string, render it as ONE
-        # shaped run and skip the manual tracking, rather than reverse/mis-space
-        # it a glyph at a time.  ASCII keeps its designed letter-spacing below.
-        if not text.isascii():
-            surf = font.render(text, True, color)
-            self._label_cache.put(key, surf)
-            return surf
-
-        extra = tracking * size
-        glyphs = [font.render(ch, True, color) for ch in text]
-        # Total width: glyph advances + tracking between characters (CSS adds
-        # tracking after every glyph including the last; trim it for cleaner
-        # right-alignment).
-        width = int(sum(g.get_width() for g in glyphs) + extra * max(0, len(glyphs) - 1))
-        surf = pygame.Surface((max(1, width), font.get_height()), pygame.SRCALPHA)
-        x = 0.0
-        for g in glyphs:
-            surf.blit(g, (int(x), 0))
-            x += g.get_width() + extra
-        self._label_cache.put(key, surf)
-        return surf
+        return self._text.render_tracked(text, size, color, tracking)
 
     @staticmethod
     def _break_long_token(token: str, font, max_width: int) -> list:
-        """Character-break a single token too wide for max_width into chunks that
-        each fit (DISP-7).
-
-        Greedy: accumulate characters until the next would overflow, then start a
-        new chunk.  A single glyph wider than max_width is emitted alone (it can't
-        be broken further; the blit clip in _draw_wrapped_text is the backstop).
-        """
-        chunks = []
-        current = ""
-        for ch in token:
-            if current and font.size(current + ch)[0] > max_width:
-                chunks.append(current)
-                current = ch
-            else:
-                current += ch
-        if current:
-            chunks.append(current)
-        return chunks
+        return TextRenderer.break_long_token(token, font, max_width)
 
     def _wrap_lines(self, text: str, font, max_width: int) -> list:
-        """Greedy word-wrap; the single source of truth for line breaking.
-
-        Used by both measurement and drawing so they can never disagree
-        (previously duplicated in _draw_wrapped_text/_measure_wrapped_text).  A
-        token wider than max_width on its own is character-broken (DISP-7) rather
-        than emitted whole, which used to run off the right edge of the column.
-        """
-        words = text.split()
-        lines = []
-        current = ""
-        for word in words:
-            test = (current + " " + word).strip()
-            if font.size(test)[0] <= max_width:
-                current = test
-                continue
-            # `test` overflows: flush the line in progress, then place `word`.
-            if current:
-                lines.append(current)
-                current = ""
-            if font.size(word)[0] <= max_width:
-                current = word
-            else:
-                # A run-on wider than the column: hard-break it.  Full chunks
-                # become their own lines; the trailing partial stays `current`
-                # so the next word can continue on the same line (greedy).
-                chunks = self._break_long_token(word, font, max_width)
-                lines.extend(chunks[:-1])
-                current = chunks[-1] if chunks else ""
-        if current:
-            lines.append(current)
-        return lines
+        return self._text.wrap_lines(text, font, max_width)
 
     def _fit_wrapped(
         self, text: str, role: str, base_size: int, max_width: int,
         max_lines: int, min_size: int = 14, step: int = 2,
     ) -> tuple:
-        """Find the largest font size ≤ base_size at which *text* wraps into
-        ≤ max_lines within max_width.  Returns (size, lines).
-
-        This is the shrink-instead-of-ellipsis behavior (product decision):
-        long artist names and album titles reduce in size rather than
-        truncate.  If even min_size can't fit the line count, returns the
-        min_size wrap (caller clips — practically unreachable for real
-        metadata).
-        """
-        size = base_size
-        while size >= min_size:
-            lines = self._wrap_lines(text, self._font(role, size), max_width)
-            if len(lines) <= max_lines:
-                return size, lines
-            size -= step
-        return min_size, self._wrap_lines(text, self._font(role, min_size), max_width)
+        return self._text.fit_wrapped(
+            text, role, base_size, max_width, max_lines, min_size, step
+        )
 
     def _ellipsize(self, text: str, font, max_width: int) -> str:
-        """Trim *text* with a trailing ellipsis to fit max_width.
-
-        Only used by the PREV/NEXT adjacent panel — everywhere else the
-        design translation shrinks instead (see _fit_wrapped).
-        """
-        if font.size(text)[0] <= max_width:
-            return text
-        ell = "…"
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if font.size(text[:mid].rstrip() + ell)[0] <= max_width:
-                lo = mid
-            else:
-                hi = mid - 1
-        return text[:lo].rstrip() + ell
+        return self._text.ellipsize(text, font, max_width)
 
     def _draw_gradient_bg(self, target, p: DisplayPalette):
         """Fill *target* with a radial gradient from surface (centre) to bg (edges).
@@ -1393,55 +1274,17 @@ class DisplayRenderer:
         self, target, text: str, role: str, size: int, rect, color: tuple,
         line_height: float = 0.98,
     ) -> int:
-        """Render text with word-wrapping to fit within rect.w, clipped to rect.h.
-
-        line_height is the CSS-style multiplier from DESIGN.md §3 (hero 0.98,
-        artist 1.04, album 1.12).  Returns the actual rendered height in
-        pixels (distance from rect.y to the bottom of the last drawn line);
-        0 if nothing was drawn.
-        """
-        import pygame
-
-        font = self._font(role, size)
-        if not text:
-            return 0
-
-        y = rect.y
-        line_h = int(font.get_height() * line_height)
-        last_bottom = rect.y
-        for line in self._wrap_lines(text, font, rect.w):
-            if y + line_h > rect.y + rect.h:
-                break
-            surf = font.render(line, True, color)
-            # DISP-7 backstop: clip the blit to the column width so a line that
-            # still exceeds rect.w (e.g. a single glyph wider than the column)
-            # can never paint past the right edge / off-screen.
-            target.blit(surf, (rect.x, y),
-                        area=pygame.Rect(0, 0, rect.w, surf.get_height()))
-            last_bottom = y + line_h
-            y += line_h + 2
-
-        return max(0, last_bottom - rect.y)
+        return self._text.draw_wrapped_text(
+            target, text, role, size, rect, color, line_height
+        )
 
     def _measure_wrapped_text(
         self, text: str, role: str, size: int, available_width: int,
         line_height: float = 0.98,
     ) -> int:
-        """Measure wrapped-text height without drawing anything.
-
-        Uses _wrap_lines — the same algorithm as _draw_wrapped_text — so
-        measurements exactly match render output.  Returns total pixel
-        height; 0 if text is empty.
-        """
-        font = self._font(role, size)
-        if not text:
-            return 0
-        lines = self._wrap_lines(text, font, available_width)
-        if not lines:
-            return 0
-        line_h = int(font.get_height() * line_height)
-        # n lines: n × (line_h + 2) minus the trailing gap after the last line
-        return len(lines) * (line_h + 2) - 2
+        return self._text.measure_wrapped_text(
+            text, role, size, available_width, line_height
+        )
 
     # -----------------------------------------------------------------------
     # Palette management
