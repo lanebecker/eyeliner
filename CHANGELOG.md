@@ -108,6 +108,23 @@ degrade (Wave 7 — Shazam/MusicBrainz/Last.fm).
   genuinely new cover is still lifted from the blacklist by `_on_state_change`
   *before* the prefetch task is spawned, so it keeps its fresh decode attempt.
   RED-first; mutation-verified.
+- **A non-creditable album-split no longer takes the finalize lock (#166 —
+  LOW).** CONC-2 moved end-of-session crediting off the lifecycle lock, but
+  `on_track_identified`'s album-split path still `await`ed `_finalize_detached`
+  inline on the recognition pipeline, and it took `_finalize_lock`
+  *unconditionally* — so a split commit could briefly stall the audio queue
+  behind an unrelated in-flight credit, even for the common mid-album swap whose
+  split-off session never reached its last track and has nothing to credit or
+  love. The split now finalizes only when `detached.potential_last_track` — a
+  necessary condition for both the Play Count credit and the Last.fm love, so a
+  non-creditable split does no write anyway and is short-circuited before the
+  lock, keeping the queue draining. A genuinely creditable split (its closer
+  played right before the swap) still finalizes and takes the lock as required;
+  the SESSION_ENDED path (fire-and-forget, never awaited on the pipeline) is
+  deliberately left unchanged and keeps its "last track not reached" log.
+  RED-first; mutation-verified; independently cold-reviewed (SPEC + QUALITY PASS
+  — verified `potential_last_track` gates every write, so only logging is
+  skipped, and it's the tightest correct gate).
 
 ## [1.5.6] — 2026-08-07
 
