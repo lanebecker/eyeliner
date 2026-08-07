@@ -7,14 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
-## [Unreleased]
+## [1.5.7] — 2026-08-07
 
-**Code-review follow-ups, round 3 (Waves 6–9).** Residuals surfaced by earlier
-waves' cold reviews, filed as GitHub issues and addressed here: first the paths
-that decide whether the appliance comes up at all (Wave 6 — boot & config
+**Code-review follow-ups, round 3 (Waves 6–10).** The residuals surfaced by
+earlier waves' cold reviews, filed as GitHub issues and cleared here: first the
+paths that decide whether the appliance comes up at all (Wave 6 — boot & config
 correctness), then hardening how malformed or failing external responses degrade
 (Wave 7 — Shazam/MusicBrainz/Last.fm), a couple of display/concurrency residuals
-(Wave 8), and a cleanup / test-infra sweep (Wave 9).
+(Wave 8), a cleanup / test-infra sweep (Wave 9), and two design-gated items
+assessed and documented as deliberate deferrals (Wave 10 — the cover-fetch
+header-drip residual and Discogs index persistence). This closes the round-3
+audit's follow-up backlog.
 
 ### Added
 
