@@ -59,6 +59,7 @@ def make_renderer(tmp_path, dynamic_theming=True):
     r._transition_start = 0.0
     r._wanted_cover_url = None
     r._cover_prefetch_inflight = set()   # STAB-1 in-flight download dedup
+    r._cover_bad_urls = set()            # #165: _prefetch_cover skips blacklisted URLs
     return r
 
 

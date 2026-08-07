@@ -1334,6 +1334,15 @@ class DisplayRenderer:
         state-change prefetch and a load-failure refetch must not both hit the
         network for one cover.
         """
+        # #165: a URL already given up on (blacklisted) keeps its corrupt bytes on
+        # disk (see _handle_corrupt_cover), so exists() is true and the palette step
+        # below would re-decode them and log one "Palette extraction failed" WARNING
+        # on every track-change prefetch. Skip a blacklisted URL entirely. A
+        # genuinely NEW cover has already been discard()'d from _cover_bad_urls by
+        # _on_state_change before this task is spawned, so it still gets a fresh
+        # attempt; only a still-blacklisted URL is short-circuited here.
+        if url in self._cover_bad_urls:
+            return
         if url in self._cover_prefetch_inflight:
             return
         self._cover_prefetch_inflight.add(url)

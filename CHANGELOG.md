@@ -94,6 +94,20 @@ degrade (Wave 7 — Shazam/MusicBrainz/Last.fm).
   deliberate, documented posture for this non-critical untrusted-payload path.
   RED-first; mutation-verified; independently cold-reviewed (SPEC + QUALITY PASS;
   blast-radius clean — the other `is_transient` callers use it only for log level).
+- **A blacklisted cover is no longer re-decoded for palette every track change
+  (#165 — LOW).** When `_load_cover` gives up on an undecodable cover,
+  `_handle_corrupt_cover` deliberately leaves the bad bytes on disk on the final
+  (blacklisting) attempt. But `_on_state_change` still spawned `_prefetch_cover`
+  for the playing track on each state change, and for a blacklisted-but-on-disk
+  cover that skipped the download (the file exists) yet still called
+  `_extract_palette_async`, which re-attempted a Pillow decode on the same bad
+  bytes and logged one `Palette extraction failed` WARNING — once per
+  `set_track`, i.e. per track change. `_prefetch_cover` now early-returns for a
+  URL in `_cover_bad_urls` (matching the blacklist check `_extract_palette_async`
+  already had), so a given-up cover does no re-download and no re-decode. A
+  genuinely new cover is still lifted from the blacklist by `_on_state_change`
+  *before* the prefetch task is spawned, so it keeps its fresh decode attempt.
+  RED-first; mutation-verified.
 
 ## [1.5.6] — 2026-08-07
 
