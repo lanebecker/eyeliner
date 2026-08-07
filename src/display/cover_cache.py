@@ -82,6 +82,22 @@ _COVER_CONNECT_READ_TIMEOUT = 15     # seconds, per HTTP request
 # aborted instead of parking an executor worker indefinitely (SEC-4).  45s is
 # generous: a 10 MB cover on a 1 Mbit/s link is ~80s, but real covers are a few
 # hundred KB, so this only ever bites a stall, never an honest slow link.
+#
+# #176 (KNOWN, ACCEPTED RESIDUAL — do not re-file):  the wall-clock deadline is a
+# Python-level check BETWEEN blocking calls (between redirect hops, and between
+# body read1() chunks — see download()).  It therefore cannot interrupt the
+# synchronous response-HEADER parse inside pool.urlopen(), which is bounded only
+# by the per-recv _COVER_CONNECT_READ_TIMEOUT above.  A host that dribbles
+# response HEADERS one byte per <15s recv can still stall a single hop past the
+# budget — the SEC-4 body-drip DoS class, in the header path SEC-4 didn't cover.
+# Deliberately NOT fixed: reaching it requires a ROGUE allow-listed host or a
+# MITM on the SSRF-pinned IP (the S-7 allow-list + IP pin + TLS hostname check
+# gate both); on this single-user appliance the worst case is "covers stop
+# loading", not data loss; and it was never reproduced (a hypothesis extrapolated
+# from the confirmed body-drip).  The only COMPLETE fix — a watchdog thread that
+# closes the socket at the deadline — adds more concurrency risk than the
+# hypothesis warrants here.  Revisit if it is ever reproduced, or if this fetch
+# moves somewhere multi-tenant / pool-starvation-sensitive (#176 cold-review).
 _DOWNLOAD_DEADLINE_SECONDS = 45
 
 # R-2 disk-cache bounds.  A serious collection touches hundreds of covers; at
