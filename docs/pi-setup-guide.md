@@ -447,6 +447,38 @@ View live logs:
 journalctl -u vinyl-now-playing -f
 ```
 
+### Cap the log disk usage (recommended for the SD card)
+
+The app logs to stderr, which systemd routes into the journal. On an always-on
+appliance the journal grows over time, and a rare warning storm (e.g. a cover
+that repeatedly fails to decode before it is blacklisted) is buffered by
+journald's own rate limiter — whose default burst (**10,000 messages / 30s**)
+sits *above* the app's worst observed rate, so such a burst is written rather
+than dropped and simply accumulates. On a small SD card that is worth bounding
+explicitly. Set a hard size cap and tighten the rate limit:
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/vinyl-now-playing.conf >/dev/null <<'EOF'
+[Journal]
+# Hard cap on persistent journal size (and the runtime/tmpfs journal).
+SystemMaxUse=200M
+RuntimeMaxUse=50M
+# Tighten the burst so a repeating warning can't flood the card between
+# the app's own in-code throttles.
+RateLimitIntervalSec=30s
+RateLimitBurst=1000
+EOF
+sudo systemctl restart systemd-journald
+```
+
+`SystemMaxUse` bounds the on-disk journal (journald deletes the oldest entries
+once the cap is reached), so logs can never fill the card. Tune the numbers to
+your card; the values above are conservative for a 16 GB+ card. This is a
+belt-and-suspenders measure — the app already bounds its own repeating warnings
+in code (the cover-decode blacklist), but journald is the right place to put the
+absolute disk ceiling for an unattended device.
+
 ---
 
 ## 13. Optional: hide the desktop and boot straight to the app

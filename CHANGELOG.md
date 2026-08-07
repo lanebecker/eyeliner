@@ -13,8 +13,10 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 the audio pipeline).** Wave 5 of the same audit (`CODE_REVIEW_2026-07-30.md`):
 tightening how a track's position within its album is parsed and ranked,
 closing gaps in the Discogs read/write layer, covering the audio-capture safety
-net that has never run on real hardware, and hardening the recognizer/silence
-path against malformed Shazam responses and cross-session state bleed.
+net that has never run on real hardware, hardening the recognizer/silence
+path against malformed Shazam responses and cross-session state bleed, and
+tightening the entry-point lifecycle (Last.fm thread-safety, shutdown coverage,
+log disk caps).
 
 ### Fixed
 
@@ -214,6 +216,47 @@ The recognizer/silence cluster (Unit 3b):
   consumer — it is the internal music→silence transition marker). Kept over
   deleting the member (Lane's call): zero test churn and it remains a semantic
   hook. Comment-only, no behaviour change.
+
+The entry-point & lifecycle cluster (Unit 4):
+
+### Fixed
+
+- **The shared Last.fm client is now thread-safe across its two callers
+  (CRIT-10 #145 — LOW).** One `LastFmClient` is injected into both
+  `TrackCommitService` (which calls `scrobble` via `run_in_executor`) and
+  `ListenTracker` (which calls `love` via `run_in_executor`), so two executor
+  threads could hit the single pylast `Network` object at the same time (a
+  session-end love overlapping a fresh scrobble), and pylast documents no
+  thread-safety guarantee — worst case a lost scrobble. `scrobble()` and
+  `love()` now serialize their `Network` access behind a `threading.Lock` held
+  only around the pylast call (not the logging or the return). A
+  `threading.Lock`, not the finding's suggested `asyncio.Lock`: the guarded
+  calls run on executor threads, off the event loop, where an `asyncio.Lock`
+  wouldn't apply. RED-first; mutation-verified (a 16-thread stress probe in
+  cold review confirmed strict serialization and clean release on exceptions).
+
+### Tests
+
+- **`main()`'s startup guard and shutdown wiring are now covered (TQ-2 #137 —
+  MEDIUM).** The config-error guard and the SIGINT/SIGTERM handler registration
+  were entirely untested (the helpers extracted from `main()` were tested, but
+  not `main()`'s own body). Two headless tests were added: a `ConfigError` from
+  `load_config` yields `SystemExit(1)`, and `main()` registers a handler for
+  both signals with the `_cancel_all` closure that cancels every pipeline task.
+  No production change — `main.py` already did the right thing; it simply wasn't
+  pinned.
+
+### Documentation
+
+- **Documented capping journald disk usage on the Pi (STAB-6 #160 — NIT).** The
+  app logs to stderr → journald with no explicit disk ceiling, and journald's
+  default rate-limit burst (10,000/30s) sits above the app's worst observed log
+  rate, so a rare warning storm accumulates rather than being dropped. Added a
+  `journald.conf.d` drop-in recipe (`SystemMaxUse`/`RuntimeMaxUse` +
+  tightened `RateLimit*`) to `docs/pi-setup-guide.md`. This is the systemd-native
+  place to bound log disk on an unattended appliance; the app already throttles
+  its own repeating warnings in code (the cover-decode blacklist), so this is
+  the belt-and-suspenders disk ceiling. Docs-only.
 
 ## [1.5.5] — 2026-08-06
 

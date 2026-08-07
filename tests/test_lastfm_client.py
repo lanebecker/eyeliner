@@ -261,3 +261,75 @@ def test_love_exception_returns_false():
         result = client.love(_make_track())
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# CRIT-10 — one LastFmClient is driven from two callers (TrackCommitService.
+# scrobble + ListenTracker.love) via run_in_executor, so two threads can hit
+# the single pylast Network at once. A threading.Lock inside the client
+# serializes those calls.
+# ---------------------------------------------------------------------------
+
+def test_scrobble_runs_under_the_network_lock():
+    """The pylast scrobble call executes while the client's lock is held."""
+    client, _ = _make_enabled_client(_LOVE_CONFIG)
+    held = {}
+
+    def fake_scrobble(**kwargs):
+        held["locked"] = client._lock.locked()
+
+    client._network.scrobble = fake_scrobble
+    client.scrobble(_make_track(), 12345)
+    assert held["locked"] is True
+
+
+def test_love_runs_under_the_network_lock():
+    """The pylast get_track/love call executes while the client's lock is held."""
+    client, _ = _make_enabled_client(_LOVE_CONFIG)
+    held = {}
+
+    def fake_get_track(*a, **k):
+        held["locked"] = client._lock.locked()
+        return MagicMock()
+
+    client._network.get_track = fake_get_track
+    client.love(_make_track())
+    assert held["locked"] is True
+
+
+def test_scrobble_and_love_are_mutually_exclusive():
+    """A scrobble in flight blocks a concurrent love against the one Network
+    (CRIT-10): they cannot both touch pylast simultaneously."""
+    import threading
+    import time
+
+    client, _ = _make_enabled_client(_LOVE_CONFIG)
+    order = []
+    in_scrobble = threading.Event()
+    release = threading.Event()
+
+    def slow_scrobble(**kwargs):
+        order.append("scrobble-start")
+        in_scrobble.set()
+        release.wait(2.0)
+        order.append("scrobble-end")
+
+    def love_get_track(*a, **k):
+        order.append("love-get_track")
+        return MagicMock()
+
+    client._network.scrobble = slow_scrobble
+    client._network.get_track = love_get_track
+
+    ts = threading.Thread(target=lambda: client.scrobble(_make_track(), 1))
+    ts.start()
+    assert in_scrobble.wait(2.0)          # scrobble now holds the lock
+    tl = threading.Thread(target=lambda: client.love(_make_track()))
+    tl.start()
+    time.sleep(0.1)                        # give love a chance to (not) proceed
+    assert "love-get_track" not in order   # blocked by the lock
+    release.set()
+    ts.join(2.0)
+    tl.join(2.0)
+    assert order[0] == "scrobble-start"
+    assert order[-1] == "love-get_track"   # love proceeded only after scrobble finished
