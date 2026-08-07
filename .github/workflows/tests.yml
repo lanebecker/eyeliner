@@ -1,0 +1,31 @@
+name: tests
+
+# TQ-9: run the test suite on every push / PR so a regression is caught before
+# it reaches the appliance. Pinned to Python 3.11 — the Raspberry Pi OS bookworm
+# system Python and the version the app targets.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Make pygame headless: SDL needs no real video/audio device in CI. The
+      # sounddevice import is stubbed by tests/conftest.py before any test module
+      # loads, so no PortAudio system package is required either.
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run tests
+        run: pytest -q
