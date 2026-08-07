@@ -73,6 +73,14 @@ _BLOCK_STALL_TIMEOUT_SECONDS = 16 * _BLOCK_SECONDS
 # failure OR a detected stall). Named so tests can drive the retry fast.
 _STREAM_RETRY_BACKOFF_SECONDS = 1.0
 
+# #178: minimum wall-clock gap between capture-loop error logs. A PERMANENT
+# failure (a misconfigured device_name that never matches, or a device absent
+# forever) raises every retry — at ~1 error per _STREAM_RETRY_BACKOFF_SECONDS
+# that would flood the journal/SD card (the PCONC-4 class, on the error path).
+# The first error, and any error whose message CHANGES, still logs immediately;
+# identical repeats are counted and summarized at most once per this interval.
+_CAPTURE_ERROR_WARN_INTERVAL_SECONDS = 30.0
+
 
 class AudioCapture:
     """Wraps sounddevice to stream overlapping audio chunks from the USB interface."""
@@ -93,6 +101,16 @@ class AudioCapture:
         # of uptime — the exact early-boot window the signal matters most.
         self._drop_count = 0
         self._last_drop_warn = float("-inf")
+
+        # #178: capture-loop error-log throttle bookkeeping. `_capture_error_
+        # suppressed` counts identical errors held back since the last logged line;
+        # `_last_capture_error_log` is that line's monotonic timestamp (seeded to
+        # -inf so the first error always reports, independent of the monotonic
+        # epoch); `_last_capture_error_msg` is the last message logged, so a CHANGED
+        # error surfaces immediately instead of waiting out the throttle window.
+        self._capture_error_suppressed = 0
+        self._last_capture_error_log = float("-inf")
+        self._last_capture_error_msg: Optional[str] = None
 
         # #164: the device lookup now runs on every stream rebuild (see run()), so
         # its two logs are deduped to avoid re-emitting every iteration during a
@@ -220,6 +238,34 @@ class AudioCapture:
 
         return callback
 
+    def _log_capture_error(self, error: Exception) -> None:
+        """Log a capture-loop error, throttled so a PERMANENT failure can't flood
+        the journal (#178).
+
+        The first error, and any error whose message CHANGED since the last one
+        logged, report immediately (a changed message is a new condition worth
+        surfacing at once). Identical repeats are counted and summarized at most
+        once per _CAPTURE_ERROR_WARN_INTERVAL_SECONDS, so a device that is
+        misconfigured or absent forever — raising the same error every retry —
+        leaves a periodic health line, not one record per backoff.
+        """
+        msg = str(error)
+        now = time.monotonic()
+        if (msg != self._last_capture_error_msg
+                or now - self._last_capture_error_log >= _CAPTURE_ERROR_WARN_INTERVAL_SECONDS):
+            if self._capture_error_suppressed > 0:
+                log.error(
+                    "Audio capture error: %s (%d further error(s) suppressed since "
+                    "the last report)", msg, self._capture_error_suppressed,
+                )
+            else:
+                log.error("Audio capture error: %s", msg)
+            self._capture_error_suppressed = 0
+            self._last_capture_error_log = now
+            self._last_capture_error_msg = msg
+        else:
+            self._capture_error_suppressed += 1
+
     async def _silence_ticker(self):
         """Periodically poke the SilenceDetector so the end-of-session timer is
         evaluated even when no audio chunks are arriving (B-6).
@@ -320,7 +366,7 @@ class AudioCapture:
                 except Exception as e:
                     # CancelledError is BaseException and intentionally NOT caught
                     # here — shutdown cancellation propagates to main() cleanly.
-                    log.error(f"Audio capture error: {e}")
+                    self._log_capture_error(e)
                     await asyncio.sleep(_STREAM_RETRY_BACKOFF_SECONDS)  # Then retry with a fresh stream
         finally:
             # Tear the ticker down with the capture loop (covers normal exit and

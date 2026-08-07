@@ -172,6 +172,17 @@ correctness), then hardening how malformed or failing external responses degrade
   so it's recorded as a known, accepted residual in `cover_cache.py` (revisit if
   reproduced, or if the fetch moves somewhere multi-tenant). No behaviour change.
 
+- **Throttled the capture-loop retry-error log (#178 — LOW).** After #164 moved
+  the device lookup inside the retry loop, a *permanent* failure (a misconfigured
+  `audio.device_name` that never matches, or a device absent forever) raises on
+  every retry — at ~1 error per `_STREAM_RETRY_BACKOFF_SECONDS` (1s) that flooded
+  the journal/SD card, the same PCONC-4 class the drop-warning already guards
+  against, on the error path. `AudioCapture` now logs the capture error through a
+  throttled helper: the first error — and any error whose message *changes* (a
+  new condition worth surfacing at once) — logs immediately, while identical
+  repeats are counted and summarized at most once per 30s. RED-first;
+  mutation-verified. (Filed from the #164 cold review.)
+
 ### Removed
 
 - **Deleted the dead `clamp_luminance` helper and its tests (#177 — LOW).**

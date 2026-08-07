@@ -427,6 +427,72 @@ def test_drop_warning_reports_aggregate_count_after_window(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# #178 — the capture-loop retry-error log is throttled: a PERMANENT failure (a
+# misconfigured device_name that never matches, a device absent forever) raises
+# every retry, so at ~1 error per _STREAM_RETRY_BACKOFF_SECONDS it would flood
+# the journal/SD card (the PCONC-4 class). First error + any CHANGED error logs
+# immediately; identical repeats are counted and summarized once per interval.
+# ---------------------------------------------------------------------------
+
+def test_capture_error_first_occurrence_logs_immediately(monkeypatch, caplog):
+    import logging
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: 1000.0)
+    with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
+        cap._log_capture_error(ValueError("device 'X' not found"))
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "device 'X' not found" in errors[0].message
+
+
+def test_capture_error_identical_repeats_are_throttled(monkeypatch, caplog):
+    """A permanent misconfig raising the SAME error every retry logs once, not
+    once per retry."""
+    import logging
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: 1000.0)  # frozen < interval
+    err = ValueError("Audio device 'Nope' not found. Available input devices: []")
+    with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
+        for _ in range(20):
+            cap._log_capture_error(err)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, f"expected 1 throttled error, got {len(errors)}"
+
+
+def test_capture_error_summarizes_after_the_interval(monkeypatch, caplog):
+    import logging
+    cap = make_capture()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: clock["t"])
+    err = ValueError("device 'Nope' not found")
+    with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
+        cap._log_capture_error(err)                # 1st -> logs
+        for _ in range(9):                         # 2..10 suppressed
+            cap._log_capture_error(err)
+        clock["t"] += capture_module._CAPTURE_ERROR_WARN_INTERVAL_SECONDS + 1  # past window
+        cap._log_capture_error(err)                # -> logs a summary
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2                        # first + post-window summary
+    assert "9" in errors[1].message                # the 9 suppressed since the first report
+
+
+def test_capture_error_changed_message_logs_immediately(monkeypatch, caplog):
+    """A DIFFERENT error (a new condition) must surface at once, not wait out the
+    throttle window behind an unrelated repeating error."""
+    import logging
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: 1000.0)  # frozen < interval
+    with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
+        cap._log_capture_error(ValueError("device absent"))
+        cap._log_capture_error(ValueError("device absent"))   # identical -> suppressed
+        cap._log_capture_error(RuntimeError("audio stream stalled"))  # CHANGED -> logs
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2
+    assert "device absent" in errors[0].message
+    assert "stream stalled" in errors[1].message
+
+
+# ---------------------------------------------------------------------------
 # TQ-7 — _silence_ticker and run()'s construction-retry path, headless.
 #
 # _silence_ticker is the SESSION_ENDED / Play-Count safety net during a stall,
