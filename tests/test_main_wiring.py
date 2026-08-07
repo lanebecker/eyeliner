@@ -516,3 +516,94 @@ async def test_main_registers_signal_handlers_and_cancel_all_cancels_tasks(monke
     cancel_all()
     await asyncio.gather(*tasks, return_exceptions=True)
     assert all(t.cancelled() for t in tasks)
+
+
+# ---------------------------------------------------------------------------
+# #170 — a startup abort BEFORE run_pipeline must still close the pools main()
+# owns (io_executor always; discogs_http if components were built), instead of
+# leaking them to concurrent.futures' atexit join.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_main_shuts_io_executor_when_build_components_aborts(monkeypatch):
+    """build_components raises (e.g. an unwritable cover_art_cache_dir) before
+    run_pipeline is entered → its cleanup finally never runs, so main() must shut
+    down the io_executor it created. components is None here, so discogs_http has
+    nothing to close."""
+    monkeypatch.setattr(main_module, "load_config", lambda: MagicMock())
+    io_executor = MagicMock()
+    monkeypatch.setattr(main_module, "install_io_executor", lambda loop: io_executor)
+    monkeypatch.setattr(
+        main_module, "build_components",
+        MagicMock(side_effect=RuntimeError("unwritable cover_art_cache_dir")),
+    )
+
+    with pytest.raises(RuntimeError, match="unwritable cover_art_cache_dir"):
+        await main()
+
+    io_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_main_closes_both_pools_when_start_display_aborts(monkeypatch):
+    """start_display raises (no HDMI / X down) AFTER components are built but
+    before run_pipeline → main() must close BOTH the discogs_http pool and the
+    io_executor on the abort path."""
+    monkeypatch.setattr(main_module, "load_config", lambda: MagicMock())
+    io_executor = MagicMock()
+    monkeypatch.setattr(main_module, "install_io_executor", lambda loop: io_executor)
+    components = MagicMock()
+    monkeypatch.setattr(main_module, "build_components", lambda config, state: components)
+    monkeypatch.setattr(main_module, "wire_silence_listeners", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "read_version", lambda: "test")
+    monkeypatch.setattr(
+        main_module, "start_display",
+        MagicMock(side_effect=RuntimeError("no HDMI / X down")),
+    )
+
+    with pytest.raises(RuntimeError, match="no HDMI"):
+        await main()
+
+    components.discogs_http.close.assert_called_once()
+    io_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_main_normal_path_does_not_double_close_pools(monkeypatch):
+    """#170: when run_pipeline IS entered it owns pool cleanup (its own finally),
+    so main()'s abort-path finally must NOT close them a second time. Pins the
+    `started_pipeline` gate — a mutation that never sets the flag double-closes and
+    this fails."""
+    monkeypatch.setattr(main_module, "load_config", lambda: MagicMock())
+    io_executor = MagicMock()
+    monkeypatch.setattr(main_module, "install_io_executor", lambda loop: io_executor)
+    components = MagicMock()
+
+    async def _leg():
+        await asyncio.sleep(3600)   # long-lived; captured + cancelled below
+    components.capture.run = _leg
+    components.recognizer.run = _leg
+    components.display.run = _leg
+    monkeypatch.setattr(main_module, "build_components", lambda config, state: components)
+    monkeypatch.setattr(main_module, "wire_silence_listeners", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "start_display", lambda display: None)
+    monkeypatch.setattr(main_module, "read_version", lambda: "test")
+
+    recorded = {}
+
+    async def fake_run_pipeline(tasks, *a, **k):
+        recorded["tasks"] = list(tasks)   # entered → run_pipeline OWNS cleanup (mocked away)
+
+    monkeypatch.setattr(main_module, "run_pipeline", fake_run_pipeline)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "add_signal_handler", lambda *a, **k: None)
+
+    await main()
+
+    # run_pipeline was entered (started_pipeline=True) → main()'s finally is gated off.
+    io_executor.shutdown.assert_not_called()
+    components.discogs_http.close.assert_not_called()
+
+    for t in recorded["tasks"]:          # tidy the still-pending legs
+        t.cancel()
+    await asyncio.gather(*recorded["tasks"], return_exceptions=True)

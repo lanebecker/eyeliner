@@ -140,6 +140,20 @@ correctness), then hardening how malformed or failing external responses degrade
   — verified `potential_last_track` gates every write, so only logging is
   skipped, and it's the tightest correct gate).
 
+- **Startup-abort now closes the thread pools instead of leaking them to atexit
+  (#170 — LOW).** If `build_components` (e.g. an unwritable cover-art cache dir)
+  or `start_display` (no HDMI / X down) raised before `run_pipeline` was entered,
+  `run_pipeline`'s cleanup `finally` — which closes the dedicated Discogs pool
+  (#61) and the owned I/O executor (CRIT-3) — never ran, leaving both to
+  `concurrent.futures`' atexit join. `main()`'s startup body is now wrapped in a
+  `try/finally` gated by a `started_pipeline` flag: on the pre-`run_pipeline`
+  abort path it closes the `io_executor` (and the `DiscogsHttp` pool, if
+  components were built); once `run_pipeline` is entered it owns cleanup, so the
+  gate prevents any double close. Behaviour on the normal path is unchanged.
+  RED-first (both abort paths); mutation-verified (including a guard pinning the
+  no-double-close gate); independently cold-reviewed (SPEC + QUALITY PASS — the
+  re-indent is statement-for-statement identical to before).
+
 ### Removed
 
 - **Deleted the dead `clamp_luminance` helper and its tests (#177 — LOW).**
