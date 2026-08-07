@@ -87,8 +87,16 @@ def make_renderer():
 # PlayerStatus.ERROR transitions
 # ---------------------------------------------------------------------------
 
-def test_error_status_exists():
-    assert PlayerStatus.ERROR is not None
+def test_error_status_is_a_distinct_member():
+    # TQ-8: the old assertion (`PlayerStatus.ERROR is not None`) was unfalsifiable
+    # — an enum member reached by attribute access is never None, so only the
+    # attribute lookup itself could fail. Assert something that CAN fail: ERROR
+    # is a real PlayerStatus member, named "ERROR", with a value distinct from
+    # every other member (guards an accidental rename or alias).
+    assert isinstance(PlayerStatus.ERROR, PlayerStatus)
+    assert PlayerStatus.ERROR.name == "ERROR"
+    others = [s for s in PlayerStatus if s is not PlayerStatus.ERROR]
+    assert all(PlayerStatus.ERROR.value != s.value for s in others)
 
 
 def test_clear_recovers_from_error_to_idle():

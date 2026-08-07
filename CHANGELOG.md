@@ -16,7 +16,9 @@ closing gaps in the Discogs read/write layer, covering the audio-capture safety
 net that has never run on real hardware, hardening the recognizer/silence
 path against malformed Shazam responses and cross-session state bleed, and
 tightening the entry-point lifecycle (Last.fm thread-safety, shutdown coverage,
-log disk caps).
+log disk caps), and clearing docs / dependency / test-hygiene debt (a config-
+reference gap, an unjustified dep, a tautological test, and the first CI to run
+the suite on push).
 
 ### Fixed
 
@@ -257,6 +259,53 @@ The entry-point & lifecycle cluster (Unit 4):
   place to bound log disk on an unattended appliance; the app already throttles
   its own repeating warnings in code (the cover-decode blacklist), so this is
   the belt-and-suspenders disk ceiling. Docs-only.
+
+The docs / deps / test-hygiene cluster (Unit 6):
+
+### Added
+
+- **CI now runs the full test suite on every push (TQ-9 #157 — LOW).** There was
+  no CI running the ~900 tests — only a badge-sync workflow — so a regression
+  could reach the appliance unnoticed. Added `.github/workflows/tests.yml`
+  running `pytest` on a pinned Python 3.11 (the target's and the sandbox's
+  version), with `SDL_VIDEODRIVER=dummy` so pygame runs headless and no
+  PortAudio system package needed (the `sounddevice` import is stubbed in
+  `conftest.py`). The Python-version constraint is also now declared at the top
+  of `requirements.txt`.
+
+### Changed
+
+- **`requirements.txt` cleanup (TQ-9 #157 — LOW).** Dropped `aiohttp` — nothing
+  in `src/` imports it directly (it is pulled transitively by `shazamio`), and
+  it carried none of the justifying comments the other direct-dependency pins
+  do. Added `pytest-cov`, which the documented `pytest --cov` coverage command
+  needs but which was undeclared.
+
+### Fixed
+
+- **Replaced a tautological test assertion (TQ-8 #162 — NIT).**
+  `test_error_status_exists` asserted `PlayerStatus.ERROR is not None`, which can
+  never fail (an enum member reached by attribute access is never `None`). It now
+  asserts a falsifiable property — `ERROR` is a real `PlayerStatus` member named
+  `"ERROR"` with a value distinct from every other member (guards an accidental
+  rename or alias). Mutation-verified.
+
+### Documentation
+
+- **Documented `display.reduced_motion` in the config reference (ARCH-5 #141 —
+  LOW).** It was the only `config.yaml` field missing from the "Configuration
+  reference" table in `docs/architecture.md`, so the documented way to quiet the
+  display's animations on a struggling Pi was invisible unless you read the
+  prose. Added the row.
+
+Three audit-completeness findings (CRIT-7 #134, CRIT-8 #147, CRIT-11 #146) were
+resolved by verification rather than code and closed with documented outcomes on
+their issues: the remediated SPEC findings (MUT-16, SIL-3, REC-4, DISP-1/2) were
+re-checked against the real `DESIGN.md`/`testing-guide.md` and all hold; TQ-1's
+"every renderer test bypasses `__init__`" was confirmed overstated (and its
+coverage gap already closed by the `test_renderer_lifecycle.py` remediation); and
+the prior concurrency pass's findings (PCONC-3/PCONC-4) were confirmed already
+reconciled and shipped earlier in Wave 5.
 
 ## [1.5.5] — 2026-08-06
 

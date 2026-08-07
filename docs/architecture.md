@@ -825,6 +825,7 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `display.width` / `height` | `1024` / `600` | Waveshare 7" HDMI LCD (H) native resolution |
 | `display.fullscreen` | `true` | |
 | `display.dynamic_theming` | `true` | Extract 5-color palette from album art via Pillow; set `false` for fixed neutral dark theme |
+| `display.reduced_motion` | `false` | Freezes the status-dot pulse and the boot-arc rotation; at steady state the render loop goes fully quiet (no per-frame redraw). Set `true` to quiet the display on a struggling Pi |
 | `display.cover_art_cache_dir` | `"src/display/assets/cache"` | MD5-keyed JPEG cache |
 | `recognition.backend` | `"shazamio"` | `"shazamio"` \| `"acrcloud"` \| `"audd"` |
 | `recognition.confirmation_required` | `2` | Consecutive matching results before committing |
