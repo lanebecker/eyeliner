@@ -260,7 +260,7 @@ were copied correctly from the API account page and the session key helper outpu
 Before dealing with audio and display, confirm the Discogs side works:
 
 ```bash
-python test_discogs_live.py
+python scripts/discogs_live_check.py
 ```
 
 All four read-only tests should pass. If test 1 (search_collection) misses, see

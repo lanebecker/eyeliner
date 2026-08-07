@@ -76,3 +76,20 @@ def test_close_is_idempotent():
     http = make_discogs_http()
     http.close()
     http.close()  # must not raise
+
+
+def test_default_headers_are_pinned_on_construction():
+    """MUT-12: the identifying default headers Discogs requires are set exactly
+    on the session at construction. Discogs 403s any request without a non-empty
+    User-Agent, and that only ever bites on the real Pi — nothing else in the
+    suite asserts these, so a header refactor that dropped or renamed the UA
+    would otherwise stay green."""
+    http = make_discogs_http("fake-token")
+    try:
+        headers = http.session.headers
+        assert headers["Authorization"] == "Discogs token=fake-token"
+        assert headers["User-Agent"] == "vinyl-now-playing/1.0"
+        assert headers["User-Agent"].strip()  # non-empty, not whitespace-only
+        assert headers["Content-Type"] == "application/json"
+    finally:
+        http.close()

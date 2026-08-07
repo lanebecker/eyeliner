@@ -9,12 +9,19 @@ boundary one taxonomy:
   - **Permanent** — a definitive negative answer that won't change on retry.
   - **Unexpected** — anything else is a real bug, logged loudly.
 
-External transient failures currently surface as `requests` exceptions (the
-Discogs client and our REST calls are requests-based); `TRANSIENT_EXTERNAL_ERRORS`
-lets the resolver classify those uniformly with our own raised errors.  The
-typed exceptions below are the vocabulary for code that wants to *signal* these
-conditions explicitly as adoption spreads.
+External transient failures surface two ways.  Our own REST calls (the shared
+`transport.py`) are requests-based and raise `requests` exceptions.  But the
+python3-discogs-client library — used by the reader for search/release/master —
+does its OWN fetching and raises its OWN `discogs_client.exceptions.HTTPError`
+for a non-2xx status; that type does NOT inherit from
+`requests.exceptions.RequestException` (META-6), so it must be listed
+explicitly or a routine Discogs 429/5xx is misclassified as an unexpected bug.
+`TRANSIENT_EXTERNAL_ERRORS` lists both families so the resolver classifies them
+uniformly with our own raised errors.  The typed exceptions below are the
+vocabulary for code that wants to *signal* these conditions explicitly as
+adoption spreads.
 """
+import discogs_client.exceptions
 import requests
 
 
@@ -31,12 +38,16 @@ class PermanentMetadataError(MetadataError):
 
 
 # External exception types that mean "transient / couldn't determine."
-# requests.exceptions.RequestException is the base for Timeout, ConnectionError,
-# HTTPError, etc. (the discogs client is requests-based); the builtin
-# ConnectionError / TimeoutError cover socket-level network failures that aren't
-# wrapped by requests.
+#  - requests.exceptions.RequestException: base for Timeout, ConnectionError,
+#    HTTPError, etc. — our own REST calls (transport.py) are requests-based.
+#  - discogs_client.exceptions.HTTPError: the python3-discogs-client library's
+#    own non-2xx type (a Discogs 429/5xx from search/release/master). It does
+#    NOT inherit from RequestException, so it must be listed explicitly (META-6).
+#  - builtin ConnectionError / TimeoutError: socket-level network failures that
+#    aren't wrapped by requests.
 TRANSIENT_EXTERNAL_ERRORS = (
     requests.exceptions.RequestException,
+    discogs_client.exceptions.HTTPError,
     ConnectionError,   # builtin (OSError subclass)
     TimeoutError,      # builtin
 )

@@ -1,7 +1,7 @@
 # Testing Guide — vinyl-now-playing
 
 This guide walks through every test suite in the project: what each one covers,
-how to run it, and how to read the output. All tests except `test_discogs_live.py`
+how to run it, and how to read the output. All tests except `scripts/discogs_live_check.py`
 require zero hardware — no Raspberry Pi, no audio interface, no display.
 
 ---
@@ -38,7 +38,7 @@ pip install -r requirements.txt
 Your prompt should now show `(venv)`. All commands below assume this environment
 is active.
 
-### Discogs credentials (only for `test_discogs_live.py`)
+### Discogs credentials (only for `scripts/discogs_live_check.py`)
 
 ```bash
 cp config.example.yaml config.yaml
@@ -83,7 +83,7 @@ The table groups related files; for the live, authoritative file list run
 | `test_error_state.py` | `EmptyState` rendering, miss counting, boot label |
 | `test_main_wiring.py` | `main.py` pipeline wiring + shutdown semantics |
 | `test_session_log_track_dedup.py` | PlaySession track-dedup logging |
-| `test_discogs_live.py` (repo root, `check_*` fns) | **Live** Discogs API — manual only, **needs Discogs creds**, excluded from pytest collection (see [T-7] / `conftest.py`) |
+| `scripts/discogs_live_check.py` (`check_*` fns) | **Live** Discogs API — manual only, **needs Discogs creds**; lives in `scripts/` (not under `tests/`, no `test_` prefix) so pytest never collects it |
 
 ---
 
@@ -530,7 +530,7 @@ Key cases:
 
 ## Running the live Discogs integration test
 
-`test_discogs_live.py` (in the repo root, not in `tests/`) makes real network calls
+`scripts/discogs_live_check.py` (in `scripts/`, not in `tests/`) makes real network calls
 to the Discogs API. It uses Sonic Youth's *Sister* as the test album.
 
 > **Requires `config.yaml`** with a valid `user_token` and `username`.
@@ -538,7 +538,7 @@ to the Discogs API. It uses Sonic Youth's *Sister* as the test album.
 ### Read-only (safe to run any time)
 
 ```bash
-python test_discogs_live.py
+python scripts/discogs_live_check.py
 ```
 
 This tests:
@@ -601,7 +601,7 @@ is valid and the `Play Count` field is found.
 ### With the write test (modifies your Discogs collection)
 
 ```bash
-python test_discogs_live.py --test-write
+python scripts/discogs_live_check.py --test-write
 ```
 
 This additionally tests `increment_play_count`. It will prompt for confirmation before

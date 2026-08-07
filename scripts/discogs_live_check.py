@@ -5,8 +5,8 @@ Hits the real Discogs API using your config.yaml credentials.
 All checks are read-only by default.
 
 Usage:
-    python test_discogs_live.py                # read-only
-    python test_discogs_live.py --test-write   # also tests increment_play_count
+    python scripts/discogs_live_check.py                # read-only
+    python scripts/discogs_live_check.py --test-write   # also tests increment_play_count
                                                # (WRITES to your Discogs collection)
 """
 
@@ -110,7 +110,7 @@ def check_get_tracklist(client, release_id: int):
 def check_collection_fields(client):
     sep("4 · collection fields")
     try:
-        fields = client._get_collection_fields()
+        fields = client.get_collection_fields()
     except Exception as e:
         fail(f"Exception: {e}")
         return
@@ -178,8 +178,9 @@ def main():
     print("  ║    vinyl-now-playing  ·  Discogs live test           ║")
     print("  ╚══════════════════════════════════════════════════════╝")
 
-    # Make sure src/ imports resolve when running from the project root
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    # Make sure src/ imports resolve. This script lives in scripts/, so the
+    # project root (which holds src/) is its parent's parent.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from src.config import load_config, ConfigError
     from src.metadata.discogs import DiscogsHttp, DiscogsReader, DiscogsCollectionWriter
 

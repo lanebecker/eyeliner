@@ -207,7 +207,7 @@ class DiscogsCollectionWriter:
                 )
                 return False
 
-            today = date.today().isoformat()  # e.g. "2026-05-24"
+            today = date.today().isoformat()  # ISO 8601, e.g. "YYYY-MM-DD"
 
             # Validate every ID before it lands in the write URL (S-5).
             url = (
@@ -238,6 +238,18 @@ class DiscogsCollectionWriter:
     # -------------------------------------------------------------------------
     # Private helpers
     # -------------------------------------------------------------------------
+
+    def get_collection_fields(self) -> dict:
+        """Public accessor for the collection's custom-field name→id map.
+
+        Exposed as public API so operator tooling — ``scripts/discogs_live_check.py``
+        and the first-boot smoke test — can read the field map through a supported
+        seam instead of reaching into the private ``_get_collection_fields`` from
+        outside the package, a cross-package private reach that a writer refactor
+        would silently break (CRIT-6).  Internal callers keep using the private
+        impl directly; this is a thin, stable facade over it.
+        """
+        return self._get_collection_fields()
 
     def _get_collection_fields(self) -> dict:
         """Lazily fetch and cache the user's collection custom field definitions.
