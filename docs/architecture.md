@@ -327,15 +327,19 @@ front cover thumbnail found. Returns `None` if nothing is available.
 - `DISCOGS_DATABASE` — found in Discogs DB, not user's collection
 - `FALLBACK` — Shazam metadata + MusicBrainz cover art
 
-**`_SIDE_RE`** — compiled regex `r"^([A-Za-z]+)(\d+)$"` — parses Discogs
-position strings like `"A1"` or `"B12"` into `(side_letter, track_number)`.
+**`_SIDE_RE`** — compiled regex `r"^\s*([A-Za-z]{1,2})\s*[.\-]?\s*(\d+)\s*$"` —
+parses Discogs position strings like `"A1"`, `"B12"`, `"A-1"`, `"A.1"` or `"A 1"`
+into `(side_letter, track_number)`. The side label is bounded to 1-2 letters and
+surrounding whitespace / a `.`/`-` separator is tolerated (META-9).
 
-**`DisplayPalette`** — five-field dataclass carrying the current color theme:
-`bg`, `surface`, `accent`, `text`, `muted` (all `(R, G, B)` tuples). It is a
-passive value object; extraction lives in `src/display/palette.py`
-(`extract_palette`, A-8), which quantizes the cover and **guarantees** the
-muted role passes the Full-Opacity Rule (≥ 4.5:1 vs bg) by construction. Falls
-back to `FALLBACK_PALETTE` when no cover art is available.
+**`DisplayPalette`** *(defined in `src/display/palette.py` since ARCH-7 — moved
+out of `models.py` alongside `FALLBACK_PALETTE`; described here for reference)* —
+five-field dataclass carrying the current color theme: `bg`, `surface`, `accent`,
+`text`, `muted` (all `(R, G, B)` tuples). It is a passive value object;
+extraction lives in `src/display/palette.py` (`extract_palette`, A-8), which
+quantizes the cover and **guarantees** the muted role passes the Full-Opacity
+Rule (≥ 4.5:1 vs bg) by construction. Falls back to `FALLBACK_PALETTE` when no
+cover art is available.
 
 **`TracklistEntry`**: `position` (e.g. `"A1"`), `title`, `duration` (optional, e.g. `"4:37"`)
 
@@ -845,7 +849,7 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `src/audio/silence.py` | RMS silence detection, AudioEvent emission (via `Signal`) |
 | `src/audio/recognizer.py` | ShazamIO recognition loop + confirmation gate; emits a confirmed result via `on_confirmed` |
 | `src/app/track_commit_service.py` | `TrackCommitService` — resolve → state → track → scrobble commit (B-1/B-11) |
-| `src/metadata/models.py` | TrackMetadata (+ `SideIndex`), PlaySession, TracklistEntry, MetadataSource, DisplayPalette, FALLBACK_PALETTE, _SIDE_RE |
+| `src/metadata/models.py` | TrackMetadata (+ `SideIndex`), PlaySession, TracklistEntry, MetadataSource, _SIDE_RE |
 | `src/metadata/resolver.py` | 3-step metadata lookup chain (depends on `DiscogsReader`) |
 | `src/metadata/errors.py` | Transient-vs-permanent external-error taxonomy (`is_transient`) |
 | `src/metadata/discogs/transport.py` | `DiscogsHttp` — shared session + rate-limit-aware `request()`, `_as_id`/`_redact_url` |
@@ -855,9 +859,11 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `src/state/player_state.py` | Central state, status transitions, change listeners (via `Signal`) |
 | `src/util/signal.py` | `Signal[T]` — log-and-continue observer used by PlayerState + SilenceDetector |
 | `src/display/layouts.py` | Pixel geometry and font sizes (restyle here) |
-| `src/display/palette.py` | Cover-art palette extraction + WCAG colour science (`extract_palette`, `ensure_contrast`, `validate_image_file`) |
+| `src/display/palette.py` | `DisplayPalette` + `FALLBACK_PALETTE` value objects (moved here in ARCH-7), cover-art palette extraction + WCAG colour science (`extract_palette`, `ensure_contrast`, `ensure_contrast_hue_preserving`, `contrast_ratio`, `validate_image_file`) |
+| `src/display/typography.py` | `TextRenderer` (ARCH-3) — font loading + text layout (wrap/fit/ellipsize/tracked-label render) over renderer-owned bounded caches; unit-testable without a pygame renderer |
+| `src/display/palette_transition.py` | `PaletteTransition` (ARCH-3) — the 1s cross-fade state machine + `_lerp_color`/`_lerp_palette`/`_quantize_palette` and `_TRANSITION_SECS`/`_PALETTE_LERP_QUANTIZE` |
 | `src/display/cover_cache.py` | `CoverArtCache` (A-15) — SSRF-hardened IP-pinned cover download (S-1/S-2/S-7), URL→disk cache, `.part` sweep + mtime-LRU prune (R-1/R-2); pygame-free |
-| `src/display/renderer.py` | pygame window, screen rendering, palette transition, in-memory scaled-cover cache, `EmptyState` table (consumes `CoverArtCache`) |
+| `src/display/renderer.py` | pygame window, screen rendering, in-memory scaled-cover cache, `EmptyState` table (consumes `CoverArtCache`); composes `TextRenderer` + `PaletteTransition` and delegates to them (ARCH-3) |
 | `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs write trigger (via `DiscogsCollectionWriter`), Last.fm love call |
 | `src/tracking/lastfm_client.py` | Last.fm scrobble and love — wraps pylast; graceful no-op when unconfigured |
 | `get_lastfm_session_key.py` | One-time desktop auth helper — generates a Last.fm session key to paste into config.yaml |

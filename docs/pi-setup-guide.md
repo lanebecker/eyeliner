@@ -372,10 +372,17 @@ timeout), far below the point where a power-cut owner assumes the Pi has wedged.
 `StartLimitIntervalSec=300` / `StartLimitBurst=5` (STAB-4) is the backstop for
 *startup*. `Restart=on-failure` will otherwise restart a crashing process every
 `RestartSec=10` **forever**, and each cold start rebuilds the Discogs collection
-index from scratch — one GET per 100 records — so a persistent crash (a bad config
-that survives validation, a wedged dependency) turns into a permanent hammering of
-the collection API: a 1,000-record collection re-pages 60 GETs/minute, which is
-exactly the authenticated rate limit. These two directives tell systemd to stop
+index from scratch — one GET per 100 records — so a persistent crash (a config
+error that survives validation, a wedged dependency) turns into a permanent
+hammering of the collection API: a 1,000-record collection re-pages 60 GETs/minute,
+which is exactly the authenticated rate limit. (Note: a wrong or absent
+`audio.device_name` is **no longer** one of these startup-crash causes. Since #164
+the device lookup happens *inside* the capture retry loop, so a mistyped name or a
+turntable unplugged at boot degrades to the same in-process backoff-and-retry path
+a mid-run unplug takes — the process stays up, re-resolving the device each attempt
+— rather than raising out of `run()` and crash-looping under systemd. The backstop
+below is therefore for genuinely fatal boots, not for a fixable audio-device typo.)
+These two directives tell systemd to stop
 retrying once the service has been started **more than 5 times within 300
 seconds**: it refuses the next start, drops the unit into a `failed` state
 (`journalctl` shows `start-limit-hit`), and stops trying — so a genuinely broken

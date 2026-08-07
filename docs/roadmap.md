@@ -344,7 +344,7 @@ correctness, security, test-coverage, and design-prototype findings. See
 `CHANGELOG.md` for the full breakdown. **Upgrade note:** config validation is
 now stricter (a hand-edited `config.yaml` with loose types may need fixing).
 
-### v1.5.1 — Code-review hardening, round 2 ✅ (current)
+### v1.5.1 — Code-review hardening, round 2 ✅
 
 **No new user-facing features.** A second-pass review (`CODE_REVIEW_2026-06-18.md`)
 produced 13 issues (#62–#74) across five milestones, all fixed here under the same
@@ -359,15 +359,41 @@ doc-vs-code gaps — Hue-Diversity formally deferred and resolution-independence
 backed by a layout matrix (#73–#74). Test suite grew 545 → 632. The one deferred
 follow-up is #61 (dedicated Discogs executor), gated on real rate-limit evidence.
 
+### v1.5.2 – v1.5.7 — Code-review hardening, round 3 ✅ (current)
+
+**No new user-facing features.** A third adversarial cold audit
+(`CODE_REVIEW_2026-07-30.md`) filed 88 issues across five milestones, remediated
+in waves and shipped incrementally — each fix through the same implement → RED
+test → mutation-check → independent cold-review discipline. By wave:
+
+- **v1.5.2 (Wave 1)** — collection data integrity: the one irreversible wave,
+  landed before the Pi is powered on.
+- **v1.5.3 (Wave 2)** — liveness & crash-loop recovery: keeping the unattended
+  appliance alive through device glitches, bad config edits, and network trouble.
+- **v1.5.4 (Wave 3)** — untrusted-input & credential hardening, plus the guard
+  paths the suite had never executed.
+- **v1.5.5 (Wave 4)** — display correctness & the contrast guarantee: making the
+  "4.5:1 on all text" promise actually true.
+- **v1.5.6 (Wave 5)** — metadata, Discogs reliability & the audio pipeline, plus
+  the ARCH-3 God-object split (`TextRenderer` and `PaletteTransition` extracted
+  out of `DisplayRenderer` into `src/display/typography.py` and
+  `src/display/palette_transition.py`).
+- **v1.5.7 (Waves 6–10)** — the residuals surfaced by earlier waves' cold
+  reviews: boot/config correctness, graceful degradation of malformed external
+  responses, and a throttled capture-error log.
+
+See `CHANGELOG.md` for the full per-issue breakdown.
+
 ---
 
 ## v1.6.0 — Idle Screen & Recent Plays
 
-**Why next:** the idle screen is currently a blank dark background. This is
-the most visible gap in the daily experience — the Pi is on all the time,
-and "nothing" is what you see most. (DESIGN.md likewise flags the current
-stripe placeholder as a design gap; any redesign must use the fallback
-palette and stay in the room-monitor vocabulary.)
+**Why next:** the idle screen is currently a minimal stripe placeholder on the
+fallback palette — no album, no content. This is the most visible gap in the
+daily experience — the Pi is on all the time, and this near-empty card is what
+you see most. (DESIGN.md likewise flags the current stripe placeholder as a
+design gap; any redesign must use the fallback palette and stay in the
+room-monitor vocabulary.)
 
 **What it adds:**
 - Grid of recently played album covers (pulled from session history or a small
