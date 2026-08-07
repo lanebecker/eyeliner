@@ -262,6 +262,40 @@ async def test_stab1_concurrent_prefetch_for_same_url_downloads_once(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_blacklisted_cover_is_not_re_decoded_for_palette(tmp_path, monkeypatch):
+    """#165: a cover already given up on (in _cover_bad_urls) whose corrupt bytes
+    were deliberately LEFT on disk by the blacklisting attempt must NOT be
+    re-decoded for palette on every track-change prefetch — that logged one
+    'Palette extraction failed' WARNING per set_track. _prefetch_cover must skip a
+    blacklisted URL entirely (no re-download, no re-decode)."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._bg_tasks = set()
+    r.dynamic_theming = True
+    r._palette_cache = _BoundedCache(200)
+    r._dirty = False
+    url = "https://i.discogs.com/bad.jpg"
+
+    # Blacklisted, but its (corrupt) bytes are still on disk — the exact state
+    # _handle_corrupt_cover leaves on the final, blacklisting attempt.
+    r._cover_store.path_for(url).write_bytes(b"not a real image")
+    r._cover_bad_urls.add(url)
+    r._wanted_cover_url = url
+
+    decodes = []
+
+    def spy_extract(path):
+        decodes.append(path)
+        raise ValueError("cannot decode corrupt cover")   # what Pillow would raise
+
+    monkeypatch.setattr("src.display.renderer.extract_palette", spy_extract)
+
+    await r._prefetch_cover(url)
+
+    assert decodes == []          # blacklisted → never re-decoded (no WARNING flood)
+
+
+@pytest.mark.asyncio
 async def test_stab1_transient_decode_failure_still_recovers(tmp_path):
     """Non-regression (B-18): a ONE-OFF decode failure (transient SD read) must
     still self-heal — unlink + one refetch, and when the re-download lands good
