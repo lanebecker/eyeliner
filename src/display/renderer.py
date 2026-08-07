@@ -94,16 +94,28 @@ from typing import Callable, Optional, Tuple, TYPE_CHECKING
 
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
-from src.display.palette import DisplayPalette, FALLBACK_PALETTE
+from src.display.palette import DisplayPalette
 from src.display.palette import (
     extract_palette,
-    ensure_contrast,
-    ensure_contrast_hue_preserving,
-    text_background,
     GRADIENT_TEXT_PEAK,
 )
+# ensure_contrast / ensure_contrast_hue_preserving / text_background were used
+# only by _quantize_palette, which moved to palette_transition.py (ARCH-3); they
+# are imported there now, not here.
 from src.display.cover_cache import CoverArtCache
 from src.display.typography import TextRenderer
+# ARCH-3: the palette cross-fade state machine lives in its own module now.  Re-
+# exported here so `from src.display.renderer import _lerp_palette` / `_quantize_
+# palette` / `_PALETTE_LERP_QUANTIZE` / `_TRANSITION_SECS` keep resolving for the
+# render loop (which reads _TRANSITION_SECS) and the existing tests.
+from src.display.palette_transition import (  # noqa: F401
+    PaletteTransition,
+    _lerp_color,
+    _lerp_palette,
+    _quantize_palette,
+    _PALETTE_LERP_QUANTIZE,
+    _TRANSITION_SECS,
+)
 
 if TYPE_CHECKING:
     import pygame
@@ -121,8 +133,9 @@ log = logging.getLogger(__name__)
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("DISPLAY", ":0")  # Needed when running headless / via SSH
 
-# How long (seconds) to lerp between palettes on track change
-_TRANSITION_SECS = 1.0
+# _TRANSITION_SECS (palette cross-fade duration) moved to palette_transition.py
+# with the state machine that owns it; it is re-imported at the top of this
+# module (the render loop still reads it).
 
 # Cap on the per-URL palette cache.  Extraction is fast (~ms per album), so
 # re-running on a cache miss is fine; the cap just prevents unbounded growth
@@ -294,54 +307,10 @@ class _BoundedCache:
         return len(self._data)
 
 
-def _lerp_color(a: tuple, b: tuple, t: float) -> tuple:
-    """Linear interpolation between two RGB tuples. t in [0, 1]."""
-    t = max(0.0, min(1.0, t))
-    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
-
-
-def _lerp_palette(a: DisplayPalette, b: DisplayPalette, t: float) -> DisplayPalette:
-    """Interpolate all five channels of two DisplayPalettes."""
-    return DisplayPalette(
-        bg=_lerp_color(a.bg, b.bg, t),
-        surface=_lerp_color(a.surface, b.surface, t),
-        accent=_lerp_color(a.accent, b.accent, t),
-        text=_lerp_color(a.text, b.text, t),
-        muted=_lerp_color(a.muted, b.muted, t),
-    )
-
-
-# Quantization step (per RGB channel) applied to the in-flight lerp palette so
-# the per-frame palette — and the static-frame + tracked-label cache keys that
-# include it — only changes ~16 times over the 1s transition instead of every
-# frame, avoiding thousands of glyph re-renders per track change (P-4).  The
-# stepping is imperceptible at the gradient's low bg→surface contrast, and the
-# final (settled) palette is the exact target, not a quantized value.
-_PALETTE_LERP_QUANTIZE = 16
-
-
-def _quantize_palette(p: DisplayPalette) -> DisplayPalette:
-    q = _PALETTE_LERP_QUANTIZE
-
-    def snap(color):
-        return tuple((c // q) * q for c in color)
-
-    bg = snap(p.bg)
-    surface = snap(p.surface)
-    # Re-assert the Full-Opacity Rule after quantizing: flooring a text role
-    # toward black could otherwise transiently drop it below the 4.5:1 WCAG
-    # floor during the lerp.  Clamp against the gradient's brightest pixel
-    # (DISP-2), not flat bg; accent (the album title) is lifted hue-preserving
-    # exactly as extract_palette does (DISP-1), muted blends toward white.  Both
-    # are deterministic in their (quantized) inputs, so the cache key stays
-    # stable while readability is preserved.
-    tb = text_background(bg, surface)
-    muted = ensure_contrast(snap(p.muted), tb, min_ratio=4.5)
-    accent = ensure_contrast_hue_preserving(snap(p.accent), tb, min_ratio=4.5)
-    return DisplayPalette(
-        bg=bg, surface=surface, accent=accent,
-        text=snap(p.text), muted=muted,
-    )
+# _lerp_color / _lerp_palette / _quantize_palette / _PALETTE_LERP_QUANTIZE moved
+# to palette_transition.py (ARCH-3) with the PaletteTransition state machine that
+# uses them; they are re-imported at the top of this module so existing importers
+# (`from src.display.renderer import _lerp_palette`) keep resolving.
 
 
 class DisplayRenderer:
@@ -377,10 +346,13 @@ class DisplayRenderer:
         # instead of once per frame (v1.4.0).
         self._layout: NowPlayingLayout = get_now_playing_layout(self.width, self.height)
 
-        # Palette transition state
-        self._current_palette: DisplayPalette = FALLBACK_PALETTE
-        self._target_palette: DisplayPalette = FALLBACK_PALETTE
-        self._transition_start: float = 0.0
+        # Palette transition state — the cross-fade state machine (ARCH-3).  The
+        # current/target/start fields it owns are still reachable as
+        # self._current_palette / _target_palette / _transition_start via
+        # delegating properties, so the render loop and the __new__-skeleton tests
+        # are unchanged.  The palette cache stays renderer-owned (below) and is
+        # passed into _queue_palette per call.
+        self._palette_impl = PaletteTransition()
         self._palette_cache = _BoundedCache(_PALETTE_CACHE_MAX)  # cover_art_url → DisplayPalette
 
         # Render hot-path caches (v1.3.3)
@@ -1287,57 +1259,60 @@ class DisplayRenderer:
         )
 
     # -----------------------------------------------------------------------
-    # Palette management
+    # Palette management (ARCH-3: delegates to the PaletteTransition engine)
     # -----------------------------------------------------------------------
+
+    @property
+    def _palette(self) -> PaletteTransition:
+        """The cross-fade engine, built lazily so __new__-skeleton tests that set
+        _current_palette / _target_palette / _transition_start directly (without
+        calling __init__) still work.  The engine holds no renderer state — the
+        palette cache and dynamic_theming flag are passed into queue() per call —
+        so it never needs rebinding when a skeleton swaps the cache."""
+        impl = self.__dict__.get("_palette_impl")
+        if impl is None:
+            impl = PaletteTransition()
+            self.__dict__["_palette_impl"] = impl
+        return impl
+
+    # The three transition-state fields live on the engine now; these delegating
+    # properties preserve the old attribute surface for the render loop (which
+    # reads _transition_start) and every __new__-skeleton test that assigns them.
+    @property
+    def _current_palette(self) -> DisplayPalette:
+        return self._palette.current
+
+    @_current_palette.setter
+    def _current_palette(self, value: DisplayPalette):
+        self._palette.current = value
+
+    @property
+    def _target_palette(self) -> DisplayPalette:
+        return self._palette.target
+
+    @_target_palette.setter
+    def _target_palette(self, value: DisplayPalette):
+        self._palette.target = value
+
+    @property
+    def _transition_start(self) -> float:
+        return self._palette.transition_start
+
+    @_transition_start.setter
+    def _transition_start(self, value: float):
+        self._palette.transition_start = value
 
     def _queue_palette(self, cover_url: Optional[str]):
         """Set the target palette for a new track, triggering a transition.
 
-        If a previous transition is still in flight, snap _current_palette to
-        the currently-interpolated value before reassigning the target — that
-        way the new lerp starts from what the user is *currently seeing*
-        instead of jumping back to a stale starting point.
+        Thin delegator to the PaletteTransition engine; the renderer owns the
+        palette cache and the dynamic_theming flag and passes them in.
         """
-        if not self.dynamic_theming:
-            return
-        if cover_url is None:
-            target = FALLBACK_PALETTE
-        elif (cached := self._palette_cache.get(cover_url)) is not None:
-            target = cached  # get() already refreshed its eviction position
-        else:
-            # P-9: _queue_palette must NEVER decode — it runs synchronously inside
-            # set_track's Signal callback on the event loop, and Pillow decode +
-            # quantize is tens of ms on the Pi.  When the palette isn't cached yet
-            # we target FALLBACK for now; _extract_palette_async (in an executor)
-            # extracts off-loop and re-queues with the real palette a frame later.
-            target = FALLBACK_PALETTE
-
-        # Skip the retarget entirely when nothing changed (v1.3.5): every
-        # track commit notifies the renderer, and tracks from the same album
-        # share a cover URL — without this guard each commit restarted the 1s
-        # transition (30 fps cadence + per-frame gradient regeneration)
-        # lerping a palette to itself.
-        if target == self._target_palette:
-            return
-
-        # Snap current to the live interpolated value before retargeting, so a
-        # mid-transition track change doesn't lerp from a stale base palette.
-        self._current_palette = self._animated_palette()
-        self._target_palette = target
-        self._transition_start = time.monotonic()
+        return self._palette.queue(cover_url, self._palette_cache, self.dynamic_theming)
 
     def _animated_palette(self) -> DisplayPalette:
         """Return the current interpolated palette for this render frame."""
-        elapsed = time.monotonic() - self._transition_start
-        t = min(1.0, elapsed / _TRANSITION_SECS)
-        if t >= 1.0:
-            self._current_palette = self._target_palette
-            return self._target_palette
-        # Quantize the in-flight palette so the per-frame cache keys stay stable
-        # across many frames during the lerp (P-4).
-        return _quantize_palette(
-            _lerp_palette(self._current_palette, self._target_palette, t)
-        )
+        return self._palette.animated()
 
     # -----------------------------------------------------------------------
     # Cover art — async fetch (via CoverArtCache) + sync load from cache

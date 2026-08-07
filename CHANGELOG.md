@@ -387,6 +387,41 @@ The God-object split, part 1 of 2 (Unit 5b — ARCH-3 #139, subset scope):
   refactor against safely. Behaviour-preserving; RED-first; mutation-verified;
   independently cold-reviewed (which caught a dead `pathlib.Path` import and a
   missing cache-invalidation guard, both fixed before delivery).
+- **Extracted `PaletteTransition` out of `DisplayRenderer` (ARCH-3 #139 — the
+  second of the two subset splits; closes the issue).** The 1-second palette
+  cross-fade on track change — its interpolation, per-frame quantization (P-4),
+  same-target skip (v1.3.5), and snap-to-live-value-before-retarget behaviour —
+  plus the `_lerp_color`/`_lerp_palette`/`_quantize_palette` helpers and the
+  `_TRANSITION_SECS`/`_PALETTE_LERP_QUANTIZE` constants now live in a new
+  `src/display/palette_transition.py` as a standalone `PaletteTransition` class,
+  with its own standalone unit tests (`tests/test_palette_transition.py`, 12
+  cases) that build the state machine over a bare cache with **no renderer, no
+  pygame, no display surface**. `DisplayRenderer` composes one and delegates
+  `_queue_palette`/`_animated_palette` via thin shims; `_current_palette`,
+  `_target_palette` and `_transition_start` remain reachable as delegating
+  properties, so the render loop and every `__new__`-skeleton test are unchanged
+  (90 existing palette-touching assertions across five test files still pass
+  untouched). The engine captures **no** renderer state — the palette cache and
+  `dynamic_theming` flag stay renderer-owned and are passed into `queue()` per
+  call — so, unlike the `TextRenderer` split, the lazy engine needs no
+  cache-swap rebind guard. Behaviour-preservation was verified by a 3000-trial
+  randomized equivalence harness against a faithful re-implementation of the
+  pre-split inline state machine (0 mismatches on `animated()` output and all
+  three state fields), plus the full suite green. RED-first; four-mutant
+  gauntlet (same-target skip, snap-before-retarget, quantization, theming guard)
+  all killed; independently cold-reviewed (SPEC + QUALITY PASS; caught one dead
+  `FALLBACK_PALETTE` import, fixed).
+- **ARCH-3 (#139) resolved as a documented subset.** With `TextRenderer` and
+  `PaletteTransition` extracted, `renderer.py` is down from ~1700 to ~1518 lines
+  (~180 lines / two whole responsibilities lifted into focused modules) and its
+  two most cohesive, pure-logic responsibilities are now independently
+  unit-testable. The remaining `FramePainter` (frame composition) and
+  `CoverPipeline` (async cover fetch/decode) extractions are **deliberately
+  deferred** and documented on the issue: they carry the heaviest render-loop
+  and event-loop coupling, the least testability payoff, and — critically — lack
+  a pixel-diff / integration harness to refactor against safely, so splitting
+  them now would be high-risk churn. The God-object is materially reduced;
+  #139 is closed as substantially addressed with the deferral recorded.
 
 ## [1.5.5] — 2026-08-06
 
