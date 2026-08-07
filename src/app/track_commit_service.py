@@ -86,6 +86,13 @@ class TrackCommitService:
         ``current_raw`` un-advanced (B-11) and the track is re-attempted on the
         next chunk.
         """
+        # This is the scrobble timestamp — one of the two DATE-DEPENDENT WRITES in
+        # the app (the other is the Last Played `date.today()` in writer.py). Both
+        # are gated by `clock_is_trustworthy` (STAB-2): this timestamp is validated
+        # below (see the clock-sanity gate before the scrobble) so a pre-NTP boot
+        # can't stamp and drop a scrobble. Noted here because META-5 cited only the
+        # writer for "bogus scrobble timestamps"; the scrobble timestamp is taken
+        # HERE, not there (CRIT-9).
         timestamp = int(time.time())
         # The epoch is bound to the AUDIO at capture/enqueue time (PCONC-1) and
         # passed in — NOT re-sampled here.  A commit-entry sample missed the

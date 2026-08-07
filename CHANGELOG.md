@@ -9,9 +9,10 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-**Code-review hardening, round 3 (Wave 5 — metadata & tracklist correctness).**
-Wave 5 of the same audit (`CODE_REVIEW_2026-07-30.md`), tightening how a track's
-position within its album is parsed and ranked.
+**Code-review hardening, round 3 (Wave 5 — metadata, tracklist & Discogs
+reliability).** Wave 5 of the same audit (`CODE_REVIEW_2026-07-30.md`):
+tightening how a track's position within its album is parsed and ranked, and
+closing gaps in the Discogs read/write layer.
 
 ### Fixed
 
@@ -63,6 +64,66 @@ position within its album is parsed and ranked.
   corrected to describe the actual first-occurrence logic. RED-first; adversarial
   cold review (no crash / no data-integrity defect; one introduced regression
   found and fixed, one degenerate nit declined).
+
+The Discogs-reliability cluster (Unit 2):
+
+### Fixed
+
+- **A routine Discogs 429/5xx during a collection search is now classified
+  transient instead of "unexpected bug" (META-6 #149 — LOW).** The reader's
+  search/release/master calls go through the python3-discogs-client library,
+  which raises its OWN `discogs_client.exceptions.HTTPError` for a non-2xx
+  status — a type that does **not** inherit from
+  `requests.exceptions.RequestException` (verified via its MRO). The
+  transient/permanent taxonomy listed only the `requests` families, so a
+  routine rate-limit or gateway error was mis-classified as non-transient and
+  logged as "Unexpected error in Discogs collection search" — erasing exactly
+  the routine-vs-defect distinction the taxonomy exists to provide for an
+  operator reading the journal after an unattended overnight run. Added
+  `discogs_client.exceptions.HTTPError` to `TRANSIENT_EXTERNAL_ERRORS` and
+  corrected the module docstring's false "the Discogs client is requests-based"
+  claim. RED-first (the new test was red before the tuple change); mutation-
+  verified.
+
+### Changed
+
+- **The live Discogs smoke test moved out of the test namespace and got a
+  public API seam (CRIT-6 #133 — MEDIUM).** `test_discogs_live.py` — a 226-line,
+  `test_`-prefixed script at the repo root that hits the real Discogs API (and,
+  with `--test-write`, increments a Play Count in the operator's live
+  collection) — was only kept out of `pytest` by a `conftest.py` `collect_ignore`
+  hack, one config edit away from a live-network write landing in CI. It is now
+  `scripts/discogs_live_check.py` (outside `testpaths=tests`, no `test_` prefix,
+  so `pytest` never collects it — verified with `--collect-only`), the
+  `collect_ignore` workaround is deleted, and the six doc references were
+  updated. It also reached into the writer's private `_get_collection_fields()`
+  from outside the package, so a writer refactor would silently break the
+  operator's first-boot smoke test; a public `DiscogsCollectionWriter.
+  get_collection_fields()` facade was added and the script now calls that. (The
+  other half of CRIT-6 — a real unit test for the field-ID map, closing MUT-1 —
+  was already satisfied by prior-wave tests.)
+- **The Discogs transport's identifying default headers are now pinned by a
+  test (MUT-12 #135 — MEDIUM).** Only the `Authorization` header was implicitly
+  exercised; `User-Agent`, `Content-Type` and their values survived string
+  mutation. Discogs returns HTTP 403 to any request without an identifying
+  `User-Agent` — a failure that only ever surfaces the first time the Pi touches
+  the real API, which this project weights higher. A test now asserts the exact
+  default header dict on `DiscogsHttp` construction, including a non-empty
+  `User-Agent`; a refactor that drops or renames it turns the suite red
+  (mutation-verified against empty, renamed, and removed UA).
+- **Clarified that the scrobble timestamp shares the Last Played clock gate
+  (CRIT-9 #148 — LOW).** The finding noted that META-5 cited only `writer.py`
+  for "bogus scrobble timestamps," while the scrobble timestamp is actually
+  captured in `track_commit_service.py`. The code already gates both
+  date-dependent writes with `clock_is_trustworthy` (STAB-2) and both are
+  tested; this adds an in-code cross-reference at the timestamp capture so a
+  triager following the cite finds the scrobble path. (No behavioural change.)
+
+### Fixed (nit)
+
+- **Removed a stale hardcoded sample date from a `writer.py` comment (STAB-7
+  #161 — NIT).** `# e.g. "2026-05-24"` beside `date.today()` became the generic
+  `# ISO 8601, e.g. "YYYY-MM-DD"`.
 
 ## [1.5.5] — 2026-08-06
 

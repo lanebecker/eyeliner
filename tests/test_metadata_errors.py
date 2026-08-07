@@ -30,3 +30,18 @@ def test_unexpected_and_permanent_are_not_transient():
     assert not is_transient(ValueError("a real bug"))
     assert not is_transient(KeyError("a real bug"))
     assert not is_transient(PermanentMetadataError("definitive"))
+
+
+def test_discogs_client_http_error_classifies_as_transient():
+    """META-6: python3-discogs-client raises its OWN HTTPError for a non-2xx
+    status, and it does NOT inherit from requests.exceptions.RequestException,
+    so a routine Discogs 429/5xx during a search must still classify as
+    transient rather than an unexpected bug."""
+    import discogs_client.exceptions
+
+    # Pin the premise the finding rests on: it is NOT a requests exception.
+    assert not issubclass(
+        discogs_client.exceptions.HTTPError, requests.exceptions.RequestException
+    )
+    assert is_transient(discogs_client.exceptions.HTTPError("rate limited", 429))
+    assert is_transient(discogs_client.exceptions.HTTPError("server error", 502))

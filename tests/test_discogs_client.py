@@ -1117,3 +1117,21 @@ def test_reader_collection_index_percent_encodes_username_in_url():
     assert method == "GET"
     assert f"/users/{_ENCODED_USERNAME}/collection/folders/0/releases" in url
     assert f"/users/{_SPECIAL_USERNAME}/" not in url
+
+
+def test_get_collection_fields_public_accessor_delegates_to_private():
+    """CRIT-6: the PUBLIC get_collection_fields() is the supported seam for
+    operator tooling (scripts/discogs_live_check.py) — it returns the same
+    name→id map as the private impl, so the smoke test no longer reaches into a
+    private method from outside the package."""
+    writer = make_unseeded_writer()
+    writer._http.request = MagicMock(return_value=_fields_response(
+        [{"name": "Play Count", "id": 3}, {"name": "Last Played", "id": 4}]
+    ))
+
+    fields = writer.get_collection_fields()
+
+    assert fields == {"Play Count": 3, "Last Played": 4}
+    # It is genuinely a facade over the private impl: the private accessor now
+    # returns the same cached object the public one just populated.
+    assert fields is writer._get_collection_fields()
