@@ -358,6 +358,36 @@ The renderer/architecture cleanup cluster (Unit 5a):
   maintainer trusting "held forever" might probe many sizes per frame assuming
   zero eviction cost.
 
+The God-object split, part 1 of 2 (Unit 5b — ARCH-3 #139, subset scope):
+
+### Changed
+
+- **Extracted `TextRenderer` out of `DisplayRenderer` (ARCH-3 #139 — the first
+  of two facade-delegation splits).** All font loading + text layout — `font`,
+  `render_tracked`, `break_long_token`, `wrap_lines`, `fit_wrapped`, `ellipsize`,
+  `draw_wrapped_text`, `measure_wrapped_text`, plus the `_FONT_DIR`/`_FONT_FILES`/
+  `_SYSFONT_FALLBACKS` constants — now lives in a new `src/display/typography.py`
+  as a standalone `TextRenderer` class. This is pure layout logic that shared no
+  state with the render loop yet could previously only be reached through a
+  pygame-initialised `DisplayRenderer`; it now has its own module and its own
+  standalone unit tests (`tests/test_typography.py`, 12 cases) that build a
+  `TextRenderer` over two bounded caches with **no renderer, no display surface,
+  no `__new__`-skeleton**. `DisplayRenderer` composes one `TextRenderer` and
+  delegates via thin shims, so its public/private method surface is byte-for-byte
+  unchanged and every existing renderer test still passes. The font + label LRU
+  caches stay **owned by the renderer** and are injected into the engine, so cache
+  bounds and eviction are identical to before; the engine is built lazily from the
+  renderer's own caches and rebinds if a test swaps a cache out (pinned by
+  `test_text_engine_rebinds_when_cache_is_swapped`), so the `__new__`-skeleton
+  tests keep working. `renderer.py` shrank ~1700 → ~1534 lines. Scope was Lane's
+  call: ARCH-3 is being addressed as a two-patch subset (TextRenderer, then
+  `PaletteTransition`), with the `FramePainter`/`CoverPipeline` extraction
+  deferred and documented on the issue — those carry the most render-loop
+  coupling and the least testability payoff, and lack a pixel-diff harness to
+  refactor against safely. Behaviour-preserving; RED-first; mutation-verified;
+  independently cold-reviewed (which caught a dead `pathlib.Path` import and a
+  missing cache-invalidation guard, both fixed before delivery).
+
 ## [1.5.5] — 2026-08-06
 
 **Code-review hardening, round 3 (Wave 4 — display correctness & the contrast

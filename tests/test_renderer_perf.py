@@ -43,6 +43,9 @@ def make_dot_renderer():
 def make_font_renderer():
     r = DisplayRenderer.__new__(DisplayRenderer)
     r._font_cache = _BoundedCache(_FONT_CACHE_MAX)
+    # ARCH-3: the typography engine is lazily built from BOTH caches, so a
+    # font-only skeleton must still provide a label cache (size irrelevant here).
+    r._label_cache = _BoundedCache(_FONT_CACHE_MAX)
     return r
 
 
@@ -194,3 +197,16 @@ def test_font_cache_is_bounded():
     for size in range(_FONT_CACHE_MAX + 20):
         r._font("mono", 8 + size)
     assert len(r._font_cache) <= _FONT_CACHE_MAX
+
+
+def test_text_engine_rebinds_when_cache_is_swapped():
+    """ARCH-3: the lazy TextRenderer rebinds if a skeleton swaps _font_cache
+    after first use, so it never keeps a stale memoized cache pair."""
+    r = make_font_renderer()
+    r._font("mono", 12)                       # builds the engine over the first caches
+    assert r._text._font_cache is r._font_cache
+    new_fc = _BoundedCache(_FONT_CACHE_MAX)
+    r._font_cache = new_fc                     # swap the cache out
+    r._font("mono", 14)                        # must rebind to the new cache
+    assert r._text._font_cache is new_fc
+    assert len(new_fc) >= 1                     # the write landed in the NEW cache
