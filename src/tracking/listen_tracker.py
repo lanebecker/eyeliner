@@ -132,11 +132,12 @@ class ListenTracker:
 
         Most write failures inside the credit path are already handled gracefully
         (``_finalize_write_with_retry`` catches and bounded-retries the Play Count
-        increment and the Last.fm love, #163). This callback is the backstop for
-        the paths that still raise rather than return False — most concretely a
-        raising ``update_last_played`` — and for any unexpected error, so the
-        operator sees the failure in the same log that records every other write
-        outcome, rather than a silent half-credited session.
+        increment and the Last.fm love, #163; and #171 now contains a raising
+        ``update_last_played`` inside ``_finalize_session`` so it can't skip the
+        love). This callback remains the backstop for any OTHER unexpected error
+        anywhere in the SESSION_ENDED task, so the operator sees the failure in the
+        same log that records every other write outcome, rather than a silent
+        half-credited session.
 
         ``task.cancelled()`` is checked first: shutdown / loop teardown can cancel
         an in-flight credit (``drain`` already warns about that), and calling
@@ -318,7 +319,25 @@ class ListenTracker:
                 # write lands, inside the helper, so a transient failure stays
                 # uncommitted and is bounded-retried instead of silently lost.
                 session.crediting = True
-                await self._credit_completed_album(session)
+                try:
+                    await self._credit_completed_album(session)
+                except Exception as e:
+                    # #171: the Last.fm love below "runs independently of Discogs"
+                    # — but a Discogs write that RAISES (concretely the SINGLE,
+                    # unretried update_last_played; the increment is already
+                    # exception-caught by _finalize_write_with_retry) would
+                    # otherwise propagate out of _finalize_session and skip the
+                    # love too. Contain a crediting raise here so the love still
+                    # runs. `credited` stays uncommitted (set only on the
+                    # increment landing, inside the helper), so a lost credit is
+                    # still not falsely latched; this only stops the raise from
+                    # also costing the love.
+                    log.error(
+                        "⚠ Discogs crediting raised (%r); Play Count / Last Played "
+                        "may be incomplete for release %s / instance %s — continuing "
+                        "to the Last.fm love, which is independent.",
+                        e, session.album_release_id, session.album_instance_id,
+                    )
 
         elif session.potential_last_track and not session.album_release_id:
             log.info(
