@@ -9,6 +9,8 @@ from typing import Optional
 
 import musicbrainzngs
 
+from src.metadata.errors import is_transient
+
 log = logging.getLogger(__name__)
 
 # Identify our app to MusicBrainz (required by their API policy)
@@ -63,7 +65,25 @@ class CoverArtFallback:
                         # through and try the next release).
                         if isinstance(url, str):
                             return url
-                except (musicbrainzngs.ResponseError, AttributeError, TypeError, KeyError) as e:
+                except Exception as e:
+                    # #175: classify with the shared metadata taxonomy. A
+                    # TRANSIENT failure (MusicBrainz unreachable/timeout —
+                    # NetworkError) means the whole service is down, so the
+                    # remaining releases would fail the same way: re-raise to the
+                    # outer handler (which logs once and returns None) instead of
+                    # hammering a dead service with every candidate.
+                    if is_transient(e):
+                        raise
+                    # Anything else is definitive for THIS release, not the
+                    # service: a ResponseError/404 or AuthenticationError for this
+                    # MBID, or a malformed/unexpected shape in an UNTRUSTED payload
+                    # (the TQ-3 parse errors and their kin). Cover art is a
+                    # best-effort fallback, so skip this candidate and try the next
+                    # rather than aborting the lookup — the outer handler still
+                    # returns None gracefully if every candidate fails. We
+                    # deliberately do NOT single out "unexpected" errors to abort
+                    # loudly here: on this non-critical, untrusted-payload path a
+                    # skip-to-None is the right degradation (#175 cold review).
                     log.debug("skipping release with no usable cover art: %s", e)
                     continue  # try the next release
 

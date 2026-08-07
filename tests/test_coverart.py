@@ -166,6 +166,70 @@ def test_all_releases_malformed_returns_none_without_crashing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #175 — a TRANSPORT error mid-loop: classify transient vs permanent.
+#   • permanent / per-release (AuthenticationError, a ResponseError/404 for this
+#     MBID) → skip to the next candidate (a later release may still have art).
+#   • transient / service-down (NetworkError) → abort the loop; trying later
+#     releases would just hammer an unreachable service.
+# ---------------------------------------------------------------------------
+
+def test_permanent_transport_error_on_first_release_skips_to_next(monkeypatch):
+    """A PERMANENT per-release transport error (AuthenticationError on r0) must
+    skip to r1, not abort. Before the fix it escaped the inner except (which only
+    caught ResponseError + parse errors) and returned None, discarding r1's art."""
+    _patch_mb(
+        monkeypatch,
+        search={"release-list": [{"id": "r0"}, {"id": "r1"}]},
+        images={
+            "r0": coverart.musicbrainzngs.AuthenticationError("401 for r0"),
+            "r1": {"images": [{"front": True,
+                               "image": "https://coverartarchive.org/r1/front.jpg"}]},
+        },
+    )
+    assert CoverArtFallback().get_cover_art_url("A", "B") == \
+        "https://coverartarchive.org/r1/front.jpg"
+
+
+def test_transient_error_aborts_the_loop_without_hammering_later_releases(monkeypatch):
+    """A TRANSIENT error (NetworkError = MusicBrainz unreachable) aborts the whole
+    loop and returns None — later releases would fail the same way, so they are
+    never queried. Pins that the fix keeps abort-on-transient (does NOT broaden
+    into hammering a down service)."""
+    queried = []
+
+    def fake_get_image_list(mbid):
+        queried.append(mbid)
+        raise coverart.musicbrainzngs.NetworkError("MB unreachable")
+
+    monkeypatch.setattr(coverart.musicbrainzngs, "search_releases",
+                        lambda **k: {"release-list": [{"id": "r0"}, {"id": "r1"}]})
+    monkeypatch.setattr(coverart.musicbrainzngs, "get_image_list", fake_get_image_list)
+
+    assert CoverArtFallback().get_cover_art_url("A", "B") is None
+    assert queried == ["r0"]          # aborted after the transient error; r1 never tried
+
+
+def test_non_transient_error_skips_to_next_release(monkeypatch):
+    """#175: a NON-transient error that isn't a service-down signal (here a
+    RuntimeError, standing in for any unexpected/malformed-payload failure that
+    is definitive for THIS release) is treated as best-effort-fallback breakage
+    of one candidate: skip it and try the next, which succeeds. It does NOT abort
+    the whole lookup (only a transient NetworkError does that)."""
+    def fake_get_image_list(mbid):
+        if mbid == "r0":
+            raise RuntimeError("this release's payload is broken")   # not transient
+        return {"images": [{"front": True,
+                            "image": "https://coverartarchive.org/r1/front.jpg"}]}
+
+    monkeypatch.setattr(coverart.musicbrainzngs, "search_releases",
+                        lambda **k: {"release-list": [{"id": "r0"}, {"id": "r1"}]})
+    monkeypatch.setattr(coverart.musicbrainzngs, "get_image_list", fake_get_image_list)
+
+    assert CoverArtFallback().get_cover_art_url("A", "B") == \
+        "https://coverartarchive.org/r1/front.jpg"
+
+
+# ---------------------------------------------------------------------------
 # Return-type contract
 # ---------------------------------------------------------------------------
 
