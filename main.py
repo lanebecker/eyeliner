@@ -294,51 +294,76 @@ async def main():
     io_executor = install_io_executor(loop)
 
     state = PlayerState()
-    # ARCH-10: construction is guarded + testable in build_components — a failure
-    # (most concretely an unwritable cover_art_cache_dir) is now an actionable log
-    # line pointing at the checklist, then a re-raise, not a bare traceback.
-    components = build_components(config, state)
 
-    # Wire silence events into state and tracker as TWO separate Signal listeners
-    # (CRIT-5, in wire_silence_listeners): splitting them lets the Signal's
-    # log-and-continue isolate a fault in one from the other (the stranded-card
-    # bug); state is registered first to match the finding's clear-before-the-end
-    # ordering.
-    wire_silence_listeners(components.silence, state, components.tracker)
+    # #170: everything from here to run_pipeline is the STARTUP body. If it aborts
+    # (build_components' unwritable-cache-dir raise, start_display's no-HDMI raise,
+    # or task/signal setup) run_pipeline is never entered, so its cleanup finally
+    # never runs and the io_executor (created above) — plus the DiscogsHttp pool,
+    # if components were built — would be left to concurrent.futures' atexit join.
+    # Own that cleanup here for the pre-run_pipeline abort path, gated on
+    # `started_pipeline` so run_pipeline (which closes BOTH pools on every path it
+    # IS entered) is never double-closed.
+    components = None
+    started_pipeline = False
+    try:
+        # ARCH-10: construction is guarded + testable in build_components — a
+        # failure (most concretely an unwritable cover_art_cache_dir) is now an
+        # actionable log line pointing at the checklist, then a re-raise, not a
+        # bare traceback.
+        components = build_components(config, state)
 
-    log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
-    # ARCH-10: guard the display init too — the single most probable first-boot
-    # failure (no HDMI / X down) is now an actionable message before the re-raise.
-    start_display(components.display)
+        # Wire silence events into state and tracker as TWO separate Signal
+        # listeners (CRIT-5, in wire_silence_listeners): splitting them lets the
+        # Signal's log-and-continue isolate a fault in one from the other (the
+        # stranded-card bug); state is registered first to match the finding's
+        # clear-before-the-end ordering.
+        wire_silence_listeners(components.silence, state, components.tracker)
 
-    # The three long-running pipeline coroutines as named tasks.
-    tasks = [
-        asyncio.create_task(components.capture.run(), name="capture"),
-        asyncio.create_task(components.recognizer.run(), name="recognizer"),
-        asyncio.create_task(components.display.run(), name="display"),
-    ]
+        log.info(f"vinyl-now-playing v{read_version()} starting up 🎵")
+        # ARCH-10: guard the display init too — the single most probable first-boot
+        # failure (no HDMI / X down) is now an actionable message before the re-raise.
+        start_display(components.display)
 
-    # Graceful shutdown on Ctrl+C or SIGTERM: cancel every leg.  Task.cancel
-    # is a plain synchronous call, so it's safe to invoke directly from a
-    # signal handler — no fire-and-forget task required.
-    def _cancel_all():
-        log.info("Shutdown signal received — stopping cleanly.")
-        for t in tasks:
-            t.cancel()
+        # The three long-running pipeline coroutines as named tasks.
+        tasks = [
+            asyncio.create_task(components.capture.run(), name="capture"),
+            asyncio.create_task(components.recognizer.run(), name="recognizer"),
+            asyncio.create_task(components.display.run(), name="display"),
+        ]
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _cancel_all)
+        # Graceful shutdown on Ctrl+C or SIGTERM: cancel every leg.  Task.cancel
+        # is a plain synchronous call, so it's safe to invoke directly from a
+        # signal handler — no fire-and-forget task required.
+        def _cancel_all():
+            log.info("Shutdown signal received — stopping cleanly.")
+            for t in tasks:
+                t.cancel()
 
-    # FIRST_COMPLETED shutdown + cleanup live in run_pipeline (extracted for
-    # testability — T-1).  The tracker is passed so shutdown can drain its
-    # in-flight end-of-session credit before the loop closes (CONC-1); the shared
-    # DiscogsHttp and the owned I/O executor are passed so run_pipeline's finally
-    # can close BOTH pools LAST, after that credit has drained off them (#61 /
-    # CRIT-3).
-    await run_pipeline(
-        tasks, components.capture, components.display, components.tracker,
-        components.discogs_http, io_executor,
-    )
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _cancel_all)
+
+        # FIRST_COMPLETED shutdown + cleanup live in run_pipeline (extracted for
+        # testability — T-1).  The tracker is passed so shutdown can drain its
+        # in-flight end-of-session credit before the loop closes (CONC-1); the
+        # shared DiscogsHttp and the owned I/O executor are passed so
+        # run_pipeline's finally can close BOTH pools LAST, after that credit has
+        # drained off them (#61 / CRIT-3).  From here run_pipeline OWNS pool
+        # cleanup on every path it takes, so mark it before the await.
+        started_pipeline = True
+        await run_pipeline(
+            tasks, components.capture, components.display, components.tracker,
+            components.discogs_http, io_executor,
+        )
+    finally:
+        # #170: only the PRE-run_pipeline abort path reaches here with cleanup
+        # still owed — run_pipeline's own finally already closed both pools once it
+        # was entered (started_pipeline). Mirror that close for the abort path so a
+        # startup failure doesn't lean on atexit. Closing an unused/lazy pool is a
+        # cheap no-op, and both close idempotently.
+        if not started_pipeline:
+            if components is not None:
+                components.discogs_http.close()
+            io_executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
