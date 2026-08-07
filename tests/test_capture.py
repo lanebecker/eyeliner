@@ -2,12 +2,13 @@
 
 capture.py imports sounddevice at module level, and sounddevice requires the
 PortAudio system library at import time — which is why this file had zero
-tests through v1.3.4.  The trick: plant a stub module into
-sys.modules["sounddevice"] BEFORE importing capture, so the import succeeds
-on machines without PortAudio.  On machines where the real sounddevice IS
-installed (e.g. a dev Mac with `brew install portaudio`), the real module
-loads instead — so every test patches `src.audio.capture.sd` explicitly and
-never touches real audio hardware either way.
+tests through v1.3.4.  The stub that makes the import succeed on machines
+without PortAudio now lives in the root conftest.py (installed before any test
+module is imported, and torn down at session end — TQ-6), replacing a
+never-restored `sys.modules.setdefault(...)` that used to sit at this module's
+scope.  On a dev Mac with the real sounddevice installed, conftest leaves it
+untouched — so every test patches `src.audio.capture.sd` explicitly and never
+touches real audio hardware either way.
 
 What this covers (pure logic):
   ✓ _find_device_index: exact/substring/case-insensitive matching,
@@ -25,17 +26,13 @@ What this deliberately does NOT cover (genuinely hardware-bound):
     drives is covered hardware-free by tests/test_chunking.py.
 """
 import asyncio
-import sys
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
-# Make capture importable without PortAudio: only installs the stub when the
-# real sounddevice is absent (setdefault), so dev machines with PortAudio use
-# the genuine module and CI-like environments use the fake.
-sys.modules.setdefault("sounddevice", MagicMock())
-
+# The sounddevice stub is installed in the root conftest.py before this module
+# is imported (TQ-6), so capture imports cleanly without PortAudio.
 from src.audio import capture as capture_module  # noqa: E402
 from src.audio.capture import AudioCapture  # noqa: E402
 from tests.factories import make_audio_config  # noqa: E402
@@ -335,3 +332,176 @@ def test_callback_error_is_logged_not_raised(caplog):
         callback(indata, 2, None, None)   # must NOT raise
 
     assert any("callback" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# PCONC-4 — the drop-oldest warning must be throttled, not one-per-drop
+# (53 WARNING records in a single stalled loop turn was measured — an SD-card
+# log flood). The drops are counted and surfaced as one throttled health signal.
+# ---------------------------------------------------------------------------
+
+def test_drop_warning_is_throttled_not_one_per_drop(caplog):
+    import logging
+    cap = make_capture()
+    q = asyncio.Queue(maxsize=2)
+    cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # fill
+    cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # full now
+    with caplog.at_level(logging.WARNING, logger="src.audio.capture"):
+        for _ in range(20):    # 20 rapid drops within one throttle window
+            cap._enqueue_block(q, np.zeros(4, dtype=np.float32))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected 1 throttled warning, got {len(warnings)}"
+
+
+def test_drop_warning_reports_aggregate_count_after_window(monkeypatch, caplog):
+    import logging
+    cap = make_capture()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: clock["t"])
+    q = asyncio.Queue(maxsize=1)
+    cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # full
+    with caplog.at_level(logging.WARNING, logger="src.audio.capture"):
+        cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # drop 1 -> logs "1"
+        for _ in range(9):                                     # drops 2..10 silent
+            cap._enqueue_block(q, np.zeros(4, dtype=np.float32))
+        clock["t"] += 999.0                                    # jump past the window
+        cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # drop 11 -> logs aggregate
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2                     # first drop + post-window summary
+    assert "10" in warnings[1].message            # the 10 drops accrued since the first report
+
+
+# ---------------------------------------------------------------------------
+# TQ-7 — _silence_ticker and run()'s construction-retry path, headless.
+#
+# _silence_ticker is the SESSION_ENDED / Play-Count safety net during a stall,
+# and run()'s except-branch rebuilds a fresh stream after a construction
+# failure. Both were fully uncovered on hardware that has never been run. These
+# exercise them with a pure-asyncio mock detector + a mocked InputStream.
+# (The stall-timeout rebuild path is already covered by
+# test_stalled_stream_is_detected_and_rebuilt above.)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_silence_ticker_ticks_repeatedly_and_survives_a_raising_listener(monkeypatch):
+    """The ticker must keep calling silence.tick() on wall-clock time, and a
+    listener raising inside tick() must NOT kill it — a dead ticker would
+    permanently disable the session-end safety net it exists to provide."""
+    cap = make_capture()
+    ticks = {"n": 0}
+
+    def raising_tick():
+        ticks["n"] += 1
+        raise RuntimeError("listener boom")   # every tick raises
+
+    cap.silence.tick = raising_tick
+    monkeypatch.setattr(capture_module, "_SILENCE_TICK_SECONDS", 0.001)
+
+    cap._running = True
+    task = asyncio.create_task(cap._silence_ticker())
+    for _ in range(500):                       # bounded wait for ≥5 ticks
+        if ticks["n"] >= 5:
+            break
+        await asyncio.sleep(0.001)
+    cap._running = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert ticks["n"] >= 5                      # survived the raising listener
+
+
+@pytest.mark.asyncio
+async def test_stream_construction_failure_retries_with_a_fresh_stream(monkeypatch):
+    """sd.InputStream() raising on CONSTRUCTION (distinct from the stall
+    timeout) must be caught, backed off, and retried with a fresh stream."""
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.sd, "query_devices",
+                        lambda *a, **k: [device("USB Audio Codec", 2)])
+    monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(capture_module, "_BLOCK_STALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(capture_module, "_SILENCE_TICK_SECONDS", 0.001)
+
+    built = asyncio.Event()
+    calls = {"n": 0}
+
+    def make_stream(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("PortAudio: device busy")   # construction fails once
+        built.set()
+        return _cm_stream_mock()                      # second construction succeeds
+
+    monkeypatch.setattr(capture_module.sd, "InputStream", MagicMock(side_effect=make_stream))
+
+    task = asyncio.create_task(cap.run())
+    try:
+        await asyncio.wait_for(built.wait(), timeout=2.0)
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert calls["n"] >= 2         # the failed construction was retried
+
+
+@pytest.mark.asyncio
+async def test_run_cancels_and_awaits_the_ticker_on_exit(monkeypatch):
+    """run()'s finally must tear the ticker down (cancel + await) so it never
+    outlives the capture loop."""
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.sd, "query_devices",
+                        lambda *a, **k: [device("USB Audio Codec", 2)])
+    monkeypatch.setattr(capture_module.sd, "InputStream",
+                        MagicMock(side_effect=lambda **k: _cm_stream_mock()))
+    monkeypatch.setattr(capture_module, "_BLOCK_STALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
+
+    lifecycle = {"started": False, "cancelled": False}
+
+    async def fake_ticker():
+        lifecycle["started"] = True
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            lifecycle["cancelled"] = True
+            raise
+
+    monkeypatch.setattr(cap, "_silence_ticker", fake_ticker)
+
+    task = asyncio.create_task(cap.run())
+    for _ in range(200):
+        if lifecycle["started"]:
+            break
+        await asyncio.sleep(0.005)
+    assert lifecycle["started"]
+
+    cap.stop()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert lifecycle["cancelled"]     # run()'s finally cancelled + awaited the ticker
+
+
+def test_first_drop_logs_even_at_low_monotonic(monkeypatch, caplog):
+    """PCONC-4 (cold-review regression): CLOCK_MONOTONIC is uptime-based and
+    resets to ~0 on a Pi reboot, so the very first overflow drop in the first
+    few seconds of uptime must STILL warn — a 0.0 seed would suppress it."""
+    import logging
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: 2.0)  # < 5s interval
+    q = asyncio.Queue(maxsize=1)
+    cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # full
+    with caplog.at_level(logging.WARNING, logger="src.audio.capture"):
+        cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # first-ever drop
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1     # reported despite monotonic() < interval

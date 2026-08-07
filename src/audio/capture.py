@@ -25,6 +25,7 @@ block is dropped and a warning logged — recent audio wins.
 
 import asyncio
 import logging
+import time
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
@@ -53,6 +54,13 @@ _BLOCK_QUEUE_MAX = 64
 # seconds, so 1s granularity is plenty and the cost (one comparison) is trivial.
 _SILENCE_TICK_SECONDS = 1.0
 
+# PCONC-4: minimum wall-clock gap between drop-oldest warnings. The overflow
+# fires once per dropped block (4×/s per stalled second), and one stalled loop
+# turn was measured emitting 53 WARNING records — an SD-card log flood. So the
+# drops are COUNTED and surfaced as at most one summarizing warning per this
+# interval: a sustained-backlog health signal, not a per-event log.
+_DROP_WARN_INTERVAL_SECONDS = 5.0
+
 # CONC-5: how long run() waits for a block before deciding the stream is DEAD.
 # Blocks arrive ~every _BLOCK_SECONDS (4×/s) on a healthy stream, so a gap of
 # 16 blocks' worth (4s) means the PortAudio callback has stopped firing — the
@@ -74,6 +82,17 @@ class AudioCapture:
         self.recognizer = recognizer
         self._running = False
         self._blocks: Optional[asyncio.Queue] = None
+
+        # PCONC-4: drop-oldest bookkeeping. `_drop_count` accrues drops since the
+        # last warning; `_last_drop_warn` is the monotonic timestamp of that
+        # warning, so bursts collapse into one throttled health signal.
+        # Seeded to -inf (NOT 0.0) so the very first drop always reports,
+        # independent of the monotonic epoch: on the Pi CLOCK_MONOTONIC is
+        # uptime-based and resets to ~0 on reboot, so a 0.0 seed would swallow
+        # the first overflow warning during the first _DROP_WARN_INTERVAL_SECONDS
+        # of uptime — the exact early-boot window the signal matters most.
+        self._drop_count = 0
+        self._last_drop_warn = float("-inf")
 
         self.sample_rate: int = config.sample_rate
         self.chunk_seconds: int = config.chunk_seconds
@@ -135,12 +154,26 @@ class AudioCapture:
         if blocks.full():
             try:
                 blocks.get_nowait()  # Drop the OLDEST block — recent audio wins
-                log.warning(
-                    "Audio block queue full; dropped the oldest block. "
-                    "The event loop appears to be stalling."
-                )
             except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
                 pass
+            else:
+                # PCONC-4: count every drop, but WARN at most once per
+                # _DROP_WARN_INTERVAL_SECONDS with the aggregate since the last
+                # report — so a stalled loop dropping 4 blocks/s can't flood the
+                # journal (53 records in one turn was measured). The first drop
+                # after a quiet spell reports immediately (`_last_drop_warn`
+                # starts at -inf); a sustained backlog then reports periodically.
+                self._drop_count += 1
+                now = time.monotonic()
+                if now - self._last_drop_warn >= _DROP_WARN_INTERVAL_SECONDS:
+                    log.warning(
+                        "Audio block queue full; dropped %d block(s) since the "
+                        "last report — the event loop is stalling (recent audio "
+                        "wins).",
+                        self._drop_count,
+                    )
+                    self._drop_count = 0
+                    self._last_drop_warn = now
         blocks.put_nowait(block)
 
     def _make_callback(self, loop: asyncio.AbstractEventLoop, blocks: asyncio.Queue):
