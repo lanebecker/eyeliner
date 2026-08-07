@@ -9,10 +9,11 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-**Code-review follow-ups, round 3 (Wave 6 — boot & config correctness).**
-Residuals surfaced by earlier waves' cold reviews, filed as GitHub issues and
-addressed here: hardening the paths that decide whether the appliance comes up
-at all.
+**Code-review follow-ups, round 3 (Waves 6–7).** Residuals surfaced by earlier
+waves' cold reviews, filed as GitHub issues and addressed here: first the paths
+that decide whether the appliance comes up at all (Wave 6 — boot & config
+correctness), then hardening how malformed or failing external responses
+degrade (Wave 7 — Shazam/MusicBrainz/Last.fm).
 
 ### Fixed
 
@@ -48,6 +49,17 @@ at all.
   `must be > 0` message in the same aggregated `ConfigError` block as its
   siblings (`None`-guarded so an upstream type error still surfaces as a friendly
   `ConfigError`, never a raw `TypeError`). RED-first; mutation-verified.
+- **A non-dict Shazam `track` is now a clean no-match (#167 — LOW).** A response
+  whose `track` is present but not a dict (e.g. a JSON list) made
+  `_parse_shazam`'s `track.get(...)` reads raise `AttributeError`, which escaped
+  the pure parser to `recognize()`'s broad `except` and was logged as a
+  misleading "recognition failed" WARNING before the (correct) miss. It now
+  returns `None` cleanly via an `isinstance(track, dict)` guard. The null-*container*
+  shapes #167 also enumerated (null `sections`/`metadata`, null list entries)
+  were verified already handled by the REC-5 `or []` guards + album `try/except`
+  — reproduced all five shapes before touching code, so this completes the issue
+  with the one guard that was still missing rather than re-hardening covered
+  paths. RED-first; mutation-verified.
 
 ## [1.5.6] — 2026-08-07
 
