@@ -37,6 +37,17 @@ at all.
   logs one capture-error per retry backoff (~1/s) via the pre-existing error
   path, versus one per systemd restart (~1/10s) before; the retry is the point,
   and the rate is bounded by `_STREAM_RETRY_BACKOFF_SECONDS`.)
+- **`session_end_silence_seconds` is now domain-validated (#168 — LOW).**
+  `AudioConfig.from_dict` ran value-domain checks for `sample_rate`,
+  `chunk_seconds`, `overlap_seconds`, `width`/`height`, `poll_interval_seconds`,
+  `confirmation_required` and `error_after_misses` (CRIT-1), but the sweep missed
+  `session_end_silence_seconds`. A config with `session_end_silence_seconds: 0`
+  (or negative) passed validation and then fired `SESSION_ENDED` on the first
+  silence tick after any `MUSIC_STOPPED` — ending the session and crediting the
+  Play Count essentially the moment the music paused. It is now rejected with a
+  `must be > 0` message in the same aggregated `ConfigError` block as its
+  siblings (`None`-guarded so an upstream type error still surfaces as a friendly
+  `ConfigError`, never a raw `TypeError`). RED-first; mutation-verified.
 
 ## [1.5.6] — 2026-08-07
 
