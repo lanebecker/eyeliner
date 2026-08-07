@@ -140,6 +140,14 @@ class ShazamIOBackend(RecognizerBackend):
         track = (result or {}).get("track")
         if not track:
             return None
+        # #167: a truthy but non-dict `track` (e.g. a JSON list) would make the
+        # `track.get(...)` reads below raise AttributeError, escaping this pure
+        # parser to recognize()'s broad except — a miss logged as a spurious
+        # "recognition failed". Treat any non-dict track as a clean no-match. (The
+        # null-CONTAINER shapes #167 also named — null sections/metadata/list
+        # entries — are already handled below by REC-5's `or []` + album try/except.)
+        if not isinstance(track, dict):
+            return None
 
         # The title is the track's IDENTITY: a track object with an empty,
         # missing, or null title is a no-match, not a recognition (REC-3).

@@ -124,3 +124,20 @@ def test_parse_malformed_album_section_does_not_sink_match(caplog):
     assert out.title == "T"
     assert out.album == ""
     assert any("album parse failed" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# #167 — a `track` present as a non-dict (e.g. a JSON list) must be a clean
+# no-match, not an AttributeError that escapes _parse_shazam to recognize()'s
+# broad except (where it logs a misleading "recognition failed" WARNING before
+# the miss). The null-CONTAINER shapes this issue also named (null sections /
+# metadata / list entries) are already handled by the REC-5 `or []` + album
+# try/except above — see the three tests immediately preceding — so this
+# non-dict `track` guard is the one remaining shape.
+# ---------------------------------------------------------------------------
+
+def test_parse_non_dict_track_is_a_clean_none_not_a_raise():
+    """`track` truthy but not a dict (a list) must return None cleanly — before
+    the fix, track.get('title') raised AttributeError out of _parse_shazam."""
+    assert ShazamIOBackend._parse_shazam({"track": ["not", "a", "dict"]}) is None
+    assert ShazamIOBackend._parse_shazam({"track": 42}) is None
