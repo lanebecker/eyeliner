@@ -262,6 +262,20 @@ class DiscogsReader:
         + local lookups (P-1).  The collection is static within a session and
         the process restarts daily, so there is no TTL.
 
+        #169 (DELIBERATELY DEFERRED — do not re-file):  persisting this index to
+        disk across restarts (with a TTL) to skip the re-page was considered and
+        declined.  It is an efficiency-only win — the crash-loop it split from
+        already shipped in #103 — and a restart re-pages just ~1 request per 100
+        releases, well under the 60/min rate limit, roughly once a day.  Against
+        that marginal gain, a persisted ``instance_id`` feeds straight into the
+        Play Count / Last Played write target, so a stale or corrupt on-disk index
+        re-introduces the wrong-write-target class Wave 1 spent 16 issues closing.
+        The in-memory rebuild is the safe default; revisit only if restarts /
+        config reloads ever become frequent enough that the re-page is a real cost
+        (and then only behind a versioned + username-keyed + TTL'd + atomically-
+        written cache that treats any miss / parse error / corruption / schema or
+        username mismatch as "rebuild from API, never authoritative").
+
         Raises on a hard fetch error so the caller (search_collection) lets it
         propagate to the resolver, which treats it as "couldn't determine" and
         leaves the album uncached for retry — rather than a false "not owned"
