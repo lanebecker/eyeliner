@@ -98,7 +98,7 @@ def test_hue_preserving_passthrough_when_already_compliant():
 @pytest.mark.parametrize("color,bg", [
     ((0, 0, 200), (10, 10, 34)),      # saturated blue on dark blue
     ((180, 20, 20), (25, 10, 10)),    # red on dark red
-    ((0, 0, 0), (8, 8, 8)),           # pure black — clamp_luminance CAN'T lift this
+    ((0, 0, 0), (8, 8, 8)),           # pure black — the degenerate case a proportional brightness scale can't lift (lum==0); the hue-preserving lift must
 ])
 def test_hue_preserving_lifts_below_to_at_or_above_floor(color, bg):
     # MUT-3: input is BELOW 4.5:1, output is AT/ABOVE — pins both the threshold
