@@ -763,3 +763,62 @@ async def test_run_threads_the_enqueued_epoch_through_to_on_confirmed():
         await task
 
     on_confirmed.assert_awaited_once_with(raw, 9)   # the PRE-lift epoch, not 10
+
+
+# ---------------------------------------------------------------------------
+# PCONC-3 — per-session health counters must reset on a session-epoch change.
+# The pending candidate is already voided across a boundary (REC-1 review); the
+# miss/churn counters were not, so a fresh side inherited the previous side's
+# streak.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_miss_count_resets_on_session_epoch_change():
+    from src.state.player_state import PlayerStatus
+    loop, state, _ = make_loop()
+    state.status = PlayerStatus.LISTENING
+    for _ in range(3):
+        await loop._handle_result(None, epoch=0)     # 3 misses in session 0
+    assert loop._miss_count == 3
+    await loop._handle_result(None, epoch=1)          # first miss of the NEW session
+    assert loop._miss_count == 1                       # reset on the boundary, not 4
+
+
+@pytest.mark.asyncio
+async def test_churn_count_resets_on_session_epoch_change():
+    from src.state.player_state import PlayerStatus
+    loop, state, _ = make_loop()
+    state.status = PlayerStatus.LISTENING
+    for i in range(3):
+        await loop._handle_result(make_raw(title=f"T{i}", artist=f"A{i}"), epoch=0)
+    assert loop._churn_count == 3
+    await loop._handle_result(make_raw(title="Z", artist="Z"), epoch=1)
+    assert loop._churn_count == 1                       # reset on the boundary, not 4
+
+
+@pytest.mark.asyncio
+async def test_epoch_change_does_not_reset_within_a_session():
+    """Guard: REC-1's accumulate-across-misses is WITHIN a session (constant
+    epoch) and must be unaffected by the PCONC-3 boundary reset."""
+    from src.state.player_state import PlayerStatus
+    loop, state, _ = make_loop()
+    state.status = PlayerStatus.LISTENING
+    for _ in range(3):
+        await loop._handle_result(None, epoch=0)
+    assert loop._miss_count == 3                        # same epoch → keeps accumulating
+
+
+# ---------------------------------------------------------------------------
+# REC-4 — _same_track must be whitespace-insensitive as its docstring claims.
+# ---------------------------------------------------------------------------
+
+def test_same_track_collapses_internal_whitespace():
+    a = make_raw(title="My  Song", artist="The  Band", album="")
+    b = make_raw(title="My Song", artist="The Band", album="")
+    assert RecognitionLoop._same_track(a, b) is True
+
+
+def test_same_track_still_distinguishes_different_titles():
+    a = make_raw(title="Song One", artist="X")
+    b = make_raw(title="Song Two", artist="X")
+    assert RecognitionLoop._same_track(a, b) is False
