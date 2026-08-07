@@ -45,3 +45,16 @@ def test_discogs_client_http_error_classifies_as_transient():
     )
     assert is_transient(discogs_client.exceptions.HTTPError("rate limited", 429))
     assert is_transient(discogs_client.exceptions.HTTPError("server error", 502))
+
+
+def test_musicbrainz_network_error_is_transient_but_response_and_auth_are_not():
+    """#175: MusicBrainz is urllib-based, so its NetworkError (unreachable /
+    timeout / HTTP error) must classify as transient — a service-down signal that
+    aborts the cover-art release loop. Its siblings ResponseError (invalid/parse-
+    failed response for one MBID) and AuthenticationError (401) are definitive for
+    that request and must NOT be transient, so they skip to the next release."""
+    import musicbrainzngs
+
+    assert is_transient(musicbrainzngs.NetworkError("MB unreachable"))
+    assert not is_transient(musicbrainzngs.ResponseError("bad response"))
+    assert not is_transient(musicbrainzngs.AuthenticationError("401"))

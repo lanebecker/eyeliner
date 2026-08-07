@@ -74,6 +74,26 @@ degrade (Wave 7 — Shazam/MusicBrainz/Last.fm).
   updated to match. RED-first; mutation-verified; independently cold-reviewed
   (SPEC + QUALITY PASS — CancelledError still propagates, B-8 idempotency
   unchanged).
+- **MusicBrainz cover-art lookup classifies transport errors transient-vs-
+  permanent instead of aborting on all of them (#175 — LOW).** After #115 a
+  malformed *payload* on one release skipped to the next candidate, but a
+  *transport* error from `get_image_list` on an early release (an
+  `AuthenticationError` or a bad value) still escaped the inner handler and
+  aborted the whole candidate loop — so a later release that had cover art was
+  never tried. The per-release handler now classifies with the shared
+  `metadata.errors.is_transient` taxonomy: a **transient** failure (MusicBrainz
+  unreachable/timeout — `NetworkError`) re-raises to abort the lookup (the whole
+  service is down; trying more releases would just hammer it), while any other
+  per-release failure (a `ResponseError`/404 or `AuthenticationError` for that
+  MBID, or a malformed payload) skips to the next candidate. `is_transient` was
+  extended to know `musicbrainzngs.NetworkError` is transient (MusicBrainz is
+  urllib-based, so its errors aren't `requests` types); its siblings
+  `ResponseError`/`AuthenticationError` are deliberately left non-transient.
+  Cover art is a best-effort fallback, so an unexpected per-release error
+  degrades to skip→`None` (logged at debug) rather than a loud abort — a
+  deliberate, documented posture for this non-critical untrusted-payload path.
+  RED-first; mutation-verified; independently cold-reviewed (SPEC + QUALITY PASS;
+  blast-radius clean — the other `is_transient` callers use it only for log level).
 
 ## [1.5.6] — 2026-08-07
 

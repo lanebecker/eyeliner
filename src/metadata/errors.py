@@ -22,6 +22,7 @@ vocabulary for code that wants to *signal* these conditions explicitly as
 adoption spreads.
 """
 import discogs_client.exceptions
+import musicbrainzngs
 import requests
 
 
@@ -45,9 +46,16 @@ class PermanentMetadataError(MetadataError):
 #    NOT inherit from RequestException, so it must be listed explicitly (META-6).
 #  - builtin ConnectionError / TimeoutError: socket-level network failures that
 #    aren't wrapped by requests.
+#  - musicbrainzngs.NetworkError: the MusicBrainz client is urllib-based (not
+#    requests), and raises NetworkError for a connection failure, timeout, or
+#    HTTP error talking to the service — i.e. "MusicBrainz is unreachable right
+#    now," which is transient. Its sibling ResponseError / AuthenticationError
+#    (an invalid/parse-failed response, or a 401) are definitive for that request
+#    and are deliberately NOT listed here (#175).
 TRANSIENT_EXTERNAL_ERRORS = (
     requests.exceptions.RequestException,
     discogs_client.exceptions.HTTPError,
+    musicbrainzngs.NetworkError,
     ConnectionError,   # builtin (OSError subclass)
     TimeoutError,      # builtin
 )
