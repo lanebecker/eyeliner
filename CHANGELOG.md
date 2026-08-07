@@ -140,6 +140,19 @@ correctness), then hardening how malformed or failing external responses degrade
   — verified `potential_last_track` gates every write, so only logging is
   skipped, and it's the tightest correct gate).
 
+### Removed
+
+- **Deleted the dead `clamp_luminance` helper and its tests (#177 — LOW).**
+  Wave 4's DISP-1 (#125) replaced `extract_palette`'s use of
+  `palette.clamp_luminance` (a perceived-brightness clamp that could not brighten
+  a pure-black or already-saturated accent) with `ensure_contrast_hue_preserving`.
+  That was its only production caller, leaving `clamp_luminance` dead in `src/` —
+  defined in `src/display/palette.py`, imported nowhere in `src/`, and exercised
+  only by three tests in `tests/test_renderer_caches.py`. Verified dead by
+  `grep -rn clamp_luminance src/ tests/` before removing the function and those
+  three tests; a comment in `tests/test_palette_contrast.py` that named it was
+  reworded. Full suite still green (943 → 940, the three removed tests).
+
 ## [1.5.6] — 2026-08-07
 
 **Code-review hardening, round 3 (Wave 5 — metadata, Discogs reliability &

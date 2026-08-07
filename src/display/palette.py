@@ -134,20 +134,6 @@ def validate_image_file(path: str, *, return_image=False):
 # WCAG colour science
 # ---------------------------------------------------------------------------
 
-def clamp_luminance(color: tuple, min_lum: float = 0.25) -> tuple:
-    """Brighten a color until it reads against a dark background.
-
-    Uses a simple perceived-brightness formula; if too dark, brightens
-    proportionally until it hits min_lum.
-    """
-    r, g, b = color
-    lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
-    if lum < min_lum and lum > 0:
-        scale = min_lum / lum
-        return tuple(min(255, int(c * scale)) for c in (r, g, b))
-    return color
-
-
 def relative_luminance(color: tuple) -> float:
     """WCAG 2.x relative luminance of an sRGB color (0.0–1.0)."""
     def chan(c: int) -> float:
