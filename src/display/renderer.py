@@ -93,7 +93,7 @@ from typing import Callable, Optional, Tuple, TYPE_CHECKING
 
 from src.state.player_state import PlayerState, PlayerStatus
 from src.display.layouts import get_now_playing_layout, NowPlayingLayout, Rect
-from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
+from src.display.palette import DisplayPalette, FALLBACK_PALETTE
 from src.display.palette import (
     extract_palette,
     ensure_contrast,
@@ -104,6 +104,7 @@ from src.display.palette import (
 from src.display.cover_cache import CoverArtCache
 
 if TYPE_CHECKING:
+    import pygame
     from src.config import DisplayConfig
 
 log = logging.getLogger(__name__)
@@ -356,7 +357,7 @@ def _quantize_palette(p: DisplayPalette) -> DisplayPalette:
 class DisplayRenderer:
     """Renders now-playing info to an HDMI screen via pygame."""
 
-    def __init__(self, config: "DisplayConfig", state: PlayerState):
+    def __init__(self, config: "DisplayConfig", state: PlayerState, cover_store=None):
         self.state = state
         self.width: int = config.width
         self.height: int = config.height
@@ -369,9 +370,15 @@ class DisplayRenderer:
         # The on-disk cover cache + SSRF-hardened fetch live in CoverArtCache
         # (A-15); it mkdir's the dir, sweeps stale .part files (R-1), bounds the
         # cache (R-2), and is the only thing that knows cover paths now.
-        self._cover_store = CoverArtCache(config.cover_art_cache_dir)
+        # ARCH-8: optional injection seam — defaults to the real CoverArtCache,
+        # but a test (or the composition root) can pass a substitute instead of
+        # monkeypatching the private attribute after construction.
+        self._cover_store = (
+            cover_store if cover_store is not None
+            else CoverArtCache(config.cover_art_cache_dir)
+        )
 
-        self._screen = None
+        self._screen: Optional["pygame.Surface"] = None
         self._font_cache = _BoundedCache(_FONT_CACHE_MAX)  # (role, size) → Font (P-8)
         self._running = True
         self._dirty = True              # Force initial render
@@ -412,19 +419,19 @@ class DisplayRenderer:
         # suppresses per-frame "decode deferred" logging until a cover decodes.
         self._cover_decode_deferred: bool = False
         self._gradient_key: Optional[tuple] = None           # (bg, surface, w, h)
-        self._gradient_surface = None                        # pygame.Surface
+        self._gradient_surface: Optional["pygame.Surface"] = None
 
         # Render hot-path caches (v1.4.0)
         self._label_cache = _BoundedCache(_LABEL_CACHE_MAX)  # tracked-label Surfaces
         self._dot_cache = _BoundedCache(_DOT_CACHE_MAX)      # pre-rendered dot phases (P-3)
         self._shadow_key: Optional[tuple] = None             # (w, h)
-        self._shadow_surface = None                          # Cover Lift shadow
+        self._shadow_surface: Optional["pygame.Surface"] = None   # Cover Lift shadow
         self._static_key: Optional[tuple] = None             # (track content, palette)
-        self._static_surface = None                          # composed frame (any screen)
+        self._static_surface: Optional["pygame.Surface"] = None   # composed frame (any screen)
 
         # Empty-state machinery (v1.4.1)
         self._listening_since: Optional[float] = None        # boot-label elapsed clock
-        self._arc_segment = None                             # pre-rendered boot/error arc
+        self._arc_segment: Optional[tuple] = None            # (key, surf) pre-rendered boot/error arc
         self._arc_rot_cache = _BoundedCache(_ARC_ROT_CACHE_MAX)  # rotated boot arcs (P-10)
 
         # Strong references to fire-and-forget tasks (cover prefetches).
@@ -483,10 +490,10 @@ class DisplayRenderer:
         """Return the bundled font for a role at a pixel size, cached.
 
         Roles map to the DESIGN.md type hierarchy (see _FONT_FILES).  Loading
-        is lazy — a TTF is opened once per (role, size) and held forever
-        (fonts are a small, fixed set of sizes).  Falls back to the DejaVu
-        SysFont family if the bundled file is missing, so dev machines and
-        CI without the assets still render.
+        is lazy and cached per (role, size) in a bounded LRU (`_FONT_CACHE_MAX`);
+        eviction is rare because the working set is small (a fixed handful of
+        sizes).  Falls back to the DejaVu SysFont family if the bundled file is
+        missing, so dev machines and CI without the assets still render.
         """
         import pygame
 
@@ -864,18 +871,19 @@ class DisplayRenderer:
         genres: list,
         layout: NowPlayingLayout,
         p: DisplayPalette,
-        chips_rect=None,
+        chips_rect,
     ):
         """Render genre chips per DESIGN.md §5: transparent background,
         1px border in accent at ~33% alpha (the JSX `{accent}55`), tracked
         muted mono text, sharp corners, max 3 + '+N' overflow.
 
-        If *chips_rect* is supplied it overrides ``layout.genre_chips`` for the
-        bounding box, allowing the caller to position chips dynamically.
+        *chips_rect* is the bounding box to lay the chips out in (required —
+        the sole caller computes it from the pushed-down layout; ARCH-9 removed
+        a dead ``layout.genre_chips`` fallback nothing used).
         """
         import pygame
 
-        rect = chips_rect if chips_rect is not None else layout.genre_chips
+        rect = chips_rect
         px = layout.chip_padding_x
         py = layout.chip_padding_y
         gap = layout.chip_gap

@@ -18,7 +18,8 @@ path against malformed Shazam responses and cross-session state bleed, and
 tightening the entry-point lifecycle (Last.fm thread-safety, shutdown coverage,
 log disk caps), and clearing docs / dependency / test-hygiene debt (a config-
 reference gap, an unjustified dep, a tautological test, and the first CI to run
-the suite on push).
+the suite on push), and a round of renderer/architecture cleanups (display-type
+relocation, injection seams, dead-code + docstring + type-annotation fixes).
 
 ### Fixed
 
@@ -306,6 +307,56 @@ re-checked against the real `DESIGN.md`/`testing-guide.md` and all hold; TQ-1's
 coverage gap already closed by the `test_renderer_lifecycle.py` remediation); and
 the prior concurrency pass's findings (PCONC-3/PCONC-4) were confirmed already
 reconciled and shipped earlier in Wave 5.
+
+The renderer/architecture cleanup cluster (Unit 5a):
+
+### Changed
+
+- **`DisplayPalette` + `FALLBACK_PALETTE` moved to the display layer (ARCH-7
+  #143 — LOW).** They are pure display value objects with no consumer anywhere
+  in `src/metadata`, yet lived in `src/metadata/models.py` — so the display layer
+  imported *up* into the model layer for a display-owned type, making the "deps
+  point inward" rule unfalsifiable. Moved to `src/display/palette.py` beside
+  `extract_palette`, with the ~8 importers rewired. No re-export from `models`
+  (the finding's guidance: add one only if a non-display consumer ever appears).
+  Behaviour-preserving; verified no circular import.
+- **Three collaborators gained an optional injection seam (ARCH-8 #144 — LOW).**
+  `DisplayRenderer` (CoverArtCache), `MetadataResolver` (CoverArtFallback) and
+  `RecognitionLoop` (the recognition backend) each constructed their collaborator
+  internally, so tests had to monkeypatch the private attribute afterwards. Each
+  now takes an optional constructor parameter (`cover_store` / `coverart` /
+  `backend`) defaulting to the current concrete — a substitute can be injected
+  directly, and production (which passes nothing) is byte-for-byte unchanged.
+  Chosen over full composition-root relocation (Lane's call): the minimal seam
+  the finding named, without the larger refactor that overlaps the deferred
+  ARCH-3 split. `x if x is not None else Concrete()` (not truthiness) so a
+  legitimately falsy injected double is never discarded. RED-first; mutation-
+  verified.
+
+### Fixed
+
+- **Removed a dead fallback in `_draw_genre_chips` (ARCH-9 #158 — NIT).**
+  `chips_rect` defaulted to `None` and fell back to `layout.genre_chips`, but the
+  sole caller and every test always pass a rect — the branch was provably dead
+  and advertised a chip-positioning mode the push-down layout would place wrong.
+  `chips_rect` is now a required parameter and the branch is gone; a test pins
+  that omitting it fails loudly.
+- **Type-annotated the renderer's uninitialised Surface handles (ARCH-6 #142 —
+  LOW).** `_screen`, `_gradient_surface`, `_shadow_surface` (Surfaces) and
+  `_arc_segment` (a `(key, surface)` tuple) initialise to `None` with no
+  annotation, so a type checker infers their type *is* `None` and flags every
+  real later assignment — removing type-checking from exactly the four pygame
+  handles that are `None` before `start()`. Annotated them `Optional[...]` (plus
+  the sibling `_static_surface`, a fifth handle the original finding missed —
+  caught in cold review) with a `TYPE_CHECKING`-only `pygame` import so the
+  forward-refs resolve. Annotate-only (Lane's call): a `mypy.ini`/CI ratchet on a
+  pygame/CFFI codebase was deferred as its own deliberate decision. No runtime
+  change (string forward-refs are never evaluated).
+- **Corrected the `_font` docstring (ARCH-4 #140 — LOW).** It claimed a TTF is
+  "opened once per (role, size) and held forever," but the font cache has been a
+  bounded LRU (`_FONT_CACHE_MAX`, cap 64) since P-8. Reworded to match; a
+  maintainer trusting "held forever" might probe many sizes per frame assuming
+  zero eviction cost.
 
 ## [1.5.5] — 2026-08-06
 

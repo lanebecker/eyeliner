@@ -25,7 +25,7 @@ from src.display.renderer import (
     _PALETTE_CACHE_MAX,
 )
 from src.display.cover_cache import CoverArtCache
-from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
+from src.display.palette import DisplayPalette, FALLBACK_PALETTE
 
 
 def _write_cover(store, url, color=(180, 90, 40)):

@@ -219,6 +219,7 @@ class RecognitionLoop:
         config: "RecognitionConfig",
         state: "PlayerState",
         on_confirmed: Callable[["RawRecognitionResult", int], Awaitable[object]],
+        backend=None,
     ):
         self.state = state
         # Called with a confirmed RawRecognitionResult; owns resolve → state →
@@ -254,7 +255,14 @@ class RecognitionLoop:
         # breadcrumb when the display "stops updating" because recognition is
         # churning rather than failing outright (B-21).
         self._churn_count: int = 0
-        self.backend: RecognizerBackend = self._init_backend()
+        # ARCH-8: optional injection seam — defaults to selecting the configured
+        # backend (with CRIT-2 validation), but a test can pass a substitute
+        # instead of patching _init_backend. When injected, backend_name-based
+        # selection/validation is intentionally bypassed (the caller owns the
+        # choice).
+        self.backend: RecognizerBackend = (
+            backend if backend is not None else self._init_backend()
+        )
 
     def _init_backend(self) -> RecognizerBackend:
         # CRIT-2: config validation (RecognitionConfig, against the shared

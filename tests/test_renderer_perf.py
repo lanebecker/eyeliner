@@ -22,7 +22,7 @@ from src.display.renderer import (  # noqa: E402
 )
 from src.display.palette import contrast_ratio, text_background
 from src.display.layouts import get_now_playing_layout  # noqa: E402
-from src.metadata.models import DisplayPalette  # noqa: E402
+from src.display.palette import DisplayPalette  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)

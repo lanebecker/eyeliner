@@ -35,7 +35,7 @@ from src.display.renderer import (  # noqa: E402
     EmptyState,
 )
 from src.display.layouts import get_now_playing_layout  # noqa: E402
-from src.metadata.models import FALLBACK_PALETTE  # noqa: E402
+from src.display.palette import FALLBACK_PALETTE  # noqa: E402
 from tests.factories import make_recognition_config  # noqa: E402
 from src.state.player_state import PlayerState, PlayerStatus  # noqa: E402
 

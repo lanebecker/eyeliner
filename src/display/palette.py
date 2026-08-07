@@ -11,11 +11,40 @@ the module stays importable on machines without the image stack.
 """
 import colorsys
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
-from src.metadata.models import DisplayPalette, FALLBACK_PALETTE
-
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class DisplayPalette:
+    """5-color palette for dynamic theming, extracted from album art.
+
+    All values are (R, G, B) tuples in 0-255 range.
+
+    Matches the palette schema from the Claude Design mockups:
+      bg      — main background tint (very dark, ~15-22% lightness)
+      surface — slightly lighter card/panel tone for radial gradient
+      accent  — vibrant extracted color (divider line, album name, badge borders)
+      text    — primary text color (near-white, slightly tinted)
+      muted   — secondary/meta text color (medium gray, slightly tinted)
+    """
+    bg: tuple
+    surface: tuple
+    accent: tuple
+    text: tuple
+    muted: tuple
+
+
+# Used when no cover art is available or palette extraction fails.
+FALLBACK_PALETTE = DisplayPalette(
+    bg=(10, 10, 10),
+    surface=(22, 22, 22),
+    accent=(200, 200, 200),
+    text=(235, 230, 220),
+    muted=(138, 133, 124),
+)
 
 # Reject images larger than this many total pixels (decompression-bomb guard,
 # S-2).  6000×6000 ≈ 36 MP comfortably exceeds any real album-cover scan.

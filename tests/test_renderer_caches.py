@@ -24,7 +24,7 @@ from src.display.renderer import (
     _lerp_palette,
 )
 from src.display.palette import clamp_luminance
-from src.metadata.models import DisplayPalette
+from src.display.palette import DisplayPalette
 
 
 # ---------------------------------------------------------------------------
