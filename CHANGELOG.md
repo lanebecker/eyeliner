@@ -7,7 +7,7 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
-## [Unreleased]
+## [1.5.6] — 2026-08-07
 
 **Code-review hardening, round 3 (Wave 5 — metadata, Discogs reliability &
 the audio pipeline).** Wave 5 of the same audit (`CODE_REVIEW_2026-07-30.md`):
