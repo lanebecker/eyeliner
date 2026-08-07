@@ -94,6 +94,17 @@ class AudioCapture:
         self._drop_count = 0
         self._last_drop_warn = float("-inf")
 
+        # #164: the device lookup now runs on every stream rebuild (see run()), so
+        # its two logs are deduped to avoid re-emitting every iteration during a
+        # sustained rebuild/stall loop (the PCONC-4 flood class this module already
+        # fights). The two signals have DIFFERENT change keys: the "using device"
+        # INFO tracks the winning index (a re-plug to a new index re-logs — exactly
+        # the signal to surface); the multi-match WARNING tracks the full match SET,
+        # so a config that becomes NEWLY ambiguous (a second matching device
+        # appears) still warns even when the winning index is unchanged.
+        self._last_device_index: Optional[int] = None
+        self._last_match_key: Optional[tuple] = None
+
         self.sample_rate: int = config.sample_rate
         self.chunk_seconds: int = config.chunk_seconds
         self.overlap_seconds: int = config.overlap_seconds
@@ -127,15 +138,25 @@ class AudioCapture:
             )
         ]
         if matches:
-            if len(matches) > 1:
-                others = ", ".join(f"[{i}] {d['name']}" for i, d in matches[1:])
+            i, device = matches[0]
+            # Multi-match WARNING: keyed on the full match SET so it re-warns when
+            # the ambiguity itself changes (a newly-matching device appears), not
+            # only when the winner moves — but stays quiet across a rebuild loop
+            # that keeps seeing the same set (#164).
+            match_key = tuple(idx for idx, _ in matches)
+            if len(matches) > 1 and match_key != self._last_match_key:
+                others = ", ".join(f"[{j}] {d['name']}" for j, d in matches[1:])
                 log.warning(
                     f"Multiple input devices match '{self.device_name}'. "
                     f"Using the first; others were: {others}. "
                     f"Tighten audio.device_name in config.yaml if this is wrong."
                 )
-            i, device = matches[0]
-            log.info(f"Using audio device [{i}]: {device['name']}")
+            self._last_match_key = match_key
+            # "Using device" INFO: keyed on the winning index, so a re-plug to a
+            # different index re-logs while a stable device stays quiet (#164).
+            if i != self._last_device_index:
+                log.info(f"Using audio device [{i}]: {device['name']}")
+                self._last_device_index = i
             return i
         available = [d["name"] for d in devices if d["max_input_channels"] > 0]
         raise ValueError(
@@ -222,7 +243,6 @@ class AudioCapture:
 
     async def run(self):
         """Main capture loop. Streams audio and dispatches overlapping chunks."""
-        device_index = self._find_device_index()
         loop = asyncio.get_running_loop()
 
         # int() guards against fractional seconds in config.yaml (v1.3.5):
@@ -252,6 +272,17 @@ class AudioCapture:
                 blocks: asyncio.Queue = asyncio.Queue(maxsize=_BLOCK_QUEUE_MAX)
                 self._blocks = blocks
                 try:
+                    # #164 (CRIT-2 follow-up): resolve the device index INSIDE the
+                    # retry loop. A device absent at startup — a mistyped
+                    # audio.device_name, or the USB interface not yet enumerated
+                    # when the service starts — otherwise made _find_device_index()
+                    # raise ABOVE the loop, escaping run() and crash-looping the
+                    # process under systemd (Restart=on-failure, 10s). Inside the
+                    # loop it degrades to the same backoff-and-rebuild path a stream
+                    # construction failure or a CONC-5 stall already take, and
+                    # re-resolving each attempt also picks up a device that
+                    # reappears on a different index after a re-plug.
+                    device_index = self._find_device_index()
                     stream = sd.InputStream(
                         samplerate=self.sample_rate,
                         channels=1,

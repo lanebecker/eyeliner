@@ -143,6 +143,61 @@ def test_find_device_multiple_matches_uses_first_and_warns(caplog):
     assert any("USB Microphone" in r.message for r in caplog.records)
 
 
+def test_device_index_logs_once_per_index_not_every_lookup(caplog):
+    """#164 follow-up: the lookup now runs on every stream rebuild, so its
+    success INFO must fire only when the resolved index CHANGES — repeated
+    resolution of the same device across a rebuild loop stays quiet (the PCONC-4
+    anti-flood invariant this file already enforces for drop warnings)."""
+    import logging
+    cap = make_capture()
+    devices = [device("USB Audio Codec", 2)]
+    with patch.object(capture_module.sd, "query_devices", return_value=devices):
+        with caplog.at_level(logging.INFO, logger="src.audio.capture"):
+            for _ in range(5):                     # five rebuilds resolving index 0
+                assert cap._find_device_index() == 0
+    using = [r for r in caplog.records if "Using audio device" in r.message]
+    assert len(using) == 1, f"expected 1 'Using audio device' log across 5 lookups, got {len(using)}"
+
+
+def test_device_index_relogs_when_the_index_changes(caplog):
+    """A re-plug that lands the device on a DIFFERENT index must re-log — that
+    index change is exactly the signal #164 wants surfaced."""
+    import logging
+    cap = make_capture()
+    with caplog.at_level(logging.INFO, logger="src.audio.capture"):
+        with patch.object(capture_module.sd, "query_devices",
+                          return_value=[device("USB Audio Codec", 2)]):
+            assert cap._find_device_index() == 0          # index 0 → log
+        with patch.object(capture_module.sd, "query_devices",
+                          return_value=[device("Silent Sink", 0), device("USB Audio Codec", 2)]):
+            assert cap._find_device_index() == 1          # re-plugged to index 1 → re-log
+    using = [r for r in caplog.records if "Using audio device" in r.message]
+    assert len(using) == 2
+
+
+def test_multimatch_warning_fires_when_the_match_set_changes_not_just_the_winner(caplog):
+    """#164 follow-up: the ambiguity WARNING is keyed on the match SET, not the
+    winning index. A config that becomes newly ambiguous (a second matching
+    device appears) must still warn even when index 0 keeps winning — and an
+    unchanged set across a rebuild loop must NOT re-warn (anti-flood)."""
+    import logging
+    cap = make_capture(device_name="USB")
+    with caplog.at_level(logging.WARNING, logger="src.audio.capture"):
+        # Unambiguous first: one match at index 0 → no multi-match warning.
+        with patch.object(capture_module.sd, "query_devices",
+                          return_value=[device("USB Audio Codec", 2)]):
+            assert cap._find_device_index() == 0
+        assert not [r for r in caplog.records if "Multiple input devices" in r.message]
+
+        # A second matching device appears; index 0 still wins → must warn ONCE.
+        two = [device("USB Audio Codec", 2), device("USB Microphone", 1)]
+        with patch.object(capture_module.sd, "query_devices", return_value=two):
+            assert cap._find_device_index() == 0
+            assert cap._find_device_index() == 0   # same set again → no re-warn
+    warnings = [r for r in caplog.records if "Multiple input devices" in r.message]
+    assert len(warnings) == 1, f"expected exactly one multi-match warning, got {len(warnings)}"
+
+
 def test_find_device_not_found_raises_with_available_list():
     cap = make_capture(device_name="Nonexistent Interface")
     devices = [
@@ -448,6 +503,55 @@ async def test_stream_construction_failure_retries_with_a_fresh_stream(monkeypat
             pass
 
     assert calls["n"] >= 2         # the failed construction was retried
+
+
+@pytest.mark.asyncio
+async def test_absent_device_at_startup_is_retried_not_crash_looped(monkeypatch):
+    """#164: the device lookup must run INSIDE the retry loop. A device absent at
+    startup — a mistyped audio.device_name, or a USB interface (UCA222) not yet
+    enumerated when the service starts — must be retried with backoff and picked
+    up when it appears, NOT escape run() and crash-loop the process under systemd
+    (Restart=on-failure). Pre-fix, _find_device_index() ran once ABOVE the loop,
+    so its ValueError faulted the whole capture task on the first miss."""
+    cap = make_capture()
+    monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(capture_module, "_BLOCK_STALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(capture_module, "_SILENCE_TICK_SECONDS", 0.001)
+
+    # ABSENT on the first lookup (no input-capable match → ValueError), then the
+    # device APPEARS on a later attempt (late USB enumeration or a re-plug).
+    lookups = {"n": 0}
+
+    def query_devices(*a, **k):
+        lookups["n"] += 1
+        if lookups["n"] == 1:
+            return [device("Some Output-Only Sink", 0)]   # no input match → ValueError
+        return [device("USB Audio Codec", 2)]             # now present
+    monkeypatch.setattr(capture_module.sd, "query_devices", query_devices)
+
+    built = asyncio.Event()
+
+    def make_stream(**kwargs):
+        built.set()
+        return _cm_stream_mock()
+    monkeypatch.setattr(capture_module.sd, "InputStream", MagicMock(side_effect=make_stream))
+
+    task = asyncio.create_task(cap.run())
+    try:
+        # Fixed: 1st lookup raises INSIDE the loop → caught → backoff → 2nd lookup
+        # finds the device → stream built → event set.
+        # Pre-fix: lookup raised ABOVE the loop → task faulted with ValueError →
+        # event never set → wait_for times out (RED).
+        await asyncio.wait_for(built.wait(), timeout=2.0)
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    assert lookups["n"] >= 2        # the absent-device lookup was retried, not fatal
+    assert built.is_set()           # and a stream was built once the device appeared
 
 
 @pytest.mark.asyncio
