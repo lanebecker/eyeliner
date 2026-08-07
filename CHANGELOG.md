@@ -9,10 +9,11 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-**Code-review hardening, round 3 (Wave 5 — metadata, tracklist & Discogs
-reliability).** Wave 5 of the same audit (`CODE_REVIEW_2026-07-30.md`):
-tightening how a track's position within its album is parsed and ranked, and
-closing gaps in the Discogs read/write layer.
+**Code-review hardening, round 3 (Wave 5 — metadata, Discogs reliability &
+audio-capture coverage).** Wave 5 of the same audit
+(`CODE_REVIEW_2026-07-30.md`): tightening how a track's position within its
+album is parsed and ranked, closing gaps in the Discogs read/write layer, and
+covering the audio-capture safety net that has never run on real hardware.
 
 ### Fixed
 
@@ -124,6 +125,47 @@ The Discogs-reliability cluster (Unit 2):
 - **Removed a stale hardcoded sample date from a `writer.py` comment (STAB-7
   #161 — NIT).** `# e.g. "2026-05-24"` beside `date.today()` became the generic
   `# ISO 8601, e.g. "YYYY-MM-DD"`.
+
+The audio-capture cluster (Unit 3a):
+
+### Fixed
+
+- **The audio block-drop warning is now a throttled health signal instead of a
+  per-drop log flood (PCONC-4 #153 — LOW).** When the event loop stalls, the
+  capture callback's drop-oldest overflow fired one WARNING per dropped block —
+  ~4/second, and a single stalled loop turn was measured emitting 53 records,
+  flooding the Pi's SD-card journal in exactly the degraded state where writes
+  are most precious. `_enqueue_block` now counts drops and emits at most one
+  summarizing warning per `_DROP_WARN_INTERVAL_SECONDS` (5s) reporting the
+  aggregate since the last report. The drop-oldest behaviour itself is
+  unchanged (oldest evicted, newest admitted). The report clock is seeded to
+  `-inf` so the very first drop always warns regardless of the monotonic epoch
+  — the Pi's `CLOCK_MONOTONIC` is uptime-based and resets to ~0 on reboot, so a
+  naive `0.0` seed would have swallowed the first warning during early boot
+  (caught in adversarial cold review). RED-first; mutation-verified.
+
+### Tests
+
+- **The audio capture safety net is now covered headless (TQ-7 #138 — MEDIUM).**
+  `AudioCapture._silence_ticker()` — the wall-clock task that keeps
+  `SESSION_ENDED` firing (and the Discogs Play Count credited) while the stream
+  is down — and `run()`'s stream-construction-retry path had zero tests, on
+  hardware that has never been powered on. Three headless tests were added
+  (pure asyncio + a mocked `InputStream`): the ticker keeps ticking and
+  survives a listener that raises; a construction failure is retried with a
+  fresh stream; and `run()`'s `finally` cancels + awaits the ticker on exit.
+  All three are mutation-verified against the exact branch they cover. No
+  production code change — the paths already worked; they simply weren't pinned.
+- **Centralized the `sounddevice` import stub with proper teardown (TQ-6
+  #156 — LOW).** `sys.modules.setdefault("sounddevice", MagicMock())` sat at
+  module scope in `test_capture.py` and `test_main_wiring.py` and was never
+  restored, leaking a `MagicMock` into `sys.modules` for the rest of the
+  process where any later test could silently pick it up. It now lives in the
+  root `conftest.py` (installed before any test module imports, `setdefault`
+  semantics preserved so a real PortAudio install is untouched) with a
+  `pytest_sessionfinish` hook that removes only a stub it planted. Consequence,
+  by design: the two test modules are no longer bare-`import`-able outside a
+  pytest run (they were only ever run under pytest).
 
 ## [1.5.5] — 2026-08-06
 

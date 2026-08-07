@@ -9,17 +9,14 @@ Covers the pieces extracted from main() for testability:
     leg's exception re-raised, capture/display stopped in the finally.
 """
 import asyncio
-import sys
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
 # main.py imports AudioCapture, which imports sounddevice (needs PortAudio at
-# import time).  Stub it before importing main so this test runs on machines
-# without the audio stack — mirrors tests/test_capture.py.  setdefault leaves a
-# real sounddevice untouched where it exists.
-sys.modules.setdefault("sounddevice", MagicMock())
-
+# import time).  The stub is installed in the root conftest.py before any test
+# module is imported (TQ-6), so `from main import ...` succeeds without the
+# audio stack; conftest leaves a real sounddevice untouched where it exists.
 from main import (
     apply_state_silence_effect, wire_silence_listeners, run_pipeline,
     install_io_executor, _IO_EXECUTOR_MAX_WORKERS,
