@@ -154,6 +154,24 @@ correctness), then hardening how malformed or failing external responses degrade
   no-double-close gate); independently cold-reviewed (SPEC + QUALITY PASS — the
   re-indent is statement-for-statement identical to before).
 
+### Security
+
+- **Assessed and documented the cover-fetch header-drip residual as accepted
+  (#176 — LOW, not reproduced).** SEC-4 (#121) bounds a slow-drip cover fetch
+  with a 45s wall-clock budget, but that budget is a Python-level check between
+  blocking calls (between redirect hops, between body `read1()` chunks) — it
+  cannot interrupt the synchronous response-HEADER parse inside `pool.urlopen()`,
+  which is bounded only by the per-recv 15s socket timeout. A host that dribbles
+  headers one byte per sub-15s recv can still stall a single hop past the budget
+  (the SEC-4 body-drip DoS class, in the header path). Deliberately NOT fixed:
+  reaching it requires a rogue allow-listed host or a MITM on the SSRF-pinned IP
+  (the S-7 allow-list + IP pin + TLS hostname check gate both); the worst case on
+  this single-user appliance is "covers stop loading," not data loss; and it was
+  never reproduced. The only complete fix (a watchdog thread closing the socket
+  at the deadline) adds more concurrency risk than the hypothesis warrants here,
+  so it's recorded as a known, accepted residual in `cover_cache.py` (revisit if
+  reproduced, or if the fetch moves somewhere multi-tenant). No behaviour change.
+
 ### Removed
 
 - **Deleted the dead `clamp_luminance` helper and its tests (#177 — LOW).**
