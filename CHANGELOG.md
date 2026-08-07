@@ -7,6 +7,37 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [Unreleased]
+
+**Code-review follow-ups, round 3 (Wave 6 — boot & config correctness).**
+Residuals surfaced by earlier waves' cold reviews, filed as GitHub issues and
+addressed here: hardening the paths that decide whether the appliance comes up
+at all.
+
+### Fixed
+
+- **Audio capture no longer crash-loops when the device is absent at startup
+  (#164 — MEDIUM).** `AudioCapture.run()` resolved the sounddevice index by
+  calling `_find_device_index()` at the very top of the method, *above*
+  `self._running = True` and the `while self._running` retry loop and outside any
+  `try`. A mistyped `audio.device_name`, or a USB interface (the UCA222) not yet
+  enumerated when the service starts, made that raise `ValueError`, which escaped
+  `run()`, faulted the capture task, and exited the process — a permanent 10s
+  crash loop under the documented systemd unit (`Restart=on-failure`,
+  `RestartSec=10`). The lookup now runs *inside* the retry loop's `try`, so an
+  absent device degrades to the same backoff-and-rebuild path a stream
+  construction failure or a CONC-5 stall already take, and re-resolving on each
+  attempt also picks up a device that reappears on a different index after a
+  re-plug. RED-first; mutation-verified; independently cold-reviewed. Because the
+  lookup now runs on every rebuild, its "using device" INFO and multi-match
+  WARNING are deduped (the former keyed on the winning index, the latter on the
+  match set) so a sustained rebuild loop can't reintroduce the PCONC-4 log flood
+  — a re-plug to a new index, or a newly-ambiguous config, still logs. (Accepted
+  trade-off of retry-over-crash: a *permanently* misconfigured `device_name` now
+  logs one capture-error per retry backoff (~1/s) via the pre-existing error
+  path, versus one per systemd restart (~1/10s) before; the retry is the point,
+  and the rate is bounded by `_STREAM_RETRY_BACKOFF_SECONDS`.)
+
 ## [1.5.6] — 2026-08-07
 
 **Code-review hardening, round 3 (Wave 5 — metadata, Discogs reliability &
