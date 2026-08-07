@@ -9,11 +9,25 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-**Code-review follow-ups, round 3 (Waves 6–7).** Residuals surfaced by earlier
+**Code-review follow-ups, round 3 (Waves 6–9).** Residuals surfaced by earlier
 waves' cold reviews, filed as GitHub issues and addressed here: first the paths
 that decide whether the appliance comes up at all (Wave 6 — boot & config
-correctness), then hardening how malformed or failing external responses
-degrade (Wave 7 — Shazam/MusicBrainz/Last.fm).
+correctness), then hardening how malformed or failing external responses degrade
+(Wave 7 — Shazam/MusicBrainz/Last.fm), a couple of display/concurrency residuals
+(Wave 8), and a cleanup / test-infra sweep (Wave 9).
+
+### Added
+
+- **Global per-test timeout via `pytest-timeout` (#174 — LOW).** The suite had
+  no bounded per-test timeout, so an infinite-loop regression (e.g. a broken
+  cache-eviction loop) would hang CI or a local run indefinitely rather than
+  failing red in seconds — the mutation harness only caught such loops because it
+  wraps each run in an external `timeout`. Added `pytest-timeout` to
+  `requirements.txt` and a generous `timeout = 60` global in `pytest.ini` (every
+  real test runs in well under a second, so it never false-trips; the signal
+  method interrupts a wedged pure-Python loop on CI and the Pi). A guard test
+  pins that the global stays configured — if the `pytest.ini` line is removed or
+  the plugin is dropped from the env, it fails loudly.
 
 ### Fixed
 
