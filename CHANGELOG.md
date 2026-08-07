@@ -60,6 +60,20 @@ degrade (Wave 7 — Shazam/MusicBrainz/Last.fm).
   — reproduced all five shapes before touching code, so this completes the issue
   with the one guard that was still missing rather than re-hardening covered
   paths. RED-first; mutation-verified.
+- **A raising Discogs credit no longer skips the Last.fm love (#171 — LOW).**
+  `_finalize_session` promises the love "runs independently of Discogs — a
+  Discogs failure doesn't prevent this," which held when a writer RETURNED False
+  but not when it RAISED: the single, unretried `update_last_played` raising
+  propagated out of `_credit_completed_album` and `_finalize_session` *before*
+  the love block, so a Discogs transport error silently cost the love too. The
+  crediting call is now wrapped so a raise is logged and contained, and the love
+  still runs (`credited` stays uncommitted, so a genuinely lost credit is still
+  not falsely latched). The CONC-3 done-callback — which previously used this
+  exact raise as its reachable vector — now backstops any *other* unexpected
+  raise in the SESSION_ENDED task; its docstring and the corresponding test were
+  updated to match. RED-first; mutation-verified; independently cold-reviewed
+  (SPEC + QUALITY PASS — CancelledError still propagates, B-8 idempotency
+  unchanged).
 
 ## [1.5.6] — 2026-08-07
 

@@ -756,16 +756,25 @@ async def test_partial_album_via_public_session_ended_path_does_not_increment():
 @pytest.mark.asyncio
 async def test_conc3_raising_end_session_task_logs_the_failure(caplog):
     """If the fire-and-forget SESSION_ENDED task raises, its done-callback must
-    LOG the failure (CONC-3).  Reproduced via an unwrapped write: the Play Count
-    increment lands (credited) but ``update_last_played`` RAISES rather than
-    returning False, so the exception propagates out of ``_end_session`` — where,
-    before the fix, the bare ``_bg_tasks.discard`` callback dropped it and only
-    asyncio's detached GC warning ever mentioned it, at an arbitrary later time.
+    LOG the failure (CONC-3), rather than letting the bare ``_bg_tasks.discard``
+    callback drop it into asyncio's detached GC "never retrieved" warning at an
+    arbitrary later time.
+
+    NOTE: #171 now CONTAINS the specific raising-``update_last_played`` vector
+    inside ``_finalize_session`` (so it can't skip the Last.fm love — see
+    ``test_raising_update_last_played_still_runs_the_lastfm_love``). This test
+    therefore exercises the backstop with a genuinely UNEXPECTED raise from the
+    finalize task, which is what CONC-3 now guards.
     """
-    tracker, writer = make_tracker(last_played_field_name="Last Played")
-    writer.update_last_played.side_effect = RuntimeError("discogs 500 on last-played")
+    tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(make_track("Master-Dik"))   # the album closer
+
+    # An unexpected raise anywhere in the fire-and-forget task must still reach
+    # the done-callback and be logged.
+    async def _boom(session):
+        raise RuntimeError("unexpected finalize error")
+    tracker._finalize_session = _boom
 
     with caplog.at_level(logging.ERROR):
         tracker.on_silence_event(AudioEvent.SESSION_ENDED)
@@ -1035,6 +1044,34 @@ async def test_love_is_committed_when_a_retry_succeeds():
         await tracker._end_session()
     assert session.loved is True
     assert lastfm.love.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_raising_update_last_played_still_runs_the_lastfm_love():
+    """#171: _finalize_session promises the Last.fm love "runs independently of
+    Discogs — a Discogs failure doesn't prevent this." That held when
+    update_last_played RETURNED False, but NOT when it RAISED: the raise escaped
+    _credit_completed_album and _finalize_session before the love block, so the
+    love was skipped too. The credit raise must now be contained so the love
+    still runs."""
+    writer = make_writer_mock(last_played_field_name="Last Played")
+    # increment succeeds; the SINGLE-attempt, unretried update_last_played RAISES
+    # (a transport error, not the deliberate STAB-2 False skip).
+    writer.update_last_played.side_effect = RuntimeError("Discogs 500 on Last Played")
+    lastfm = MagicMock()
+    lastfm.love_on_completion = True
+    lastfm.love = MagicMock(return_value=True)
+    tracker = ListenTracker(writer, lastfm)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Master-Dik"))   # full album, last track
+    session = tracker._session
+    assert session.potential_last_track is True
+
+    await tracker._finalize_session(session)   # pre-fix: RAISES here, skipping the love
+
+    lastfm.love.assert_called_once()           # love ran despite the Discogs raise
+    assert session.loved is True
+    assert session.credited is True            # increment landed; only Last Played raised
 
 
 @pytest.mark.asyncio
