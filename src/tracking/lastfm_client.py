@@ -14,6 +14,7 @@ a warning and the method returns False.
 """
 
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -35,6 +36,18 @@ class LastFmClient:
     def __init__(self, config: "LastFmConfig"):
         self._love_on_completion: bool = config.love_on_completion
         self._network = None  # pylast.LastFMNetwork, or None when disabled
+
+        # CRIT-10: this one client is injected into BOTH TrackCommitService
+        # (scrobble) and ListenTracker (love), and each caller dispatches its
+        # sync method via run_in_executor — so two DIFFERENT executor threads can
+        # touch the single pylast Network object at the same time (a session-end
+        # love overlapping a fresh scrobble), and pylast documents no thread-
+        # safety guarantee. This lock serializes every Network access below so
+        # only one call is ever in flight against it. A threading.Lock (not an
+        # asyncio.Lock) is required: the guarded calls run OFF the event loop, on
+        # executor threads. Contention is rare and brief (one scrobble/track, one
+        # love/album), so the serialization is effectively free.
+        self._lock = threading.Lock()
 
         if not config.scrobble_enabled:
             log.debug("Last.fm scrobbling is disabled (scrobble_enabled: false).")
@@ -97,12 +110,13 @@ class LastFmClient:
             return True  # Graceful no-op
 
         try:
-            self._network.scrobble(
-                artist=track.artist,
-                title=track.title,
-                timestamp=timestamp,
-                album=track.album or None,
-            )
+            with self._lock:  # CRIT-10: serialize access to the shared Network
+                self._network.scrobble(
+                    artist=track.artist,
+                    title=track.title,
+                    timestamp=timestamp,
+                    album=track.album or None,
+                )
             log.info(f"Last.fm scrobbled: {track.artist} — {track.title}")
             return True
         except Exception as e:
@@ -124,8 +138,9 @@ class LastFmClient:
             return True  # Graceful no-op
 
         try:
-            pylast_track = self._network.get_track(track.artist, track.title)
-            pylast_track.love()
+            with self._lock:  # CRIT-10: serialize access to the shared Network
+                pylast_track = self._network.get_track(track.artist, track.title)
+                pylast_track.love()
             log.info(f"Last.fm loved: {track.artist} — {track.title}")
             return True
         except Exception as e:

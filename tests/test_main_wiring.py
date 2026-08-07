@@ -20,8 +20,9 @@ import pytest
 from main import (
     apply_state_silence_effect, wire_silence_listeners, run_pipeline,
     install_io_executor, _IO_EXECUTOR_MAX_WORKERS,
-    build_components, start_display,
+    build_components, start_display, main,
 )
+import main as main_module
 from src.audio.silence import AudioEvent
 from src.state.player_state import PlayerState, PlayerStatus
 from src.util.signal import Signal
@@ -442,3 +443,76 @@ async def test_install_io_executor_routes_default_run_in_executor():
         assert seen["thread"].startswith("vnp-io"), seen
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
+
+
+# ---------------------------------------------------------------------------
+# TQ-2 — main() itself: the config-error startup guard and the SIGINT/SIGTERM
+# shutdown wiring were entirely uncovered (the extracted helpers above were
+# tested, but not main()'s own body).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_main_exits_1_on_config_error(monkeypatch):
+    """A ConfigError from load_config must become sys.exit(1), not a traceback."""
+    from src.config import ConfigError
+
+    def boom():
+        raise ConfigError("bad config.yaml")
+
+    monkeypatch.setattr(main_module, "load_config", boom)
+    with pytest.raises(SystemExit) as exc_info:
+        await main()
+    assert exc_info.value.code == 1
+
+
+@pytest.mark.asyncio
+async def test_main_registers_signal_handlers_and_cancel_all_cancels_tasks(monkeypatch):
+    """main() must register a SIGINT and SIGTERM handler, and that handler
+    (_cancel_all) must cancel every pipeline task."""
+    import signal as signal_module
+
+    monkeypatch.setattr(main_module, "load_config", lambda: MagicMock())
+    monkeypatch.setattr(main_module, "install_io_executor", lambda loop: MagicMock())
+    monkeypatch.setattr(main_module, "wire_silence_listeners", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "start_display", lambda display: None)
+    monkeypatch.setattr(main_module, "read_version", lambda: "test")
+
+    async def _leg():
+        await asyncio.sleep(3600)   # long-lived; only ends via cancel
+
+    comps = MagicMock()
+    comps.capture.run = _leg
+    comps.recognizer.run = _leg
+    comps.display.run = _leg
+    monkeypatch.setattr(main_module, "build_components", lambda config, state: comps)
+
+    recorded = {"handlers": {}, "tasks": None}
+
+    async def fake_run_pipeline(tasks, *a, **k):
+        recorded["tasks"] = list(tasks)   # capture without awaiting the legs
+
+    monkeypatch.setattr(main_module, "run_pipeline", fake_run_pipeline)
+
+    # Patch add_signal_handler on the REAL running loop (main() uses this loop
+    # for create_task), so signal registration is captured without touching the
+    # process's actual signal disposition.
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        loop, "add_signal_handler",
+        lambda sig, handler, *a: recorded["handlers"].__setitem__(sig, handler),
+    )
+
+    await main()
+
+    # Both signals registered, to the same _cancel_all closure.
+    assert set(recorded["handlers"]) == {signal_module.SIGINT, signal_module.SIGTERM}
+    cancel_all = recorded["handlers"][signal_module.SIGINT]
+    assert recorded["handlers"][signal_module.SIGTERM] is cancel_all
+
+    # _cancel_all cancels every pipeline task.
+    tasks = recorded["tasks"]
+    assert len(tasks) == 3
+    assert not any(t.cancelled() for t in tasks)
+    cancel_all()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(t.cancelled() for t in tasks)
