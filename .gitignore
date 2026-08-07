@@ -45,6 +45,10 @@ htmlcov/
 # Local-only code review reports (findings live in GitHub issues; see MEMORY)
 CODE_REVIEW_*.md
 
+# Local-only wave/round handoff notes (working artifacts of the audit loop;
+# the durable record lives in CHANGELOG.md + GitHub issues — never committed)
+HANDOFF-*.md
+
 # Local-only handoff/review patch artifacts (delivered per-finding, applied on
 # the Mac, then parked in docs/archive/ — never committed; keeps `git add -A` from re-polluting)
 *.patch

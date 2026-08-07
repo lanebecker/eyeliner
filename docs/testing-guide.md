@@ -79,6 +79,11 @@ The table groups related files; for the live, authoritative file list run
 | `test_lastfm_client.py` | LastFmClient scrobble & love logic |
 | `test_layouts.py` | Display layout geometry |
 | `test_renderer_palette.py`, `_caches.py`, `_typography.py`, `_perf.py`, `_robustness.py` | Palette transitions incl. off-loop extraction + `_cover_version` recompose (P-9/B-22), bounded caches, typography, hot-loop perf, degenerate covers, boot-arc bucket cache (P-10) |
+| `test_renderer_text.py` | Text drawing — non-ASCII shaping (DISP-5) + over-wide-token break/clip (DISP-7) |
+| `test_renderer_lifecycle.py` | Real `DisplayRenderer` construction + `_render()` status dispatch wiring (TQ-1) |
+| `test_typography.py` | Standalone `TextRenderer` (ARCH-3 extraction) — wrap/fit/ellipsize/chips over bounded caches, no renderer instance |
+| `test_palette_transition.py` | Standalone `PaletteTransition` (ARCH-3 extraction) — queue/animate lerp state machine, no renderer instance |
+| `test_palette_contrast.py` | Full-Opacity Rule on `extract_palette` output vs `text_background` (DISP-1/DISP-2/MUT-3) |
 | `test_cover_cache.py` | `CoverArtCache` — SSRF IP-pinning + DNS-rebinding/mixed-IP rejection (S-1/S-2/S-7), `.part` sweep + mtime-LRU disk prune (R-1/R-2) |
 | `test_error_state.py` | `EmptyState` rendering, miss counting, boot label |
 | `test_main_wiring.py` | `main.py` pipeline wiring + shutdown semantics |
@@ -146,6 +151,49 @@ pytest -x
 ```bash
 pytest tests/test_listen_tracker.py::test_only_side_a_played_does_not_increment
 ```
+
+### Per-test timeout
+
+`pytest.ini` sets `timeout = 60` (via **pytest-timeout**, in `requirements.txt`).
+Every real test runs in well under a second, so the ceiling never false-trips —
+but an infinite-loop regression (say, a broken cache-eviction loop) now fails
+fast with a stack dump instead of hanging the run or CI indefinitely. On POSIX
+(CI and the Pi) it uses the signal method, which can interrupt a wedged
+pure-Python loop. `tests/test_pytest_timeout_config.py` guards that the ini value
+stays set, so nobody can quietly drop it. To override for a slow debugging
+session: `pytest --timeout=0` (disable) or `--timeout=120`.
+
+### Coverage
+
+**pytest-cov** is in `requirements.txt` (TQ-9). To see line coverage for the
+production package:
+
+```bash
+pytest --cov=src --cov-report=term-missing
+```
+
+Add `--cov-report=html` for a browsable `htmlcov/` report. Coverage is a
+diagnostic aid, not a gate — the suite does not enforce a minimum percentage.
+
+---
+
+## Continuous integration
+
+Two GitHub Actions workflows live in `.github/workflows/`:
+
+- **`tests.yml`** — runs `pytest -q` on every push and pull request, on Python
+  3.11 (the Raspberry Pi OS bookworm system Python and the version the app
+  targets). It sets `SDL_VIDEODRIVER=dummy` / `SDL_AUDIODRIVER=dummy` so pygame
+  is headless, and `tests/conftest.py` stubs `sounddevice` before any test
+  module loads, so no PortAudio or display hardware is needed on the runner.
+- **`sync-version-badge.yml`** — runs when `VERSION` is pushed to `main`,
+  revalidates the new version against a strict semver pattern (TQ-5, the file is
+  treated as untrusted repo content), and rewrites the shields.io badge in
+  `README.md` so it always matches `VERSION`. It also warns — without failing —
+  if `CHANGELOG.md` was not touched in the same push. **Release reminder:** a
+  release means editing **both `VERSION` and `CHANGELOG.md`** and pushing; the
+  badge sync only fires on a `VERSION` change, so bumping the changelog alone
+  leaves the badge (and any VERSION-derived display) stale.
 
 ---
 
@@ -414,8 +462,6 @@ Key cases — `_BoundedCache` (backs the palette, scaled-cover, and gradient cac
 Key cases — color helpers:
 - `_lerp_color` endpoints, midpoint, and clamping of `t` outside [0, 1]
 - `_lerp_palette` interpolates all five palette channels
-- `_clamp_luminance` brightens too-dark colors, leaves bright colors and
-  pure black unchanged
 
 ### `test_renderer_palette.py` — _queue_palette decisions (new in v1.3.5)
 
@@ -450,10 +496,10 @@ Key cases:
   and fits the available width (PREV/NEXT panel only)
 - `_chip_texts` — ≤3 genres pass through; 5 genres collapse to 3 + `+2`;
   empty list stays empty
-- `_contrast_ratio` / `_ensure_contrast` — black-on-white is 21:1; the
-  fallback muted already passes against the fallback bg; failing colors are
-  lightened until ≥4.5:1, including against cool-dark backgrounds (the
-  DESIGN.md Cavetown case)
+- `contrast_ratio` / `ensure_contrast` (both in `src/display/palette.py`) —
+  black-on-white is 21:1; the fallback muted already passes against the
+  fallback bg; failing colors are lightened until ≥4.5:1, including against
+  cool-dark backgrounds (the DESIGN.md Cavetown case)
 - **Compose smoke test:** `_compose_now_playing` renders a full 1024×600
   frame headlessly without error, and `_draw_status_dot` draws over it —
   one test that catches API drift across every drawing helper
