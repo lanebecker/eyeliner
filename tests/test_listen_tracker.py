@@ -73,6 +73,7 @@ def make_track(
     instance_id=67890,
     source=MetadataSource.DISCOGS_COLLECTION,
     tracklist=None,
+    resolve_key=None,
 ):
     return TrackMetadata(
         title=title,
@@ -82,6 +83,7 @@ def make_track(
         discogs_release_id=release_id,
         discogs_instance_id=instance_id,
         tracklist=tracklist if tracklist is not None else make_tracklist(),
+        resolve_key=resolve_key,
     )
 
 

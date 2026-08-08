@@ -72,7 +72,16 @@ class MetadataResolver:
 
     @staticmethod
     def _cache_key(raw: "RawRecognitionResult") -> tuple:
-        """Normalize (artist, album) the same way RecognitionLoop compares tracks."""
+        """Normalize (artist, album) for the album cache (strip + lower).
+
+        NOTE: intentionally simpler than both RecognitionLoop's dedup
+        normalizer (casefold + whitespace collapse) and the #179/#180
+        matching folds — the key is only ever compared against keys from
+        this same function (cache lookups, and #184's tier-upgrade check via
+        ``TrackMetadata.resolve_key``), so self-consistency is all that is
+        required.  String variance across chunks yields different keys and
+        fails safe (cache miss / conservative split).
+        """
         return (raw.artist.strip().lower(), raw.album.strip().lower())
 
     def _cache_get(self, key: tuple):
@@ -101,6 +110,7 @@ class MetadataResolver:
                 album=raw.album,
                 cover_art_url=payload,
                 source=source,
+                resolve_key=self._cache_key(raw),
             )
         return self._from_discogs(raw, payload, source)
 
@@ -176,6 +186,7 @@ class MetadataResolver:
             album=raw.album,
             cover_art_url=cover_url,
             source=MetadataSource.FALLBACK,
+            resolve_key=key,
         )
 
     def _from_discogs(
@@ -188,6 +199,7 @@ class MetadataResolver:
         return TrackMetadata(
             title=raw.title,
             artist=raw.artist,
+            resolve_key=self._cache_key(raw),
             album=discogs_result.get("album", raw.album),
             year=discogs_result.get("year"),
             label=discogs_result.get("label"),
