@@ -44,6 +44,48 @@ section accumulates the fixes.
 
 ### Fixed
 
+- **The transient/permanent error taxonomy is now honoured end-to-end
+  (#188/#189/#190 — MEDIUM, Wave 2 bundle 1).** Three sites computed the
+  transient-vs-permanent verdict and then discarded or misrouted it:
+  - **#189 (`is_transient` status discrimination):** the classifier blanket-
+    treated every `requests.HTTPError` and `discogs_client` HTTPError as
+    transient, so a revoked Discogs token (401), wrong username (404), or
+    malformed request (400) logged only as INFO "(transient)" — indistinguish-
+    able from a wifi blip, hiding a dead credential that silently stopped all
+    Play Count accrual. `is_transient` now judges HTTP errors BY STATUS
+    (408/429/5xx transient; every other status permanent); status-less
+    connection/timeout/NetworkError keep the family classification. The
+    resolver escalates a permanent 401/403/404 to an ACTIONABLE `ERROR`
+    naming the fix ("check your Discogs user_token" / "check your
+    discogs.username"), logged once and throttled per-tier until that tier's
+    lookup next succeeds (clockless, cf. #178). Permanent auth errors stay uncached/
+    retryable — no downgrade is pinned (B-4), so accrual resumes the moment
+    the token is fixed.
+  - **#188 (`_build_result` transient swallow):** a transient 429/5xx during
+    the lazy release fetch (tracklist, master year, images) was caught
+    per-field and the degraded result (no cover, empty tracklist → no
+    `is_last_track` → no Play Count) was cached session-long as a Discogs hit.
+    A new `_reraise_if_transient` propagates transient failures from the
+    CREDIT-CRITICAL enrichment sites (`_build_result`'s release-load per-field
+    guards and `get_tracklist`) to the resolve boundary so the album stays
+    uncached/retryable; permanent/malformed data still degrades that field.
+    `search_database`'s per-candidate catch re-raises transient too, so the
+    bug can't just move one tier down (a "clean miss" the resolver would cache
+    as FALLBACK). Deliberate carve-out (cold review): `get_original_year`
+    DEGRADES transient to the pressing year rather than propagating — it is
+    display-only with a valid fallback, and re-raising would discard an
+    otherwise credit-capable result over a decorative field. Mirrors the
+    established #175 pattern.
+  - **#190 (cover-art transient flattened to None):** `CoverArtFallback`'s
+    outer handler returned `None` for both a transient MusicBrainz outage and
+    a clean "no art exists", and `resolve()` cached that `None` as the album's
+    FALLBACK payload for the session — pinning an album coverless even after
+    MusicBrainz recovered. The outer handler now re-raises transient (keeps
+    catch-and-None for permanent), and `resolve()` Step 3 mirrors the
+    `discogs_completed` pattern: on a transient cover-art failure it returns
+    the fallback for this track but skips the cache. A clean "no art" still
+    caches (load-bearing for MusicBrainz rate limits).
+
 - **A transient blip on an album's first resolve no longer causes a spurious
   session split (#184 — MEDIUM, `R4:gap3-1`).** The B-4 carve-out
   deliberately returns a DATABASE-tier result *uncached* after a transient

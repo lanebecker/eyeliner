@@ -90,6 +90,16 @@ class CoverArtFallback:
             return None
 
         except Exception as e:
+            # #190: a TRANSIENT failure (MusicBrainz unreachable/timeout —
+            # NetworkError, re-raised here by the inner loop) means the service
+            # is down.  Propagate it so the resolver leaves the album
+            # uncached/retryable (mirroring the Discogs tiers' B-4 behaviour)
+            # instead of flattening it to None and caching that None as the
+            # album's FALLBACK payload for the whole session.  Everything else
+            # (ResponseError/parse/auth — definitive for this lookup) still
+            # degrades to None: cover art is best-effort.
+            if is_transient(e):
+                raise
             log.warning(
                 f"MusicBrainz cover art lookup failed for '{artist} / {album}': {e}"
             )

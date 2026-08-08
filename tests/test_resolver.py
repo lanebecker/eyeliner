@@ -75,6 +75,7 @@ def resolver(mock_discogs, mock_coverart):
     r.reader = mock_discogs
     r.coverart = mock_coverart
     r._album_cache = {}  # Normally created in __init__ (bypassed via __new__)
+    r._logged_discogs_config = {}
     return r
 
 

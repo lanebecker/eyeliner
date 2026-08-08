@@ -21,6 +21,7 @@ import discogs_client
 
 from src.metadata.models import TracklistEntry
 from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _HTTP_TIMEOUT
+from src.metadata.errors import is_transient
 
 if TYPE_CHECKING:
     from src.config import DiscogsConfig
@@ -84,6 +85,24 @@ _PUNCT_FOLD = str.maketrans({
     "–": "-", "—": "-", "−": "-",
     "…": "...",
 })
+
+
+def _reraise_if_transient(exc: BaseException) -> None:
+    """#188: a CREDIT-CRITICAL enrichment fetch (the lazy release load and the
+    tracklist) failed.  A TRANSIENT failure (429/5xx/network blip) must
+    PROPAGATE so the resolve boundary leaves the album uncached/retryable
+    (B-4/B-13) — otherwise a degraded result (no cover, empty tracklist → no
+    is_last_track → no Play Count) is cached session-long as a Discogs hit and
+    the album's Play Count is silently forfeited.  A permanent/malformed
+    failure is the caller's to swallow as graceful degradation of that field.
+
+    NOTE the deliberate carve-out (#188 cold review): get_original_year does
+    NOT use this — the original release year is DISPLAY-ONLY with a valid
+    pressing-year fallback, so it degrades on transient rather than discarding
+    an otherwise credit-capable result over a decorative field.
+    """
+    if is_transient(exc):
+        raise exc
 
 
 def _normalize_artist(s: str) -> str:
@@ -350,6 +369,11 @@ class DiscogsReader:
             try:
                 return self._build_result(release, instance_id=None)
             except Exception as e:
+                # #188: a transient failure means the service is down and every
+                # candidate would fail the same way — propagate so the album
+                # stays uncached/retryable, rather than returning None (a "clean
+                # miss" the resolver would cache as a FALLBACK downgrade).
+                _reraise_if_transient(e)
                 log.debug(f"Failed to build result for release {release.id}: {e}")
                 continue
 
@@ -377,6 +401,7 @@ class DiscogsReader:
                 ))
             return entries
         except Exception as e:
+            _reraise_if_transient(e)
             log.warning(f"Failed to fetch tracklist for release {release_id}: {e}")
             return []
 
@@ -397,6 +422,14 @@ class DiscogsReader:
             master = release.master
             master_id = master.id if master else None
         except Exception:
+            # #188 cold review: the original-year lookup is DISPLAY-ONLY and has
+            # a valid fallback (the pressing year, release.year), UNLIKE the
+            # tracklist which gates the Play Count and has none. So a transient
+            # blip on the separate master fetch degrades to the pressing year
+            # rather than re-raising — re-raising would discard an otherwise
+            # complete, credit-capable collection result (instance_id +
+            # tracklist) over a decorative field. The credit-critical fetches
+            # (release load, get_tracklist) still propagate transient.
             master_id = None
         if not master_id:
             return None
@@ -408,6 +441,8 @@ class DiscogsReader:
             if year and int(year) > 0:
                 return str(year)
         except Exception as e:
+            # Display-only field with a pressing-year fallback: degrade rather
+            # than abort the credit-capable resolve (#188 cold review).
             log.debug(f"Master year lookup failed for master {master_id}: {e}")
         return None
 
@@ -536,8 +571,8 @@ class DiscogsReader:
                     images[0],
                 )
                 cover_url = primary.get("uri")
-        except Exception:
-            pass
+        except Exception as e:
+            _reraise_if_transient(e)
 
         # Label and catalog number
         label_name = None
@@ -548,8 +583,8 @@ class DiscogsReader:
                 raw_catno = release.labels[0].catno
                 # Discogs uses the string "none" when there's no catalog number
                 catno = raw_catno if raw_catno and raw_catno.lower() != "none" else None
-        except Exception:
-            pass
+        except Exception as e:
+            _reraise_if_transient(e)
 
         # Year — prefer the album's ORIGINAL year from the master (v1.4.2);
         # release.year is the pressing year, so a reissue would otherwise
@@ -561,8 +596,8 @@ class DiscogsReader:
             try:
                 if release.year and release.year > 0:
                     year = str(release.year)
-            except Exception:
-                pass
+            except Exception as e:
+                _reraise_if_transient(e)
 
         # Tracklist — fetch separately; log but don't fail on error
         tracklist = self.get_tracklist(release.id)
@@ -573,13 +608,13 @@ class DiscogsReader:
         try:
             if release.styles:
                 genres.extend(release.styles)
-        except Exception:
-            pass
+        except Exception as e:
+            _reraise_if_transient(e)
         try:
             if release.genres:
                 genres.extend(release.genres)
-        except Exception:
-            pass
+        except Exception as e:
+            _reraise_if_transient(e)
 
         return {
             "album": release.title,

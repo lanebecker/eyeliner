@@ -61,7 +61,46 @@ TRANSIENT_EXTERNAL_ERRORS = (
 )
 
 
+# HTTP statuses that mean "couldn't determine right now, retry later": 408
+# Request Timeout, 429 Too Many Requests, and any 5xx server error.  Every
+# OTHER status carried by an HTTPError is a definitive answer for this request
+# (401/403 dead credential, 404/410 gone, 400/405 malformed) and is PERMANENT
+# — it will not change on retry (#189).
+_TRANSIENT_HTTP_STATUS = frozenset({408, 429})
+
+
+def http_status(exc: BaseException):
+    """Best-effort HTTP status from an exception, or None if it carries none.
+
+    requests.HTTPError attaches the failing ``response`` (from
+    ``raise_for_status``); python3-discogs-client's own HTTPError exposes
+    ``status_code`` directly (it has no ``response``).  Connection/timeout
+    errors and non-HTTP exceptions carry no status → None.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if isinstance(code, int):
+            return code
+    code = getattr(exc, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
 def is_transient(exc: BaseException) -> bool:
     """True if `exc` is an expected transient/couldn't-determine failure rather
-    than an unexpected bug."""
+    than a definitive (permanent) answer or an unexpected bug.
+
+    #189: an HTTP error is judged BY STATUS — 408/429/5xx are transient, every
+    other status is permanent — so a revoked Discogs token (401), wrong
+    username (404), or malformed request (400) is no longer misclassified as a
+    transient blip (which logged only as INFO "(transient)" and hid a dead
+    credential for months).  Status-less errors (connection reset, timeout,
+    MusicBrainz NetworkError, our own TransientMetadataError) keep the family
+    classification below.
+    """
+    if isinstance(exc, PermanentMetadataError):
+        return False
+    status = http_status(exc)
+    if status is not None:
+        return status in _TRANSIENT_HTTP_STATUS or 500 <= status <= 599
     return isinstance(exc, (TransientMetadataError, *TRANSIENT_EXTERNAL_ERRORS))
