@@ -134,6 +134,49 @@ section accumulates the fixes.
   re-drop and double-credit — a genuine re-drop and this case both yield a
   2-row remainder, so it is documented rather than fixed.
 
+- **Recognition is gated on the music verdict; a low-gain session can no longer
+  become immortal (#193 + #195 + #196 — Wave 3 bundle 1).** Three linked
+  recognition/session-lifecycle findings, fixed together because the first two
+  share a root cause:
+  - **#193 (stab-1, HIGH):** `AudioCapture` enqueued EVERY assembled chunk for
+    Shazam recognition unconditionally — silence included — so an idle turntable
+    POSTed to Shazam's unofficial API on every hop, ~8,640×/day forever (pure
+    waste, and a fixed-cadence 24/7 traffic profile that risks the endpoint
+    throttling or blocking recognition when music actually plays). Recognition is
+    now gated on the already-computed music verdict: a new `_dispatch_chunk`
+    still runs silence classification on every chunk (it drives the lifecycle)
+    but only enqueues for recognition while `SilenceDetector.is_music_playing`.
+  - **#195 (conc-3, MEDIUM):** because recognition ran ungated, sub-threshold
+    audio (a mis-set capture gain — RMS below `silence_threshold_rms`, at which
+    Shazam still identifies) could confirm tracks and start a tracker session
+    while the detector never left silence-state — so `_silence_since` was never
+    armed, `SESSION_ENDED` could NEVER fire, and the session was immortal: the
+    card stuck on screen forever and the album's Play Count / Last Played / love
+    were silently never written, while the box LOOKED like it worked. The same
+    gate fixes this structurally — a session can only start off a recognized
+    track, hence only in music-state, so the music→silence transition that ends
+    it is always reachable. Sub-threshold audio is now treated as silence and
+    surfaced by a throttled low-gain WARNING (audio persistently in
+    `[threshold*0.25, threshold)` for ≥60s, re-logged ≤ every 300s — the #178
+    flood-guard pattern) so a miscalibrated preamp is visible, not invisible.
+    Two defence-in-depth backstops complete it: a **wall-clock max-session
+    safety** — after `_MAX_MUSIC_SECONDS` (60 min) of CONTINUOUS music the
+    detector force-emits `SESSION_ENDED`, so a **locked groove / stuck input**
+    (RMS never falls, so the normal music→silence transition never fires) still
+    credits the side; and a **recognized-in-silence tripwire** — since the gate
+    makes `MUSIC_STARTED` always precede recognition, `on_track_identified`
+    having to create the session itself is the immortal-session signature, so it
+    logs a loud WARNING (the session still starts, so no play is lost).
+  - **#196 (conc-4, LOW):** on the stale-discard race (the session ends while
+    `on_track_identified` is in flight), `commit()` fell through to the "Now
+    playing" log and returned `True`, contradicting its documented "returns
+    False when discarded" contract — a misleading journal line during exactly
+    the races one would be debugging, and a latent trap for any future caller
+    that trusts the boolean. It now takes the same epoch-discard exit as the
+    post-resolve path (log a discard line, `return False`) before the now-playing
+    log. The existing B-1/B-19/LB-1 epoch, `current_raw`, and scrobble guards are
+    unchanged; the happy path is byte-for-byte identical.
+
 - **An ambiguous Play Count write can no longer double-credit one play
   (#186 — HIGH, `R4:data-1`, Wave 2 bundle 2).** The #163 bounded finalize
   retry re-ran the WHOLE read-modify-write on each attempt: read current →

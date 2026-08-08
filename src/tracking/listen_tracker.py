@@ -630,6 +630,20 @@ class ListenTracker:
                 return
 
             if self._session is None:
+                # #195 tripwire: since the recognition gate (AudioCapture only
+                # enqueues while the detector is in music-state), MUSIC_STARTED
+                # always precedes recognition, so a session already exists here in
+                # normal operation. Having to CREATE it means a track was
+                # recognized without a music transition — the exact immortal-session
+                # signature — so surface it loudly (defense in depth; the session
+                # is still started so no play is lost).
+                log.warning(
+                    "Track '%s' was recognized without a preceding music "
+                    "transition (no active session) — starting one, but this "
+                    "should not happen with the recognition gate; check the "
+                    "silence detector / capture wiring (#195).",
+                    track.title,
+                )
                 self._start_session()
 
             split_reason = None

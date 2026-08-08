@@ -119,6 +119,20 @@ class TrackCommitService:
         await self.tracker.on_track_identified(
             metadata, is_stale=lambda: self.state.session_epoch != audio_epoch
         )
+        # #196 (conc-4): the session can end WHILE on_track_identified is in
+        # flight (it can await a Discogs write; a SESSION_ENDED in that window
+        # bumps the epoch and the tracker drops the track via is_stale). Take the
+        # same discard exit as the post-resolve path BEFORE the "Now playing" log
+        # and return — otherwise commit() logs a now-playing line for a track
+        # already cleared off the screen and returns True, contradicting its
+        # documented "returns False when discarded" contract.
+        if self.state.session_epoch != audio_epoch:
+            log.info(
+                "Discarding stale commit for %s — %s: the session ended while the "
+                "track was being handed to the tracker.",
+                raw.artist, raw.title,
+            )
+            return False
         # Advance the dedup key (current_raw) only AFTER the tracker has accepted
         # the track, and only while the session is still the one this audio came
         # from (LB-1 + B-19).  Two failures are handled here that the old order

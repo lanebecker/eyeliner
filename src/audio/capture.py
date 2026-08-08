@@ -287,6 +287,31 @@ class AudioCapture:
                 # intentionally NOT caught, so shutdown still propagates.)
                 log.error(f"Silence ticker tick failed: {e}")
 
+    async def _dispatch_chunk(self, chunk: np.ndarray, sample_rate: int):
+        """Classify one chunk and dispatch it for recognition ONLY while music
+        is playing (#193/#195).
+
+        Silence detection runs on EVERY chunk (sync, one RMS) because it drives
+        the whole session lifecycle — MUSIC_STARTED / MUSIC_STOPPED / SESSION_ENDED.
+        Recognition, by contrast, is gated on the detector's music verdict: an
+        idle turntable otherwise POSTs digitally-silent audio to Shazam's
+        unofficial API every hop, ~8,640×/day forever (#193 — pure waste plus a
+        throttle/block risk that would break recognition when music DOES play).
+        Gating here also closes #195 structurally: a tracker session can only
+        start off a recognized track, so it can only start while the detector is
+        in music-state — which guarantees the music→silence transition that arms
+        SESSION_ENDED is reachable, so a session can never become immortal. The
+        low-gain case (audible music below the RMS threshold) is treated as
+        silence and surfaced by SilenceDetector's throttled low-gain warning
+        rather than tracked. `is_music_playing` reflects the state AFTER this
+        chunk was processed (SIL-4 hysteresis), so the first music chunk is
+        recognized and the first fully-silent chunk is not.
+        """
+        self.silence.process(chunk, sample_rate)
+        if self.silence.is_music_playing:
+            # Recognition enqueue never blocks (drops when full).
+            await self.recognizer.enqueue(chunk, sample_rate)
+
     async def run(self):
         """Main capture loop. Streams audio and dispatches overlapping chunks."""
         loop = asyncio.get_running_loop()
@@ -359,10 +384,7 @@ class AudioCapture:
                             if block is None:
                                 continue  # stop() sentinel — re-check self._running
                             for chunk in assembler.feed(block):
-                                # Silence detection is sync and fast (one RMS).
-                                self.silence.process(chunk, self.sample_rate)
-                                # Recognition enqueue never blocks (drops when full).
-                                await self.recognizer.enqueue(chunk, self.sample_rate)
+                                await self._dispatch_chunk(chunk, self.sample_rate)
                 except Exception as e:
                     # CancelledError is BaseException and intentionally NOT caught
                     # here — shutdown cancellation propagates to main() cleanly.
