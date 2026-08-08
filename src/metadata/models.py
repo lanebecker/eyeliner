@@ -7,6 +7,8 @@ from functools import cached_property
 from typing import Optional
 import time
 
+from src.metadata.normalize import decoration_base, fold_text, strip_title_decoration
+
 
 class MetadataSource(Enum):
     DISCOGS_COLLECTION = auto()   # Found in user's personal collection
@@ -78,6 +80,11 @@ class SideIndex:
     def from_tracklist(cls, tracklist: list["TracklistEntry"], title: str) -> "SideIndex":
         """Compute the full positional picture for *title* within *tracklist*.
 
+        Title comparison is tiered normalised matching (#180; see the inline
+        comment): losslessly folded exact equality first, then a keyword-gated
+        one-side decoration strip requiring a unique folded title.  One
+        ``matcher`` predicate serves every comparison site in this method.
+
         The current entry is located by title (first occurrence); its position
         string yields the side letter and — after a numeric sort of the side by
         track number (META-8) — the within-side ordinal.  Prev/next neighbours
@@ -108,12 +115,79 @@ class SideIndex:
         if not tracklist:
             return cls.empty()
 
-        title_key = title.lower().strip()
+        # #180: locate the row via tiered normalised matching, replacing bare
+        # ``lower().strip()`` equality (which missed every Shazam-decorated
+        # title — "Eclipse - 2011 Remastered Version" vs a tracklist row
+        # "Eclipse" — silently forfeiting the album-completion Play Count).
+        #
+        # Tier 1: exact equality of losslessly FOLDED text (punctuation fold +
+        # NFKC + casefold + whitespace collapse; src/metadata/normalize.py).
+        # Tier 2: retry with a keyword-gated trailing decoration stripped from
+        # ONE side at a time (never both — distinct decorated siblings like
+        # "Song (Live)" vs "Song (Mono)" are different rows), and only when
+        # the matching rows share ONE folded title across the whole tracklist
+        # — on ambiguity the conservative empty() failure is kept, so the
+        # META-4/#78 phantom-last-track class cannot resurface.
+        #
+        # ``matcher`` is the SAME predicate for all three comparison sites
+        # below (current row, side ordinal, global index), so the positional
+        # facts can never desync (#180 fix note, point 1).
+        fold_key = fold_text(title)
 
-        # The current track's row, matched by title (first occurrence).
-        current = next(
-            (e for e in tracklist if e.title.lower().strip() == title_key), None
-        )
+        def _tier1(entry_title: str) -> bool:
+            return fold_text(entry_title) == fold_key
+
+        matcher = _tier1
+        current = next((e for e in tracklist if _tier1(e.title)), None)
+
+        if current is None:
+            stripped_key = strip_title_decoration(fold_key)
+
+            def _tier2(entry_title: str) -> bool:
+                entry_key = fold_text(entry_title)
+                # Decorated query vs plain row ("Eclipse (Remastered)" → row
+                # "Eclipse") — only when the query actually carried decoration,
+                # and never on a degenerate empty base (query "(Live)" must not
+                # match a whitespace-only row; the truthiness guards mirror
+                # reader.py's #179 equivalents).
+                if stripped_key and stripped_key != fold_key and stripped_key == entry_key:
+                    return True
+                # Decorated row vs plain query (row "Song (2019 Mix)" →
+                # "Song") — only when the row actually carried decoration.
+                entry_stripped = strip_title_decoration(entry_key)
+                return (
+                    bool(entry_stripped)
+                    and entry_stripped != entry_key
+                    and entry_stripped == fold_key
+                )
+
+            tier2_rows = [e for e in tracklist if _tier2(e.title)]
+            # Uniqueness by folded TITLE, not row count: a reprise (the same
+            # folded title on two rows) is one match group resolved to its
+            # first occurrence, preserving B-5 semantics; two DIFFERENT folded
+            # titles both qualifying is a genuine ambiguity — refuse.
+            if len({fold_text(e.title) for e in tier2_rows}) == 1:
+                accepted_key = fold_text(tier2_rows[0].title)
+                # Contested-base refusal (#180 cold review): a row whose OWN
+                # stripped base equals the query's stripped base, but which
+                # matched neither one-side branch — its decoration diverges
+                # from the query's only in syntax (row "Song (Demo)" vs query
+                # "Song - Demo") — is invisible to the branches yet is a
+                # plausible true target.  Accepting the plain twin instead
+                # would arm a phantom last track (the META-4/#78 class) when
+                # the twin is the closer.  The base is contested: refuse.
+                # The scan uses decoration_base — a fixpoint strip that also
+                # sees bracket and stacked forms ("Song [Demo]",
+                # "Song (Demo) (Live)") the single-strip matcher cannot;
+                # refusal-only aggression is safe (#180 second pass).
+                contested = any(
+                    fold_text(e.title) != accepted_key
+                    and decoration_base(fold_text(e.title)) == stripped_key
+                    for e in tracklist
+                )
+                if not contested:
+                    matcher = _tier2
+                    current = tier2_rows[0]
 
         # Strip surrounding whitespace so a padded Discogs row ("A1 ") renders
         # a clean caption rather than a trailing-space artifact (META-9).
@@ -143,7 +217,7 @@ class SideIndex:
         )
         side_position = None
         for i, entry in enumerate(sorted_side):
-            if entry.title.lower().strip() == title_key:
+            if matcher(entry.title):
                 side_position = i + 1
                 break
         side_total = len(side_entries) if side_entries else None
@@ -177,7 +251,7 @@ class SideIndex:
             # three surviving mutants were equivalent (they only mutated a
             # variable nothing consumed).
             for i, e in enumerate(tracklist):
-                if e.position == target_position and e.title.lower().strip() == title_key:
+                if e.position == target_position and matcher(e.title):
                     global_index = i
                     break
 
