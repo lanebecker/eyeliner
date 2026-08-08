@@ -44,11 +44,14 @@ _MAX_COLLECTION_PAGES = 1000
 # from INDEX artist names before comparison.  Titles never carry it.
 _ARTIST_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
 
-# #179 tier 2: a single trailing parenthetical — the dominant decoration
-# divergence between Shazam's Apple-Music-backed catalogue and Discogs vinyl
-# titles ("Rumours (Deluxe Edition)" vs "Rumours", "The Wall (UK)" vs "The
-# Wall").  Deliberately anchored and single: interior parentheticals are part
-# of the title ("(What's the Story) Morning Glory?" is untouched).
+# #179 tier 2 / #183: a single trailing parenthetical OR square-bracket
+# qualifier — the dominant decoration divergences between Shazam's
+# Apple-Music-backed catalogue and Discogs vinyl titles ("Rumours (Deluxe
+# Edition)" / "Rumours [Deluxe Edition]" vs "Rumours"; brackets are a
+# standard iTunes/Apple Music form).  Deliberately anchored and single:
+# interior qualifiers are part of the title ("(What's the Story) Morning
+# Glory?" is untouched), and STACKED decorations ("Pet Sounds (Mono)
+# (Remastered)") remain a documented conservative miss (one strip only).
 #
 # The strip is applied ONE SIDE AT A TIME (stripped query vs raw index title,
 # or raw query vs stripped index title) — never both sides in the same
@@ -68,7 +71,7 @@ _ARTIST_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
 # hardening is a decoration-keyword allowlist for the query-side strip
 # ("deluxe", "edition", "remaster(ed)", "expanded", "anniversary", …), tracked
 # as a follow-up issue rather than smuggled into #179.
-_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+_TRAILING_PAREN_RE = re.compile(r"\s*(?:\([^()]*\)|\[[^\[\]]*\])\s*$")
 
 
 # #179: NFKC does NOT fold typographic punctuation to ASCII (U+2019 "’" stays
@@ -81,6 +84,29 @@ _PUNCT_FOLD = str.maketrans({
     "–": "-", "—": "-", "−": "-",
     "…": "...",
 })
+
+
+def _normalize_artist(s: str) -> str:
+    """Normalise an artist name for collection matching (#223, via #183).
+
+    On top of :func:`_normalize_term`: folds ``&`` to ``and`` and strips one
+    leading ``the`` — the two real-world variant classes ("Rolling Stones" vs
+    "The Rolling Stones", "Simon & Garfunkel" vs "Simon And Garfunkel") that
+    the old ownership-only strategy 1 happened to bridge and exact equality
+    silently lost.  ARTIST names only, never titles ("The Wall" must not
+    equal "Wall"); anything fuzzier stays out per the exact-or-nothing
+    principle.  Symmetric edge: "The The" folds to "the" on both sides.
+
+    The ``&`` fold runs on BOTH sides of the NFKC inside ``_normalize_term``
+    (second-pass catch): a fullwidth ``＆`` (U+FF06) only becomes ``&`` via
+    NFKC, so a pre-normalize-only replace would miss it — the same ordering
+    discipline ``_normalize_term``'s own punctuation fold documents.
+    """
+    s = _normalize_term(s.replace("&", " and "))
+    s = " ".join(s.replace("&", " and ").split())
+    if s.startswith("the "):
+        s = s[4:]
+    return s
 
 
 def _normalize_term(s: str) -> str:
@@ -154,7 +180,11 @@ class DiscogsReader:
 
         Strategy 1 — database cross-reference (fast):
           Search the Discogs database for up to 25 candidates and check each
-          against the local index by release_id.  Returns the first hit.
+          against the local index by release_id.  Returns the first OWNED
+          candidate whose index entry exactly matches the recognition on
+          normalised title + artist (#183 — ownership alone is not
+          acceptance); mismatched owned candidates are skipped and the scan
+          continues, deferring fuzzier cases to strategy 2.
 
         Strategy 2 — index exact-first match (catches rare/obscure pressings):
           If strategy 1 finds nothing, match the index entries on normalised
@@ -171,14 +201,12 @@ class DiscogsReader:
         rather than a false "not owned" (B-4/B-13).
         """
         # SEC-1: an incomplete recognition (empty / whitespace artist OR album)
-        # cannot identify a SPECIFIC owned pressing.  The strategy-2 substring
-        # test degenerates on an empty term — ``"" in title`` and ``"" in
-        # artist`` are always True, and even a single space is a substring of
-        # most titles ("Kind of Blue" contains spaces) — so it would return an
-        # arbitrary owned release, whose ``instance_id`` becomes the Play Count /
-        # Last Played write target.  Refuse to guess: return None so the track
-        # resolves via the database / fallback tiers (no instance_id, no write)
-        # instead of crediting a play to the wrong record.  This does NOT reject
+        # cannot identify a SPECIFIC owned pressing, so refuse to guess: return
+        # None and let the track resolve via the database / fallback tiers (no
+        # instance_id, no write).  Historically this guarded the old substring
+        # matcher's degenerate empty-term behaviour (#179 replaced it with
+        # exact-first tiers); it stays because the principle stands and it
+        # short-circuits the index-build cost.  This does NOT reject
         # legitimately short titles ("4", "Q") — only empty/whitespace terms.
         if not artist.strip() or not album.strip():
             log.info(
@@ -191,16 +219,46 @@ class DiscogsReader:
 
         index = self._get_collection_index()
 
+        artist_key = _normalize_artist(artist)
+        album_key = _normalize_term(album)
+
+        def entry_artist_matches(entry: dict) -> bool:
+            # The " (n)" disambiguation suffix is stripped from INDEX names
+            # only — Discogs appends it to artist names, never to titles, and
+            # Shazam never produces it (#179).  Artist comparison uses the
+            # folded form (#223: leading-"the" + "&"/"and") on both sides.
+            return any(
+                _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", a)) == artist_key
+                for a in entry["artists"]
+            )
+
         # Strategy 1: database candidates, matched locally against the index.
+        # #183: ownership alone is NOT acceptance — the candidate's INDEX entry
+        # (clean collection title/artists, no 'Artist - Album' search-title
+        # ambiguity) must exactly match the recognition on normalised title +
+        # artist.  Discogs' q= relevance ranking freely interleaves
+        # similar-titled releases ('Greatest Hits II' for 'Greatest Hits',
+        # deluxe/anniversary editions), so first-owned-wins credited a
+        # wrong-but-owned album whenever it outranked the right one.  Among
+        # exact matches, relevance order still picks the pressing (unchanged).
+        # Anything fuzzier is strategy 2's business — the single authority for
+        # tiered matching, uniqueness, and refuse-to-guess.
         candidates = self._database_search(artist, album, limit=25)
         for release in candidates:
             entry = index.get(release.id)
-            if entry is not None:
+            if entry is None:
+                continue
+            if _normalize_term(entry["title"]) == album_key and entry_artist_matches(entry):
                 log.debug(
                     f"Found in collection (strategy 1): '{release.title}' "
                     f"(release {release.id}, instance {entry['instance_id']})"
                 )
                 return self._build_result(release, instance_id=entry["instance_id"])
+            log.debug(
+                f"Strategy 1: skipping owned candidate '{entry['title']}' "
+                f"(release {release.id}) — not an exact match for "
+                f"'{artist} / {album}' (#183)."
+            )
 
         # Strategy 2: exact-first match against the index locally (no extra
         # HTTP).  #179 replaced the old bare substring containment, whose
@@ -213,19 +271,9 @@ class DiscogsReader:
             f"Strategy 1 found nothing for '{artist} / {album}'; "
             f"matching the collection index (exact-first, #179)."
         )
-        artist_key = _normalize_term(artist)
-        album_key = _normalize_term(album)
 
-        def entry_artist_matches(entry: dict) -> bool:
-            # The " (n)" disambiguation suffix is stripped from INDEX names
-            # only — Discogs appends it to artist names, never to titles, and
-            # Shazam never produces it.
-            return any(
-                _normalize_term(_ARTIST_DISAMBIG_RE.sub("", a)) == artist_key
-                for a in entry["artists"]
-            )
-
-        # Tier 1: exact normalised album + artist equality.
+        # Tier 1: exact normalised album + artist equality (keys and the
+        # artist rule are shared with strategy 1 above, #183).
         matches = [
             (release_id, entry)
             for release_id, entry in index.items()
