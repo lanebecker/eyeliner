@@ -177,6 +177,47 @@ section accumulates the fixes.
     log. The existing B-1/B-19/LB-1 epoch, `current_raw`, and scrobble guards are
     unchanged; the happy path is byte-for-byte identical.
 
+- **Capture recovers a hot-plugged audio device, and recognition failures no
+  longer flood the journal (#194 + #197 — Wave 3 bundle 2).** Two
+  recognition/hardware-lifecycle findings on the real Pi:
+  - **#194 (conc-1, MEDIUM):** #164 moved the device lookup inside the rebuild
+    loop and its comment promised late-enumeration / re-plug recovery — but the
+    lookup reads PortAudio's device table, which is frozen once at
+    `import sounddevice` (Pa_Initialize) and **never** rescans, so every retry
+    saw the identical stale snapshot. A UCA222 still USB-enumerating when systemd
+    (ordered only on `network.target`, CRIT-4/#83) starts the service, or a
+    mid-run unplug→replug to a different ALSA card index after a CONC-5 stall,
+    left capture an **alive-but-idle zombie** until a human restarted the
+    process — no crash loop, so systemd never intervened. The rebuild loop's
+    failure handler now calls `sd._terminate(); sd._initialize()`
+    (`_refresh_audio_devices`) — python-sounddevice's documented rescan recipe —
+    before the next attempt, so a device that appeared or moved is actually
+    picked up. It runs **only** on the failure path and never against a live
+    stream: if `InputStream` opened but `__enter__`/`start()` then raised (a
+    brown-out in the open→start window), `with` never runs `__exit__`, so the
+    still-open stream is closed first (`_terminate()` on a live stream is
+    undefined behaviour — second cold-review catch). Both are private APIs
+    (pinned sounddevice 0.5.5), wrapped so an upstream refactor degrades to the
+    pre-#194 behaviour instead of crashing the loop. The unit test that falsely
+    pinned this recovery — green only because its `query_devices` mock returned a
+    different list on the second call, exactly what the frozen table cannot do —
+    now asserts the refresh happens *between* the failed and successful lookups.
+  - **#197 (err-5, LOW):** the per-chunk `ShazamIO recognition failed` WARNING
+    was unthrottled. Recognition is attempted every ~10s hop, 24/7, so a
+    sustained network outage wrote ~8,640 identical lines/day — the flood class
+    #178 / PCONC-4 already throttle on the capture leg — drowning the journal and
+    amplifying SD-card writes. **Both** failure legs are now rate-limited through
+    a shared `ThrottledLogger` (the #178 pattern, extracted to
+    `src/audio/log_throttle.py`): the fast-fail `except` in
+    `ShazamIOBackend.recognize` (connection-refused / DNS) **and** `run()`'s
+    loop-error `ERROR` — where a HANGING outage lands instead, cancelled by the
+    `recognize_timeout` `wait_for` *before* the backend's own `except` can log
+    (~2,700 lines/day). First occurrence and any changed message log immediately;
+    identical repeats summarise at most once per 60s; a full success (transport
+    **and** parse — a transport-only reset would let a persistent malformed
+    response re-flood, second cold-review catch) flushes the streak with a
+    recovery tally.
+
 - **An ambiguous Play Count write can no longer double-credit one play
   (#186 — HIGH, `R4:data-1`, Wave 2 bundle 2).** The #163 bounded finalize
   retry re-ran the WHOLE read-modify-write on each attempt: read current →

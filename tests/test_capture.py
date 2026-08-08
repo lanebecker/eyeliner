@@ -573,27 +573,48 @@ async def test_stream_construction_failure_retries_with_a_fresh_stream(monkeypat
 
 @pytest.mark.asyncio
 async def test_absent_device_at_startup_is_retried_not_crash_looped(monkeypatch):
-    """#164: the device lookup must run INSIDE the retry loop. A device absent at
-    startup — a mistyped audio.device_name, or a USB interface (UCA222) not yet
-    enumerated when the service starts — must be retried with backoff and picked
-    up when it appears, NOT escape run() and crash-loop the process under systemd
-    (Restart=on-failure). Pre-fix, _find_device_index() ran once ABOVE the loop,
-    so its ValueError faulted the whole capture task on the first miss."""
+    """#164 + #194: a device absent when the service starts (a mistyped
+    audio.device_name, or the UCA222 not yet USB-enumerated) must be retried
+    INSIDE the loop, NOT escape run() and crash-loop under systemd (#164) — AND
+    must actually be RECOVERED once it appears, which needs a PortAudio table
+    refresh between attempts (#194).
+
+    #194 is why this test changed. PortAudio freezes its device table at import,
+    so a fresh _find_device_index() alone sees the same stale snapshot every
+    retry — a device absent at import can never appear no matter how long the loop
+    spins. run()'s failure handler must call sd._terminate()+sd._initialize() to
+    re-enumerate BEFORE the next lookup; this asserts that ordering. The old test
+    let query_devices silently return a new list on call 2 and asserted nothing
+    about a refresh, so it was green against code that could never recover on real
+    hardware — the exact false pin #194 records. The mock returning a new list on
+    the second lookup is kept, but is now a FAITHFUL model: only the rescan can
+    make PortAudio report a device it didn't report before, and we assert the
+    rescan is what happened."""
     cap = make_capture()
     monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr(capture_module, "_BLOCK_STALL_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(capture_module, "_SILENCE_TICK_SECONDS", 0.001)
 
-    # ABSENT on the first lookup (no input-capable match → ValueError), then the
-    # device APPEARS on a later attempt (late USB enumeration or a re-plug).
-    lookups = {"n": 0}
+    # Ordered trace of every device-API interaction, so we can assert a refresh
+    # sits BETWEEN the failed first lookup and the successful second one.
+    trace = []
 
     def query_devices(*a, **k):
-        lookups["n"] += 1
-        if lookups["n"] == 1:
+        trace.append("lookup")
+        # ABSENT on the first lookup (no input-capable match → ValueError); the
+        # device APPEARS only after a refresh has re-enumerated the table.
+        if trace.count("lookup") == 1:
             return [device("Some Output-Only Sink", 0)]   # no input match → ValueError
         return [device("USB Audio Codec", 2)]             # now present
     monkeypatch.setattr(capture_module.sd, "query_devices", query_devices)
+    monkeypatch.setattr(
+        capture_module.sd, "_terminate",
+        MagicMock(side_effect=lambda *a, **k: trace.append("terminate")),
+    )
+    monkeypatch.setattr(
+        capture_module.sd, "_initialize",
+        MagicMock(side_effect=lambda *a, **k: trace.append("initialize")),
+    )
 
     built = asyncio.Event()
 
@@ -604,10 +625,11 @@ async def test_absent_device_at_startup_is_retried_not_crash_looped(monkeypatch)
 
     task = asyncio.create_task(cap.run())
     try:
-        # Fixed: 1st lookup raises INSIDE the loop → caught → backoff → 2nd lookup
-        # finds the device → stream built → event set.
-        # Pre-fix: lookup raised ABOVE the loop → task faulted with ValueError →
-        # event never set → wait_for times out (RED).
+        # Fixed: lookup 1 raises INSIDE the loop → caught → refresh → backoff →
+        # lookup 2 finds the device → stream built → event set.
+        # Pre-#164: lookup raised ABOVE the loop → task faulted (event never set).
+        # Pre-#194: refresh never happened → the frozen table never gains the
+        # device → event never set. Either way wait_for times out (RED).
         await asyncio.wait_for(built.wait(), timeout=2.0)
     finally:
         cap.stop()
@@ -616,8 +638,182 @@ async def test_absent_device_at_startup_is_retried_not_crash_looped(monkeypatch)
             await task
         except asyncio.CancelledError:
             pass
-    assert lookups["n"] >= 2        # the absent-device lookup was retried, not fatal
-    assert built.is_set()           # and a stream was built once the device appeared
+
+    assert trace.count("lookup") >= 2   # the absent-device lookup was retried, not fatal
+    assert built.is_set()               # and a stream was built once the device appeared
+    # The crux (#194): a _terminate()+_initialize() rescan ran BETWEEN the failed
+    # first lookup and the successful later one — the real recovery mechanism, not
+    # a mock silently re-enumerating on its own.
+    first = trace.index("lookup")
+    second = trace.index("lookup", first + 1)
+    assert trace[first + 1:second] == ["terminate", "initialize"], (
+        f"expected a PortAudio refresh between the failed and successful lookups, "
+        f"got trace={trace!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replug_to_new_index_is_recovered_via_refresh(monkeypatch):
+    """#194: a device re-plugged to a DIFFERENT ALSA card index mid-run (e.g.
+    after a CONC-5 stall tears the stream down) must be recovered. Without the
+    refresh, _find_device_index() keeps returning the stale index off the frozen
+    table and sd.InputStream(device=stale) raises every retry — capture never
+    comes back. With the refresh, the rescan surfaces the new index and the
+    rebuilt stream opens against it."""
+    cap = make_capture()
+    monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(capture_module, "_BLOCK_STALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(capture_module, "_SILENCE_TICK_SECONDS", 0.001)
+
+    refreshed = {"n": 0}
+
+    def query_devices(*a, **k):
+        # Before any refresh: the device sits at index 0 (a stale entry that will
+        # fail to open). After a refresh: it re-enumerates at index 1 (the new
+        # card index), which opens successfully.
+        if refreshed["n"] == 0:
+            return [device("USB Audio Codec", 2)]                     # stale @ idx 0
+        return [device("Some Other Sink", 0), device("USB Audio Codec", 2)]  # new @ idx 1
+    monkeypatch.setattr(capture_module.sd, "query_devices", query_devices)
+    monkeypatch.setattr(capture_module.sd, "_terminate", MagicMock())
+    monkeypatch.setattr(
+        capture_module.sd, "_initialize",
+        MagicMock(side_effect=lambda *a, **k: refreshed.__setitem__("n", refreshed["n"] + 1)),
+    )
+
+    opened_indices = []
+    built = asyncio.Event()
+
+    def make_stream(**kwargs):
+        idx = kwargs.get("device")
+        opened_indices.append(idx)
+        if idx == 0:
+            # The stale index no longer addresses the interface — opening it fails,
+            # driving the rebuild/refresh path.
+            raise OSError("Invalid device (stale index after re-plug)")
+        built.set()
+        return _cm_stream_mock()
+    monkeypatch.setattr(capture_module.sd, "InputStream", MagicMock(side_effect=make_stream))
+
+    task = asyncio.create_task(cap.run())
+    try:
+        await asyncio.wait_for(built.wait(), timeout=2.0)
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert 0 in opened_indices and 1 in opened_indices  # stale tried, new index recovered
+    assert built.is_set()
+    assert refreshed["n"] >= 1                           # a refresh actually ran
+
+
+@pytest.mark.asyncio
+async def test_stream_start_failure_closes_stream_before_refresh(monkeypatch):
+    """#194: sd.InputStream opens the stream at CONSTRUCTION (Pa_OpenStream), and
+    `with stream:` starts it via __enter__. If start() raises — a device
+    brown-out/unplug in the window between open and start, the exact hotplug class
+    #194 targets — Python never runs __exit__, so the stream stays OPEN.
+    _terminate() (inside _refresh_audio_devices) against a live stream is
+    undefined behaviour, so run() MUST close the opened stream BEFORE refreshing
+    the device table."""
+    cap = make_capture()
+    monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(capture_module, "_SILENCE_TICK_SECONDS", 0.001)
+    monkeypatch.setattr(capture_module.sd, "query_devices",
+                        lambda *a, **k: [device("USB Audio Codec", 2)])
+
+    trace = []
+
+    def make_stream(**kwargs):
+        s = MagicMock()
+        # Construction SUCCEEDED (this returned a stream), but __enter__/start()
+        # raises → `with` does NOT call __exit__ → the stream is left open.
+        s.__enter__ = MagicMock(side_effect=OSError("Pa_StartStream: device unavailable"))
+        s.__exit__ = MagicMock(return_value=False)
+        s.close = MagicMock(side_effect=lambda *a, **k: trace.append("close"))
+        return s
+    monkeypatch.setattr(capture_module.sd, "InputStream", MagicMock(side_effect=make_stream))
+    monkeypatch.setattr(capture_module.sd, "_terminate",
+                        MagicMock(side_effect=lambda *a, **k: trace.append("terminate")))
+    monkeypatch.setattr(capture_module.sd, "_initialize",
+                        MagicMock(side_effect=lambda *a, **k: trace.append("initialize")))
+
+    task = asyncio.create_task(cap.run())
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if "close" in trace and "terminate" in trace:
+                break
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # The open stream was closed, and BEFORE the _terminate() rescan touched
+    # PortAudio — never _terminate() against a live stream.
+    assert "close" in trace and "terminate" in trace, trace
+    assert trace.index("close") < trace.index("terminate"), trace
+
+
+@pytest.mark.asyncio
+async def test_device_refresh_private_api_failure_degrades_not_crashes(monkeypatch):
+    """#194: _terminate()/_initialize() are PRIVATE sounddevice APIs. If an
+    upstream refactor removes or breaks them, the refresh must degrade to the
+    pre-#194 behaviour (retry against the existing table), NOT turn a recoverable
+    device-down loop into a crash. The loop must keep running and recover once the
+    device appears on its own."""
+    cap = make_capture()
+    monkeypatch.setattr(capture_module, "_STREAM_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(capture_module, "_BLOCK_STALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(capture_module, "_SILENCE_TICK_SECONDS", 0.001)
+
+    lookups = {"n": 0}
+
+    def query_devices(*a, **k):
+        lookups["n"] += 1
+        if lookups["n"] == 1:
+            return [device("Some Output-Only Sink", 0)]   # absent → ValueError
+        return [device("USB Audio Codec", 2)]             # appears anyway
+    monkeypatch.setattr(capture_module.sd, "query_devices", query_devices)
+    # The refresh recipe is broken upstream — both raise.
+    monkeypatch.setattr(
+        capture_module.sd, "_terminate",
+        MagicMock(side_effect=AttributeError("sounddevice refactored away _terminate")),
+    )
+    monkeypatch.setattr(
+        capture_module.sd, "_initialize",
+        MagicMock(side_effect=AttributeError("sounddevice refactored away _initialize")),
+    )
+
+    built = asyncio.Event()
+
+    def make_stream(**kwargs):
+        built.set()
+        return _cm_stream_mock()
+    monkeypatch.setattr(capture_module.sd, "InputStream", MagicMock(side_effect=make_stream))
+
+    task = asyncio.create_task(cap.run())
+    try:
+        # The broken refresh is swallowed (logged at debug); the loop keeps
+        # retrying and still builds a stream when the device appears.
+        await asyncio.wait_for(built.wait(), timeout=2.0)
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert lookups["n"] >= 2   # retried despite the refresh raising — no crash
+    assert built.is_set()
 
 
 @pytest.mark.asyncio

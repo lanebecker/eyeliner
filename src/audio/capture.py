@@ -182,6 +182,54 @@ class AudioCapture:
             f"Available input devices: {available}"
         )
 
+    def _refresh_audio_devices(self) -> None:
+        """Re-enumerate PortAudio's device table on the rebuild loop's FAILURE
+        path so a device that appeared or moved after import can be found (#194).
+
+        PortAudio snapshots the device table ONCE, at Pa_Initialize() — which
+        python-sounddevice runs at ``import sounddevice`` (sd 0.5.5), long before
+        this loop. ``query_devices()`` only iterates that frozen table; PortAudio
+        never rescans. So a device absent when the service started (the UCA222
+        still enumerating over USB while systemd — ordered only on network.target,
+        CRIT-4/#83 — brings us up), or one re-plugged to a different ALSA card
+        index mid-run, can NEVER appear to ``_find_device_index()`` no matter how
+        many times the loop retries: capture becomes an alive-but-idle zombie
+        until a human restarts the process. #164's in-loop re-resolution promised
+        this recovery but could not deliver it against a static table — the unit
+        test only passed because its ``query_devices`` mock returned a different
+        list on the second call, exactly what the real library cannot do.
+
+        ``_terminate()`` + ``_initialize()`` is python-sounddevice's documented
+        rescan recipe: it tears PortAudio down and re-runs Pa_Initialize(),
+        rebuilding the table so the NEXT ``_find_device_index()`` sees the current
+        hardware.
+
+        Safety and cost:
+          * Call ONLY from the rebuild loop's failure handler, where the
+            ``with stream:`` block has already exited and NO stream object is
+            live — ``_terminate()`` while a stream is open is undefined behaviour.
+          * Both are PRIVATE sounddevice APIs (pinned: 0.5.5). The whole thing is
+            wrapped: if an upstream refactor removes or breaks them, we log once at
+            debug and DEGRADE to the pre-#194 behaviour (retry against the existing
+            table) rather than turning the recovery path into a new crash loop.
+          * The rescan is synchronous (ALSA re-enumeration, up to a few hundred
+            ms) and runs on the event loop. Acceptable at the 1s retry cadence —
+            during a device-down retry the display is parked on IDLE/ERROR anyway,
+            and the independent _silence_ticker only needs ~1s granularity.
+        """
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            # Degrade to pre-#194 behaviour: the next retry simply sees the table
+            # it would have seen anyway. A private-API breakage must not escalate a
+            # recoverable device-down loop into a crash. Debug (not error): the
+            # real failure is already surfaced by _log_capture_error just above.
+            log.debug(
+                "PortAudio device-table refresh unavailable (%r); retrying "
+                "against the existing table.", e
+            )
+
     def _enqueue_block(self, blocks: asyncio.Queue, block: np.ndarray):
         """Put an audio block on the queue, dropping the OLDEST first when it's
         full so recent audio wins — the drop-oldest overflow policy the module
@@ -342,6 +390,10 @@ class AudioCapture:
                 assembler = ChunkAssembler(chunk_frames, hop_frames)
                 blocks: asyncio.Queue = asyncio.Queue(maxsize=_BLOCK_QUEUE_MAX)
                 self._blocks = blocks
+                # #194: track the stream for the except handler. Reset per
+                # iteration so a construction failure can't leave a stale
+                # reference from the previous pass.
+                stream = None
                 try:
                     # #164 (CRIT-2 follow-up): resolve the device index INSIDE the
                     # retry loop. A device absent at startup — a mistyped
@@ -350,9 +402,13 @@ class AudioCapture:
                     # raise ABOVE the loop, escaping run() and crash-looping the
                     # process under systemd (Restart=on-failure, 10s). Inside the
                     # loop it degrades to the same backoff-and-rebuild path a stream
-                    # construction failure or a CONC-5 stall already take, and
-                    # re-resolving each attempt also picks up a device that
-                    # reappears on a different index after a re-plug.
+                    # construction failure or a CONC-5 stall already take.
+                    # #194: re-resolving alone is NOT enough — PortAudio's device
+                    # table is frozen at import, so a fresh lookup sees the same
+                    # stale snapshot every retry. The except handler below calls
+                    # _refresh_audio_devices() to actually re-enumerate before the
+                    # next attempt, which is what lets a late-enumerated or
+                    # re-plugged device be picked up here.
                     device_index = self._find_device_index()
                     stream = sd.InputStream(
                         samplerate=self.sample_rate,
@@ -389,6 +445,25 @@ class AudioCapture:
                     # CancelledError is BaseException and intentionally NOT caught
                     # here — shutdown cancellation propagates to main() cleanly.
                     self._log_capture_error(e)
+                    # #194: if construction succeeded (Pa_OpenStream) but the
+                    # `with` __enter__/start() then raised — a device brown-out or
+                    # unplug in the window between open and start, exactly the
+                    # hotplug class this fixes — Python never runs __exit__, so the
+                    # stream is still OPEN. _terminate() (in _refresh_audio_devices)
+                    # against a live stream is undefined behaviour, so close it
+                    # first. Idempotent: on the normal error paths __exit__ has
+                    # already closed it, and close() is safe to call again.
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                    # Then refresh PortAudio's frozen device table before the next
+                    # attempt so a device that appeared or moved (late USB
+                    # enumeration, or a re-plug to a new ALSA index after a CONC-5
+                    # stall) can actually be found on the retry. No stream is live
+                    # now — the branch above guaranteed it.
+                    self._refresh_audio_devices()
                     await asyncio.sleep(_STREAM_RETRY_BACKOFF_SECONDS)  # Then retry with a fresh stream
         finally:
             # Tear the ticker down with the capture loop (covers normal exit and
