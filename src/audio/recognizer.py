@@ -12,6 +12,7 @@ from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 import numpy as np
 
+from src.audio.log_throttle import ThrottledLogger
 from src.config import IMPLEMENTED_BACKENDS
 from src.state.player_state import PlayerStatus
 
@@ -46,6 +47,20 @@ _RECOGNIZE_TIMEOUT_SECONDS = 30
 # run()'s wait_for is the hard backstop that actually bounds a hung request.
 _SHAZAM_RETRY_ATTEMPTS = 2
 _SHAZAM_RETRY_MAX_TIMEOUT_SECONDS = 5
+
+# #197: minimum wall-clock gap between repeated recognition-FAILURE logs, on the
+# #178 model already used in capture.py. Recognition is attempted on every chunk
+# hop (~10s at the defaults), 24/7. A sustained network outage makes EVERY hop
+# fail, so an unthrottled failure line would write ~8,640 identical records/day —
+# the flood class #178/PCONC-4 already throttle on the capture leg. Both
+# recognition failure legs are throttled through ThrottledLogger: the fast-fail
+# except in ShazamIOBackend.recognize (connection refused / DNS — fails inside
+# the call) AND run()'s loop-error handler (a HUNG outage that black-holes
+# packets is cancelled by the recognize_timeout wait_for BEFORE recognize's
+# except can log, and lands there instead). Throttling only one leg would just
+# move the flood between WARNING and ERROR depending on the outage's shape.
+# 60s (vs capture's 30s) keeps at most ~1,440 lines/day worst case.
+_RECOGNITION_ERROR_LOG_INTERVAL_SECONDS = 60.0
 
 
 @dataclass
@@ -85,6 +100,14 @@ class ShazamIOBackend(RecognizerBackend):
 
     def __init__(self):
         self._shazam = None  # Created lazily on first recognize()
+        # #197: throttle the per-chunk failure WARNING. A network outage fails
+        # this call every ~10s hop, 24/7; unthrottled that is ~8,640 identical
+        # journal lines/day (the #178 flood class). First failure and any changed
+        # message log at once; identical repeats summarise at most once per
+        # _RECOGNITION_ERROR_LOG_INTERVAL_SECONDS; a success flushes the tally.
+        self._error_log = ThrottledLogger(
+            log, _RECOGNITION_ERROR_LOG_INTERVAL_SECONDS, level=logging.WARNING
+        )
 
     async def recognize(
         self, audio: np.ndarray, sample_rate: int
@@ -101,9 +124,22 @@ class ShazamIOBackend(RecognizerBackend):
                 None, self._encode_wav, audio, sample_rate
             )
             result = await self._call_shazam(wav_bytes)
-            return self._parse_shazam(result)
+            parsed = self._parse_shazam(result)
+            # FULL success (transport AND parse) — the failure (if any) is over,
+            # so flush the throttle: the streak count is reported and the next
+            # failure logs immediately (#197). Deliberately AFTER _parse_shazam,
+            # not after _call_shazam: a truthy-but-malformed response (e.g. a
+            # top-level JSON list) makes _parse_shazam raise on EVERY chunk, and
+            # resetting on transport-only success would clear the streak each hop
+            # so that identical parse error logged every ~10s forever — re-opening
+            # the very flood this throttle closes. Skipping reset on a parse raise
+            # keeps the repeat throttled. A healthy miss (parse returns None) is a
+            # real success and still resets here.
+            self._error_log.reset()
+            return parsed
         except Exception as e:
-            log.warning(f"ShazamIO recognition failed: {e}")
+            # #197: route through the throttle instead of logging every chunk.
+            self._error_log.error(f"ShazamIO recognition failed: {e}")
             return None
 
     async def _call_shazam(self, wav_bytes: bytes) -> dict:
@@ -271,6 +307,16 @@ class RecognitionLoop:
         self.backend: RecognizerBackend = (
             backend if backend is not None else self._init_backend()
         )
+        # #197: throttle run()'s loop-error ERROR. A network outage that HANGS
+        # (black-holed packets, not connection-refused) is cancelled by the
+        # recognize_timeout wait_for BEFORE ShazamIOBackend's own except can log,
+        # so it floods HERE — ~1 line per (timeout + 2s sleep) ≈ every 32s, ~2,700
+        # lines/day — the same class the backend throttle catches on the fast-fail
+        # leg. Both must be throttled or the flood just moves with the outage's
+        # shape. A clean recognize+commit flushes the streak (below).
+        self._loop_error_log = ThrottledLogger(
+            log, _RECOGNITION_ERROR_LOG_INTERVAL_SECONDS, level=logging.ERROR
+        )
 
     def _init_backend(self) -> RecognizerBackend:
         # CRIT-2: config validation (RecognitionConfig, against the shared
@@ -363,6 +409,10 @@ class RecognitionLoop:
                     timeout=self.recognize_timeout,
                 )
                 await self._handle_result(result, epoch)
+                # A full recognize+commit turn succeeded — flush any loop-error
+                # streak so its count is reported and the next error logs at once
+                # (#197). Reached only when nothing above raised.
+                self._loop_error_log.reset()
             except Exception as e:
                 # Any error under the recognize/commit path — INCLUDING a genuine
                 # TimeoutError (a raw socket timeout OR the wait_for above) — is
@@ -371,7 +421,9 @@ class RecognitionLoop:
                 # hiding the exact flaky-wifi hang this bound exists to surface.
                 # (asyncio.CancelledError is a BaseException, so a task cancel still
                 # unwinds the loop cleanly.)
-                log.error(f"Recognition loop error: {e!r}")
+                # #197: throttled — a HUNG outage fires this every ~32s, 24/7; the
+                # first error and any changed message still log immediately.
+                self._loop_error_log.error(f"Recognition loop error: {e!r}")
                 await asyncio.sleep(2)
 
     @staticmethod

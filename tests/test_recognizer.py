@@ -528,10 +528,20 @@ async def test_run_timeout_from_recognize_is_logged_and_backed_off_not_swallowed
         side_effect=[TimeoutError("socket read timed out"), raw]
     )
 
+    # #197: run() now routes loop errors through its ThrottledLogger rather than
+    # calling log.error() directly (so a hung-network flood is rate-limited). Swap
+    # in a spy to capture what the loop hands off; the throttle's own first-line/
+    # summary logging is covered by tests/test_log_throttle.py.
     errors = []
-    monkeypatch.setattr(
-        "src.audio.recognizer.log.error", lambda msg, *a, **k: errors.append(msg)
-    )
+
+    class _SpyThrottle:
+        def error(self, msg):
+            errors.append(msg)
+
+        def reset(self):
+            pass
+
+    loop._loop_error_log = _SpyThrottle()
     slept = []
     real_sleep = asyncio.sleep
 
@@ -577,10 +587,20 @@ async def test_run_idle_timeout_polls_again_without_error(monkeypatch):
         loop = RecognitionLoop(config, state, on_confirmed)
     loop.backend.recognize = AsyncMock(return_value=make_raw())
 
+    # #197: run() now routes loop errors through its ThrottledLogger rather than
+    # calling log.error() directly (so a hung-network flood is rate-limited). Swap
+    # in a spy to capture what the loop hands off; the throttle's own first-line/
+    # summary logging is covered by tests/test_log_throttle.py.
     errors = []
-    monkeypatch.setattr(
-        "src.audio.recognizer.log.error", lambda msg, *a, **k: errors.append(msg)
-    )
+
+    class _SpyThrottle:
+        def error(self, msg):
+            errors.append(msg)
+
+        def reset(self):
+            pass
+
+    loop._loop_error_log = _SpyThrottle()
 
     task = asyncio.create_task(loop.run())
     await asyncio.sleep(0.05)   # let a few idle polls (0.01s each) elapse on the EMPTY queue
@@ -614,10 +634,20 @@ async def test_run_hung_recognize_is_bounded_and_the_loop_recovers(monkeypatch):
 
     loop.backend.recognize = recognize
 
+    # #197: run() now routes loop errors through its ThrottledLogger rather than
+    # calling log.error() directly (so a hung-network flood is rate-limited). Swap
+    # in a spy to capture what the loop hands off; the throttle's own first-line/
+    # summary logging is covered by tests/test_log_throttle.py.
     errors = []
-    monkeypatch.setattr(
-        "src.audio.recognizer.log.error", lambda msg, *a, **k: errors.append(msg)
-    )
+
+    class _SpyThrottle:
+        def error(self, msg):
+            errors.append(msg)
+
+        def reset(self):
+            pass
+
+    loop._loop_error_log = _SpyThrottle()
     real_sleep = asyncio.sleep
 
     async def fast_sleep(secs):          # collapse only the recognizer's error-path backoff
