@@ -269,3 +269,252 @@ def test_strategy2_error_propagates_for_retry_not_swallowed_as_not_owned():
         pass
     else:
         raise AssertionError("expected the transient fetch error to propagate")
+
+
+# ---------------------------------------------------------------------------
+# #183 (R4:gap1-4) — Strategy 1 must validate the candidate against the
+# recognition, not accept the first owned release among 25 loose-search
+# candidates.  Exact normalised title+artist only; anything fuzzier defers to
+# strategy 2 (the single authority for tiered matching + refuse-to-guess).
+# ---------------------------------------------------------------------------
+
+def _reader_with_candidates(entries, candidates):
+    """A reader whose index holds ``entries`` and whose strategy-1 database
+    search returns ``candidates`` (MagicMock releases with .id/.title) in
+    Discogs relevance order."""
+    reader = _reader_with_index(entries)
+    cands = []
+    for rid, title in candidates:
+        c = MagicMock()
+        c.id = rid
+        c.title = title
+        cands.append(c)
+    reader._database_search = MagicMock(return_value=cands)
+    return reader
+
+
+def test_strategy1_does_not_credit_a_similar_titled_owned_album():
+    """#183 headline: user owns 'Greatest Hits II', plays a borrowed
+    'Greatest Hits'.  The owned GH II pressing appears in the top-25 — it must
+    NOT become the write target; with no owned GH anywhere, the result is
+    None (no instance_id, no write)."""
+    reader = _reader_with_candidates(
+        entries=[(7100, 71, "Greatest Hits II", ["Queen"])],
+        candidates=[(7100, "Queen - Greatest Hits II"), (7200, "Queen - Greatest Hits")],
+    )
+
+    assert reader.search_collection("Queen", "Greatest Hits") is None
+
+
+def test_strategy1_skips_wrong_titles_to_reach_the_exactly_owned_one():
+    """Both GH II and GH owned, Discogs ranks GH II first: strategy 1 must
+    skip past the mismatched title and credit the exact match."""
+    reader = _reader_with_candidates(
+        entries=[
+            (7100, 71, "Greatest Hits II", ["Queen"]),
+            (7200, 72, "Greatest Hits", ["Queen"]),
+        ],
+        candidates=[(7100, "Queen - Greatest Hits II"), (7200, "Queen - Greatest Hits")],
+    )
+
+    result = reader.search_collection("Queen", "Greatest Hits")
+
+    assert result is not None
+    assert result["instance_id"] == 72
+
+
+def test_strategy1_rejects_an_owned_candidate_with_the_wrong_artist():
+    """Search noise: an owned release whose index artist differs from the
+    recognition must not be accepted just because it surfaced as a candidate."""
+    reader = _reader_with_candidates(
+        entries=[(7300, 73, "Low", ["David Bowie"])],
+        candidates=[(7300, "David Bowie - Low")],
+    )
+
+    assert reader.search_collection("Testament", "Low") is None
+
+
+def test_strategy1_mismatch_still_falls_through_to_strategy2_tiers():
+    """An owned deluxe pressing that isn't an exact match for the plain Shazam
+    album is strategy 2's business — and its tier-2 strip credits it."""
+    reader = _reader_with_candidates(
+        entries=[(7400, 74, "Rumours (Deluxe Edition)", ["Fleetwood Mac"])],
+        candidates=[(7400, "Fleetwood Mac - Rumours (Deluxe Edition)")],
+    )
+
+    result = reader.search_collection("Fleetwood Mac", "Rumours")
+
+    assert result is not None
+    assert result["instance_id"] == 74
+
+
+def test_strategy1_keeps_scanning_past_a_mismatch_when_strategy2_cannot_rescue():
+    """The mismatch must CONTINUE the candidate scan, not abort it: with two
+    owned pressings of the album, strategy 2's uniqueness rule refuses the
+    same-title pair, so only strategy 1's continued scan can credit the play.
+    An early abort would turn this into a silent None."""
+    reader = _reader_with_candidates(
+        entries=[
+            (7100, 71, "Greatest Hits II", ["Queen"]),
+            (7200, 72, "Greatest Hits", ["Queen"]),     # pressing 1
+            (7201, 78, "Greatest Hits", ["Queen"]),     # pressing 2
+        ],
+        candidates=[(7100, "Queen - Greatest Hits II"), (7200, "Queen - Greatest Hits")],
+    )
+
+    result = reader.search_collection("Queen", "Greatest Hits")
+
+    assert result is not None
+    assert result["instance_id"] == 72
+
+
+def test_strategy1_exact_match_first_candidate_unchanged():
+    """Control: the common case — first owned candidate IS the exact album —
+    behaves as before."""
+    reader = _reader_with_candidates(
+        entries=[(7500, 75, "Sister", ["Sonic Youth"])],
+        candidates=[(7500, "Sonic Youth - Sister")],
+    )
+
+    result = reader.search_collection("Sonic Youth", "Sister")
+
+    assert result is not None
+    assert result["instance_id"] == 75
+
+
+def test_strategy1_pressing_choice_among_exact_matches_keeps_relevance_order():
+    """Two owned pressings of the same album: the first in Discogs relevance
+    order wins, as before (#183 changes which titles qualify, not the
+    pressing-choice rule)."""
+    reader = _reader_with_candidates(
+        entries=[
+            (7600, 76, "Sister", ["Sonic Youth"]),
+            (7601, 77, "Sister", ["Sonic Youth"]),
+        ],
+        candidates=[(7601, "Sonic Youth - Sister"), (7600, "Sonic Youth - Sister")],
+    )
+
+    result = reader.search_collection("Sonic Youth", "Sister")
+
+    assert result is not None
+    assert result["instance_id"] == 77
+
+
+# ---------------------------------------------------------------------------
+# #183 rework (cold-review catches): artist-name folding (#223) and bracket
+# qualifiers, so exact-first matching doesn't lose credits the old
+# ownership-only strategy 1 happened to bridge.
+# ---------------------------------------------------------------------------
+
+def test_leading_the_artist_variant_still_credits():
+    """#223 via #183: Shazam 'Rolling Stones' vs index 'The Rolling Stones' —
+    old S1 bridged this via release id alone; exact matching must fold it,
+    not lose every play by the artist."""
+    reader = _reader_with_candidates(
+        entries=[(8100, 81, "Sticky Fingers", ["The Rolling Stones"])],
+        candidates=[(8100, "The Rolling Stones - Sticky Fingers")],
+    )
+
+    result = reader.search_collection("Rolling Stones", "Sticky Fingers")
+
+    assert result is not None
+    assert result["instance_id"] == 81
+
+
+def test_ampersand_artist_variant_still_credits_via_strategy2():
+    """'Simon & Garfunkel' vs index 'Simon And Garfunkel', strategy-2 path."""
+    reader = _reader_with_index([
+        (8200, 82, "Bookends", ["Simon And Garfunkel"]),
+    ])
+
+    result = reader.search_collection("Simon & Garfunkel", "Bookends")
+
+    assert result is not None
+    assert result["instance_id"] == 82
+
+
+def test_the_the_folds_symmetrically():
+    """Edge control: the band 'The The' folds to 'the' on both sides."""
+    reader = _reader_with_index([
+        (8300, 83, "Soul Mining", ["The The"]),
+    ])
+
+    result = reader.search_collection("The The", "Soul Mining")
+
+    assert result is not None
+    assert result["instance_id"] == 83
+
+
+def test_the_folding_never_applies_to_titles():
+    """'The Wall' must not equal 'Wall' — folding is artist-only."""
+    reader = _reader_with_index([
+        (8400, 84, "Wall", ["Pink Floyd"]),
+    ])
+
+    assert reader.search_collection("Pink Floyd", "The Wall") is None
+
+
+def test_bracket_qualifier_query_matches_plain_owned_title():
+    """#183 rework: '[Deluxe Edition]' is the iTunes bracket form of the
+    decoration tier 2 already strips in paren form."""
+    reader = _reader_with_index([
+        (8500, 85, "Rumours", ["Fleetwood Mac"]),
+    ])
+
+    result = reader.search_collection("Fleetwood Mac", "Rumours [Deluxe Edition]")
+
+    assert result is not None
+    assert result["instance_id"] == 85
+
+
+def test_bracket_qualified_owned_title_matches_plain_query():
+    reader = _reader_with_index([
+        (8600, 86, "Nevermind [30th Anniversary]", ["Nirvana"]),
+    ])
+
+    result = reader.search_collection("Nirvana", "Nevermind")
+
+    assert result is not None
+    assert result["instance_id"] == 86
+
+
+def test_distinct_bracket_and_paren_siblings_are_different_albums():
+    """One-side-at-a-time still holds across bracket grammar: 'Live [1975]'
+    vs an owned 'Live (1980)' must not be equated."""
+    reader = _reader_with_index([
+        (8700, 87, "Live (1980)", ["Thin Lizzy"]),
+    ])
+
+    assert reader.search_collection("Thin Lizzy", "Live [1975]") is None
+
+
+def test_stacked_decorations_remain_a_conservative_miss():
+    """Documented residual: only ONE trailing qualifier is stripped."""
+    reader = _reader_with_index([
+        (8800, 88, "Pet Sounds (Mono) (Remastered)", ["The Beach Boys"]),
+    ])
+
+    assert reader.search_collection("The Beach Boys", "Pet Sounds") is None
+
+
+def test_fullwidth_ampersand_is_also_folded():
+    """#183 second-pass regression: the fullwidth ＆ (U+FF06) only becomes an
+    ASCII & via NFKC, so the &-fold must run on both sides of it."""
+    reader = _reader_with_index([
+        (8900, 89, "Bookends", ["Simon And Garfunkel"]),
+    ])
+
+    result = reader.search_collection("Simon ＆ Garfunkel", "Bookends")
+
+    assert result is not None
+    assert result["instance_id"] == 89
+
+
+def test_distinct_bracket_siblings_are_different_albums():
+    """Bracket-vs-bracket parity for the sibling protection: 'Live [1975]'
+    vs an owned 'Live [1980]' must not be equated."""
+    reader = _reader_with_index([
+        (9300, 90, "Live [1980]", ["Thin Lizzy"]),
+    ])
+
+    assert reader.search_collection("Thin Lizzy", "Live [1975]") is None

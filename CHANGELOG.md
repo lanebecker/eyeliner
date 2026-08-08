@@ -94,6 +94,34 @@ section accumulates the fixes.
   `RecognitionLoop._same_track` is deliberately untouched (Shazam-to-Shazam
   comparison needs no decoration logic).
 
+- **Collection strategy 1 validates the candidate against the recognition
+  before accepting it (#183 — MEDIUM, `R4:gap1-4`).** Strategy 1 fetched up
+  to 25 loose-search candidates and returned the FIRST whose release id was
+  in the collection index — ownership was the only criterion, the title never
+  compared. Discogs' q= relevance ranking freely interleaves similar-titled
+  releases, so playing a borrowed "Greatest Hits" while owning "Greatest
+  Hits II" credited GH II whenever it outranked the right pressing, with no
+  distinguishing log line. Strategy 1 now requires an exact normalised
+  title + artist match against the candidate's clean INDEX entry (sharing
+  #179's keys and " (n)" artist-suffix rule); mismatched owned candidates
+  are skipped with a debug line and the scan continues — an early abort
+  would silently lose multi-pressing collections, where strategy 2's
+  uniqueness rule refuses the same-title pair (mutation-pinned). Anything
+  fuzzier defers to strategy 2, the single authority for tiered matching
+  and refuse-to-guess. Among exact matches, relevance order still picks the
+  pressing (unchanged). Because the old ownership-only strategy 1 was the
+  last path that bridged artist-name string divergence, exactness would have
+  silently lost every play by affected artists (cold-review catch, executed:
+  "Rolling Stones" vs an indexed "The Rolling Stones") — so #223's
+  conservative artist folding ships here in the now-shared artist rule
+  (`_normalize_artist`: fold "&"→"and", strip one leading "the"; artist
+  names ONLY, never titles — "The Wall" ≠ "Wall", regression-pinned), and
+  tier 2's trailing-qualifier strip also accepts the iTunes square-bracket
+  form ("Rumours [Deluxe Edition]"). Documented conservative-miss residuals,
+  pinned: stacked decorations ("Pet Sounds (Mono) (Remastered)"), truly
+  divergent artist names ("The Charlatans UK"), and distinct
+  bracket-vs-paren siblings are still never equated.
+
 - **Collection strategy 2 no longer matches by bare substring containment
   (#179 — HIGH, `R4:gap1-1`).** The old fuzzy match (`album_lower in title`,
   artist likewise), walking the index most-recently-added-first, could select
@@ -116,11 +144,11 @@ section accumulates the fixes.
   distinguished only by parentheticals (the Discogs "Weezer"-×4 case) —
   uniqueness protects only when 2+ owned members match under the one-side
   strip; follow-up filed for a decoration-keyword allowlist. Behaviour note:
-  exact artist matching is stricter than the old containment — real-world
-  name variants ("Rolling Stones" vs "The Rolling Stones", "The Charlatans"
-  vs "The Charlatans UK") that the substring test happened to match now miss
-  (fail-safe: no write target rather than a guessed one); follow-up filed
-  for conservative artist-name folding.
+  exact artist matching is stricter than the old containment; the common
+  variant classes ("Rolling Stones" vs "The Rolling Stones", "&" vs "and")
+  are folded by #223's `_normalize_artist` (shipped with #183, below), while
+  truly divergent names ("The Charlatans" vs "The Charlatans UK") still miss
+  (fail-safe: no write target rather than a guessed one).
 
 ## [1.5.7] — 2026-08-07
 

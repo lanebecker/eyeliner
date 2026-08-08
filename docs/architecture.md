@@ -281,7 +281,12 @@ exceptions and fall through the resolver's fallback chain. Also home to `_as_id`
   against a session-cached collection index (P-1)**, so neither pays a
   per-candidate HTTP cost:
   - Strategy 1: search the Discogs database for up to 25 candidates and look
-    each up in the local index by `release_id`; return the first owned hit.
+    each up in the local index by `release_id`; return the first owned hit
+    whose index entry **exactly matches** the recognition on normalised
+    title + artist (#183 — ownership alone is not acceptance; mismatched
+    owned candidates are skipped and the scan continues, deferring fuzzier
+    cases to strategy 2). Among exact matches, relevance order picks the
+    pressing.
   - Strategy 2: if strategy 1 misses, match the index entries locally on
     normalised artist + album title (#179): tier 1 exact equality (NFKC +
     typographic-punctuation fold + casefold + whitespace collapse, with the
