@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.metadata.coverart import CoverArtFallback
-from src.metadata.errors import is_transient
+from src.metadata.errors import is_transient, http_status
 
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
@@ -69,6 +69,20 @@ class MetadataResolver:
         #   payload is the Discogs result dict for Discogs tiers,
         #   or the cover art URL (Optional[str]) for FALLBACK.
         self._album_cache: dict = {}
+        # #189: a dead Discogs credential (401/403) or wrong username (404) is a
+        # PERMANENT error that recurs on EVERY track's resolve — so its
+        # actionable warning is logged once and then suppressed until a Discogs
+        # lookup next succeeds, rather than spamming the journal per track (a
+        # clockless throttle, cf. #178's per-interval capture-log throttle).
+        # Keyed PER TIER by the last-logged permanent status ({tier: status}),
+        # for two reasons (#188 cold review, defects 2 + D1): a DIFFERENT fault
+        # on a tier (token fixed → wrong-username 404) still surfaces; and a
+        # success on ONE tier does not re-arm the OTHER's warning — a wrong
+        # username fails only the collection tier while the database tier keeps
+        # succeeding every track, so a single shared flag cleared by either
+        # success would re-log the collection 404 on every track (the exact
+        # per-track spam this throttle exists to kill).
+        self._logged_discogs_config: dict = {}
 
     @staticmethod
     def _cache_key(raw: "RawRecognitionResult") -> tuple:
@@ -114,6 +128,40 @@ class MetadataResolver:
             )
         return self._from_discogs(raw, payload, source)
 
+    def _log_discogs_error(self, tier: str, exc: Exception) -> None:
+        """Log a Discogs-tier failure at the right level (#189).
+
+        Transient (429/5xx/network blip) → INFO "(transient)", a routine
+        couldn't-determine.  A definitive credential/config error (401/403 dead
+        token, 404 wrong username) → an ACTIONABLE ERROR naming the fix, logged
+        ONCE and then throttled (it recurs every track until the operator
+        intervenes; a success re-arms it).  Anything else → WARNING "Unexpected".
+        """
+        if is_transient(exc):
+            log.info(f"Discogs {tier} search couldn't determine (transient): {exc}")
+            return
+        status = http_status(exc)
+        if status in (401, 403, 404):
+            if self._logged_discogs_config.get(tier) != status:
+                self._logged_discogs_config[tier] = status
+                # A 404 on the collection tier points at the username; a
+                # database-tier 404 (rare — build 404s are swallowed) does not.
+                if status in (401, 403):
+                    hint = "check your Discogs user_token"
+                elif tier == "collection":
+                    hint = "check your discogs.username"
+                else:
+                    hint = "the requested Discogs resource was not found"
+                log.error(
+                    "Discogs %s search rejected (HTTP %s) — %s. Play Count / "
+                    "Last Played updates are disabled until this is fixed; "
+                    "further identical occurrences suppressed until the %s "
+                    "lookup succeeds.",
+                    tier, status, hint, tier,
+                )
+            return
+        log.warning(f"Unexpected error in Discogs {tier} search: {exc}")
+
     async def resolve(self, raw: "RawRecognitionResult") -> TrackMetadata:
         """Run the full lookup chain. Always returns a TrackMetadata."""
         loop = asyncio.get_running_loop()
@@ -140,14 +188,12 @@ class MetadataResolver:
             )
             if result:
                 log.debug(f"Resolved from Discogs collection: {raw.artist} / {raw.album}")
+                self._logged_discogs_config.pop("collection", None)   # #189: re-arm THIS tier
                 self._cache_store(key, MetadataSource.DISCOGS_COLLECTION, result)
                 return self._from_discogs(raw, result, MetadataSource.DISCOGS_COLLECTION)
         except Exception as e:
             discogs_completed = False
-            if is_transient(e):
-                log.info(f"Discogs collection search couldn't determine (transient): {e}")
-            else:
-                log.warning(f"Unexpected error in Discogs collection search: {e}")
+            self._log_discogs_error("collection", e)
 
         # Step 2: Discogs database
         try:
@@ -163,22 +209,36 @@ class MetadataResolver:
                 # to no-Play-Count tracking for the rest of the session (B-4).
                 # Return it for this track, but leave it uncached so the next
                 # track retries the collection lookup.
+                self._logged_discogs_config.pop("database", None)   # #189: re-arm THIS tier
                 if discogs_completed:
                     self._cache_store(key, MetadataSource.DISCOGS_DATABASE, result)
                 return self._from_discogs(raw, result, MetadataSource.DISCOGS_DATABASE)
         except Exception as e:
             discogs_completed = False
-            if is_transient(e):
-                log.info(f"Discogs database search couldn't determine (transient): {e}")
-            else:
-                log.warning(f"Unexpected error in Discogs database search: {e}")
+            self._log_discogs_error("database", e)
 
         # Step 3: Fallback — Shazam data + MusicBrainz cover art
         log.info(f"Using fallback metadata for: {raw.artist} / {raw.album}")
-        cover_url = await loop.run_in_executor(
-            None, self.coverart.get_cover_art_url, raw.artist, raw.album
-        )
-        if discogs_completed:
+        # #190: a TRANSIENT MusicBrainz outage must not be cached as this
+        # album's FALLBACK payload — otherwise the album is pinned coverless
+        # for the whole session even after the service recovers.  Mirror the
+        # discogs_completed pattern: on a transient cover-art failure, return
+        # the fallback for THIS track but skip the cache so the next track
+        # retries.  A clean "no art exists" (None) still caches — that
+        # negative result is load-bearing for MusicBrainz rate limits.
+        cover_completed = True
+        try:
+            cover_url = await loop.run_in_executor(
+                None, self.coverart.get_cover_art_url, raw.artist, raw.album
+            )
+        except Exception as e:
+            cover_url = None
+            if is_transient(e):
+                cover_completed = False
+                log.info(f"Cover art couldn't determine (transient): {e}")
+            else:
+                log.warning(f"Unexpected error in cover art lookup: {e}")
+        if discogs_completed and cover_completed:
             self._cache_store(key, MetadataSource.FALLBACK, cover_url)
         return TrackMetadata(
             title=raw.title,

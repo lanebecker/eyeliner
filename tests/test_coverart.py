@@ -14,6 +14,8 @@ tests in ``test_cover_cache.py``).  Here we only require that a ``str`` (or
 lookup.
 """
 
+import pytest
+
 import src.metadata.coverart as coverart
 from src.metadata.coverart import CoverArtFallback
 
@@ -190,11 +192,13 @@ def test_permanent_transport_error_on_first_release_skips_to_next(monkeypatch):
         "https://coverartarchive.org/r1/front.jpg"
 
 
-def test_transient_error_aborts_the_loop_without_hammering_later_releases(monkeypatch):
+def test_transient_error_aborts_the_loop_and_propagates(monkeypatch):
     """A TRANSIENT error (NetworkError = MusicBrainz unreachable) aborts the whole
-    loop and returns None — later releases would fail the same way, so they are
-    never queried. Pins that the fix keeps abort-on-transient (does NOT broaden
-    into hammering a down service)."""
+    loop — later releases would fail the same way, so they are never queried —
+    and PROPAGATES rather than flattening to None (#190): the resolver relies on
+    the raise to leave the album uncached/retryable instead of pinning a coverless
+    FALLBACK for the session. Pins abort-on-transient without hammering a down
+    service."""
     queried = []
 
     def fake_get_image_list(mbid):
@@ -205,7 +209,8 @@ def test_transient_error_aborts_the_loop_without_hammering_later_releases(monkey
                         lambda **k: {"release-list": [{"id": "r0"}, {"id": "r1"}]})
     monkeypatch.setattr(coverart.musicbrainzngs, "get_image_list", fake_get_image_list)
 
-    assert CoverArtFallback().get_cover_art_url("A", "B") is None
+    with pytest.raises(coverart.musicbrainzngs.NetworkError):
+        CoverArtFallback().get_cover_art_url("A", "B")
     assert queried == ["r0"]          # aborted after the transient error; r1 never tried
 
 

@@ -124,6 +124,7 @@ def _resolver():
     r.reader = MagicMock()
     r.coverart = MagicMock()
     r._album_cache = {}
+    r._logged_discogs_config = {}
     return r
 
 

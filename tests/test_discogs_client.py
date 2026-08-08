@@ -993,9 +993,20 @@ def test_original_year_none_when_master_year_is_zero():
     assert client.get_original_year(_make_release()) is None
 
 
-def test_original_year_none_when_fetch_raises():
+def test_original_year_degrades_to_none_on_transient_master_fetch():
+    """#188 cold review: original-year is DISPLAY-ONLY with a valid pressing-year
+    fallback, UNLIKE the tracklist which gates the Play Count. So a transient
+    master-fetch blip degrades to None (→ pressing year) rather than re-raising
+    and discarding an otherwise credit-capable resolve."""
     client = make_reader()
     client._http.session.get = MagicMock(side_effect=ConnectionError("network down"))
+    assert client.get_original_year(_make_release()) is None
+
+
+def test_original_year_degrades_to_none_on_permanent_master_error():
+    """A permanent/malformed master lookup also degrades to None."""
+    client = make_reader()
+    client._http.session.get = MagicMock(side_effect=RuntimeError("malformed"))
     assert client.get_original_year(_make_release()) is None
 
 
