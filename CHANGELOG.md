@@ -15,6 +15,42 @@ section accumulates the fixes.
 
 ### Fixed
 
+- **SideIndex now matches Shazam titles against Discogs tracklist rows with
+  tiered normalisation (#180 — HIGH, `R4:gap1-2`).** The old
+  ``lower().strip()`` exact equality missed every routinely-decorated Shazam
+  title ("Eclipse - 2011 Remastered Version" vs a tracklist row "Eclipse",
+  "(Remastered 2009)", "(feat. X)", typographic apostrophes, NFD accents,
+  "&" vs "and") — 12 of the 13-case realistic-divergence regression corpus
+  miss on the old comparator (executed; only the bare case/whitespace pair
+  matched) — silently forfeiting the album-completion Play Count, Last Played, and
+  Last.fm love for flawless full-album plays, while blanking the side caption
+  and logging a line that blamed the listener. Matching is now tier 1 exact
+  equality of losslessly folded text (shared helper
+  `src/metadata/normalize.py`: punctuation fold before AND after NFKC,
+  casefold, whitespace collapse, "&"→"and"), tier 2 a keyword-gated trailing
+  decoration strip (parenthetical or dash suffix) applied one side at a time
+  and only accepted on a UNIQUE folded title across the tracklist —
+  ambiguity keeps the conservative `SideIndex.empty`, so the META-4/#78
+  phantom-last-track class cannot resurface, and a reprise (same folded
+  title twice) still resolves to its first occurrence (B-5). All three
+  comparison sites in `from_tracklist` share one matcher, so side ordinal,
+  global index, and neighbours cannot desync. The cold review caught — and a
+  contested-base refusal now prevents — a phantom-credit regression: a row
+  whose decoration diverges from the query's only in SYNTAX (row "Song
+  (Demo)", Shazam "Song - Demo") is invisible to the one-side branches, and
+  the matcher would otherwise confidently pick the plain twin row, arming a
+  phantom `is_last_track` when the twin is the closer; when any row outside
+  the accepted group shares the query's stripped base, the matcher refuses
+  (regression-pinned). The contested scan uses a refusal-only fixpoint base
+  (`decoration_base`) that also sees square-bracket and stacked decoration
+  grammar the single-strip matcher cannot, so "Song [Demo]" and "Song (Demo)
+  (Live)" siblings contest too (second-pass catch, regression-pinned).
+  Accepted residuals, all conservative misses pinned in the corpus: reworded
+  titles ("Pt. 2" vs "Part Two"), square-bracket decorations on the QUERY
+  side ("Song [Live]"), and stacked double decorations on the query side.
+  `RecognitionLoop._same_track` is deliberately untouched (Shazam-to-Shazam
+  comparison needs no decoration logic).
+
 - **Collection strategy 2 no longer matches by bare substring containment
   (#179 — HIGH, `R4:gap1-1`).** The old fuzzy match (`album_lower in title`,
   artist likewise), walking the index most-recently-added-first, could select
