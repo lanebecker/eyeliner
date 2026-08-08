@@ -1,5 +1,6 @@
-# Requires Python 3.11 (Raspberry Pi OS bookworm system Python; the
-# CI matrix and the target appliance both run 3.11). (TQ-9)
+# Supported: Python 3.11 (Raspberry Pi OS "bookworm"/Legacy system Python; the
+# CI matrix runs 3.11) AND Python 3.13 (the current default Raspberry Pi OS
+# "trixie" image) via the audioop-lts backport below. (TQ-9, #198)
 
 # Audio capture
 sounddevice>=0.4.6
@@ -8,6 +9,15 @@ soundfile>=0.12.1
 
 # Music recognition
 shazamio>=0.6.0
+# #198 (ops-1): PEP 594 removed the stdlib `audioop` module in Python 3.13, which
+# is what the current DEFAULT Raspberry Pi OS image ("trixie") ships. shazamio's
+# transitive dep `pydub` imports `audioop` at import time, so on 3.13 `pip install`
+# SUCCEEDS but `import shazamio` fails at runtime — surfacing only as a per-chunk
+# recognition miss on the appliance. audioop-lts reinstalls the `audioop` module
+# so the default image works; the marker keeps it off 3.11 (Bookworm/Legacy),
+# which still has audioop in the stdlib. main.py probes the import at startup and
+# fails loud if this is somehow missing.
+audioop-lts>=0.2; python_version >= "3.13"
 
 # Discogs
 python3-discogs-client>=2.6.0

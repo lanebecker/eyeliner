@@ -472,6 +472,11 @@ async def test_main_registers_signal_handlers_and_cancel_all_cancels_tasks(monke
     import signal as signal_module
 
     monkeypatch.setattr(main_module, "load_config", lambda: MagicMock())
+    # #198/#202: stub the new startup steps — their own behaviour is covered in
+    # tests/test_main_startup_hardening.py; here they'd otherwise run against a
+    # MagicMock config and leave a redaction filter on the global root handler.
+    monkeypatch.setattr(main_module, "verify_recognition_backend_importable", lambda config: None)
+    monkeypatch.setattr(main_module, "install_secret_redaction", lambda config: None)
     monkeypatch.setattr(main_module, "install_io_executor", lambda loop: MagicMock())
     monkeypatch.setattr(main_module, "wire_silence_listeners", lambda *a, **k: None)
     monkeypatch.setattr(main_module, "start_display", lambda display: None)

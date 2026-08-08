@@ -218,6 +218,28 @@ section accumulates the fixes.
     response re-flood, second cold-review catch) flushes the streak with a
     recovery tally.
 
+- **A fresh install no longer dies silently on the current default Pi OS image,
+  and the Discogs check script resolves config from the repo root (#198 + #204 —
+  Wave 4 bundle 3).**
+  - **#198 (ops-1, HIGH):** Raspberry Pi Imager's default "Raspberry Pi OS
+    (64-bit)" now flashes Trixie (Python 3.13), where PEP 594 removed the stdlib
+    `audioop` module that shazamio's `pydub` dependency imports — so `pip install`
+    succeeded but `import shazamio` failed at runtime, surfacing only as a
+    per-chunk recognition miss (display latched to NO MATCH FOUND) while systemd
+    saw a healthy service. Fixed in three layers: `requirements.txt` now pulls in
+    the `audioop-lts` backport on Python 3.13+ (so the default image works);
+    `docs/pi-setup-guide.md` documents the nested "Raspberry Pi OS (Legacy,
+    64-bit)"/Bookworm option and adds a `python3 --version` check; and `main.py`
+    eagerly probes `import shazamio` at startup (gated on the shazamio backend),
+    turning a broken install into an actionable `ConfigError` + non-zero exit that
+    systemd surfaces instead of the silent per-chunk miss. The lazy import in
+    `recognizer.py` (the A-13 testability seam) is unchanged.
+  - **#204 (gap2-3, LOW):** `scripts/discogs_live_check.py` fixed `sys.path` from
+    the repo root but called `load_config()` with its CWD-relative default, so
+    running it from anywhere but the repo root failed with a misleading
+    "config.yaml not found" for an operator whose config already existed. It now
+    loads `config.yaml` from the repo root it already computes.
+
 - **An ambiguous Play Count write can no longer double-credit one play
   (#186 — HIGH, `R4:data-1`, Wave 2 bundle 2).** The #163 bounded finalize
   retry re-ran the WHOLE read-modify-write on each attempt: read current →
@@ -411,6 +433,28 @@ section accumulates the fixes.
   are folded by #223's `_normalize_artist` (shipped with #183, below), while
   truly divergent names ("The Charlatans" vs "The Charlatans UK") still miss
   (fail-safe: no write target rather than a guessed one).
+
+### Security
+
+- **The Discogs user token can no longer leak into the journal or the setup
+  terminal (#202 + #203 — Wave 4 bundle 3).** `python3-discogs-client`
+  authenticates by putting the token in the request URL's query string (unlike
+  the app's own header-auth transport), so a routine network blip raised a
+  `requests` error whose text embedded `token=<the real write-capable token>`.
+  - **#202 (sec-1, MEDIUM):** that exception was logged verbatim by the resolver
+    (×4) and reader (×1), persisting in the systemd journal across reboots and
+    bypassing `transport._redact_url` (which only guards the header-auth
+    transport). A redacting `logging.Filter` is now installed on the root log
+    HANDLER at startup — scrubbing the four known credentials by exact match plus
+    a `token=[^&\s]+` regex and rewriting the record so `%`-formatting can't
+    reintroduce the secret; a record that can't render is dropped rather than
+    handed to `handleError` (which would dump raw args). The now-false "never the
+    URL" claim in `transport._redact_url`'s docstring is corrected.
+  - **#203 (gap2-2, LOW):** the same token could reach the setup terminal,
+    scrollback, or a screen recording via `discogs_live_check.py`'s
+    `Exception: {e}` prints and the library's stderr warnings. The script now
+    redacts `token=` on every exception print and installs a redacting filter for
+    the stderr sink.
 
 ## [1.5.7] — 2026-08-07
 

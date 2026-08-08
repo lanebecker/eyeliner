@@ -11,9 +11,50 @@ Usage:
 """
 
 import argparse
+import logging
+import re
 import sys
 from pathlib import Path
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Security: the python3-discogs-client library authenticates by putting the
+# Discogs user token in the URL QUERY (unlike the app's own header-auth
+# transport), so a requests transport error — a Wi-Fi drop mid bring-up, which
+# is exactly when this script runs — stringifies with `token=<real token>`
+# embedded. Redact it before it reaches the terminal, scrollback, tmux/SSH
+# logs, or a screen recording of the setup session (#203 / gap2-2). The token
+# grants full write access to the operator's Discogs account.
+# ---------------------------------------------------------------------------
+_TOKEN_RE = re.compile(r"(token=)[^&\s]+")
+
+
+def _redact(value) -> str:
+    """Mask any ``token=<value>`` inside text (e.g. a requests exception message)."""
+    return _TOKEN_RE.sub(r"\1<redacted>", str(value))
+
+
+class _RedactTokenFilter(logging.Filter):
+    """Scrub ``token=`` from records the library logs to stderr — reader.get_tracklist
+    swallows the transport error and log.warning's ``str(e)`` through logging's
+    lastResort handler, a second sink the fail() redaction alone wouldn't cover."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            # Never raise out of a filter (it runs before emit()'s fault
+            # isolation): a malformed %-format record would otherwise crash the
+            # log call. DROP it (return False) rather than passing it on — it can
+            # never render, and letting it reach handleError() would dump the raw
+            # record.msg/.args (possibly holding the token) to stderr.
+            return False
+        scrubbed = _redact(rendered)
+        if scrubbed != rendered:
+            record.msg = scrubbed
+            record.args = ()
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Test parameters — change to an album you know is in your Discogs collection
@@ -45,7 +86,7 @@ def check_search_collection(client) -> Optional[dict]:
     try:
         result = client.search_collection(TEST_ARTIST, TEST_ALBUM)
     except Exception as e:
-        fail(f"Exception: {e}")
+        fail(f"Exception: {_redact(e)}")
         return None
 
     if result is None:
@@ -76,7 +117,7 @@ def check_search_database(client):
     try:
         result = client.search_database(TEST_ARTIST, TEST_ALBUM)
     except Exception as e:
-        fail(f"Exception: {e}")
+        fail(f"Exception: {_redact(e)}")
         return
 
     if result is None:
@@ -94,7 +135,7 @@ def check_get_tracklist(client, release_id: int):
     try:
         tracks = client.get_tracklist(release_id)
     except Exception as e:
-        fail(f"Exception: {e}")
+        fail(f"Exception: {_redact(e)}")
         return
 
     if not tracks:
@@ -112,7 +153,7 @@ def check_collection_fields(client):
     try:
         fields = client.get_collection_fields()
     except Exception as e:
-        fail(f"Exception: {e}")
+        fail(f"Exception: {_redact(e)}")
         return
 
     if not fields:
@@ -148,7 +189,7 @@ def check_increment_play_count(client, collection_result: Optional[dict]):
     try:
         success = client.increment_play_count(release_id, instance_id)
     except Exception as e:
-        fail(f"Exception: {e}")
+        fail(f"Exception: {_redact(e)}")
         return
 
     if success:
@@ -180,12 +221,28 @@ def main():
 
     # Make sure src/ imports resolve. This script lives in scripts/, so the
     # project root (which holds src/) is its parent's parent.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root))
     from src.config import load_config, ConfigError
     from src.metadata.discogs import DiscogsHttp, DiscogsReader, DiscogsCollectionWriter
 
+    # #203: route the library's own stderr warnings (reader.get_tracklist swallows
+    # a transport error and log.warning's str(e)) through the token-redacting
+    # filter — otherwise that second sink leaks the token even when every fail()
+    # call is redacted. Attached to the handler basicConfig installs.
+    logging.basicConfig(level=logging.WARNING)
+    for _handler in logging.getLogger().handlers:
+        _handler.addFilter(_RedactTokenFilter())
+
     try:
-        config = load_config()
+        # #204: resolve config.yaml from the repo ROOT (reuse `root`), not the CWD.
+        # The script fixes sys.path from root but previously called load_config()
+        # with its CWD-relative default 'config.yaml', so running it from anywhere
+        # but the repo root (e.g. `python vinyl-now-playing/scripts/...` from $HOME
+        # over SSH) failed with a misleading "config.yaml not found. Copy
+        # config.example.yaml ..." for an operator whose config.yaml already exists.
+        # main.py runs with WorkingDirectory=repo root, so this cannot diverge.
+        config = load_config(str(root / "config.yaml"))
     except ConfigError as e:
         print(f"\n  ✗  {e}\n")
         sys.exit(1)

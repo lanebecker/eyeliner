@@ -14,6 +14,16 @@ Use **Raspberry Pi Imager** (download at [raspberrypi.com/software](https://www.
 pygame needs a desktop environment. If you want a minimal install you can add
 LXDE later, but the full image is easier.
 
+> ⚠️ **Which image / Python version (matters — #198).** Imager's default
+> "Raspberry Pi OS (64-bit)" now flashes **Trixie (Python 3.13)**. That works
+> with this project: `requirements.txt` pulls in the `audioop-lts` backport on
+> 3.13 (Python 3.13 removed the stdlib `audioop` module that the recognition
+> stack needs). If you'd rather run the longer-proven **Bookworm (Python 3.11)**
+> base, choose it explicitly — it is now nested, not top-level:
+> **Choose OS → Raspberry Pi OS (other) → Raspberry Pi OS (Legacy, 64-bit)**.
+> Either image is fine; you'll confirm the Python version in step 6 before
+> creating the virtual environment.
+
 **Before writing**, click the gear icon in Imager and pre-configure:
 - Hostname: `vinylpi` (or whatever you like)
 - Enable SSH (password or public key — your choice)
@@ -143,7 +153,20 @@ card index `hw:1,0` if `arecord -l` shows the UCA222 on a different card number.
 cd ~
 git clone https://github.com/lanebecker/vinyl-now-playing.git
 cd vinyl-now-playing
+```
 
+First confirm which Python this image gives you (all supported):
+
+```bash
+python3 --version
+```
+
+Expected: `Python 3.11.x` (Bookworm/Legacy), `3.12.x`, **or** `3.13.x` (Trixie,
+the current default) — all three work. On 3.13 the install below automatically
+pulls in the `audioop-lts` backport (#198); on 3.11/3.12 `audioop` is still in
+the standard library. Then create the virtual environment and install:
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
 
@@ -152,6 +175,11 @@ pip install -r requirements.txt
 
 Installation will take a few minutes on the Pi — numpy and pygame both compile
 native extensions.
+
+If recognition later shows `NO MATCH FOUND` for every record, the app will now
+refuse to start with a clear message instead (it probes the recognition backend
+at startup, #198) — the usual cause is a Python 3.13 venv created before this
+fix; `pip install -r requirements.txt` inside the venv resolves it.
 
 ---
 
