@@ -44,6 +44,54 @@ section accumulates the fixes.
 
 ### Fixed
 
+- **A transient blip on an album's first resolve no longer causes a spurious
+  session split (#184 — MEDIUM, `R4:gap3-1`).** The B-4 carve-out
+  deliberately returns a DATABASE-tier result *uncached* after a transient
+  collection-tier error, so the next track retries and resolves to the OWNED
+  pressing — a different release id. The split detector's documented premise
+  ("every track of an album resolves to identical release IDs within a
+  session") was revoked by exactly that carve-out: one 429/network blip on
+  track 1 split the session, and in the closer-first case silently lost the
+  Play Count. The resolver now threads its normalised cache key onto every
+  track (`TrackMetadata.resolve_key` — RAW Shazam strings, not the
+  cross-pressing Discogs album title), the session records the source and
+  key alongside `last_release_id`, and the detector suppresses the split
+  for the asymmetric tier upgrade only: last id DATABASE-sourced, incoming
+  COLLECTION-sourced, same key. Genuine swaps (different key), keyless
+  tracks, and the collection→database direction all still split
+  (each pinned by a direct test, including the DATABASE-source conjunct,
+  which is near-equivalent in production today but must not be silently
+  droppable). The module docstring's revoked guarantee is corrected, and so
+  is `docs/architecture.md`'s copy of it. Accepted residuals: a DB-sourced
+  closer's `is_last_track` derives from the DB pressing's tracklist
+  (conservative-miss direction), and the degraded DB row is not #182
+  support — a short album needs two collection-resolved rows after the blip
+  to credit (identical outcome to the pre-#184 baseline, executed).
+
+- **Re-dropping the same record inside the silence window now credits both
+  playthroughs (#185 — LOW, `R4:data-4`).** The auto-split's only trigger
+  was a *differing* release id, so an immediate replay (equal ids) merged
+  two complete playthroughs into one session and one credit. The album's
+  OPENER (resolved tracklist row 0) arriving after `potential_last_track`
+  armed — and not a consecutive re-identification of the last logged track —
+  is now a replay boundary: the session splits exactly like a record change,
+  the finished playthrough credits (and loves) at the boundary, and the
+  replay earns its own session. Opener-only deliberately: the cold review
+  executed a double credit under a looser any-same-release-track trigger (a
+  stale mid-album re-identification split + credited, then the still-playing
+  closer's own re-identification re-armed the remainder past the #182 gate)
+  — that sequence is regression-pinned to a single credit. Release-less
+  (FALLBACK) tracks still never trigger splits, preserving #181's no-split
+  love-target path. Accepted conservative residuals, pinned or documented:
+  a re-drop straight into a later track (side-B replay) still merges — the
+  old undercount, for that slice only; a replay of a wholly DB-degraded
+  playthrough is absorbed by the #184 suppression (at most one lost Last.fm
+  love; the degraded playthrough was uncreditable anyway); and one KNOWN
+  phantom (#227, accepted with Lane): a reprise/bookend closer whose tail
+  Shazam-resolves to the opener's row can trip the boundary with no real
+  re-drop and double-credit — a genuine re-drop and this case both yield a
+  2-row remainder, so it is documented rather than fixed.
+
 - **The Last.fm love now targets the album's closer, not the last track
   identified (#181 — MEDIUM, `R4:data-3`).** `_finalize_session` recomputed
   the love target as `identified_tracks[-1]`, which equals the closer only if

@@ -23,18 +23,50 @@ new record.  Detection compares against the session's last_release_id
 (v1.3.5) rather than the latched album_release_id: the latch only sets from
 collection-owned tracks, so a DB-resolved first record would otherwise leave
 nothing to compare against and let record 2 inherit (and be phantom-credited
-for) record 1's completed play.  The signal is reliable because
-MetadataResolver's album cache (v1.3.3) guarantees every track of an album
-resolves to identical release IDs within a session.  Tracks without a
-release_id (FALLBACK source) can't be distinguished and never trigger a
-split.
+for) record 1's completed play.  The album cache (v1.3.3) makes the signal
+MOSTLY reliable — every cached track of an album resolves to the same
+release id — but B-4's carve-out deliberately leaves a transiently-degraded
+DATABASE-tier resolve UNCACHED so the next track retries the collection
+tier, and that retry routinely lands on a DIFFERENT (owned) pressing id for
+the same album.  #184 therefore suppresses the split for exactly that tier
+upgrade: last id DATABASE-sourced, incoming track COLLECTION-sourced with
+the same resolver cache key (threaded as TrackMetadata.resolve_key).  A
+genuine swap changes the key and still splits.  Residual, accepted: a
+DB-sourced closer's is_last_track was computed against the DB pressing's
+tracklist, which can differ from the owned pressing's — erring toward the
+conservative miss.
+
+Replay boundary (#185): equal release ids can also hide a REAL boundary —
+the same record re-dropped inside the silence window used to merge two
+complete playthroughs into one credit.  The album's OPENER (resolved row 0)
+arriving after potential_last_track armed (and not a consecutive
+re-identification) now splits exactly like a record change: the finished
+playthrough credits at the boundary and the replay earns its own session.
+Opener-only on purpose — a looser trigger let stale mid-album
+re-identifications mint a double credit for one playthrough.  Accepted
+conservative residuals: a re-drop straight into a later track still merges
+(the old undercount, for that slice); a replay of a WHOLLY DB-degraded
+playthrough is absorbed by the #184 suppression (costing at most one
+Last.fm love — the degraded playthrough was uncreditable anyway); and after
+a #184 tier upgrade the degraded DB row is not #182 support, so a SHORT
+album needs two collection-resolved rows after the blip to credit.  One
+KNOWN phantom residual survives opener-only (#227, LOW, accepted with Lane
+2026-08-08): on a reprise/bookend album whose closer musically echoes the
+opener, a late chunk of the still-playing closer can Shazam-resolve to the
+opener's row (global_index 0), tripping this boundary with no real re-drop
+and minting a second credit — distinguishing it from a genuine re-drop is
+not cheaply possible (both yield a 2-row remainder), so it is documented
+rather than fixed.
+
+Tracks without a release_id (FALLBACK source) can't be distinguished and
+never trigger a split.
 """
 
 import asyncio
 import logging
 from typing import Callable, Optional, TYPE_CHECKING
 
-from src.metadata.models import PlaySession, TrackMetadata
+from src.metadata.models import MetadataSource, PlaySession, TrackMetadata
 from src.audio.silence import AudioEvent
 from src.util.clock import clock_is_trustworthy
 
@@ -242,6 +274,21 @@ class ListenTracker:
             detached = self._detach_session_locked(expected=expected)
         if detached is not None:
             await self._finalize_detached(detached)
+
+    def _is_consecutive_reidentification(self, track) -> bool:
+        """#185: is *track* the same physical identification as the last logged
+        one?  Mirrors log_track's consecutive-dedup identity (title, artist,
+        release id) — the replay boundary must not fire on a closer merely
+        re-confirmed across overlapping chunks, and this check runs BEFORE
+        log_track's own dedup gets the chance to swallow the duplicate."""
+        if not self._session or not self._session.identified_tracks:
+            return False
+        last = self._session.identified_tracks[-1]
+        return (
+            last.title == track.title
+            and last.artist == track.artist
+            and last.discogs_release_id == track.discogs_release_id
+        )
 
     def _detach_session_locked(self, expected=_CURRENT_SESSION):
         """Detach and return the active session (or None).  SYNCHRONOUS — no
@@ -585,16 +632,70 @@ class ListenTracker:
             if self._session is None:
                 self._start_session()
 
+            split_reason = None
             if (
                 self._session.last_release_id is not None
                 and track.discogs_release_id is not None
                 and track.discogs_release_id != self._session.last_release_id
             ):
-                log.info(
-                    f"Album change detected mid-session "
-                    f"(release {self._session.last_release_id} → "
-                    f"{track.discogs_release_id}) — splitting session."
+                # #184: suppress the split for a B-4 tier upgrade — the last id
+                # came from a DATABASE-sourced degraded resolve (transient blip
+                # left the album uncached), and this track re-resolved the SAME
+                # album (same resolver cache key) via the collection tier under
+                # the owned pressing's id.  Asymmetric on purpose: a genuine
+                # swap changes the key, and collection→database (unreachable —
+                # collection results are cached) stays a conservative split.
+                if (
+                    self._session.last_release_source is MetadataSource.DISCOGS_DATABASE
+                    and track.source is MetadataSource.DISCOGS_COLLECTION
+                    and track.resolve_key is not None
+                    and track.resolve_key == self._session.last_release_resolve_key
+                ):
+                    log.info(
+                        f"Tier upgrade, not an album change (#184): release "
+                        f"{self._session.last_release_id} (database-degraded) → "
+                        f"{track.discogs_release_id} (owned pressing) for the same "
+                        f"album {track.resolve_key!r} — continuing the session."
+                    )
+                else:
+                    split_reason = (
+                        f"Album change detected mid-session "
+                        f"(release {self._session.last_release_id} → "
+                        f"{track.discogs_release_id})"
+                    )
+            elif (
+                # #185: the replay boundary.  The album's OPENER (resolved
+                # tracklist row 0) arriving AFTER the closer armed the session
+                # means the record was re-dropped inside the silence window.
+                # Split exactly like a record change so the finished
+                # playthrough credits and the replay earns its own session.
+                #
+                # Opener-only ON PURPOSE (#184/#185 cold review): a looser
+                # "any same-release non-duplicate track" trigger double-
+                # credited one physical playthrough — a stale mid-album
+                # re-identification split + credited, then the still-playing
+                # closer's own re-identification re-armed the remainder with
+                # two genuine rows, passing the #182 gate for a second credit.
+                # The opener is the one row a genuine re-drop identifies first
+                # and chunk-overlap noise essentially never resurfaces late.
+                # Accepted conservative residuals: a re-drop straight into a
+                # LATER track (side-B replay, needle past the opener) still
+                # merges (the pre-#185 undercount, for that slice only).
+                # Release-less (FALLBACK) tracks keep never triggering splits.
+                self._session.potential_last_track
+                and track.discogs_release_id is not None
+                and track.discogs_release_id == self._session.last_release_id
+                and track.side_index.global_index == 0
+                and not self._is_consecutive_reidentification(track)
+            ):
+                split_reason = (
+                    f"Replay boundary (#185): '{track.title}' of release "
+                    f"{track.discogs_release_id} identified after the closer "
+                    f"armed the session — the record was re-dropped"
                 )
+
+            if split_reason is not None:
+                log.info(f"{split_reason} — splitting session.")
                 # Detach + restart atomically under the lock so a concurrently
                 # scheduled SESSION_ENDED can't slip between them (B-2).  The
                 # detach is synchronous; the OLD session's crediting is deferred to

@@ -46,17 +46,18 @@ def _loved_title(lastfm):
 @pytest.mark.asyncio
 async def test_replay_after_closer_still_loves_the_closer():
     """Sequence 1: closer arms the session, side A is re-dropped inside the
-    silence window (same release, no split) — the love must target the closer,
-    not the replayed opener."""
+    silence window.  Since #185 the replay is a SPLIT boundary: the finished
+    playthrough finalizes at the boundary and its love must target the closer
+    — never the replayed opener, which lives in a fresh session that ends
+    unloved (completion gate).  (#181's closing_track remains load-bearing on
+    the no-split FALLBACK path, tested below.)"""
     tracker, lastfm = _love_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))      # supporting (#182 gate)
     await tracker.on_track_identified(make_track("Master-Dik"))        # closer (B4)
-    await tracker.on_track_identified(make_track("Catholic Block"))    # replayed opener (A1)
     session = tracker._session
-
-    # Production path: detach + finalize via _end_session, not the private
-    # finalize on a still-attached session (#181 cold-review note).
-    await tracker._end_session()
+    await tracker.on_track_identified(make_track("Catholic Block"))    # replay → #185 split
+    await tracker._end_session()                                       # ends the replay session
 
     assert _loved_title(lastfm) == "Master-Dik"
     assert session.loved is True

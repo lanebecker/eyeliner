@@ -396,15 +396,21 @@ Key properties (all delegating to `side_index`):
 **`PlaySession`**: Tracks one needle-drop-to-lift session.
 
 Key fields: `started_at`, `identified_tracks`, `potential_last_track`,
-`album_release_id`, `album_instance_id`, `last_release_id` (v1.3.5 — most
-recent release ID seen from any source; drives the auto-split, unlike the
-latched pair which only collection-owned tracks set)
+`closing_track` (#181 — the track that armed the flag; the Last.fm love
+target), `album_release_id`, `album_instance_id`, `last_release_id`
+(v1.3.5 — most recent release ID seen from any source; drives the
+auto-split, unlike the latched pair which only collection-owned tracks
+set), `last_release_source` / `last_release_resolve_key` (#184 — recorded
+beside `last_release_id` so the split detector can recognise a B-4 tier
+upgrade)
 
 `log_track(track)` behaviour:
 - Deduplicates consecutive identical tracks
-- Sets `potential_last_track = True` when `track.is_last_track`
-- Updates `last_release_id` from any track carrying a `discogs_release_id`
-  (v1.3.5 — including DB-sourced tracks that never latch)
+- Sets `potential_last_track = True` when `track.is_last_track` (and records
+  the arming track as `closing_track`, #181)
+- Updates `last_release_id` (plus its source and resolver key, #184) from
+  any track carrying a `discogs_release_id` (v1.3.5 — including DB-sourced
+  tracks that never latch)
 - Latches `album_release_id` / `album_instance_id` from the **first track that
   has BOTH IDs** — i.e. the first DISCOGS_COLLECTION-sourced track.
   DISCOGS_DATABASE results (which have a `release_id` but no `instance_id`,
@@ -686,9 +692,21 @@ completion.
    `last_release_id` (v1.3.5), which updates from ANY source carrying a
    release ID — comparing against the latch alone missed swaps where the
    first record was DB-resolved (never latches), letting record 2 inherit
-   and be phantom-credited for record 1's completed play.  Reliable because
-   the v1.3.3 album cache guarantees consistent release IDs per album;
-   FALLBACK tracks (no release ID) never trigger a split
+   and be phantom-credited for record 1's completed play.  The v1.3.3 album
+   cache makes the signal MOSTLY reliable — but B-4's carve-out leaves a
+   transiently-degraded DATABASE-tier resolve uncached, and the next track's
+   collection retry routinely lands on a different (owned) pressing id for
+   the same album.  **#184** therefore suppresses the split for exactly that
+   tier upgrade: last id DATABASE-sourced, incoming COLLECTION-sourced, same
+   resolver cache key (`TrackMetadata.resolve_key`, recorded on the session
+   as `last_release_source`/`last_release_resolve_key`).  A genuine swap
+   changes the key and still splits.  **#185 replay boundary:** the album's
+   OPENER (resolved row 0) arriving after `potential_last_track` armed — and
+   not a consecutive re-identification — splits like a record change, so an
+   immediate same-record re-drop credits both playthroughs (opener-only on
+   purpose: a looser trigger double-credited one playthrough via stale
+   mid-album re-identifications).  FALLBACK tracks (no release ID) never
+   trigger a split
 3. `SESSION_ENDED` → `_end_session()` scheduled via `asyncio.create_task`,
    with a strong reference held in `_bg_tasks` until the task completes
    (v1.3.3 — asyncio only weak-references tasks, and this one performs the

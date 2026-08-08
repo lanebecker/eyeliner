@@ -300,6 +300,14 @@ class TrackMetadata:
     cover_art_url: Optional[str] = None
     tracklist: list["TracklistEntry"] = field(default_factory=list)
     genres: list[str] = field(default_factory=list)
+    # #184: the resolver's normalised (artist, album) cache key that produced
+    # this track — RAW Shazam strings, not the Discogs album title (which can
+    # differ between pressings).  Lets the split detector recognise a B-4
+    # tier upgrade (DATABASE→COLLECTION re-resolve of the SAME album under a
+    # different release id) without trusting cross-pressing album strings.
+    # None for tracks built outside the resolver (older tests, direct
+    # construction) — a None key never suppresses a split.
+    resolve_key: Optional[tuple] = None
 
     # ------------------------------------------------------------------
     # Positional facts (side-awareness + last-track detection)
@@ -372,6 +380,13 @@ class PlaySession:
     # DB-resolved (nothing latched → no difference detected → record 2 could
     # be phantom-credited with record 1's completed play).
     last_release_id: Optional[int] = None
+    # #184: recorded alongside last_release_id so the split detector can
+    # recognise a B-4 tier upgrade (the last id came from a DATABASE-sourced
+    # degraded resolve; the incoming COLLECTION-sourced track re-resolved the
+    # SAME album — same resolver cache key — under the owned pressing's id)
+    # and suppress the spurious split.
+    last_release_source: Optional[MetadataSource] = None
+    last_release_resolve_key: Optional[tuple] = None
     # Set True once this session's Play Count has actually been credited
     # (the write LANDED), so a re-entrant end (the B-2 race, or a split misfire
     # that finalizes the same session twice) cannot double-increment the same
@@ -488,6 +503,8 @@ class PlaySession:
             self.closing_track = track
         if track.discogs_release_id:
             self.last_release_id = track.discogs_release_id
+            self.last_release_source = track.source          # #184
+            self.last_release_resolve_key = track.resolve_key
         # Latch the release/instance IDs from the first collection-sourced track.
         # We require BOTH release_id and instance_id to be set — a release_id alone
         # (which is what DISCOGS_DATABASE returns) is not enough to call the
