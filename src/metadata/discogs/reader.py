@@ -13,6 +13,7 @@ It has no knowledge of the write side (play-count / last-played) — that lives 
 
 import logging
 import re
+import time
 import unicodedata
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import quote
@@ -38,6 +39,26 @@ log = logging.getLogger(__name__)
 # 100,000 records — several times the most extreme personal vinyl collection, so it
 # never clips a real one; it only bounds the pathological case.
 _MAX_COLLECTION_PAGES = 1000
+
+# #191 (stab-2): the appliance runs 24/7 (nothing implements the old "restarts
+# daily" premise), so the collection index CANNOT be cached for the whole
+# process lifetime — a record added to Discogs mid-uptime would never be seen.
+# It gets a monotonic-clock TTL: on access past the TTL the index is rebuilt
+# from the API (one paginated re-fetch, ~1 request/100 releases, trivially
+# within the 60/min limit). monotonic (not wall-clock) is deliberate: it is
+# immune to the Pi's CLOCK_REALTIME jumps, and a reboot — which resets monotonic
+# — rebuilds the index anyway, so the reset is harmless. 12h is the safety-net
+# bound; the staleness-triggered refresh below credits same-day additions well
+# before it elapses.
+_COLLECTION_INDEX_TTL_SECONDS = 12 * 3600
+
+# #191 (C): a collection miss whose album the Discogs DATABASE does know is the
+# signature of a just-added record (or simply one the user does not own). The
+# resolver asks the reader to force-refresh the index and re-check ownership;
+# this cooldown bounds that speculative re-page, since the same signal fires on
+# every genuinely-unowned record too. Seeded to -inf so the first refresh is
+# always allowed regardless of the monotonic epoch.
+_INDEX_REFRESH_COOLDOWN_SECONDS = 15 * 60
 
 # #179: Discogs disambiguates same-named artists by appending " (2)", " (3)",
 # etc. to the NAME field ("Nirvana (2)" is the UK 60s band).  The suffix is a
@@ -169,11 +190,20 @@ class DiscogsReader:
         )
         self._client.set_timeout(connect=5, read=_HTTP_TIMEOUT)
 
-        # Lazily-built, session-cached index of the user's collection:
+        # Lazily-built index of the user's collection:
         #   {release_id: {"instance_id", "title", "artists"}}.
-        # The collection is static within a session, so building this ONCE and
-        # matching locally replaces the per-candidate N+1 membership GETs (P-1).
+        # Building this ONCE and matching locally replaces the per-candidate N+1
+        # membership GETs (P-1). It carries a TTL (#191) so a record added during
+        # a long uptime is eventually seen rather than pinned to a boot-time
+        # snapshot; the staleness refresh below picks up same-day additions.
         self._collection_index: Optional[dict] = None
+        # #191: monotonic timestamp of the last successful build, for the TTL.
+        # None means "not built via the TTL'd path" (e.g. injected in a test) —
+        # such an index is trusted and never expired.
+        self._collection_index_built_at: Optional[float] = None
+        # #191 (C): monotonic timestamp of the last forced staleness-refresh,
+        # for the cooldown. -inf so the first refresh always runs.
+        self._last_index_refresh_at: float = float("-inf")
 
     async def run(self, fn, *args):
         """Dispatch one of this reader's blocking methods on the shared,
@@ -193,9 +223,9 @@ class DiscogsReader:
     def search_collection(self, artist: str, album: str) -> Optional[dict]:
         """Search the user's Discogs collection for a release matching artist + album.
 
-        Both strategies match against a session-cached in-memory index of the
-        collection (built once, the collection being static within a session),
-        so neither pays a per-candidate HTTP cost (P-1):
+        Both strategies match against an in-memory index of the collection
+        (built once per TTL window, #191), so neither pays a per-candidate HTTP
+        cost (P-1):
 
         Strategy 1 — database cross-reference (fast):
           Search the Discogs database for up to 25 candidates and check each
@@ -468,8 +498,11 @@ class DiscogsReader:
 
         Replaces the old per-candidate membership GET (one per database
         candidate, up to 25) and the full re-walk with a single paginated fetch
-        + local lookups (P-1).  The collection is static within a session and
-        the process restarts daily, so there is no TTL.
+        + local lookups (P-1).  #191: the index carries a monotonic TTL
+        (_COLLECTION_INDEX_TTL_SECONDS) — the appliance runs 24/7, so a
+        process-lifetime cache would never see a record added mid-uptime; on
+        access past the TTL the index is rebuilt from the API. Same-day
+        additions are picked up sooner by refresh_index_and_research (C).
 
         #169 (DELIBERATELY DEFERRED — do not re-file):  persisting this index to
         disk across restarts (with a TTL) to skip the re-page was considered and
@@ -491,7 +524,15 @@ class DiscogsReader:
         that pins a downgrade for the session (B-4/B-13).  A successfully built
         (possibly empty) index is cached.
         """
-        if self._collection_index is not None:
+        # #191: serve the cached index only while it is within the TTL. A
+        # built_at of None means the index was injected (tests) rather than built
+        # here — trust it and never expire it. A real build stamps built_at, so
+        # the TTL applies and a stale index rebuilds from the API below.
+        if self._collection_index is not None and (
+            self._collection_index_built_at is None
+            or time.monotonic() - self._collection_index_built_at
+            < _COLLECTION_INDEX_TTL_SECONDS
+        ):
             return self._collection_index
 
         index: dict = {}
@@ -545,8 +586,38 @@ class DiscogsReader:
             page += 1
 
         self._collection_index = index
+        self._collection_index_built_at = time.monotonic()   # #191: stamp for the TTL
         log.debug(f"Built collection index: {len(index)} release(s).")
         return index
+
+    def refresh_index_and_research(self, artist: str, album: str) -> Optional[dict]:
+        """#191 (C): force a stale-index rebuild and re-check ownership, once per
+        cooldown.
+
+        The resolver calls this when the collection tier missed but the Discogs
+        DATABASE knows the album — the signature of a record the owner may have
+        just added (the index is a snapshot from up to the TTL ago). It discards
+        the cached index and re-runs :meth:`search_collection` against a freshly
+        built one, returning the owned release if it is now present, else None.
+
+        The cooldown is load-bearing, not cosmetic: the same "missed collection,
+        hit database" signal fires on EVERY record the user genuinely does not
+        own (the common database-tier case), so without it every unowned-record
+        play would trigger a full collection re-page. Within the cooldown this
+        returns None immediately and re-pages nothing. The cooldown is stamped on
+        the ATTEMPT (before the re-page), so a transiently-failing refresh does
+        not hammer Discogs — search_collection's build error still propagates so
+        the resolver leaves the album uncached/retryable (B-4).
+        """
+        now = time.monotonic()
+        if now - self._last_index_refresh_at < _INDEX_REFRESH_COOLDOWN_SECONDS:
+            return None
+        self._last_index_refresh_at = now
+        # Invalidate so search_collection's _get_collection_index rebuilds from
+        # the API rather than serving the stale snapshot.
+        self._collection_index = None
+        self._collection_index_built_at = None
+        return self.search_collection(artist, album)
 
     def _build_result(self, release, instance_id: Optional[int]) -> dict:
         """Build a standardised result dict from a Discogs Release object.

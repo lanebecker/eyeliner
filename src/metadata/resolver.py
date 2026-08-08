@@ -21,9 +21,12 @@ resolve() therefore caches per normalized (artist, album) key:
   - Fallback results cache the cover art URL — but ONLY when both Discogs
     tiers completed without raising.  A network blip should not pin an album
     to fallback metadata for the rest of the session.
-  - The cache is bounded (insertion-order eviction, LRU-refresh on hit) and
-    deliberately has no TTL: collection metadata is effectively static within
-    a single listening session, and the process restarts daily in practice.
+  - The cache is bounded (insertion-order eviction, LRU-refresh on hit).
+    COLLECTION hits are correct and cached without a TTL. DATABASE/FALLBACK
+    entries are DOWNGRADES ("not owned right now"), so they carry a monotonic
+    TTL (_DOWNGRADE_TTL_SECONDS, #191): on a 24/7 appliance a record played
+    before it was added to Discogs would otherwise pin its downgrade forever,
+    with Step 0 short-circuiting every replay before it could re-resolve.
 
 Note: an empty Shazam album string ("") keys all of an artist's unknown-album
 tracks together.  Those tracks would resolve identically anyway, so the
@@ -36,6 +39,7 @@ no locking.
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from src.metadata.models import TrackMetadata, MetadataSource
@@ -52,6 +56,16 @@ log = logging.getLogger(__name__)
 # single listening session will ever touch; eviction exists purely to bound
 # memory on very long uptimes.
 _ALBUM_CACHE_MAX = 64
+
+# #191 (stab-2): DATABASE/FALLBACK entries are DOWNGRADES — they mean "not found
+# in the collection right now" and carry no instance_id, so nothing is credited.
+# On a 24/7 appliance a record played before it was added to Discogs would pin
+# that downgrade forever (Step 0 short-circuits every replay), so these entries
+# get a monotonic-clock TTL: once elapsed the album re-resolves, giving the
+# refreshed index (B1) / staleness refresh (C) a chance to upgrade it to
+# COLLECTION. A COLLECTION hit is correct and is cached WITHOUT a TTL — it never
+# expires. monotonic for the same reason as the index TTL (reboot-safe).
+_DOWNGRADE_TTL_SECONDS = 3600
 
 
 class MetadataResolver:
@@ -99,17 +113,29 @@ class MetadataResolver:
         return (raw.artist.strip().lower(), raw.album.strip().lower())
 
     def _cache_get(self, key: tuple):
-        """Return the cached entry for key (refreshing its LRU position), or None."""
+        """Return the cached ``(source, payload)`` for key (refreshing its LRU
+        position), or None. #191: a DATABASE/FALLBACK downgrade past
+        _DOWNGRADE_TTL_SECONDS is treated as a miss and evicted, so the album
+        re-resolves; a COLLECTION entry never expires."""
         entry = self._album_cache.get(key)
-        if entry is not None:
-            # LRU-ish refresh: pop and re-insert so this entry isn't first to evict.
+        if entry is None:
+            return None
+        source, payload, stored_at = entry
+        if source is not MetadataSource.DISCOGS_COLLECTION and (
+            time.monotonic() - stored_at >= _DOWNGRADE_TTL_SECONDS
+        ):
+            # Stale downgrade: drop it so the caller re-runs the lookup chain.
             self._album_cache.pop(key)
-            self._album_cache[key] = entry
-        return entry
+            return None
+        # LRU-ish refresh: pop and re-insert so this entry isn't first to evict.
+        self._album_cache.pop(key)
+        self._album_cache[key] = entry
+        return (source, payload)
 
     def _cache_store(self, key: tuple, source: MetadataSource, payload):
-        """Insert an entry, evicting oldest entries beyond _ALBUM_CACHE_MAX."""
-        self._album_cache[key] = (source, payload)
+        """Insert an entry, evicting oldest entries beyond _ALBUM_CACHE_MAX.
+        #191: stamps a monotonic timestamp for the downgrade TTL in _cache_get."""
+        self._album_cache[key] = (source, payload, time.monotonic())
         while len(self._album_cache) > _ALBUM_CACHE_MAX:
             # dict preserves insertion order — iter(...) yields oldest first
             self._album_cache.pop(next(iter(self._album_cache)))
@@ -202,14 +228,45 @@ class MetadataResolver:
             )
             if result:
                 log.debug(f"Resolved from Discogs database: {raw.artist} / {raw.album}")
-                # Only cache the database result if the collection tier above
-                # completed cleanly.  If the collection lookup ERRORED (a
-                # transient blip — "couldn't determine ownership"), caching this
-                # DATABASE downgrade would pin an album the user may actually own
-                # to no-Play-Count tracking for the rest of the session (B-4).
-                # Return it for this track, but leave it uncached so the next
-                # track retries the collection lookup.
                 self._logged_discogs_config.pop("database", None)   # #189: re-arm THIS tier
+                # #191 (C): the collection tier missed but the DATABASE knows this
+                # album — the signature of a record the owner may have just added
+                # (the index is a snapshot from up to the TTL ago). Only when the
+                # collection lookup was a CLEAN miss (not an error), ask the reader
+                # to force-refresh the index (cooldown'd) and re-check ownership.
+                # If it is now owned, credit it via the COLLECTION tier instead of
+                # pinning the no-instance_id DATABASE downgrade.
+                if discogs_completed:
+                    try:
+                        upgraded = await self.reader.run(
+                            self.reader.refresh_index_and_research, raw.artist, raw.album
+                        )
+                    except Exception as e:
+                        # A speculative refresh failed transiently: keep the
+                        # DATABASE result for this track but do NOT cache the
+                        # downgrade (ownership unconfirmed), so a later play
+                        # retries — mirrors the B-4 posture.
+                        discogs_completed = False
+                        # Attribute to the "collection" tier: the refresh re-hits
+                        # the same collection endpoint, so its errors share that
+                        # tier's #189 throttle key and actionable hint (and a later
+                        # collection success re-arms it) rather than an orphan key
+                        # that never re-arms.
+                        self._log_discogs_error("collection", e)
+                        upgraded = None
+                    if upgraded:
+                        log.info(
+                            f"Collection index was stale — {raw.artist} / {raw.album} "
+                            f"is owned after a refresh; crediting via the collection."
+                        )
+                        self._logged_discogs_config.pop("collection", None)
+                        self._cache_store(key, MetadataSource.DISCOGS_COLLECTION, upgraded)
+                        return self._from_discogs(
+                            raw, upgraded, MetadataSource.DISCOGS_COLLECTION
+                        )
+                # Only cache the database downgrade if BOTH the collection lookup
+                # and the refresh above completed cleanly (a transient error must
+                # stay retryable, B-4).
                 if discogs_completed:
                     self._cache_store(key, MetadataSource.DISCOGS_DATABASE, result)
                 return self._from_discogs(raw, result, MetadataSource.DISCOGS_DATABASE)

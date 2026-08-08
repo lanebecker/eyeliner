@@ -26,6 +26,9 @@ def make_resolver():
     # mock awaits and calls the target, so a search_collection side_effect
     # (ConnectionError, etc.) still propagates exactly as run_in_executor did.
     r.reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
+    # #191 (C): default the staleness-refresh to "still not owned" so a clean
+    # collection miss + database hit degrades to DATABASE as these tests expect.
+    r.reader.refresh_index_and_research.return_value = None
     r.coverart = MagicMock()
     r.coverart.get_cover_art_url.return_value = "https://coverartarchive.org/x/front"
     r._album_cache = {}

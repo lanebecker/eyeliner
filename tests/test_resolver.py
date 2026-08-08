@@ -51,6 +51,11 @@ def mock_discogs():
     m = MagicMock()
     m.search_collection.return_value = None
     m.search_database.return_value = None
+    # #191 (C): a clean collection miss + database hit asks the reader to
+    # refresh the index and re-check ownership. Default to "still not owned" so
+    # these tests exercise the DATABASE/FALLBACK tiers as before; the C-upgrade
+    # path has its own tests in test_cache_expiry.py.
+    m.refresh_index_and_research.return_value = None
     # #61: the resolver now dispatches Discogs searches through reader.run(fn, …)
     # (the dedicated-executor delegate) instead of loop.run_in_executor(None, …).
     # The mock's run awaits and simply calls the target, so return values /

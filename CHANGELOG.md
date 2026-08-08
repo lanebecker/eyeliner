@@ -134,6 +134,94 @@ section accumulates the fixes.
   re-drop and double-credit — a genuine re-drop and this case both yield a
   2-row remainder, so it is documented rather than fixed.
 
+- **An ambiguous Play Count write can no longer double-credit one play
+  (#186 — HIGH, `R4:data-1`, Wave 2 bundle 2).** The #163 bounded finalize
+  retry re-ran the WHOLE read-modify-write on each attempt: read current →
+  POST current+1. On flaky Pi Wi-Fi an AMBIGUOUS first POST — applied
+  server-side but its response lost to a timeout — made the retry re-read the
+  ALREADY-incremented value and increment AGAIN, so one completed play added
+  **+2** (executed repro: a record at 5 ended at 7, not 6). The write path is
+  now SPLIT into an idempotent read-then-set: `DiscogsCollectionWriter`
+  exposes `read_play_count` (returns the current int, `0` for a
+  confirmed-blank field, or `None` to abort — preserving META-1 "unreadable ≠
+  0" and META-2 "don't clobber a non-integer") and `set_play_count` (an
+  idempotent absolute POST, `retry_on_429=True`). The tracker reads the value
+  ONCE (bounded-retrying only the SAFE GET, via a new `_read_value_with_retry`
+  that treats `0` as valid and only `None` as retryable), then bounded-retries
+  ONLY the absolute set of `current+1` — re-POSTing a fixed value lands the
+  field at that value whether or not a prior POST applied (mirrors the proven
+  B-15 429-retry idempotency). `increment_play_count` remains as a single-shot
+  `read_play_count` + `set_play_count` convenience. Credit is committed
+  (`credited=True`) only after the set lands; an untrusted read aborts with
+  nothing written and the loss logged loudly. Accepted residual: if the FINAL
+  retry's response is ALSO lost, the set may have landed while we log LOST and
+  leave `credited` False — an irreducible ambiguity without a read-back
+  (follow-up filed), but never a double-credit.
+
+- **A creditable album-split finalize now survives shutdown cancellation
+  (#187 — MEDIUM, `R4:data-2`, Wave 2 bundle 2).** The rare creditable split
+  (a record's closer plays right before the swap to another record) finalized
+  its credit AWAITED INLINE in the recognition leg — which `run_pipeline`
+  cancels on shutdown BEFORE `tracker.drain()` runs, and `drain()` only covers
+  the `_bg_tasks` (SESSION_ENDED) tasks — so a `CancelledError` (a
+  `BaseException`, uncaught by the credit's `except Exception`) tore the write
+  in half. The split credit is now registered as a `_bg_tasks` task (so
+  `drain()` awaits it) and awaited under `asyncio.shield`. A plain `await task`
+  does **not** protect the task — cancelling the awaiter propagates to the task
+  it is blocked on via `Task._fut_waiter`, cancelling the credit too (this was
+  the first cut, and its RED test caught it before commit); `asyncio.shield`
+  decouples them, so on shutdown the inline await unwinds while the shielded
+  credit keeps running for `drain()` to complete. shield still propagates a
+  genuine finalize raise out of `on_track_identified` (LB-1: `current_raw`
+  stays un-advanced), and `_on_end_session_done` tolerates the double-retrieval.
+
+- **Stale post-#61 rate-limit comments and an overclaiming 429 log corrected
+  (#192 — LOW, `R4:err-2`, Wave 2 bundle 2).** The transport's
+  `_RATE_LIMIT_MAX_WAIT` rationale still described `request()` as running on
+  the SHARED `run_in_executor(None,…)` pool "that also serves cover downloads
+  and Last.fm scrobbles" — false since #61 moved Discogs to a DEDICATED
+  two-worker pool; the comment now explains the cap in terms of not parking one
+  of only two discogs workers plus the META-10 "a retry inside the cap lands in
+  the same throttle window" logic, and drops the "deferred to #61" language for
+  work #61 already did. The two 429-skip ERROR logs claimed "its caller has no
+  further retry, so the write (e.g. a Play Count credit) may be lost" — false
+  for exactly the example cited: the Play Count credit IS bounded-retried by
+  the finalize layer (#163/#186). The logs now state accurately that idempotent
+  writes are re-issued by their caller while a single-shot write (e.g.
+  `update_last_played`) with no caller retry is the one genuinely lost.
+
+- **Records added to Discogs during a long uptime are now credited without a
+  restart (#191 — MEDIUM, `R4:stab-2`, Wave 2 bundle 3).** The collection index
+  and the resolver's album cache were held for the whole process lifetime on a
+  "restarts daily" premise that nothing implemented — the appliance runs 24/7.
+  So on a multi-week uptime the index was frozen at a boot-time snapshot: a
+  record bought, added to Discogs, and played that evening missed the stale
+  index (both `search_collection` strategies), resolved via the database tier,
+  and was cached as a DATABASE-tier downgrade with **no `instance_id`** and no
+  TTL — every subsequent play silently uncredited until a reboot (the B-4/B-13
+  retry machinery can't help; it's a clean "not owned", not a transient error).
+  Fixed with a **B+C hybrid**, all in-memory (no disk — #169's wrong-write-target
+  concern stands and is untouched):
+  - **B1** — the collection index gets a monotonic-clock TTL
+    (`_COLLECTION_INDEX_TTL_SECONDS`, 12h): past the TTL it rebuilds from the
+    API on next access. `monotonic` (not wall-clock) is deliberate — reboot-safe,
+    and a reboot rebuilds anyway.
+  - **B2** — the resolver's album cache expires **DATABASE/FALLBACK** entries
+    after `_DOWNGRADE_TTL_SECONDS` (1h); **COLLECTION** hits are correct and
+    never expire. This is the load-bearing half the naïve "just TTL the index"
+    fix misses: without it, a previously-downgraded album stays pinned in the
+    Step-0 cache and never re-reaches the lookup chain.
+  - **C** — on a *clean* collection miss whose album the Discogs database DOES
+    know (the signature of a just-added record), the reader force-refreshes the
+    index (behind `_INDEX_REFRESH_COOLDOWN_SECONDS`, 15min) and re-checks
+    ownership, crediting via COLLECTION on that very play instead of pinning the
+    downgrade. The cooldown is load-bearing: the same signal fires on every
+    genuinely-unowned record, so it bounds the speculative re-page. C is gated on
+    a clean miss — a collection *error* leaves the album uncached/retryable (B-4)
+    and never triggers a refresh. The three stale "restarts daily" docstrings
+    (`reader.py`, `resolver.py`, `cover_cache.py`) are corrected. Follow-ups
+    filed: #230 (periodic cover-cache `.part` sweep for the no-restart appliance).
+
 - **The Last.fm love now targets the album's closer, not the last track
   identified (#181 — MEDIUM, `R4:data-3`).** `_finalize_session` recomputed
   the love target as `identified_tracks[-1]`, which equals the closer only if
