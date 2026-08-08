@@ -401,6 +401,64 @@ class PlaySession:
     # album split), and the love must not land on those.
     closing_track: Optional["TrackMetadata"] = None
 
+    @property
+    def completion_supported(self) -> bool:
+        """#182: is this session's armed completion SUPPORTED by its history?
+
+        A Shazam attribution swing can mint a split-off session whose sole
+        track latches an owned compilation AND arms ``potential_last_track``
+        (compilations routinely close with the hit) — phantom-crediting a
+        record that never left its sleeve.  The gate (Lane, 2026-08-08):
+        a latched-release completion counts only when the session identified
+        at least TWO DISTINCT TRACKLIST ROWS of that release (the closer's
+        row plus one supporting row), with a carve-out for genuine
+        single-track releases, whose full play IS one row.
+
+        Distinctness is judged on the resolved row identity
+        (``side_index.global_index``, #182 second-pass review): a decorated
+        re-identification of the closer ("The Hit - 2011 Remaster" after
+        "The Hit" — same release via the album cache, invisible to both the
+        recognizer's and log_track's dedups) resolves to the SAME row via
+        the #180 tiered matcher and counts once, while genuinely different
+        sibling variants ("Golden Hour" and "Golden Hour (Acoustic)" as two
+        rows; a variants-only 12" EP) resolve to different rows and count
+        separately — a decoration-base rule got both of those wrong.  A track
+        whose title resolves to NO row contributes nothing: an identification
+        that cannot be placed on the tracklist cannot vouch for a completed
+        side.  Missed count preferred over phantom count (the META-4
+        posture); callers log the suppression loudly with
+        :attr:`supporting_row_count` for diagnosis.
+
+        Sessions without a latched release are not this gate's concern
+        (returns True; the fallback-metadata branch handles them).
+
+        Documented residual (#182 third pass, accepted): one physical spin
+        whose chunks resolve to two DIFFERENT rows (chunk 1 misattributed to
+        the plain row, chunk 2 to the variant closer, both rows on the
+        tracklist) counts as two rows and passes the gate — as it did under
+        every prior rule except the rejected decoration-base one, whose cure
+        was worse (it falsely refused legitimate sibling rows).
+        """
+        if self.album_release_id is None:
+            return True
+        if self.supporting_row_count >= 2:
+            return True
+        closer = self.closing_track
+        return closer is not None and len(closer.tracklist) == 1
+
+    @property
+    def supporting_row_count(self) -> int:
+        """#182: distinct resolved tracklist rows of the latched release
+        identified this session (0 when no release is latched)."""
+        if self.album_release_id is None:
+            return 0
+        return len({
+            t.side_index.global_index
+            for t in self.identified_tracks
+            if t.discogs_release_id == self.album_release_id
+            and t.side_index.global_index is not None
+        })
+
     def log_track(self, track: TrackMetadata):
         """Record a newly identified track in this session."""
         # Avoid duplicate *consecutive* entries (the same physical track

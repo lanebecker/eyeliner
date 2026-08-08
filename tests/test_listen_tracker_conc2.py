@@ -30,6 +30,9 @@ async def test_conc2_slow_session_credit_does_not_block_recognition():
     # Record A plays through its closer → creditable, latched to release 111.
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(
+        make_track("Cotton Crown", release_id=111, instance_id=222)
+    )  # 182 gate: supporting track
+    await tracker.on_track_identified(
         make_track("Master-Dik", release_id=111, instance_id=222)
     )
     session_a = tracker._session
@@ -86,6 +89,9 @@ async def test_conc2_finalizes_are_serialized_no_concurrent_writer_calls():
     # Two independent creditable, detached sessions (different releases).
     async def detached_creditable(release_id, instance_id):
         tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+        await tracker.on_track_identified(
+            make_track("Cotton Crown", release_id=release_id, instance_id=instance_id)
+        )  # 182 gate: supporting track
         await tracker.on_track_identified(
             make_track("Master-Dik", release_id=release_id, instance_id=instance_id)
         )

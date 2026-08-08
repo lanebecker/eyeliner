@@ -69,6 +69,7 @@ async def test_fallback_swap_does_not_love_the_other_record():
     split) — the love must not land on the other artist's track."""
     tracker, lastfm = _love_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))     # supporting (#182 gate)
     await tracker.on_track_identified(make_track("Master-Dik"))        # closer
     swapped = TrackMetadata(
         title="Unrelated Song",

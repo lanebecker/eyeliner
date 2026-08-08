@@ -23,6 +23,9 @@ async def test_stale_session_ended_does_not_end_new_session_after_split():
 
     # Record A plays through its closer → creditable, latched to release 111.
     await tracker.on_track_identified(
+        make_track("Cotton Crown", release_id=111, instance_id=222)
+    )  # 182 gate: supporting track
+    await tracker.on_track_identified(
         make_track("Master-Dik", release_id=111, instance_id=222)
     )
     session_a = tracker._session
@@ -50,6 +53,7 @@ async def test_session_ended_for_current_session_still_ends_it():
     still works."""
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     live = tracker._session
 
@@ -67,6 +71,9 @@ async def test_scheduled_session_ended_after_split_is_a_noop():
 
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(
+        make_track("Cotton Crown", release_id=111, instance_id=222)
+    )  # 182 gate: supporting track
     await tracker.on_track_identified(
         make_track("Master-Dik", release_id=111, instance_id=222)
     )
@@ -102,6 +109,9 @@ async def test_lock_free_music_started_during_end_does_not_corrupt(tmp_path=None
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(
+        make_track("Cotton Crown", release_id=111, instance_id=222)
+    )  # 182 gate: supporting track
+    await tracker.on_track_identified(
         make_track("Master-Dik", release_id=111, instance_id=222)
     )  # record A, played through its closer → creditable
     session_a = tracker._session
@@ -130,6 +140,9 @@ async def test_real_session_ended_for_current_session_credits_once():
 
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(
+        make_track("Cotton Crown", release_id=111, instance_id=222)
+    )  # 182 gate: supporting track
     await tracker.on_track_identified(
         make_track("Master-Dik", release_id=111, instance_id=222)
     )

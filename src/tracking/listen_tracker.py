@@ -303,7 +303,33 @@ class ListenTracker:
             f"Last track reached: {session.potential_last_track}"
         )
 
-        if session.potential_last_track and session.album_release_id:
+        if (
+            session.potential_last_track
+            and session.album_release_id
+            and not session.completion_supported
+        ):
+            # #182: the completion gate.  The closer armed the session, but no
+            # earlier track of the latched release was identified — the classic
+            # shape of a Shazam attribution swing that minted a one-track
+            # split-off session for an owned compilation.  Suppress the credit
+            # AND the love (below, same gate) rather than phantom-credit a
+            # record that never left its sleeve.  Loud on purpose: a deliberate
+            # closer-only needle drop lands here too (approved behaviour
+            # change), and the operator deserves a diagnosable line.
+            log.info(
+                "Completion gate (#182): closer '%s' armed release %s, but the "
+                "session's %d identification(s) [%s] resolve to only %d distinct "
+                "tracklist row(s) of it — suppressing Play Count / Last Played / "
+                "love (mis-attributed single, re-identified closer, or "
+                "closer-only needle drop; missed count preferred over phantom).",
+                session.closing_track.title if session.closing_track else "?",
+                session.album_release_id,
+                len(session.identified_tracks),
+                ", ".join(repr(t.title) for t in session.identified_tracks[:6])
+                + ("…" if len(session.identified_tracks) > 6 else ""),
+                session.supporting_row_count,
+            )
+        elif session.potential_last_track and session.album_release_id:
             if session.crediting:
                 # A concurrent/re-entrant finalize already owns this session's
                 # credit — in flight, or having already exhausted its bounded
@@ -363,6 +389,7 @@ class ListenTracker:
         # love-side analogue of the B-8 credited/crediting guard above.
         if (
             session.potential_last_track
+            and session.completion_supported   # #182: same gate as the credit
             and not session.loved
             and not session.loving
             and self.lastfm

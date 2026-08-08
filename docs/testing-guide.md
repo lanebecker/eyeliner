@@ -307,7 +307,13 @@ the public `on_silence_event(SESSION_ENDED)` → `create_task` path, T-5). Tests
 every edge case from the architecture doc.
 
 Key cases — Play Count:
-- **Happy path:** last track identified + session ends → `increment_play_count` called with correct `release_id` and `instance_id`
+- **Happy path:** a supporting track AND the last track identified + session
+  ends → `increment_play_count` called with correct `release_id` and
+  `instance_id` (#182: a closer alone no longer credits — the session needs
+  ≥2 distinct resolved tracklist rows of the latched release, single-track
+  releases excepted)
+- **Closer only:** just the last track identified → NOT called, suppression
+  logged with `#182` in the message
 - **Only Side A:** session ends before last track → NOT called
 - **Missed recognition:** all tracks except the last identified → NOT called
 - **Fallback metadata:** last track reached but `discogs_release_id = None` → NOT called

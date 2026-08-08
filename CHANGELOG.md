@@ -13,6 +13,35 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 milestone #17).** The fourth cold audit (2026-08-07) filed #179–#221; this
 section accumulates the fixes.
 
+### Changed
+
+- **A latched-release session must identify ≥2 tracks of that release to earn
+  its Play Count / Last Played / love (#182 — MEDIUM, `R4:gap1-3`; behaviour
+  change approved by Lane 2026-08-08).** A Shazam attribution swing —
+  per-track album attribution jumping to an owned compilation for a hit
+  single — minted a one-track split-off session whose sole track latched the
+  compilation AND armed `potential_last_track` (compilations routinely close
+  with the hit); the next track's split then finalized it as a "completed
+  album": a phantom Play Count + fresh Last Played for a record that never
+  left its sleeve (executed repro: one straight-through album play issued TWO
+  increments). The gate (`PlaySession.completion_supported`) requires the
+  closer's row plus one supporting row of the same release — **distinct
+  resolved tracklist rows** (`side_index.global_index`), so a decorated
+  re-identification of the closer ("The Hit - 2011 Remaster") resolves to
+  the same row and cannot fake supporting evidence (first cold-review
+  catch), while genuine same-base sibling rows ("Golden Hour" / "Golden
+  Hour (Acoustic)", variants-only 12" EPs) each count (second-pass catch —
+  a decoration-base rule wrongly suppressed those; both directions
+  regression-pinned). Identifications that resolve to no row contribute
+  nothing — with a carve-out for
+  genuine single-track releases (their full play IS one track); release-less
+  (FALLBACK) tracks don't count as support, and unlatched sessions are not
+  the gate's concern. Suppression is logged loudly (`#182` in the message) so
+  the one legitimately-affected case — a deliberate needle-drop on just an
+  album's closer, which previously credited — is diagnosable. Missed count
+  preferred over phantom count (the META-4 posture). The same gate covers the
+  Last.fm love (love-on-*completion* — a completion that didn't happen).
+
 ### Fixed
 
 - **The Last.fm love now targets the album's closer, not the last track
