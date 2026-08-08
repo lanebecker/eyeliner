@@ -282,8 +282,17 @@ exceptions and fall through the resolver's fallback chain. Also home to `_as_id`
   per-candidate HTTP cost:
   - Strategy 1: search the Discogs database for up to 25 candidates and look
     each up in the local index by `release_id`; return the first owned hit.
-  - Strategy 2: if strategy 1 misses, fuzzy-match the index entries on
-    artist + album title locally. Catches rare/obscurely-ranked pressings.
+  - Strategy 2: if strategy 1 misses, match the index entries locally on
+    normalised artist + album title (#179): tier 1 exact equality (NFKC +
+    typographic-punctuation fold + casefold + whitespace collapse, with the
+    Discogs `" (n)"` disambiguation suffix stripped from index artist names);
+    tier 2 retries with a trailing parenthetical stripped from one side at a
+    time (decorated query vs plain owned title, or the reverse). Either tier
+    must identify a **unique** owned entry — on ambiguity it refuses to guess
+    and returns `None`, degrading the track to the database tier (correct
+    metadata, no `instance_id`, no Play Count / Last Played write). Catches
+    rare/obscurely-ranked pressings without the old substring matcher's
+    wrong-write-target collisions.
 
   The index (`_get_collection_index`, built once via paginated GETs) replaced
   the old per-candidate membership GET and full re-walk.

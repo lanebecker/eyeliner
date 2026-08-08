@@ -7,6 +7,42 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [Unreleased]
+
+**Round-4 audit remediation begins (Wave 1 — Credit the right record,
+milestone #17).** The fourth cold audit (2026-08-07) filed #179–#221; this
+section accumulates the fixes.
+
+### Fixed
+
+- **Collection strategy 2 no longer matches by bare substring containment
+  (#179 — HIGH, `R4:gap1-1`).** The old fuzzy match (`album_lower in title`,
+  artist likewise), walking the index most-recently-added-first, could select
+  the WRONG owned record as the Play Count / Last Played write target
+  (executed repros: "Led Zeppelin II" credited to an owned *III*; War's "War"
+  credited to an owned Warpaint "Warpaint"; self-titled families silently
+  resolved to the newest addition) and missed exactly-owned records on
+  decorated Shazam titles ("Rumours (Deluxe Edition)" never matched an owned
+  "Rumours"). Strategy 2 is now tiered exact-first on normalised strings
+  (typographic-punctuation fold before NFKC, casefold, whitespace collapse;
+  Discogs `" (n)"` artist-disambiguation suffix stripped from index names),
+  with a tier-2 retry that strips a trailing parenthetical from **one side at
+  a time** — the cold review caught that a both-sides strip would equate
+  distinct parenthetical siblings ("Live (1975)" vs an owned "Live (1980)"),
+  an introduced wrong-write regression, and it is regression-pinned. Either
+  tier must identify a unique owned entry; on ambiguity the matcher refuses
+  to guess (SEC-1 principle) and the track degrades to the database tier (no
+  write target). Known accepted residual, documented at the strip regex: a
+  decorated query can still credit an owned plain-titled member of a family
+  distinguished only by parentheticals (the Discogs "Weezer"-×4 case) —
+  uniqueness protects only when 2+ owned members match under the one-side
+  strip; follow-up filed for a decoration-keyword allowlist. Behaviour note:
+  exact artist matching is stricter than the old containment — real-world
+  name variants ("Rolling Stones" vs "The Rolling Stones", "The Charlatans"
+  vs "The Charlatans UK") that the substring test happened to match now miss
+  (fail-safe: no write target rather than a guessed one); follow-up filed
+  for conservative artist-name folding.
+
 ## [1.5.7] — 2026-08-07
 
 **Code-review follow-ups, round 3 (Waves 6–10).** The residuals surfaced by
