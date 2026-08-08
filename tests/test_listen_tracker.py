@@ -166,6 +166,7 @@ async def test_session_cleared_after_end():
 async def test_increment_play_count_uses_correct_release_and_instance_ids():
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown", release_id=99, instance_id=77))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik", release_id=99, instance_id=77))
     await tracker._end_session()
     writer.increment_play_count.assert_called_once_with(99, 77)
@@ -312,6 +313,7 @@ async def test_increment_play_count_returning_false_does_not_raise():
     from src.tracking.listen_tracker import _FINALIZE_WRITE_ATTEMPTS
     tracker, writer = make_tracker(increment_play_count_return=False)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     # Should complete without raising
     with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
@@ -338,6 +340,7 @@ async def test_failed_credit_is_not_committed_and_is_bounded_retried(caplog):
     import logging
     tracker, writer = make_tracker(increment_play_count_return=False)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     session = tracker._session
     with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()), \
@@ -356,6 +359,7 @@ async def test_credit_is_committed_when_a_retry_eventually_succeeds():
     tracker, writer = make_tracker()
     writer.increment_play_count.side_effect = [False, False, True]
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     session = tracker._session
     with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
@@ -370,6 +374,7 @@ async def test_successful_credit_does_not_retry():
     issues a second increment."""
     tracker, writer = make_tracker(increment_play_count_return=True)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     session = tracker._session
     with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
@@ -431,6 +436,7 @@ async def test_already_counted_album_still_calls_increment_once():
     """increment_play_count handles existing counts — we just call it once per session."""
     tracker, writer = make_tracker(increment_play_count_return=True)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     await tracker._end_session()
     # We called it; Discogs handles the read-before-write
@@ -446,6 +452,7 @@ async def test_full_album_calls_update_last_played_when_configured():
     """When last_played_field_name is configured, update_last_played is called on completion."""
     tracker, writer = make_tracker(last_played_field_name="Last Played")
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     await tracker._end_session()
 
@@ -462,6 +469,7 @@ async def test_discogs_writes_dispatch_through_the_dedicated_executor():
     exactly the two Discogs writes — nothing else is routed through it."""
     tracker, writer = make_tracker(last_played_field_name="Last Played")
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     await tracker._end_session()
 
@@ -476,6 +484,7 @@ async def test_full_album_does_not_call_update_last_played_when_not_configured()
     """When last_played_field_name is None, update_last_played is never called."""
     tracker, writer = make_tracker(last_played_field_name=None)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     await tracker._end_session()
 
@@ -491,6 +500,7 @@ async def test_update_last_played_returning_false_does_not_raise():
         update_last_played_return=False,
     )
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     # Should complete without raising
     await tracker._end_session()
@@ -527,6 +537,7 @@ async def test_real_last_played_failure_is_still_logged(caplog):
         update_last_played_return=False,
     )
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     with caplog.at_level(logging.WARNING), \
          patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
@@ -592,6 +603,7 @@ async def test_divergence_warning_when_playcount_lands_but_last_played_fails(cap
         update_last_played_return=False,
     )
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     with caplog.at_level(logging.WARNING), \
          patch("src.tracking.listen_tracker.clock_is_trustworthy", return_value=True):
@@ -618,6 +630,7 @@ async def test_divergence_warning_when_last_played_lands_but_playcount_fails(cap
         update_last_played_return=True,
     )
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     with caplog.at_level(logging.WARNING), \
          patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()), \
@@ -721,6 +734,7 @@ async def test_full_album_increments_via_public_session_ended_path():
     _end_session() await."""
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))  # the album closer
 
     tracker.on_silence_event(AudioEvent.SESSION_ENDED)
@@ -852,6 +866,7 @@ async def test_album_change_credits_first_record_if_its_closer_played():
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
 
+    await tracker.on_track_identified(make_track("Cotton Crown", release_id=111, instance_id=222))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik", release_id=111, instance_id=222))
     assert tracker._session.potential_last_track is True
 
@@ -1023,6 +1038,7 @@ async def test_failed_love_is_not_committed_and_is_bounded_retried():
     from src.tracking.listen_tracker import _FINALIZE_WRITE_ATTEMPTS
     tracker, lastfm = _make_love_tracker(love_return=False)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     session = tracker._session
     with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
@@ -1038,6 +1054,7 @@ async def test_love_is_committed_when_a_retry_succeeds():
     success."""
     tracker, lastfm = _make_love_tracker(love_side_effect=[False, True])
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))
     session = tracker._session
     with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
@@ -1063,6 +1080,7 @@ async def test_raising_update_last_played_still_runs_the_lastfm_love():
     lastfm.love = MagicMock(return_value=True)
     tracker = ListenTracker(writer, lastfm)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik"))   # full album, last track
     session = tracker._session
     assert session.potential_last_track is True
@@ -1094,6 +1112,7 @@ async def test_collection_then_db_record_still_splits():
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
 
+    await tracker.on_track_identified(make_track("Cotton Crown", release_id=111, instance_id=222))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik", release_id=111, instance_id=222))
     db_track = TrackMetadata(
         title="So What", artist="Miles Davis", album="Kind of Blue",

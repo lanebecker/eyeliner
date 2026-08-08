@@ -695,14 +695,28 @@ the writes use the injected `DiscogsCollectionWriter`):
 ```
 potential_last_track == True
 AND album_release_id is not None
+AND completion_supported == False          (#182 gate: fewer than 2 DISTINCT
+                                            resolved tracklist ROWS of the
+                                            latched release identified —
+                                            unless the release has 1 track)
+    → suppress everything, log loudly ("#182" in the message): the classic
+      shape of a mis-attributed single minting a phantom session, or a
+      closer-only needle drop (missed count preferred over phantom count)
+
+potential_last_track == True
+AND album_release_id is not None
+AND completion_supported == True
     → writer.increment_play_count(release_id, instance_id)
     → writer.update_last_played(release_id, instance_id)   [if configured]
-    → lastfm.love(last_identified_track)                   [if love_on_completion=true]
+    → lastfm.love(closing_track)                           [if love_on_completion=true;
+                                                            #181: the closer that ARMED
+                                                            the session, not the last
+                                                            track identified]
 
 potential_last_track == True
 AND album_release_id is None
     → skip Discogs (fallback metadata, not in collection)
-    → lastfm.love(last_identified_track)                   [if love_on_completion=true]
+    → lastfm.love(closing_track or last_identified_track)  [if love_on_completion=true]
 
 potential_last_track == False
     → skip (only Side A played, or recognition never reached the last track)

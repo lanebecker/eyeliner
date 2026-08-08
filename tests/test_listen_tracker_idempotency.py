@@ -14,6 +14,7 @@ from tests.test_listen_tracker import make_tracker, make_track
 async def test_double_finalize_credits_once():
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown", release_id=111, instance_id=222))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik", release_id=111, instance_id=222))
     session = tracker._session
 
@@ -29,6 +30,7 @@ async def test_double_finalize_credits_once():
 async def test_credited_flag_set_after_crediting():
     tracker, _ = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown", release_id=111, instance_id=222))  # 182 gate: supporting track
     await tracker.on_track_identified(make_track("Master-Dik", release_id=111, instance_id=222))
     session = tracker._session
     assert session.credited is False
