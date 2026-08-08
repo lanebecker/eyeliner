@@ -323,9 +323,17 @@ class CoverArtCache:
     def _sweep_partials(self) -> None:
         """R-1: remove orphaned ``.cover-*.part`` tempfiles.
 
-        A SIGKILL between the tempfile write and the atomic rename strands a
-        partial; nothing else ever removes it, so it accumulates across the
-        daily-restart cadence.  Swept once on construction.
+        A SIGKILL or power-loss between the tempfile write and the atomic rename
+        strands a partial (download()'s own except-handler unlinks its tempfile
+        on an ordinary exception, so those do NOT strand). Swept once on
+        construction — which clears any partial left by the previous run's hard
+        kill (Restart=on-failure boots a fresh process, so a SIGKILL-stranded
+        partial is cleared at the next boot). #191: the appliance is NOT
+        restarted daily, so the rare partial stranded *within* one long uptime
+        (a cleanup unlink that itself failed) is not swept until the next boot; a
+        periodic in-uptime sweep is deferred to a follow-up. The *.jpg disk bound
+        itself is enforced continuously by _prune after every download, so cover
+        files never grow unbounded — only these rare .part orphans can.
         """
         try:
             partials = list(self.cache_dir.glob(".cover-*.part"))
