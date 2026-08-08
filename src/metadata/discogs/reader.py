@@ -12,6 +12,8 @@ It has no knowledge of the write side (play-count / last-played) — that lives 
 """
 
 import logging
+import re
+import unicodedata
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import quote
 
@@ -35,6 +37,68 @@ log = logging.getLogger(__name__)
 # 100,000 records — several times the most extreme personal vinyl collection, so it
 # never clips a real one; it only bounds the pathological case.
 _MAX_COLLECTION_PAGES = 1000
+
+# #179: Discogs disambiguates same-named artists by appending " (2)", " (3)",
+# etc. to the NAME field ("Nirvana (2)" is the UK 60s band).  The suffix is a
+# Discogs rendering artifact, not part of the artist's name, so it is stripped
+# from INDEX artist names before comparison.  Titles never carry it.
+_ARTIST_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
+
+# #179 tier 2: a single trailing parenthetical — the dominant decoration
+# divergence between Shazam's Apple-Music-backed catalogue and Discogs vinyl
+# titles ("Rumours (Deluxe Edition)" vs "Rumours", "The Wall (UK)" vs "The
+# Wall").  Deliberately anchored and single: interior parentheticals are part
+# of the title ("(What's the Story) Morning Glory?" is untouched).
+#
+# The strip is applied ONE SIDE AT A TIME (stripped query vs raw index title,
+# or raw query vs stripped index title) — never both sides in the same
+# comparison.  A both-sides strip would equate two DIFFERENT albums that each
+# carry a distinct trailing parenthetical ("Live (1975)" vs an owned "Live
+# (1980)"), re-introducing the wrong-write-target class this fix exists to
+# kill (caught by the #179 cold review; regression-pinned).
+#
+# ACCEPTED RESIDUAL: a decorated query can still wrongly credit an owned
+# plain-titled member of a family distinguished only by parentheticals — e.g.
+# Discogs titles every colour-era Weezer album "Weezer", so playing "Weezer
+# (Blue Album)" while owning only the Green album credits Green.  Uniqueness
+# protects only when 2+ owned members MATCH THE QUERY under the one-side
+# strip; a plain-titled owned member alongside decorated siblings is still
+# credited (the siblings' distinct parentheticals disqualify them, so
+# ambiguity never arms).  The future
+# hardening is a decoration-keyword allowlist for the query-side strip
+# ("deluxe", "edition", "remaster(ed)", "expanded", "anniversary", …), tracked
+# as a follow-up issue rather than smuggled into #179.
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+# #179: NFKC does NOT fold typographic punctuation to ASCII (U+2019 "’" stays
+# U+2019), and Shazam/Apple Music systematically use the typographic forms
+# where Discogs contributors typically type ASCII.  Fold the common variants
+# explicitly; everything here is a rendering choice, never a semantic one.
+_PUNCT_FOLD = str.maketrans({
+    "‘": "'", "’": "'", "ʼ": "'", "`": "'", "´": "'",
+    "“": '"', "”": '"',
+    "–": "-", "—": "-", "−": "-",
+    "…": "...",
+})
+
+
+def _normalize_term(s: str) -> str:
+    """Normalise one side of a collection-match comparison (#179).
+
+    The explicit table folds typographic punctuation NFKC leaves alone (curly
+    quotes, en/em-dashes) and runs on BOTH sides of NFKC (#179 cold review +
+    second pass): before, because NFKC decomposes some table inputs (``´``
+    becomes space + combining acute) so a post-NFKC-only translate would never
+    see them; and again after, because some characters' NFKC *outputs* are
+    table keys (fullwidth grave U+FF40 folds to `````, ``ŉ`` to ``'n``).
+    The table's ASCII outputs are NFKC-stable, so the second pass cannot
+    regress the first.  casefold() is the aggressive Unicode lowercase, and
+    interior whitespace is collapsed so spacing differences can't defeat an
+    exact comparison.
+    """
+    s = unicodedata.normalize("NFKC", s.translate(_PUNCT_FOLD)).translate(_PUNCT_FOLD).casefold()
+    return " ".join(s.split())
 
 
 class DiscogsReader:
@@ -92,9 +156,14 @@ class DiscogsReader:
           Search the Discogs database for up to 25 candidates and check each
           against the local index by release_id.  Returns the first hit.
 
-        Strategy 2 — index fuzzy-match (catches rare/obscure pressings):
-          If strategy 1 finds nothing, fuzzy-match the index entries on
-          artist + album title.
+        Strategy 2 — index exact-first match (catches rare/obscure pressings):
+          If strategy 1 finds nothing, match the index entries on normalised
+          artist + album title: tier 1 exact equality, tier 2 a retry with a
+          trailing parenthetical stripped from ONE album side at a time.  Either
+          tier must identify a UNIQUE owned entry — on ambiguity this refuses
+          to guess and returns None (#179; the SEC-1 principle), because the
+          winner's instance_id becomes the Play Count / Last Played write
+          target and a guessed target corrupts two records' histories at once.
 
         Returns None if the release is not found in the collection.  The index
         build raises on a hard error so the resolver treats it as
@@ -133,32 +202,89 @@ class DiscogsReader:
                 )
                 return self._build_result(release, instance_id=entry["instance_id"])
 
-        # Strategy 2: fuzzy-match the index locally (no extra HTTP).
+        # Strategy 2: exact-first match against the index locally (no extra
+        # HTTP).  #179 replaced the old bare substring containment, whose
+        # executed failure modes all selected a WRONG write target: superstring
+        # siblings ("led zeppelin ii" ⊂ "led zeppelin iii"), cross-artist
+        # collisions ("war" ⊂ "warpaint" in both fields), silently-picked
+        # self-titled family members, and a one-directional miss on decorated
+        # Shazam titles ("Rumours (Deluxe Edition)" never matched "Rumours").
         log.debug(
             f"Strategy 1 found nothing for '{artist} / {album}'; "
-            f"fuzzy-matching the collection index."
+            f"matching the collection index (exact-first, #179)."
         )
-        artist_lower = artist.lower()
-        album_lower = album.lower()
-        # dict iteration is insertion order = collection "added desc", so on a
-        # substring collision the most-recently-added owned album wins (matches
-        # the old collection walk's first-hit-wins behaviour).
-        for release_id, entry in index.items():
-            title = entry["title"].lower()
-            artists = [a.lower() for a in entry["artists"]]
-            if album_lower in title and any(artist_lower in a for a in artists):
-                log.debug(
-                    f"Found in collection (strategy 2): '{entry['title']}' "
-                    f"(release {release_id}, instance {entry['instance_id']})"
-                )
-                # Fetch + build like strategy 1.  A fetch/build error is allowed
-                # to PROPAGATE rather than be swallowed as "not owned": the index
-                # says the user owns this, so a transient blip should leave the
-                # album uncached for retry, not downgrade it (B-4/B-13 parity).
-                release_obj = self._client.release(release_id)
-                return self._build_result(release_obj, instance_id=entry["instance_id"])
+        artist_key = _normalize_term(artist)
+        album_key = _normalize_term(album)
 
-        return None
+        def entry_artist_matches(entry: dict) -> bool:
+            # The " (n)" disambiguation suffix is stripped from INDEX names
+            # only — Discogs appends it to artist names, never to titles, and
+            # Shazam never produces it.
+            return any(
+                _normalize_term(_ARTIST_DISAMBIG_RE.sub("", a)) == artist_key
+                for a in entry["artists"]
+            )
+
+        # Tier 1: exact normalised album + artist equality.
+        matches = [
+            (release_id, entry)
+            for release_id, entry in index.items()
+            if _normalize_term(entry["title"]) == album_key
+            and entry_artist_matches(entry)
+        ]
+
+        # Tier 2: retry with a single trailing parenthetical stripped from ONE
+        # side at a time — the decorated-query direction (stripped query vs raw
+        # index title: "Rumours (Deluxe Edition)" → owned "Rumours") and the
+        # decorated-index direction (raw query vs stripped index title:
+        # "The Wall" → owned "The Wall (UK)").  Never stripped-vs-stripped,
+        # which would equate two different parenthetical siblings (see the
+        # _TRAILING_PAREN_RE comment).  Only reached when tier 1 found nothing.
+        if not matches:
+            album_key_stripped = _normalize_term(_TRAILING_PAREN_RE.sub("", album))
+            if album_key_stripped:
+                def tier2_album_matches(index_title: str) -> bool:
+                    title_key = _normalize_term(index_title)
+                    if album_key_stripped == title_key:
+                        return True
+                    title_key_stripped = _normalize_term(
+                        _TRAILING_PAREN_RE.sub("", index_title)
+                    )
+                    return bool(title_key_stripped) and album_key == title_key_stripped
+
+                matches = [
+                    (release_id, entry)
+                    for release_id, entry in index.items()
+                    if tier2_album_matches(entry["title"])
+                    and entry_artist_matches(entry)
+                ]
+
+        if not matches:
+            return None
+        if len(matches) > 1:
+            # Refuse to guess (#179, SEC-1 principle): two owned entries
+            # qualify, so there is no principled write target.  Returning None
+            # degrades the track to the database tier — correct metadata, no
+            # instance_id, no Play Count / Last Played write.
+            log.info(
+                "Collection match for '%s / %s' is ambiguous (%d owned entries "
+                "qualify: %s); refusing to guess a Play Count write target.",
+                artist, album, len(matches),
+                ", ".join(f"release {rid}" for rid, _ in matches),
+            )
+            return None
+
+        release_id, entry = matches[0]
+        log.debug(
+            f"Found in collection (strategy 2): '{entry['title']}' "
+            f"(release {release_id}, instance {entry['instance_id']})"
+        )
+        # Fetch + build like strategy 1.  A fetch/build error is allowed
+        # to PROPAGATE rather than be swallowed as "not owned": the index
+        # says the user owns this, so a transient blip should leave the
+        # album uncached for retry, not downgrade it (B-4/B-13 parity).
+        release_obj = self._client.release(release_id)
+        return self._build_result(release_obj, instance_id=entry["instance_id"])
 
     def search_database(self, artist: str, album: str) -> Optional[dict]:
         """Search the full Discogs database (not just the user's collection).
