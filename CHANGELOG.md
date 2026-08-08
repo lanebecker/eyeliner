@@ -15,6 +15,20 @@ section accumulates the fixes.
 
 ### Fixed
 
+- **The Last.fm love now targets the album's closer, not the last track
+  identified (#181 — MEDIUM, `R4:data-3`).** `_finalize_session` recomputed
+  the love target as `identified_tracks[-1]`, which equals the closer only if
+  nothing was identified after it. Two realistic sequences broke that
+  (executed repros): re-dropping side A within the 45s silence window (same
+  release id, no album split — the replayed opener got loved), and a
+  FALLBACK-resolved record swap (no release id, split can't trigger — a
+  track of a *different record and artist* got loved on the operator's real
+  Last.fm profile). `PlaySession` now records `closing_track` — the exact
+  track whose `is_last_track` armed `potential_last_track` — and the love
+  targets it, with `identified_tracks[-1]` retained only as a fallback for
+  sessions armed without a recorded closer (behaviour-identical for normal
+  completions, mutation-pinned in both directions).
+
 - **SideIndex now matches Shazam titles against Discogs tracklist rows with
   tiered normalisation (#180 — HIGH, `R4:gap1-2`).** The old
   ``lower().strip()`` exact equality missed every routinely-decorated Shazam

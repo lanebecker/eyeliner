@@ -393,6 +393,13 @@ class PlaySession:
     loved: bool = False
     # #163: the love-side "in-flight" latch — the B-23 analogue of `crediting`.
     loving: bool = False
+    # #181: the track whose is_last_track ARMED potential_last_track — the
+    # album's closer, recorded at arming time.  The Last.fm love targets this,
+    # NOT identified_tracks[-1]: tracks can legitimately be identified AFTER
+    # the closer within the same session (side A re-dropped inside the 45s
+    # silence window; a FALLBACK-resolved record swap that can't trigger the
+    # album split), and the love must not land on those.
+    closing_track: Optional["TrackMetadata"] = None
 
     def log_track(self, track: TrackMetadata):
         """Record a newly identified track in this session."""
@@ -416,6 +423,11 @@ class PlaySession:
         self.identified_tracks.append(track)
         if track.is_last_track:
             self.potential_last_track = True
+            # #181: remember WHICH track armed the flag (the closer) so the
+            # Last.fm love can target it even if more tracks are identified
+            # afterwards.  The consecutive-dedup early-return above is
+            # harmless here: the first occurrence already recorded itself.
+            self.closing_track = track
         if track.discogs_release_id:
             self.last_release_id = track.discogs_release_id
         # Latch the release/instance IDs from the first collection-sourced track.

@@ -350,7 +350,13 @@ class ListenTracker:
                 "or updating Last Played (likely only one side played)."
             )
 
-        # Last.fm: love the last track if the full side completed and love is enabled.
+        # Last.fm: love the album's CLOSER if the full side completed and love
+        # is enabled.  #181: the target is session.closing_track — the track
+        # whose is_last_track armed potential_last_track — NOT the last track
+        # identified: a side re-dropped inside the silence window or a
+        # FALLBACK-resolved swap appends tracks AFTER the closer, and the love
+        # must not land on those (identified_tracks[-1] remains only as a
+        # fallback for sessions armed without a recorded closer).
         # Runs independently of Discogs — a Discogs failure doesn't prevent this.
         # Gated on session.loved (committed) AND session.loving (in-flight) so a
         # re-entrant/double finalize can't love the same track twice (B-23) — the
@@ -362,7 +368,9 @@ class ListenTracker:
             and self.lastfm
             and self.lastfm.love_on_completion
         ):
-            last_track = session.identified_tracks[-1] if session.identified_tracks else None
+            last_track = session.closing_track or (
+                session.identified_tracks[-1] if session.identified_tracks else None
+            )
             if last_track:
                 # #163: latch IN-FLIGHT before the await (a re-entrant finalize
                 # bails on the guard above), but commit `loved` only AFTER the love
