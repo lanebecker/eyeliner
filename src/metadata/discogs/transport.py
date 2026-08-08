@@ -70,9 +70,14 @@ def _redact_url(url: str) -> str:
     """Return a log-safe version of a Discogs URL: path only, with the username
     segment masked and the query string dropped (finding S-4).
 
-    The auth token rides in a header (never the URL), so this isn't a live leak
-    today, but the full request path embeds the account username and any future
-    query-string credential would otherwise land in the logs verbatim.
+    In THIS transport the auth token rides in an Authorization header, not the
+    URL, so dropping the query here is defence-in-depth against a future
+    query-string credential rather than a live leak. Note the OTHER half of
+    Discogs traffic is different: the python3-discogs-client library
+    (DiscogsReader's search/release/tracklist calls) authenticates with the token
+    as a URL QUERY parameter, so its exception text DOES embed the token — that
+    leak is handled centrally by main.py's _SecretRedactingFilter (#202), not
+    here, because those library exceptions never pass through this function.
     """
     try:
         parts = urlsplit(url)

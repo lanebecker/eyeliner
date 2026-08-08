@@ -19,6 +19,7 @@ recognition running headless forever (the "ESC zombie", fixed in v1.3.5).
 
 import asyncio
 import logging
+import re
 import signal
 import sys
 from collections import namedtuple
@@ -64,6 +65,116 @@ def read_version() -> str:
         return (Path(__file__).resolve().parent / "VERSION").read_text().strip()
     except Exception:
         return "unknown"
+
+
+def verify_recognition_backend_importable(config, _import=None) -> None:
+    """#198 (ops-1): fail LOUD at startup if the selected recognition backend's
+    heavy dependencies can't be imported, instead of silently once per chunk.
+
+    shazamio is imported LAZILY inside ShazamIOBackend (the A-13/#17 testability
+    seam the suite relies on — the module must import without the audio stack), so
+    a broken install surfaces only as a WARNING every ~10s chunk with the display
+    latched to NO MATCH FOUND, while systemd sees a healthy service. The dominant
+    cause is Python 3.13+ (the current default Raspberry Pi OS "trixie" image),
+    where PEP 594 removed the stdlib `audioop` module that shazamio's `pydub`
+    dependency imports. Probe the import once here so that failure becomes a
+    ConfigError main() reports and exits non-zero on — which systemd surfaces —
+    while the lazy import stays in place for the recognizer.
+
+    ``_import`` is an injection seam for tests (defaults to importlib.import_module)
+    so both the success and ImportError branches are exercisable without touching
+    the real install.
+    """
+    if config.recognition.backend != "shazamio":
+        return
+    import importlib
+    _import = _import or importlib.import_module
+    try:
+        _import("shazamio")
+    except ImportError as e:
+        raise ConfigError(
+            f"The 'shazamio' recognition backend failed to import: {e}.\n"
+            "  This is almost always Python 3.13+ (the current default Raspberry "
+            "Pi OS 'trixie' image) missing the 'audioop' module that PEP 594 "
+            "removed and shazamio's 'pydub' dependency imports at import time.\n"
+            "  Fix: reinstall dependencies with 'pip install -r requirements.txt' "
+            "(it now pulls in the 'audioop-lts' backport on Python 3.13+), or "
+            "flash the 'Raspberry Pi OS (Legacy, 64-bit)' image (Python 3.11) — "
+            "see docs/pi-setup-guide.md section 1."
+        ) from e
+
+
+class _SecretRedactingFilter(logging.Filter):
+    """#202 (sec-1): scrub known credentials from every log record's message.
+
+    python3-discogs-client authenticates by putting the user token in the URL
+    QUERY, not a header, so a requests-level failure (flaky wifi) stringifies as
+    '... url: /database/search?...&token=<RAW TOKEN>' and is logged VERBATIM by
+    resolver.py / reader.py — bypassing transport._redact_url, which only guards
+    the app's own header-auth transport. Rather than redact per-site, scrub at the
+    boundary: render each record, replace the exact secret strings (and any
+    `token=` query value as belt-and-suspenders for any future/unknown secret)
+    with '<redacted>', then rewrite record.msg/.args so %-formatting downstream
+    cannot reintroduce the secret.
+    """
+
+    _TOKEN_QUERY_RE = re.compile(r"(token=)[^&\s]+")
+
+    def __init__(self, secrets):
+        super().__init__()
+        # Non-empty STRING secrets only (config values should be str, but guard so
+        # a mistyped/None credential can't crash the log path), longest-first so a
+        # secret that is a substring of another is masked before the shorter one.
+        self._secrets = sorted(
+            {s for s in secrets if isinstance(s, str) and s}, key=len, reverse=True
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            # A filter runs in Handler.handle() BEFORE emit(), outside logging's
+            # emit()/handleError fault isolation. getMessage() does msg % args, so
+            # a malformed %-format log call would otherwise raise straight out to
+            # the caller — on this 24/7 pipeline that could kill a coroutine leg
+            # and trip the FIRST_COMPLETED shutdown. DROP such a record (return
+            # False): it can never render (emit()'s own getMessage() would raise
+            # identically), so we lose no real log line — but a `return True` would
+            # hand it to handleError(), which dumps the RAW record.msg/.args to
+            # stderr, and a secret sitting in record.args would leak to exactly the
+            # journal sink this filter exists to protect. Dropping is safe on both
+            # axes: nothing renderable is lost, and nothing unredacted is emitted.
+            return False
+        scrubbed = rendered
+        for secret in self._secrets:
+            if secret in scrubbed:
+                scrubbed = scrubbed.replace(secret, "<redacted>")
+        scrubbed = self._TOKEN_QUERY_RE.sub(r"\1<redacted>", scrubbed)
+        if scrubbed != rendered:
+            record.msg = scrubbed
+            record.args = ()
+        return True  # never drop a record — only sanitise it
+
+
+def install_secret_redaction(config) -> _SecretRedactingFilter:
+    """#202: attach the secret-redacting filter to the root HANDLER(s).
+
+    Attached to the handler, NOT the root logger: per Python logging semantics a
+    logger-level filter does not apply to records propagating up from child
+    loggers (src.metadata.resolver, ...), so a root-LOGGER filter would scrub
+    nothing from the sites that actually leak. basicConfig (module top) installs
+    one root handler; adding the filter there covers every propagated record.
+    """
+    secrets = [
+        config.discogs.user_token,
+        config.lastfm.api_key,
+        config.lastfm.api_secret,
+        config.lastfm.session_key,
+    ]
+    log_filter = _SecretRedactingFilter(secrets)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(log_filter)
+    return log_filter
 
 
 def install_io_executor(loop) -> ThreadPoolExecutor:
@@ -282,9 +393,18 @@ async def main():
     # one friendly startup failure here, not a KeyError deep in a constructor.
     try:
         config = load_config()
+        # #198: fail loud NOW if the configured recognition backend can't import
+        # (e.g. Python 3.13 missing audioop) — reuses this same friendly exit
+        # instead of a silent per-chunk miss at runtime.
+        verify_recognition_backend_importable(config)
     except ConfigError as e:
         log.error(f"Configuration error:\n{e}")
         sys.exit(1)
+
+    # #202: install the credential-redaction filter on the root log handler as
+    # early as possible — before any component can log a token-bearing exception
+    # (the discogs-client library carries the token in the request URL).
+    install_secret_redaction(config)
 
     # CRIT-3: own the shared I/O pool (see install_io_executor) so every
     # run_in_executor(None, …) blocking call runs on a pool we shut down with
