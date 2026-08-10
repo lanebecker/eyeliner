@@ -44,11 +44,38 @@ _PUNCT_FOLD = str.maketrans({
 # one of these — "Song - Part 2" and "(Section I)" are title content, not
 # decoration, and must never be stripped.  Matched against FOLDED text, so the
 # patterns are lowercase ASCII.
-_DECORATION_WORD_RE = re.compile(
-    r"(?:\b(?:remaster(?:ed)?|live|mono|stereo|featuring|version|edit|mix|"
-    r"remix|demo|bonus|deluxe|single|acoustic|instrumental|sessions?|"
-    r"(?:19|20)\d{2})\b|\bfeat\.?)"
+#
+# The CORE lexical vocabulary is shared verbatim by the track-level strip (#180)
+# and the album-level collection matcher (#222) so the two cannot drift (#225).
+_DECORATION_LEXICAL = (
+    r"\b(?:remaster(?:ed)?|live|mono|stereo|featuring|version|edit|mix|"
+    r"remix|demo|bonus|deluxe|single|acoustic|instrumental|sessions?)\b|\bfeat\.?"
 )
+
+# Album-ONLY edition vocabulary (#222).  Deliberately NOT added to the track-
+# level regex below: #222 is scoped to the collection matcher, and the #180
+# track matcher (its 19-mutant campaign) must not shift behaviour.  These words
+# name whole-album editions ("Deluxe Edition", "30th Anniversary", "Expanded",
+# "2011 Reissue") that Shazam/iTunes append; they are the album grammar #222's
+# gate must let through while still rejecting title distinguishers.
+_ALBUM_EXTRA = r"\b(?:edition|expanded|anniversary|reissue)\b"
+
+# A bare 4-digit year is decoration at the TRACK level (a re-recording / version
+# year — "Money (1975)") but a genuine DISTINGUISHER at the ALBUM level (a
+# live-album pressing date — "Live (1975)" vs "Live (1980)").  So the two levels
+# share the core vocabulary above but compose DIFFERENT year policies (#222):
+# the track keeps the year as decoration, the album keeps it as a distinguisher.
+_BARE_YEAR = r"\b(?:19|20)\d{2}\b"
+
+# Track level (#180 — SideIndex): CORE lexical keywords OR a bare year.  This is
+# byte-for-byte the pre-#222 track behaviour (no album-extra words, year kept).
+_DECORATION_WORD_RE = re.compile(f"(?:{_DECORATION_LEXICAL}|{_BARE_YEAR})")
+
+# Album level (#222 — collection matcher): core + album-edition words, NO bare
+# year.  Because a bare-year parenthetical stays a distinguisher, a decorated
+# query ("Live (1975)") can no longer collapse onto a plain-titled owned family
+# member — the #179 residual documented at reader.py's tier 2.
+_ALBUM_DECORATION_WORD_RE = re.compile(f"(?:{_DECORATION_LEXICAL}|{_ALBUM_EXTRA})")
 
 # Anchored, single, innermost-last: interior parentheticals are part of the
 # title ("(What's the Story) Morning Glory?" is untouched), and only the LAST
@@ -111,4 +138,32 @@ def strip_title_decoration(folded: str) -> str:
     m = _TRAILING_DASH_RE.search(folded)
     if m and _DECORATION_WORD_RE.search(m.group(1)):
         return folded[: m.start()].rstrip()
+    return folded
+
+
+def strip_album_decoration(folded: str) -> str:
+    """Strip ONE trailing paren- OR bracket-decoration from a folded ALBUM
+    title, gated on a decoration keyword and EXCLUDING a bare year (#222).
+
+    Distinct from :func:`strip_title_decoration` in two deliberate ways the
+    collection matcher (reader.py) needs and the track-level matcher does not:
+
+    * **Bracket forms.** Shazam/iTunes render album decoration in brackets
+      ("Rumours [Deluxe Edition]", "Nevermind [30th Anniversary]"); the
+      track-level strip handles paren/dash only.
+    * **Bare-year exclusion.** A trailing "(1975)" on an ALBUM is a pressing
+      distinguisher, not decoration (see ``_ALBUM_DECORATION_WORD_RE``), so it
+      is never stripped — otherwise a decorated query collapses onto a plain
+      owned family member.
+
+    Operates on already-folded text, so NFKC has already mapped fullwidth parens
+    "（）"→"()" — closing #222's fullwidth wrong-miss for free.  LOSSY: the caller
+    must apply it ONE SIDE AT A TIME and require a unique match (the #179/#180
+    refuse-to-guess discipline).  Returns *folded* unchanged when no
+    keyword-gated trailing paren/bracket suffix is present.
+    """
+    for pattern in (_TRAILING_PAREN_RE, _TRAILING_BRACKET_RE):
+        m = pattern.search(folded)
+        if m and _ALBUM_DECORATION_WORD_RE.search(m.group(1)):
+            return folded[: m.start()].rstrip()
     return folded
