@@ -15,6 +15,25 @@ section accumulates the fixes.
 
 ### Changed
 
+- **The commit-path session-epoch invariant now lives in one `EpochGuard`
+  (#217 — MEDIUM, Wave 7 bundle 9; behaviour-preserving).** The rule "after any
+  await in the commit path, re-validate the audio's session epoch before the next
+  side effect" was ~8 hand-placed point checks, and five separate past bugs
+  (B-1 #1, PCONC-1 #80, B-19 #68, LB-1 #84, CONC-6 #87) were each one await
+  missing one re-check. `PlayerState.epoch_guard(audio_epoch)` now returns an
+  `EpochGuard` bound once to the audio's own epoch; `TrackCommitService.commit()`
+  threads that guard through every step — the four inline
+  `session_epoch != audio_epoch` comparisons became `guard.is_stale()` /
+  `guard.still_current()`, the tracker's CONC-6 post-lock check is handed
+  `guard.is_stale` as a live BOUND METHOD (never a precomputed bool), and the
+  scrobble runs through `guard.run(...)` — the sanctioned way to add a new
+  commit-path side effect after an await (a v1.6 play-history append would compose
+  with it instead of needing its own remembered check). The recognizer's
+  enqueue-time epoch bind (PCONC-1) and its `_last_epoch`/`_pending_epoch` health
+  counters are deliberately untouched — different invariants. All epoch tests
+  (B-1/PCONC-1/B-19/LB-1/CONC-6) stay green; the load-bearing gates are
+  mutation-verified.
+
 - **Shared `src/util/` extractions — one bounded-LRU cache and one log throttle,
   no longer hand-rolled per module (#220 / #221 — Wave 7 bundle 8).** Both are
   behaviour-preserving; every existing test stays green and each behaviour was

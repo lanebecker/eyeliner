@@ -103,3 +103,69 @@ class PlayerState:
         self.current_raw = None
         self.session_epoch += 1
         self.set_status(PlayerStatus.IDLE)
+
+    def epoch_guard(self, audio_epoch: int) -> "EpochGuard":
+        """Bind an :class:`EpochGuard` to this audio's session epoch (arch-1/#217).
+
+        Call once at commit entry with the AUDIO's OWN epoch — bound at capture
+        time by the recognition loop (PCONC-1), never re-sampled here — and thread
+        the returned guard through every commit-path side effect so the
+        "re-validate after each await" invariant lives in one place.
+        """
+        return EpochGuard(self, audio_epoch)
+
+
+class EpochGuard:
+    """The commit-path session-epoch invariant, in ONE named home (arch-1/#217).
+
+    The rule five separate bugs each violated — B-1 (#1), PCONC-1 (#80),
+    B-19 (#68), LB-1 (#84), CONC-6 (#87) — is: *after any await in the commit
+    path, the session the audio came from may have ENDED* (a needle lift bumps
+    ``session_epoch`` via :meth:`PlayerState.clear`), so re-validate before the
+    next side effect. Each of those bugs was one await missing one re-check.
+
+    A guard binds the audio's own epoch once (via :meth:`PlayerState.epoch_guard`)
+    and every commit-path step checks it through this object instead of
+    re-deriving ``state.session_epoch != audio_epoch`` inline. New side effects
+    compose with :meth:`run` rather than each needing a hand-remembered check —
+    so the invariant is greppable (one type) and an unguarded ``await`` in the
+    commit path reads as a pattern violation.
+
+    Event-loop-thread-only, like the ``PlayerState`` it reads (A-12): it holds no
+    snapshot, only a reference, so :meth:`still_current` / :meth:`is_stale` always
+    read the LIVE epoch — which is why they are passed as bound methods to
+    collaborators that re-check after an await (never a precomputed bool).
+    """
+
+    __slots__ = ("_state", "_audio_epoch")
+
+    def __init__(self, state: "PlayerState", audio_epoch: int):
+        self._state = state
+        self._audio_epoch = audio_epoch
+
+    def still_current(self) -> bool:
+        """True while the audio's session is still the live one."""
+        return self._state.session_epoch == self._audio_epoch
+
+    def is_stale(self) -> bool:
+        """True once the audio's session has ended (the needle lifted).
+
+        Passed as a BOUND METHOD to collaborators that re-evaluate it AFTER
+        acquiring a lock — the tracker's CONC-6 post-lock drop — so they read the
+        live epoch, not a snapshot taken before the wait.
+        """
+        return self._state.session_epoch != self._audio_epoch
+
+    async def run(self, step):
+        """Await ``step()`` ONLY while the session is still current; else skip.
+
+        THE sanctioned way to add a new commit-path side effect that follows an
+        await (a v1.6 play-history append, say): routing it through ``run`` means
+        its staleness re-check cannot be forgotten — the recurrence class #217
+        closes. ``step`` is a ZERO-ARG CALLABLE returning an awaitable (a factory,
+        so a skipped step's coroutine is never created — no "coroutine was never
+        awaited" warning). Returns the step's result, or ``None`` when skipped.
+        """
+        if not self.still_current():
+            return None
+        return await step()
