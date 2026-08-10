@@ -26,7 +26,7 @@ What this deliberately does NOT cover (genuinely hardware-bound):
     drives is covered hardware-free by tests/test_chunking.py.
 """
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import numpy as np
 import pytest
@@ -871,3 +871,133 @@ def test_first_drop_logs_even_at_low_monotonic(monkeypatch, caplog):
         cap._enqueue_block(q, np.zeros(4, dtype=np.float32))   # first-ever drop
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1     # reported despite monotonic() < interval
+
+
+# ---------------------------------------------------------------------------
+# #209 (R4:test-1) — run()'s block loop is the SINGLE integration point that
+# feeds the whole pipeline (silence → session lifecycle; recognizer → display/
+# scrobble). Coverage showed the happy-path dispatch never executed: a mutant
+# replacing the loop body with `pass` (every chunk silently dropped) passed the
+# full suite. These pin that run() actually feeds each assembled chunk to
+# silence.process + (music-gated) recognizer.enqueue, plus the None stop-sentinel.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_feeds_assembled_chunks_to_silence_and_recognizer(monkeypatch):
+    # chunk_seconds=1, overlap=0 → chunk_frames == sample_rate, so a single block
+    # of sample_rate samples makes ChunkAssembler emit exactly one chunk.
+    cap = make_capture(chunk_seconds=1, overlap_seconds=0)
+    cap.silence = MagicMock()
+    cap.silence.is_music_playing = True          # music verdict → recognition runs (#193)
+    cap.recognizer = MagicMock()
+    cap.recognizer.enqueue = AsyncMock()          # run() awaits enqueue
+
+    monkeypatch.setattr(capture_module.sd, "query_devices",
+                        lambda *a, **k: [device("USB Audio Codec", 2)])
+    monkeypatch.setattr(capture_module.sd, "InputStream",
+                        MagicMock(side_effect=lambda **k: _cm_stream_mock()))
+
+    dispatched = asyncio.Event()
+    real_dispatch = cap._dispatch_chunk
+    async def spy(chunk, sr):
+        await real_dispatch(chunk, sr)
+        dispatched.set()
+    cap._dispatch_chunk = spy
+
+    task = asyncio.create_task(cap.run())
+    try:
+        for _ in range(200):                      # wait until run() creates the queue
+            if cap._blocks is not None:
+                break
+            await asyncio.sleep(0)
+        assert cap._blocks is not None
+        cap._blocks.put_nowait(np.ones(cap.sample_rate, dtype=np.float32))
+        await asyncio.wait_for(dispatched.wait(), timeout=2.0)
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # silence.process ran on the assembled chunk with the stream's sample_rate…
+    assert cap.silence.process.call_count >= 1
+    proc_args = cap.silence.process.call_args.args
+    assert isinstance(proc_args[0], np.ndarray) and len(proc_args[0]) == cap.sample_rate
+    assert proc_args[1] == cap.sample_rate
+    # …and the same chunk was enqueued for recognition with the sample_rate.
+    cap.recognizer.enqueue.assert_awaited()
+    assert cap.recognizer.enqueue.await_args.args[1] == cap.sample_rate
+
+
+@pytest.mark.asyncio
+async def test_dispatch_chunk_gates_recognition_on_the_music_verdict():
+    # #193/#195: silence.process runs on EVERY chunk (drives the lifecycle), but
+    # recognizer.enqueue is skipped when the detector reports no music — an idle
+    # turntable must not POST digital silence to Shazam every hop.
+    cap = make_capture()
+    cap.silence = MagicMock()
+    cap.silence.is_music_playing = False
+    cap.recognizer = MagicMock()
+    cap.recognizer.enqueue = AsyncMock()
+    chunk = np.zeros(8, dtype=np.float32)
+
+    await cap._dispatch_chunk(chunk, 44100)
+
+    cap.silence.process.assert_called_once_with(chunk, 44100)
+    cap.recognizer.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_treats_a_none_block_as_a_stop_sentinel_not_a_chunk(monkeypatch):
+    # #209: `if block is None: continue` — the stop() wake sentinel must be
+    # skipped, never fed to assembler.feed() (which raises on None and would take
+    # the CONC-5 error/rebuild path). Deterministic pin (no sleeps, no reliance on
+    # queue.empty() — which flips at PUT time, before run() resumes): spy
+    # ChunkAssembler.feed and assert every block it receives is a real array. A
+    # trailing real block, once fed, proves run() consumed PAST the sentinel; on
+    # the guard-removed mutant feed(None) records a None first and this goes RED.
+    cap = make_capture(chunk_seconds=1, overlap_seconds=0)
+    cap.silence = MagicMock()
+    cap.silence.is_music_playing = True
+    cap.recognizer = MagicMock()
+    cap.recognizer.enqueue = AsyncMock()
+
+    fed = []
+    real_feed = capture_module.ChunkAssembler.feed
+    def spy_feed(self, block):
+        fed.append(block)
+        return real_feed(self, block)
+    monkeypatch.setattr(capture_module.ChunkAssembler, "feed", spy_feed)
+
+    monkeypatch.setattr(capture_module.sd, "query_devices",
+                        lambda *a, **k: [device("USB Audio Codec", 2)])
+    monkeypatch.setattr(capture_module.sd, "InputStream",
+                        MagicMock(side_effect=lambda **k: _cm_stream_mock()))
+
+    task = asyncio.create_task(cap.run())
+    try:
+        for _ in range(200):
+            if cap._blocks is not None:
+                break
+            await asyncio.sleep(0)
+        assert cap._blocks is not None
+        cap._blocks.put_nowait(None)                                        # the stop sentinel
+        cap._blocks.put_nowait(np.ones(cap.sample_rate, dtype=np.float32))  # a real block behind it
+        for _ in range(500):                    # wait until the assembler is fed at all
+            if fed:
+                break
+            await asyncio.sleep(0)
+    finally:
+        cap.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # The assembler WAS fed (the real block got through), and NOTHING it received
+    # was the None sentinel — i.e. `if block is None: continue` held.
+    assert fed, "run() never fed the assembler — the block did not flow through"
+    assert all(isinstance(b, np.ndarray) for b in fed)
