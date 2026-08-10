@@ -359,7 +359,7 @@ doc-vs-code gaps — Hue-Diversity formally deferred and resolution-independence
 backed by a layout matrix (#73–#74). Test suite grew 545 → 632. The one deferred
 follow-up is #61 (dedicated Discogs executor), gated on real rate-limit evidence.
 
-### v1.5.2 – v1.5.7 — Code-review hardening, round 3 ✅ (current)
+### v1.5.2 – v1.5.7 — Code-review hardening, round 3 ✅
 
 **No new user-facing features.** A third adversarial cold audit
 (`CODE_REVIEW_2026-07-30.md`) filed 88 issues across five milestones, remediated
@@ -383,6 +383,31 @@ test → mutation-check → independent cold-review discipline. By wave:
   responses, and a throttled capture-error log.
 
 See `CHANGELOG.md` for the full per-issue breakdown.
+
+### v1.5.8 — Code-review hardening, round 4 ✅ (current)
+
+**No new user-facing features** (one visible tweak: brighter status-strip text so
+the WCAG AA 4.5:1 promise holds on the strip too — #206). A fourth adversarial
+cold audit (`CODE_REVIEW_2026-08-07.md`) filed #179–#221 across milestones
+#17–#23, remediated in waves through the same implement → RED test →
+mutation-check → independent cold-review discipline:
+
+- **Credit-the-right-record correctness** and the transient/permanent error
+  taxonomy honoured end-to-end.
+- **First-boot / install robustness** and audio-device hotplug + recognition
+  hardening.
+- **Display correctness** — status-strip contrast (#206), background-task
+  exception surfacing (#207), and the settled-palette fix (#208).
+- **Test debt & doc drift** — mutation pins for code three rounds of discipline
+  missed (#209–#213), `DisplayRenderer.run()` loop coverage (#215), and
+  recognition-backend / suite-runtime doc reconciliation (#214/#216).
+- **Architecture pay-down** — one shared `EpochGuard` for the commit-path epoch
+  invariant (#217), and `BoundedCache` + `LogThrottle` extracted to `src/util/`
+  (#220/#221).
+
+#218 and #219 (the v1.6 / v1.7 roadmap seams) are intentionally deferred with
+triggers — they land with the features that need them. See `CHANGELOG.md` for the
+full per-issue breakdown.
 
 ---
 

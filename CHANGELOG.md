@@ -9,9 +9,13 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-**Round-4 audit remediation begins (Wave 1 — Credit the right record,
-milestone #17).** The fourth cold audit (2026-08-07) filed #179–#221; this
-section accumulates the fixes.
+## [1.5.8] — 2026-08-10
+
+**Round-4 audit remediation — Waves 1–7 (milestones #17–#23).** The fourth cold
+audit (2026-08-07) filed #179–#221; this release lands the remediation, each fix
+through the same implement → RED test → mutation-check → independent cold-review
+discipline. #218 and #219 (the v1.6 / v1.7 roadmap seams) are intentionally
+deferred with triggers.
 
 ### Changed
 
