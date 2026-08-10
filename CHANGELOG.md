@@ -9,6 +9,32 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-4 follow-ups (milestone TBD).** The residuals the R4 cold audit filed as
+separate follow-ups (#222–#230), each through the same RED-test → mutation-check
+→ independent-audit discipline.
+
+### Fixed
+
+- **`is_transient` now classifies a `JSONDecodeError` as transient (#228 —
+  LOW).** python3-discogs-client calls `json.loads()` on the response body
+  *before* building its `HTTPError`, so during a real outage a 429/5xx carrying a
+  non-JSON body (a Cloudflare/HTML error page) raises `JSONDecodeError` — which
+  `is_transient` returned `False` for, misclassifying a genuine transient outage
+  as permanent (album cached as a downgrade instead of retried). Added
+  `json.JSONDecodeError` to the transient set, scoped precisely (it is a
+  `ValueError` subclass; a bare `ValueError` stays non-transient).
+- **Cover cache sweeps `.part` orphans in-uptime, not only at construction (#230
+  — LOW).** `_sweep_partials()` now also runs from `_prune()` (after every
+  download), so a partial stranded within one long uptime on the 24/7 appliance
+  is cleared without waiting for the next boot. The in-uptime sweep is **age-gated**
+  (`_PARTIAL_SWEEP_MIN_AGE_SECONDS`) so it never unlinks a *concurrent* download's
+  fresh in-flight tempfile on the shared executor — only genuine orphans.
+- **`side_position` no longer desyncs from `track_display` for a duplicated title
+  with out-of-order rows (#224 — nit).** `SideIndex.from_tracklist` now locates
+  `side_position` by the current entry's *identity* within the number-sorted
+  side, not by re-matching the title — so `[("A2","Theme"),("A1","Theme")]`
+  querying "Theme" reads a coherent "A2 · 02 OF 02" instead of "A2 · 01 OF 02".
+
 ## [1.5.8] — 2026-08-10
 
 **Round-4 audit remediation — Waves 1–7 (milestones #17–#23).** The fourth cold

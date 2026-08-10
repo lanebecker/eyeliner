@@ -964,6 +964,24 @@ def test_init_sweeps_stale_part_files(tmp_path):
     assert keep.exists()        # real covers untouched
 
 
+def test_prune_sweeps_aged_part_orphans_but_spares_fresh_ones(tmp_path):
+    # #230: the in-uptime sweep (from _prune, after every download) clears an
+    # AGED .part orphan without waiting for the next boot — but SPARES a fresh
+    # one, which may be a concurrent download's in-flight tempfile on the shared
+    # executor (a blanket sweep would unlink it and fail that download).
+    store = _make_store(tmp_path)
+    aged = tmp_path / ".cover-aged.part"
+    aged.write_bytes(b"orphan")
+    os.utime(aged, (0, 0))                       # epoch-0 mtime → far past the age gate
+    fresh = tmp_path / ".cover-fresh.part"
+    fresh.write_bytes(b"in-flight")              # mtime ~now
+
+    store._prune()
+
+    assert not aged.exists()    # aged orphan swept in-uptime (#230)
+    assert fresh.exists()       # fresh partial spared (concurrent download safe)
+
+
 # ---------------------------------------------------------------------------
 # R-2 — bounded on-disk cache (mtime-LRU prune)
 # ---------------------------------------------------------------------------

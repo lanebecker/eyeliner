@@ -271,3 +271,16 @@ def test_out_of_order_side_rows_rank_correctly_under_tier2():
     si = SideIndex.from_tracklist(tl, "One (Live)")
     assert si.side_position == 1
     assert si.side_total == 2
+
+
+def test_side_position_follows_the_display_row_for_a_duplicate_title_out_of_order():
+    # #224: a duplicated title on one side with out-of-order rows. track_display
+    # is the row-order first match ("A2"); side_position must be THAT row's
+    # number-order ordinal (2), not the other "Theme" row's (1) — otherwise the
+    # caption reads an incoherent "A2 · 01 OF 02".
+    tl = _tl(("A2", "Theme"), ("A1", "Theme"))
+    si = SideIndex.from_tracklist(tl, "Theme")
+    assert si.track_display == "A2"
+    assert si.side_position == 2
+    assert si.side_total == 2
+
