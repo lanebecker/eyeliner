@@ -47,6 +47,30 @@ _RATE_LIMIT_MAX_WAIT = 10
 _RATE_LIMIT_DEFAULT_WAIT = 2
 
 
+class DiscogsRateLimited(Exception):
+    """A 429 whose ``Retry-After`` exceeds ``_RATE_LIMIT_MAX_WAIT`` on a caller
+    that OPTED IN to honoring it (``honor_long_retry_after=True``) — #229.
+
+    Rather than park this executor thread for a minute (the P-2 concern the cap
+    protects against) or fire futile in-window retries, ``request()`` raises this
+    so the ASYNC caller can wait the server-requested backoff out in the event
+    loop (cancellable, thread-free) and re-issue the write.  Only the idempotent
+    absolute-set Play Count POST opts in, so honoring the wait can never
+    double-credit (#186).  ``retry_after`` is the server's requested wait in
+    seconds; the async layer decides its own honored cap.
+    """
+
+    def __init__(self, retry_after: int, method: str = "", url: str = ""):
+        self.retry_after = retry_after
+        self.method = method
+        self.url = url
+        super().__init__(
+            f"Discogs rate limit (429) on {method} {url}: "
+            f"server asked to wait {retry_after}s (beyond the {_RATE_LIMIT_MAX_WAIT}s "
+            f"in-thread cap); deferring the wait to the event loop."
+        )
+
+
 def _as_id(value, name: str) -> int:
     """Coerce an identifier to a positive int before it is interpolated into a
     write URL.
@@ -126,7 +150,12 @@ class DiscogsHttp:
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="discogs")
 
     def request(
-        self, method: str, url: str, retry_on_429: Optional[bool] = None, **kwargs
+        self,
+        method: str,
+        url: str,
+        retry_on_429: Optional[bool] = None,
+        honor_long_retry_after: bool = False,
+        **kwargs,
     ) -> requests.Response:
         """Issue a session request with rate-limit awareness (v1.3.3).
 
@@ -134,9 +163,14 @@ class DiscogsHttp:
         is retried at most once.  The retry sleeps for the server-suggested
         Retry-After (with _RATE_LIMIT_DEFAULT_WAIT as the fallback when the
         header is missing or unparseable) — but ONLY when that wait is within
-        _RATE_LIMIT_MAX_WAIT.  A Retry-After beyond the cap is NOT retried (the
-        retry would still be throttled); the futile retry is skipped and a
-        distinct, loud error is logged instead (META-10).
+        _RATE_LIMIT_MAX_WAIT.  A Retry-After beyond the cap is NOT retried
+        in-thread (the retry would still be throttled).  Beyond the cap the
+        behaviour forks on ``honor_long_retry_after`` (#229): callers that opt in
+        — only the idempotent Play Count POST — get a raised
+        :class:`DiscogsRateLimited` carrying the server's wait, so the async
+        finalize layer can honour it in the event loop; everyone else (all GETs,
+        Last Played) gets the futile retry skipped and a distinct, loud error
+        logged instead (META-10).
 
         `retry_on_429` controls whether that one retry happens.  It defaults to
         True for GET (always safe to repeat) and False for POST: a blind POST
@@ -174,14 +208,27 @@ class DiscogsHttp:
 
             if retry_after > _RATE_LIMIT_MAX_WAIT:
                 # Discogs is asking us to back off LONGER than we are willing to
-                # park this shared executor thread (P-2).  A retry inside our cap
-                # would land in the same throttle window and 429 again, so skip the
+                # park this executor thread (P-2). A retry inside our cap would land
+                # in the same throttle window and 429 again, so we never sleep the
+                # long wait IN-THREAD.
+                if honor_long_retry_after:
+                    # #229: an idempotent write POST (the Play Count credit) opted
+                    # in to honoring the long wait. Raise so the ASYNC finalize
+                    # layer can await it in the event loop — cancellable at shutdown,
+                    # parking no thread — and re-POST the same absolute value (#186,
+                    # so no double-credit). Do NOT sleep here.
+                    log.warning(
+                        "Discogs rate limit (429) for %s %s: server asked to wait "
+                        "%ss (beyond the %ss in-thread cap); deferring the wait to "
+                        "the event loop so the credit can still land (#229).",
+                        method, _redact_url(url), retry_after, _RATE_LIMIT_MAX_WAIT,
+                    )
+                    raise DiscogsRateLimited(retry_after, method, _redact_url(url))
+                # Not opted in (every GET, and the non-honored writes): skip the
                 # futile retry entirely — no wasted sleep, no second request
                 # hammering Discogs mid-backoff — and surface a DISTINCT, LOUD
                 # outcome (META-10) instead of a capped wait the caller can't tell
-                # apart from a generic failure.  Actually WAITING OUT a long
-                # Retry-After so the write can still land needs Discogs off the
-                # shared pool; that is deferred to the dedicated executor (#61).
+                # apart from a generic failure.
                 log.error(
                     "Discogs rate limit (429) for %s %s: server asked to wait %ss, "
                     "beyond our %ss cap — NOT retrying (it would still be throttled). "
