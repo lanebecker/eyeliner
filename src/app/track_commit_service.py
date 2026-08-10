@@ -38,6 +38,7 @@ from src.util.clock import clock_is_trustworthy
 
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
+    from src.metadata.models import TrackMetadata
     from src.metadata.resolver import MetadataResolver
     from src.state.player_state import PlayerState
     from src.tracking.lastfm_client import LastFmClient
@@ -94,15 +95,18 @@ class TrackCommitService:
         # writer for "bogus scrobble timestamps"; the scrobble timestamp is taken
         # HERE, not there (CRIT-9).
         timestamp = int(time.time())
-        # The epoch is bound to the AUDIO at capture/enqueue time (PCONC-1) and
-        # passed in — NOT re-sampled here.  A commit-entry sample missed the
+        # arch-1/#217: the "re-validate the session epoch after each await" rule
+        # (B-1 / PCONC-1 / B-19 / LB-1 / CONC-6) lives in ONE object now. Bind it
+        # once to the AUDIO's own epoch — passed in, bound at capture/enqueue
+        # (PCONC-1), NOT re-sampled here (a commit-entry sample missed the
         # queue-lag race: a chunk captured before the needle lifted could be
         # dequeued and confirmed AFTER a new session began, and the entry sample
-        # would read the new (stable-across-resolve) epoch and commit the dead
-        # track into the fresh session.  Validating against the audio's own epoch
-        # closes that window as well as the mid-resolve one (B-1).
+        # would read the new, stable-across-resolve epoch and commit the dead
+        # track into the fresh session). Every side effect below checks `guard`.
+        guard = self.state.epoch_guard(audio_epoch)
+
         metadata = await self.resolver.resolve(raw)
-        if self.state.session_epoch != audio_epoch:
+        if guard.is_stale():   # B-1: session ended while metadata was resolving
             log.info(
                 "Discarding stale commit for %s — %s: the session ended while "
                 "metadata was resolving.",
@@ -116,9 +120,11 @@ class TrackCommitService:
         # previous session's Discogs write holds it, and a SESSION_ENDED landing in
         # that window ends this audio's session. The predicate lets the tracker drop
         # the track then, instead of resurrecting it as a phantom session.
-        await self.tracker.on_track_identified(
-            metadata, is_stale=lambda: self.state.session_epoch != audio_epoch
-        )
+        # Hand the tracker the guard's is_stale BOUND METHOD (CONC-6): it re-reads
+        # the live epoch AFTER acquiring the lifecycle lock, so a SESSION_ENDED
+        # that lands while on_track_identified parks on that lock drops the track
+        # instead of starting a phantom session. A precomputed bool would miss it.
+        await self.tracker.on_track_identified(metadata, is_stale=guard.is_stale)
         # #196 (conc-4): the session can end WHILE on_track_identified is in
         # flight (it can await a Discogs write; a SESSION_ENDED in that window
         # bumps the epoch and the tracker drops the track via is_stale). Take the
@@ -126,7 +132,7 @@ class TrackCommitService:
         # and return — otherwise commit() logs a now-playing line for a track
         # already cleared off the screen and returns True, contradicting its
         # documented "returns False when discarded" contract.
-        if self.state.session_epoch != audio_epoch:
+        if guard.is_stale():
             log.info(
                 "Discarding stale commit for %s — %s: the session ended while the "
                 "track was being handed to the tracker.",
@@ -149,40 +155,46 @@ class TrackCommitService:
         #     rather than being suppressed by a resurrected dead-session dedup key.
         # Still satisfies B-11: set_track ran first, so current_raw never leads
         # current_track.
-        if self.state.session_epoch == audio_epoch:
+        if guard.still_current():
             self.state.set_raw(raw)
         log.info(
             f"Now playing: {metadata.artist} / {metadata.album} / "
             f"{metadata.title} [{metadata.source.name}]"
         )
 
-        # Re-check the epoch before scrobbling (B-19).  set_track ran with no
-        # intervening await since the post-resolve epoch check, so the display
-        # commit is consistent with it — but on_track_identified CAN yield (its
-        # album-split path awaits a Discogs write), and a SESSION_ENDED during that
-        # window means the needle lifted.  The set_raw above already shares this
-        # guard; apply it to the scrobble too so a track whose session has already
-        # ended is neither re-committed nor scrobbled.
-        if self.lastfm and self.state.session_epoch == audio_epoch:
-            # Clock-sanity gate (STAB-2): validate the EXACT timestamp captured at
-            # the top of commit().  A pre-NTP boot (the Pi has no RTC) stamps an
-            # epoch/stale time; Last.fm silently drops a scrobble that is too old
-            # or in the future — or lands it at the wrong point in listening
-            # history — while reporting success either way.  Skip with one WARNING
-            # rather than submit a wrong time.
-            if not clock_is_trustworthy(timestamp):
-                log.warning(
-                    "Skipping Last.fm scrobble for %s — %s: the system clock is not yet "
-                    "trustworthy (pre-NTP boot?); a wrong timestamp would be dropped or land "
-                    "at the wrong point in listening history.",
-                    metadata.artist, metadata.title,
-                )
-            else:
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, self.lastfm.scrobble, metadata, timestamp
-                    )
-                except Exception as e:
-                    log.warning(f"Last.fm scrobble error: {e}")
+        # Scrobble is the last commit-path side effect and the natural spot a
+        # future await (v1.6 play-history) would be added, so it goes through
+        # guard.run() — the sanctioned pattern (#217): run() re-checks the epoch
+        # (B-19: on_track_identified's album-split path can yield on a Discogs
+        # write, and a SESSION_ENDED there means the needle lifted) and skips the
+        # step for a session that has already ended, neither re-committing nor
+        # scrobbling.
+        if self.lastfm:
+            await guard.run(lambda: self._scrobble(metadata, timestamp))
 
         return True
+
+    async def _scrobble(self, metadata: "TrackMetadata", timestamp: int) -> None:
+        """Submit the Last.fm scrobble, off the event loop. Run ONLY via
+        ``guard.run`` so it can't fire for an ended session (B-19).
+
+        Clock-sanity gate (STAB-2): validates the EXACT timestamp captured at the
+        top of commit(). A pre-NTP boot (the Pi has no RTC) stamps an epoch/stale
+        time; Last.fm silently drops a scrobble that is too old or in the future —
+        or lands it at the wrong point in listening history — while reporting
+        success either way. Skip with one WARNING rather than submit a wrong time.
+        """
+        if not clock_is_trustworthy(timestamp):
+            log.warning(
+                "Skipping Last.fm scrobble for %s — %s: the system clock is not yet "
+                "trustworthy (pre-NTP boot?); a wrong timestamp would be dropped or land "
+                "at the wrong point in listening history.",
+                metadata.artist, metadata.title,
+            )
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.lastfm.scrobble, metadata, timestamp
+            )
+        except Exception as e:
+            log.warning(f"Last.fm scrobble error: {e}")
