@@ -15,7 +15,7 @@ from datetime import date
 from typing import Optional, Union, TYPE_CHECKING
 from urllib.parse import quote
 
-from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _as_id
+from src.metadata.discogs.transport import DiscogsHttp, DiscogsRateLimited, _API_BASE, _as_id
 from src.util.clock import clock_is_trustworthy
 
 if TYPE_CHECKING:
@@ -146,9 +146,15 @@ class DiscogsCollectionWriter:
                 f"/fields/{_as_id(field_id, 'field_id')}"
             )
             # Idempotent absolute-set (writes new_count, not an increment), so a
-            # single 429 retry is safe (B-15).
+            # single 429 retry is safe (B-15).  #229: honor_long_retry_after opts
+            # THIS write in to the event-loop backoff — a long Retry-After raises
+            # DiscogsRateLimited (below) instead of losing the credit.  The
+            # absolute-set means the honored re-POST writes the same new_count, so
+            # honoring the wait cannot double-credit (#186): a 429 never applied
+            # the value, so the re-read on retry still sees current_count.
             resp = self._http.request(
-                "POST", url, retry_on_429=True, json={"value": str(new_count)}
+                "POST", url, retry_on_429=True, honor_long_retry_after=True,
+                json={"value": str(new_count)},
             )
 
             if resp.status_code == 204:
@@ -162,6 +168,12 @@ class DiscogsCollectionWriter:
             log.error(f"Discogs field update returned {resp.status_code}.")
             return False
 
+        except DiscogsRateLimited:
+            # #229: must PROPAGATE, not be swallowed to False by the broad handler
+            # below — the async finalize layer catches it to honor the wait and
+            # retry. Swallowing it here would silently drop the credit (the very
+            # loss #229 fixes).
+            raise
         except Exception as e:
             log.error(f"Failed to increment Play Count for release {release_id}: {e}")
             return False
@@ -259,8 +271,15 @@ class DiscogsCollectionWriter:
         if self._collection_fields is not None:
             return self._collection_fields
 
+        # #229: the fields map is the first GET in a cold-cache credit, so it
+        # honors the long wait too — otherwise a first-credit-of-session landing
+        # in a throttle window would 429 here and abort before the value read /
+        # POST could honor it. Cached after one success, so this is paid at most
+        # once per session. A long-429 raises DiscogsRateLimited (propagates to
+        # the finalize layer); raise_for_status still handles other non-2xx.
         resp = self._http.request(
-            "GET", f"{_API_BASE}/users/{self._username_path}/collection/fields"
+            "GET", f"{_API_BASE}/users/{self._username_path}/collection/fields",
+            honor_long_retry_after=True,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -289,10 +308,20 @@ class DiscogsCollectionWriter:
             not present in the 200 body (absent / paged / edited — ambiguous).
         """
         try:
+            # #229: this GET is the READ half of the credit's read-modify-write,
+            # so it opts into honor_long_retry_after too. In a real throttle window
+            # EVERY request 429s — if only the POST honored the wait, a throttled
+            # READ would return _READ_FAILED and abort the credit to False BEFORE
+            # the POST honor-branch could fire, losing the credit to three futile
+            # in-window retries (the exact failure #229 targets). Honoring here
+            # raises DiscogsRateLimited (re-raised below) so the finalize layer
+            # waits out the window and re-reads; the GET is idempotent, so the
+            # honored re-read is free of side effects.
             resp = self._http.request(
                 "GET",
                 f"{_API_BASE}/users/{self._username_path}/collection"
                 f"/releases/{_as_id(release_id, 'release_id')}",
+                honor_long_retry_after=True,
             )
             if resp.status_code != 200:
                 log.debug(
@@ -317,6 +346,11 @@ class DiscogsCollectionWriter:
                 f"release {release_id} response; current value UNKNOWN (not writing)."
             )
             return _READ_FAILED
+        except DiscogsRateLimited:
+            # #229: propagate the honored-wait signal (the broad handler below
+            # would otherwise swallow it to _READ_FAILED, aborting the credit
+            # before the finalize layer could wait out the throttle window).
+            raise
         except Exception as e:
             log.debug(f"_get_field_value failed for release {release_id}: {e}")
             return _READ_FAILED

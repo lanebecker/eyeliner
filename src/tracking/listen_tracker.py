@@ -68,6 +68,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from src.metadata.models import MetadataSource, PlaySession, TrackMetadata
 from src.audio.silence import AudioEvent
+from src.metadata.discogs.transport import DiscogsRateLimited
 from src.util.clock import clock_is_trustworthy
 
 if TYPE_CHECKING:
@@ -103,6 +104,23 @@ _SHUTDOWN_DRAIN_SECONDS = 10.0
 # never blocked (sleep + writer.run yield).
 _FINALIZE_WRITE_ATTEMPTS = 3
 _FINALIZE_RETRY_BACKOFF_SECONDS = 1.0
+
+# #229: when a Play Count credit is rejected with a 429 whose Retry-After is
+# longer than the transport's in-thread cap, the finalize layer honours the wait
+# in the EVENT LOOP (asyncio.sleep — cancellable at shutdown, parks no thread)
+# instead of burning all three attempts inside the same throttle window. This
+# caps how long a single honoured wait may be: a Retry-After above it is waited
+# only this long (the next 429 then reports the shrinking remainder), so a
+# hostile/huge header can't turn one wait into an unbounded park. 90s comfortably
+# covers Discogs' 60/min-window backoff, so the typical case is a SINGLE honoured
+# wait and the credit lands on the next attempt. The bound is per-wait, not total:
+# the retry loop can honour a wait after attempts 1 and 2 (never after the last),
+# so the worst case is (_FINALIZE_WRITE_ATTEMPTS - 1) waits ≈ 180s for one
+# finalize. That is acceptable because it runs OUTSIDE the lifecycle lock
+# (CONC-2/#96) — it never stalls the next record's session, only serialises behind
+# _finalize_lock — and every wait is a cancellable event-loop sleep that shutdown
+# drain() abandons after _SHUTDOWN_DRAIN_SECONDS.
+_HONORED_RETRY_AFTER_CAP_SECONDS = 90.0
 
 
 class ListenTracker:
@@ -480,22 +498,44 @@ class ListenTracker:
         crediting it: a first-attempt failure would otherwise be the ONLY attempt,
         losing the completed play's Play Count credit (or its Last.fm love) with
         nothing to retry it (#163). The caller commits its latch (``credited`` /
-        ``loved``) only when this returns True. The bound keeps the total backoff
-        (1s + 2s = 3s) inside the shutdown drain window (_SHUTDOWN_DRAIN_SECONDS)
-        and — on the album-split path, where this runs under the lifecycle lock —
-        keeps that lengthened lock window small (see the constants above).
+        ``loved``) only when this returns True. The default per-attempt backoff is
+        short (1s + 2s = 3s total) so the attempts fit the shutdown drain window
+        (_SHUTDOWN_DRAIN_SECONDS) and never spin. This whole helper runs OUTSIDE
+        the lifecycle lock (CONC-2/#96) — it holds only the finalize lock — so its
+        backoff never stalls the next record's session start.
+
+        #229: when an attempt raises :class:`DiscogsRateLimited` (a Play Count 429
+        whose Retry-After exceeds the transport's in-thread cap), the backoff for
+        that attempt becomes the honoured server wait (``asyncio.sleep``, capped at
+        _HONORED_RETRY_AFTER_CAP_SECONDS) instead of the short linear one — so the
+        credit lands after the throttle window clears rather than losing itself to
+        three futile in-window retries. The sleep is a normal event-loop await, so
+        shutdown's drain cancels it cleanly (no parked worker thread), and #186's
+        idempotent absolute-set means the honoured re-POST cannot double-credit.
         """
         for n in range(1, _FINALIZE_WRITE_ATTEMPTS + 1):
+            backoff = _FINALIZE_RETRY_BACKOFF_SECONDS * n
             try:
                 if await attempt():
                     return True
                 log.warning("%s attempt %d/%d failed.", label, n, _FINALIZE_WRITE_ATTEMPTS)
+            except DiscogsRateLimited as e:
+                # #229: honour the server's Retry-After in the event loop instead
+                # of the short linear backoff, so the write lands once the throttle
+                # window clears. Capped so a huge/hostile header can't wedge the
+                # serialized finalize path.
+                backoff = min(float(e.retry_after), _HONORED_RETRY_AFTER_CAP_SECONDS)
+                log.warning(
+                    "%s attempt %d/%d rate-limited (Retry-After=%ss); honouring the "
+                    "wait in the event loop (sleeping %ss) before retrying (#229).",
+                    label, n, _FINALIZE_WRITE_ATTEMPTS, e.retry_after, backoff,
+                )
             except Exception as e:
                 log.warning(
                     "%s attempt %d/%d raised: %s", label, n, _FINALIZE_WRITE_ATTEMPTS, e
                 )
             if n < _FINALIZE_WRITE_ATTEMPTS:
-                await asyncio.sleep(_FINALIZE_RETRY_BACKOFF_SECONDS * n)
+                await asyncio.sleep(backoff)
         return False
 
     async def _credit_completed_album(self, session: PlaySession):
