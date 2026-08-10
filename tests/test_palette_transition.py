@@ -204,3 +204,55 @@ def test_quantize_preserves_muted_wcag_floor():
     )
     q = _quantize_palette(p)
     assert contrast_ratio(q.muted, q.bg) >= 4.5
+
+
+def test_quantized_muted_meets_AA_on_surface():
+    """#206/disp-1: the lerp re-clamp (_quantize_palette) shares the status-strip
+    blind spot, so muted must clear 4.5:1 against the (quantized) SURFACE it can be
+    drawn on — not merely the darker gradient peak."""
+    p = DisplayPalette(
+        bg=(56, 56, 56), surface=(89, 89, 89), accent=(210, 120, 90),
+        text=(235, 230, 220), muted=(150, 150, 150),
+    )
+    q = _quantize_palette(p)
+    assert contrast_ratio(q.muted, q.surface) >= 4.5, (
+        f"quantized muted {q.muted} vs surface {q.surface}"
+    )
+
+
+def test_static_screen_settles_on_exact_target_palette(monkeypatch):
+    """#208/disp-2: after a transition into a STATIC screen (IDLE/ERROR, or
+    now-playing under reduced_motion), run()'s loop must compose ONE final frame
+    with the EXACT target palette — not hold the quantized lerp frame from t just
+    under 1.0s for the whole idle period. Simulates run()'s dirty-or-transitioning
+    loop against a real PaletteTransition, with and without the True→False
+    edge-dirty fix."""
+    start = DisplayPalette(bg=(40, 40, 40), surface=(64, 64, 64),
+                           accent=(200, 120, 90), text=(235, 230, 220), muted=(150, 150, 150))
+    target = DisplayPalette(bg=(10, 10, 10), surface=(22, 22, 22),
+                            accent=(180, 90, 70), text=(235, 230, 220), muted=(150, 150, 150))
+    clock = {"t": 100.0}
+    monkeypatch.setattr("src.display.palette_transition.time.monotonic", lambda: clock["t"])
+    step = 1 / 30
+    frames = int((_TRANSITION_SECS + 0.5) / step)
+
+    def run_loop(edge_fix):
+        pt = PaletteTransition(start)
+        pt.current, pt.target, pt.transition_start = start, target, 100.0
+        dirty, prev_transitioning, last = True, False, None
+        for i in range(frames):
+            clock["t"] = 100.0 + i * step
+            transitioning = (clock["t"] - pt.transition_start) < _TRANSITION_SECS  # run()'s check
+            if edge_fix and prev_transitioning and not transitioning:              # #208 fix
+                dirty = True
+            prev_transitioning = transitioning
+            if dirty or transitioning:
+                dirty = False
+                last = pt.animated()      # the palette _render would compose
+        return last
+
+    # With the fix, the last on-glass frame is the exact target palette.
+    assert run_loop(edge_fix=True) == target
+    # Without it (regression pin), the loop goes quiet on the quantized frame —
+    # e.g. bg floored toward black — never the exact target the design specifies.
+    assert run_loop(edge_fix=False) != target

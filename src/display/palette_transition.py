@@ -68,13 +68,14 @@ def _quantize_palette(p: DisplayPalette) -> DisplayPalette:
     surface = snap(p.surface)
     # Re-assert the Full-Opacity Rule after quantizing: flooring a text role
     # toward black could otherwise transiently drop it below the 4.5:1 WCAG
-    # floor during the lerp.  Clamp against the gradient's brightest pixel
-    # (DISP-2), not flat bg; accent (the album title) is lifted hue-preserving
-    # exactly as extract_palette does (DISP-1), muted blends toward white.  Both
-    # are deterministic in their (quantized) inputs, so the cache key stays
+    # floor during the lerp.  muted is clamped against SURFACE — the solid strip
+    # fill it can land on, brighter than the gradient peak `tb` (#206/disp-1,
+    # matching extract_palette); accent (the album title, gradient-card only) is
+    # lifted hue-preserving against `tb` exactly as extract_palette does (DISP-1).
+    # Both are deterministic in their (quantized) inputs, so the cache key stays
     # stable while readability is preserved.
     tb = text_background(bg, surface)
-    muted = ensure_contrast(snap(p.muted), tb, min_ratio=4.5)
+    muted = ensure_contrast(snap(p.muted), surface, min_ratio=4.5)
     accent = ensure_contrast_hue_preserving(snap(p.accent), tb, min_ratio=4.5)
     return DisplayPalette(
         bg=bg, surface=surface, accent=accent,

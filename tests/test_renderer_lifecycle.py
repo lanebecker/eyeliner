@@ -97,3 +97,65 @@ def test_cover_store_can_be_injected(tmp_path):
     sentinel = MagicMock(name="fake-cover-store")
     r = DisplayRenderer(_config(tmp_path), state, cover_store=sentinel)
     assert r._cover_store is sentinel
+
+
+def test_on_bg_task_done_logs_and_discards_faulted_task(tmp_path, caplog):
+    """#207/arch-6: an exception escaping a _spawn'd display background task must
+    be RETRIEVED and logged with context, not left as a detached GC-time 'Task
+    exception was never retrieved'. The done-callback also releases the strong
+    ref."""
+    import asyncio
+    import logging
+    state = PlayerState()
+    r = DisplayRenderer(_config(tmp_path), state)
+
+    class _FakeTask:
+        def __init__(self, exc=None, cancelled=False):
+            self._exc, self._cancelled = exc, cancelled
+        def cancelled(self): return self._cancelled
+        def exception(self):
+            # A REAL asyncio.Task.exception() RAISES CancelledError when the task
+            # was cancelled — so the callback's cancelled() guard MUST run first.
+            # Modelling that here pins the ordering: an exception-first refactor
+            # would raise out of the done-callback and this test would catch it.
+            if self._cancelled:
+                raise asyncio.CancelledError()
+            return self._exc
+
+    faulted = _FakeTask(exc=RuntimeError("cover decode blew up"))
+    r._bg_tasks.add(faulted)
+    with caplog.at_level(logging.ERROR, logger="src.display.renderer"):
+        r._on_bg_task_done(faulted)
+    assert faulted not in r._bg_tasks     # strong ref released
+    assert any("cover decode blew up" in rec.getMessage() for rec in caplog.records)
+
+
+def test_on_bg_task_done_silent_on_cancelled_and_clean(tmp_path, caplog):
+    """A cancelled task is normal shutdown, and a clean completion has no
+    exception — neither should log an error, but both must be discarded."""
+    import asyncio
+    import logging
+    state = PlayerState()
+    r = DisplayRenderer(_config(tmp_path), state)
+
+    class _FakeTask:
+        def __init__(self, exc=None, cancelled=False):
+            self._exc, self._cancelled = exc, cancelled
+        def cancelled(self): return self._cancelled
+        def exception(self):
+            # A REAL asyncio.Task.exception() RAISES CancelledError when the task
+            # was cancelled — so the callback's cancelled() guard MUST run first.
+            # Modelling that here pins the ordering: an exception-first refactor
+            # would raise out of the done-callback and this test would catch it.
+            if self._cancelled:
+                raise asyncio.CancelledError()
+            return self._exc
+
+    cancelled_t = _FakeTask(cancelled=True)
+    clean_t = _FakeTask(exc=None)
+    r._bg_tasks.update({cancelled_t, clean_t})
+    with caplog.at_level(logging.ERROR, logger="src.display.renderer"):
+        r._on_bg_task_done(cancelled_t)
+        r._on_bg_task_done(clean_t)
+    assert cancelled_t not in r._bg_tasks and clean_t not in r._bg_tasks
+    assert [rec for rec in caplog.records if rec.levelno >= logging.ERROR] == []

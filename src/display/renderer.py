@@ -431,8 +431,27 @@ class DisplayRenderer:
             return None
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+        task.add_done_callback(self._on_bg_task_done)
         return task
+
+    def _on_bg_task_done(self, task: "asyncio.Task") -> None:
+        """Done-callback for _spawn'd display tasks (#207 / arch-6).
+
+        Discards the strong ref AND retrieves the task's exception, matching the
+        tracker's CONC-3 registry. Without the retrieval, a raise escaping a
+        display background task — a path not covered by the coroutine's own
+        try/excepts (e.g. a future edit to _decode_cover_async, or an OSError from
+        the cover store on a worn SD card) — surfaced only as asyncio's detached
+        "Task exception was never retrieved" at GC time, with none of the context
+        that turns a Pi debugging session into one journal line. A cancelled task
+        is normal shutdown, not a fault.
+        """
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("Display background task failed: %r", exc)
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -517,6 +536,7 @@ class DisplayRenderer:
     async def run(self):
         """Async display loop — re-renders when dirty or transitioning."""
         import pygame
+        prev_transitioning = False
         while self._running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -528,6 +548,19 @@ class DisplayRenderer:
 
             # Keep re-rendering during a palette transition even if not dirty
             transitioning = (time.monotonic() - self._transition_start) < _TRANSITION_SECS
+            # #208 (disp-2): when a transition JUST ended (True→False edge), force
+            # one more frame so the EXACT target palette is composed. Otherwise the
+            # loop's "<1.0s" check and PaletteTransition.animated()'s ">=1.0s" check
+            # straddle by ~1ms, so on a static screen (IDLE/ERROR, or now-playing
+            # under reduced_motion) the last frame ever drawn holds the QUANTIZED
+            # lerp palette forever — e.g. bg (0,0,0) instead of the intended
+            # (10,10,10) the design's 8–10 floor guarantees. On the edge iteration
+            # elapsed ≥ _TRANSITION_SECS, so animated() returns the exact target
+            # and snaps current.
+            if prev_transitioning and not transitioning:
+                self._dirty = True
+            prev_transitioning = transitioning
+
             if self._dirty or transitioning:
                 # Reset BEFORE rendering so _render_now_playing /
                 # _render_empty can set self._dirty = True to request
