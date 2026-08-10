@@ -159,3 +159,104 @@ def test_on_bg_task_done_silent_on_cancelled_and_clean(tmp_path, caplog):
         r._on_bg_task_done(clean_t)
     assert cancelled_t not in r._bg_tasks and clean_t not in r._bg_tasks
     assert [rec for rec in caplog.records if rec.levelno >= logging.ERROR] == []
+
+
+# ---------------------------------------------------------------------------
+# #215 (R4:test-5) — DisplayRenderer.run()'s loop had ZERO coverage: the
+# QUIT/ESC stop paths, the dirty-reset-BEFORE-render ordering (the P-3 "goes
+# quiet at steady state" mechanism, and the #208 settle), and the 30-vs-10fps
+# cadence were all unpinned. These drive the REAL loop under the SDL dummy
+# driver. Each test owns its renderer + start()/quit() because stop() calls
+# pygame.quit(); the cadence/dirty tests end the loop by clearing _running from a
+# fake asyncio.sleep (never a second pygame.event.get() after teardown).
+# ---------------------------------------------------------------------------
+
+async def test_run_stops_on_quit_event(tmp_path):
+    import asyncio
+    r = DisplayRenderer(_config(tmp_path), PlayerState())
+    r.start()
+    try:
+        pygame.event.post(pygame.event.Event(pygame.QUIT))
+        await asyncio.wait_for(r.run(), timeout=2.0)   # returns via the QUIT arm
+        assert r._running is False
+    finally:
+        pygame.display.quit()
+
+
+async def test_run_stops_on_escape_key(tmp_path):
+    import asyncio
+    r = DisplayRenderer(_config(tmp_path), PlayerState())
+    r.start()
+    try:
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+        await asyncio.wait_for(r.run(), timeout=2.0)
+        assert r._running is False
+    finally:
+        pygame.display.quit()
+
+
+async def test_run_sleeps_at_30fps_while_transitioning(tmp_path, monkeypatch):
+    import asyncio
+    import time
+    r = DisplayRenderer(_config(tmp_path), PlayerState())
+    r.start()
+    try:
+        r._render = lambda: None                  # isolate cadence from rendering
+        r._transition_start = time.monotonic()    # a LIVE transition → transitioning True
+        intervals = []
+        async def fake_sleep(interval):
+            intervals.append(interval)
+            r._running = False                    # end the loop after one iteration
+        monkeypatch.setattr("src.display.renderer.asyncio.sleep", fake_sleep)
+        await asyncio.wait_for(r.run(), timeout=2.0)
+        assert intervals == [1 / 30]              # smooth 30fps during the lerp
+    finally:
+        pygame.display.quit()
+
+
+async def test_run_sleeps_at_10fps_at_rest(tmp_path, monkeypatch):
+    import asyncio
+    import time
+    r = DisplayRenderer(_config(tmp_path), PlayerState())
+    r.start()
+    try:
+        r._render = lambda: None
+        r._dirty = False
+        r._transition_start = time.monotonic() - 10.0   # transition long over → at rest
+        intervals = []
+        async def fake_sleep(interval):
+            intervals.append(interval)
+            r._running = False
+        monkeypatch.setattr("src.display.renderer.asyncio.sleep", fake_sleep)
+        await asyncio.wait_for(r.run(), timeout=2.0)
+        assert intervals == [1 / 10]              # easy 10fps when nothing animates
+    finally:
+        pygame.display.quit()
+
+
+async def test_run_resets_dirty_before_render_so_a_frame_can_request_another(tmp_path, monkeypatch):
+    # The loop resets self._dirty BEFORE calling _render(), so a render that sets
+    # _dirty=True (a pulsing dot / spinner asking for the next frame) is honoured.
+    # Moving the reset to AFTER _render() would make animation frames self-cancel
+    # — the P-3 "freezes at steady state" regression. Pin the ordering: after one
+    # iteration whose render re-requests a frame, _dirty must still be True.
+    import asyncio
+    import time
+    r = DisplayRenderer(_config(tmp_path), PlayerState())
+    r.start()
+    try:
+        r._transition_start = time.monotonic() - 10.0   # at rest, so only _dirty drives render
+        r._dirty = True
+        rendered = []
+        def fake_render():
+            rendered.append(True)
+            r._dirty = True                       # this frame asks for another
+        r._render = fake_render
+        async def fake_sleep(interval):
+            r._running = False
+        monkeypatch.setattr("src.display.renderer.asyncio.sleep", fake_sleep)
+        await asyncio.wait_for(r.run(), timeout=2.0)
+        assert rendered == [True]                 # it rendered exactly once
+        assert r._dirty is True                   # the render's re-request survived the reset
+    finally:
+        pygame.display.quit()

@@ -21,7 +21,7 @@ When the last track of an album finishes, it automatically increments the Play C
 - 🎧 Last.fm scrobbling (opt-in) — when enabled, every identified track is posted to your listening history automatically
 - ❤️ Optional Last.fm "Loved" mark when a full album side completes (configurable, off by default)
 - 🔄 Graceful fallback: Discogs collection → Discogs database → MusicBrainz
-- 🔧 Swappable recognition backend (ShazamIO, ACRCloud, AudD)
+- 🔧 Swappable recognition backend (ShazamIO today; ACRCloud/AudD planned)
 
 ## Hardware
 

@@ -74,7 +74,28 @@ section accumulates the fixes.
   - **#213 (LOW)** — the STAB-5 `_cover_version` bump in `_decode_cover_async`
     (mutating it to `pass` survived) is pinned via the existing clean-decode test.
 
+- **`DisplayRenderer.run()` loop coverage (#215 — Wave 6 bundle 7).** Test-only.
+  The whole async render loop had zero coverage: the QUIT / ESC stop paths, the
+  reset-`_dirty`-BEFORE-`_render()` ordering (the P-3 "goes quiet at steady
+  state" mechanism, and what makes the #208 settle fire), and the 30-vs-10fps
+  cadence were all unpinned. Added five tests that drive the real loop under the
+  SDL dummy driver — each mutation-verified (QUIT/ESC arm removed, cadence pinned
+  to one rate, `transitioning` comparison flipped, and dirty-reset moved after
+  render all go RED).
+
 ### Fixed
+
+- **Doc/comment drift: recognition backends and suite runtime (#214 / #216 —
+  Wave 6 bundle 7).** Docs only; no behaviour change. `README.md`,
+  `docs/architecture.md`'s config table, and `recognizer.py`'s module docstring
+  all advertised `acrcloud`/`audd` as usable `recognition.backend` values, but
+  since #93 (CRIT-2) `config.py` rejects everything except `shazamio` at startup
+  — so an operator following the docs would hit a ConfigError. Reconciled all
+  three to "shazamio today; acrcloud/audd planned/rejected until built."
+  Separately, `docs/testing-guide.md` claimed the suite runs "in well under a
+  second" (measured ~5s at 1000+ tests); changed to an order-of-magnitude phrase
+  ("a few seconds on a laptop, tens of seconds on the Pi"), consistent with the
+  T-8 treatment of the test count three lines below.
 
 - **Display correctness — status-strip WCAG contrast, background-task exception
   surfacing, and a settled-palette fix (#206 / #207 / #208 — Wave 5 bundle 5).**

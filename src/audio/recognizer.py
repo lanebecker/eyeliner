@@ -1,7 +1,9 @@
 """Recognition loop — polls for track identity while music plays.
 
-Abstracts the recognition backend behind RecognizerBackend so ShazamIO,
-ACRCloud, or AudD can be swapped via config without touching this file.
+Abstracts the recognition backend behind RecognizerBackend so a backend
+(ShazamIO today; ACRCloud and AudD planned) can be swapped via config without
+touching this file. Only "shazamio" is implemented — config.py's CRIT-2 gate
+rejects the others at startup until they are built (see the TODO below).
 """
 
 import asyncio
