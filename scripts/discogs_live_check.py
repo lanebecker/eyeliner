@@ -160,10 +160,18 @@ def check_collection_fields(client):
         fail("No custom fields found — have you added any in Discogs?")
         return
 
+    # Both of the writer's production targets are marked DISTINCTLY (#199): a
+    # single "← this is the one we update" was ambiguous once Last Played is also
+    # checked below.
+    last_played = getattr(client, "last_played_field_name", None)
     ok(f"{len(fields)} custom field(s) in your collection:")
     for name, fid in fields.items():
-        target = name == client.play_count_field_name
-        marker = "  ← this is the one we update" if target else ""
+        markers = []
+        if name == client.play_count_field_name:
+            markers.append("← Play Count target")
+        if last_played and name == last_played:
+            markers.append("← Last Played target")
+        marker = ("  " + ", ".join(markers)) if markers else ""
         info(f"    [{fid}]  {name}{marker}")
 
     if client.play_count_field_name not in fields:
@@ -172,6 +180,24 @@ def check_collection_fields(client):
             f"     Check that play_count_field_name in config.yaml matches exactly "
             f"(case-sensitive)."
         )
+
+    # #199 (gap2-1): the writer's OTHER production write — update_last_played — was
+    # never verified here, so a case-slip in last_played_field_name ("Last played"
+    # vs "Last Played") passed every check green and then silently failed on every
+    # session end (update_last_played logs "field not found" and returns False).
+    # Mirror the play-count check when the field is configured; when it's
+    # intentionally unset, say so (an info line, not a failure — Last Played is
+    # optional).
+    if last_played:
+        if last_played not in fields:
+            fail(
+                f"Field '{last_played}' not found!\n"
+                f"     Check that last_played_field_name in config.yaml matches "
+                f"exactly (case-sensitive)."
+            )
+    else:
+        info("last_played_field_name is unset — Last Played won't be recorded "
+             "(optional; set it in config.yaml if you have that custom field).")
 
 
 def check_increment_play_count(client, collection_result: Optional[dict]):

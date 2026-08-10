@@ -68,6 +68,44 @@ def test_log_filter_drops_malformed_record_without_raising():
     assert filt.filter(rec) is False
 
 
+def test_collection_fields_flags_last_played_case_mismatch(capsys):
+    """#199: a case-slip in last_played_field_name must be caught, not sail through
+    green (it was never checked before — only play_count was)."""
+    client = MagicMock()
+    client.get_collection_fields.return_value = {"Play Count": 1, "Last Played": 2}
+    client.play_count_field_name = "Play Count"
+    client.last_played_field_name = "Last played"   # case slip vs "Last Played"
+    dlc.check_collection_fields(client)
+    out = capsys.readouterr().out
+    assert "Last played" in out and "not found" in out          # flagged
+    assert "last_played_field_name in config.yaml" in out        # actionable hint
+
+
+def test_collection_fields_accepts_matching_last_played(capsys):
+    """A correctly-configured Last Played field is marked and not flagged."""
+    client = MagicMock()
+    client.get_collection_fields.return_value = {"Play Count": 1, "Last Played": 2}
+    client.play_count_field_name = "Play Count"
+    client.last_played_field_name = "Last Played"
+    dlc.check_collection_fields(client)
+    out = capsys.readouterr().out
+    assert "← Last Played target" in out
+    assert "← Play Count target" in out
+    assert "not found" not in out
+
+
+def test_collection_fields_notes_unset_last_played(capsys):
+    """An intentionally-unset last_played_field_name is an info line, not a failure."""
+    client = MagicMock()
+    client.get_collection_fields.return_value = {"Play Count": 1}
+    client.play_count_field_name = "Play Count"
+    client.last_played_field_name = None
+    dlc.check_collection_fields(client)
+    out = capsys.readouterr().out
+    assert "unset" in out
+    assert "not found" not in out
+
+
 def test_log_filter_scrubs_token_from_records():
     """The stderr sink (reader.get_tracklist's swallowed log.warning) is covered by
     the _RedactTokenFilter, not the fail() redaction."""

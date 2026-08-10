@@ -1,7 +1,9 @@
 """One-time helper: generate a Last.fm session key via the desktop auth flow.
 
-Run this once, approve access in the browser, then paste the printed session key
-into config.yaml under `lastfm.session_key`. You never need to run it again —
+Run this once and approve access in the browser. The generated session key is
+written to a 0600 owner-only file (lastfm_session_key.txt) rather than printed
+(finding S-3): paste the file's contents into config.yaml under
+`lastfm.session_key`, then delete the file. You never need to run it again —
 session keys don't expire.
 
 Usage:
