@@ -1146,3 +1146,122 @@ def test_get_collection_fields_public_accessor_delegates_to_private():
     # It is genuinely a facade over the private impl: the private accessor now
     # returns the same cached object the public one just populated.
     assert fields is writer._get_collection_fields()
+
+
+# ---------------------------------------------------------------------------
+# #211 (R4:test-3) — the DATABASE tier (search_database) resolves every album
+# NOT in the operator's collection, and _build_result's cover/label extraction
+# drives the card + palette. Both had zero coverage: a triple mutation (tier
+# → return None; primary-image preference inverted + uri→resource_url; catno
+# 'none' filter dropped) passed the full suite. These pin all three.
+# ---------------------------------------------------------------------------
+
+def _release_for_build(images, labels, rid=555, title="Some Album"):
+    """A Release mock complete enough for the REAL _build_result to run."""
+    r = _make_release()
+    r.id = rid
+    r.title = title
+    r.images = images
+    r.labels = labels
+    r.styles = []
+    r.genres = []
+    return r
+
+
+def _label(name, catno):
+    lbl = MagicMock()
+    lbl.name = name
+    lbl.catno = catno
+    return lbl
+
+
+def test_search_database_returns_first_buildable_candidate():
+    reader = make_reader()
+    reader.get_tracklist = MagicMock(return_value=[])
+    reader.get_original_year = MagicMock(return_value=None)
+    rel = _release_for_build(images=[], labels=[], rid=42, title="Spirit of Eden")
+    reader._database_search = MagicMock(return_value=[rel])
+
+    result = reader.search_database("Talk Talk", "Spirit of Eden")
+
+    assert result is not None
+    assert result["release_id"] == 42
+    assert result["album"] == "Spirit of Eden"
+    assert result["instance_id"] is None      # database tier: not owned, no instance
+
+
+def test_search_database_skips_a_candidate_whose_build_raises_non_transiently():
+    # The try/skip loop (reader.py): a NON-transient build failure on one
+    # candidate must be skipped (continue) and the next tried — not returned as
+    # None (that only happens when the loop is deleted) and not propagated (that
+    # is the transient case, tested elsewhere).
+    reader = make_reader()
+    reader.get_tracklist = MagicMock(return_value=[])
+    bad = _release_for_build(images=[], labels=[], rid=1, title="Bad")
+    good = _release_for_build(images=[], labels=[], rid=2, title="Good")
+
+    def year_side(release):
+        if release is bad:
+            raise ValueError("malformed release")   # non-transient → skip
+        return None
+    reader.get_original_year = MagicMock(side_effect=year_side)
+    reader._database_search = MagicMock(return_value=[bad, good])
+
+    result = reader.search_database("A", "B")
+
+    assert result is not None and result["release_id"] == 2   # skipped bad, built good
+
+
+def test_build_result_prefers_primary_image_over_order_and_reads_uri():
+    reader = make_reader()
+    reader.get_tracklist = MagicMock(return_value=[])
+    reader.get_original_year = MagicMock(return_value=None)
+    rel = _release_for_build(
+        images=[
+            {"type": "secondary", "uri": "https://img/secondary.jpg"},
+            {"type": "primary", "uri": "https://img/primary.jpg"},   # NOT first
+        ],
+        labels=[],
+    )
+    result = reader._build_result(rel, instance_id=None)
+    # primary wins despite being second; the value comes from .get("uri").
+    assert result["cover_art_url"] == "https://img/primary.jpg"
+
+
+def test_build_result_falls_back_to_first_image_when_no_primary():
+    reader = make_reader()
+    reader.get_tracklist = MagicMock(return_value=[])
+    reader.get_original_year = MagicMock(return_value=None)
+    rel = _release_for_build(
+        images=[
+            {"type": "secondary", "uri": "https://img/first.jpg"},
+            {"type": "secondary", "uri": "https://img/second.jpg"},
+        ],
+        labels=[],
+    )
+    result = reader._build_result(rel, instance_id=None)
+    assert result["cover_art_url"] == "https://img/first.jpg"     # images[0] fallback
+
+
+def test_build_result_extracts_label_and_catalog_number():
+    reader = make_reader()
+    reader.get_tracklist = MagicMock(return_value=[])
+    reader.get_original_year = MagicMock(return_value=None)
+    rel = _release_for_build(images=[], labels=[_label("Blue Note", "BST 84003")])
+    result = reader._build_result(rel, instance_id=None)
+    assert result["label"] == "Blue Note"
+    assert result["catalog_number"] == "BST 84003"
+
+
+@pytest.mark.parametrize("sentinel", ["none", "None", "NONE"])
+def test_build_result_filters_discogs_none_catalog_number(sentinel):
+    # Discogs uses the literal string "none" for "no catalog number"; the filter
+    # is .lower()-based, so every case must degrade to None (never render "none"
+    # as a catalog number on the card).
+    reader = make_reader()
+    reader.get_tracklist = MagicMock(return_value=[])
+    reader.get_original_year = MagicMock(return_value=None)
+    rel = _release_for_build(images=[], labels=[_label("Some Label", sentinel)])
+    result = reader._build_result(rel, instance_id=None)
+    assert result["catalog_number"] is None
+    assert result["label"] == "Some Label"     # the name still passes through

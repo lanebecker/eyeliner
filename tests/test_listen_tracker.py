@@ -386,6 +386,46 @@ async def test_successful_credit_does_not_retry():
 
 
 @pytest.mark.asyncio
+async def test_raising_increment_is_treated_as_a_failed_attempt_and_retried():
+    """#210 (test-2): a RAISED increment (Discogs 500/timeout) must count as a
+    failed attempt and be retried — exactly like a falsy return. This exercises
+    the except branch (listen_tracker.py:411-412) that the #163 retry contract
+    depends on; every existing retry test uses only False side_effects, so a
+    re-raise mutant there (losing the credit on the first raise) shipped green."""
+    tracker, writer = make_tracker()
+    writer.increment_play_count.side_effect = [RuntimeError("Discogs 500"), True]
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()):
+        await tracker._end_session()
+    assert session.credited is True                     # raise-then-success still credits
+    assert writer.increment_play_count.call_count == 2  # the raise was retried, stopped on success
+
+
+@pytest.mark.asyncio
+async def test_increment_raising_on_every_attempt_loses_credit_without_propagating(caplog):
+    """#210 (test-2): if the increment RAISES on every attempt, _end_session must
+    complete without propagating, leave `credited` False, exhaust the retry bound,
+    and log the loss loudly — the raise-case analogue of the #163 falsy-return
+    loss, and the exact behaviour a re-raise or narrowed except would break."""
+    import logging
+    tracker, writer = make_tracker()
+    writer.increment_play_count.side_effect = RuntimeError("Discogs down")
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # 182 gate: supporting track
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()), \
+         caplog.at_level(logging.ERROR):
+        await tracker._end_session()                    # must NOT raise
+    assert session.credited is False                    # not falsely committed
+    assert writer.increment_play_count.call_count == _FINALIZE_WRITE_ATTEMPTS
+    assert "LOST" in caplog.text                         # the loss is logged loudly
+
+
+@pytest.mark.asyncio
 async def test_reentrant_finalize_while_crediting_does_not_double_increment():
     """B-8 preserved: a finalize of a session whose credit is already in flight
     (crediting latched) must NOT issue a second increment."""

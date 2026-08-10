@@ -43,6 +43,10 @@ def make_discogs_result(release_id=100, instance_id=200):
             TracklistEntry("B1", "All Blues"),
             TracklistEntry("B2", "Flamenco Sketches"),
         ],
+        # #211 (R4:test-3): the real _build_result ALWAYS emits a "genres" key;
+        # this factory omitted it, so the resolver's genre pass-through was only
+        # ever exercised against a shape its producer never produces. Shape parity.
+        "genres": ["Jazz"],
     }
 
 
@@ -365,8 +369,12 @@ async def test_genres_passed_through_from_discogs_result(resolver, mock_discogs)
 
 @pytest.mark.asyncio
 async def test_genres_default_empty_when_missing_from_result(resolver, mock_discogs):
-    """If Discogs result has no genres key, TrackMetadata.genres is []."""
-    mock_discogs.search_collection.return_value = make_discogs_result()  # no genres key
+    """If a Discogs result has no genres key, TrackMetadata.genres is []."""
+    # The factory now carries genres for shape parity with the real
+    # _build_result (#211), so construct the missing-key case explicitly here.
+    result_without_genres = make_discogs_result()
+    del result_without_genres["genres"]
+    mock_discogs.search_collection.return_value = result_without_genres
 
     result = await resolver.resolve(make_raw())
     assert result.genres == []

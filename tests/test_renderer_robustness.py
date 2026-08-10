@@ -347,6 +347,14 @@ async def test_stab1_deferred_flag_clears_when_display_returns(tmp_path):
         await r._decode_cover_async(url, 100, 100)
         assert r._cover_cache.get((url, 100, 100)) is not None   # decodes cleanly now
         assert r._cover_decode_deferred is False    # …and the defer flag cleared
+        # #213 (gap3-3): the decode path MUST bump _cover_version so the static
+        # frame's cache key (renderer.py:620) changes and the newly-decoded cover
+        # is recomposed — the deferred first attempt did NOT bump (returns early),
+        # only this clean landing does.  Mutating the bump to `pass` left _dirty
+        # True (so redraws still fire) but reused the stale no-cover frame forever
+        # on a slow-SD/reduced_motion decode; the whole suite stayed green. Pin it.
+        assert r._cover_version == 1                 # exactly one landing bumped it
+        assert r._dirty is True                      # and the frame was marked dirty
     finally:
         pygame.display.quit()
 

@@ -939,6 +939,13 @@ def test_cover_fetch_constants_are_the_shipped_values(monkeypatch):
     assert cc._MAX_COVER_BYTES == 10 * 1024 * 1024   # 10 MB
     assert cc._MAX_COVER_REDIRECTS == 5
     assert cc._COVER_CONNECT_READ_TIMEOUT == 15
+    # #212 (gap3-2): the SEC-4 total-wall-clock budget is the slow-drip control
+    # in this path and the most security-relevant numeric in the file, yet the
+    # MUT-9 closure omitted it — mutating 45 → 10**9 passed the whole suite,
+    # because its mechanism tests (test at :703/:822) monkeypatch it to 45 before
+    # exercising it, proving the mechanism while leaving the shipped value free to
+    # drift.  Pin the value itself here, beside its siblings.
+    assert cc._DOWNLOAD_DEADLINE_SECONDS == 45
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,38 @@ section accumulates the fixes.
   preferred over phantom count (the META-4 posture). The same gate covers the
   Last.fm love (love-on-*completion* — a completion that didn't happen).
 
+### Tests
+
+- **Mutation pins for code three rounds of discipline missed (#209 / #210 / #211
+  / #212 / #213 — Wave 6 bundle 6).** Test-only; no production behaviour changed.
+  Each defect was reproduced as a surviving mutant (a reversion that passed the
+  full suite) and is now pinned RED:
+  - **#209 (MEDIUM)** — `AudioCapture.run()`'s block loop is the single
+    integration point feeding the whole pipeline (silence → session lifecycle;
+    recognizer → display/scrobble), and its happy path never executed: a mutant
+    dropping every chunk passed. Added a run()-level test that pushes a real block
+    and asserts `silence.process` + (music-gated) `recognizer.enqueue` are called
+    with the sample rate, a `_dispatch_chunk` gate test (no recognition while the
+    detector reports no music, #193/#195), and the `None` stop-sentinel case.
+  - **#210 (MEDIUM)** — `_finalize_write_with_retry`'s except branch (a raised
+    Play Count write counts as a failed attempt and is retried, #163) was
+    unpinned; every existing retry test used only falsy returns. Added raise-then-
+    succeed (credited, 2 attempts) and raise-always (credit lost, logged, bound
+    exhausted, no propagation) tests.
+  - **#211 (MEDIUM)** — the Discogs database tier (`search_database`, resolving
+    every non-owned album) and `_build_result`'s cover/label branches had zero
+    coverage; a triple mutation (tier → `return None`; primary-image preference
+    inverted + `uri`→`resource_url`; catalog-number `"none"` filter dropped)
+    passed. Added realistic-Release-mock tests for the tier's build/skip loop and
+    the image-preference + label/catno-`"none"` extraction, and gave the resolver
+    factory a `genres` key for shape parity with the real producer.
+  - **#212 (LOW)** — shipped-value pins the MUT-9 closure omitted:
+    `_DOWNLOAD_DEADLINE_SECONDS == 45` (the SEC-4 slow-drip budget) and
+    `_RECOGNIZE_TIMEOUT_SECONDS == 30` (the PCONC-2 bound, plus that the loop
+    actually seeds `recognize_timeout` from it) — both were mutable to 10⁹ green.
+  - **#213 (LOW)** — the STAB-5 `_cover_version` bump in `_decode_cover_async`
+    (mutating it to `pass` survived) is pinned via the existing clean-decode test.
+
 ### Fixed
 
 - **Display correctness — status-strip WCAG contrast, background-task exception

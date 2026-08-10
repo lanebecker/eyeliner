@@ -19,7 +19,12 @@ import asyncio
 import numpy as np
 import pytest
 
-from src.audio.recognizer import RawRecognitionResult, RecognitionLoop, ShazamIOBackend
+from src.audio.recognizer import (
+    RawRecognitionResult,
+    RecognitionLoop,
+    ShazamIOBackend,
+    _RECOGNIZE_TIMEOUT_SECONDS,
+)
 from tests.factories import make_recognition_config
 
 
@@ -50,6 +55,19 @@ def make_loop(confirmation_required=2):
         loop = RecognitionLoop(config, state, on_confirmed)
 
     return loop, state, on_confirmed
+
+
+def test_recognize_timeout_is_the_shipped_value_and_seeds_the_loop():
+    # #212 (gap3-2): the PCONC-2/#100 bound. Mutating 30 → 10**9 passed 948/948,
+    # because the timeout-path test (:623) overrides loop.recognize_timeout on the
+    # instance — proving the wait_for mechanism while leaving both the shipped
+    # value AND the seeded timeout unpinned. Pin both: the constant's value, and
+    # that a freshly built loop adopts THAT value (so a regression seeding
+    # recognize_timeout from a different value ships RED — a value-equality pin,
+    # so a behaviour-preserving reseed to the same literal 30 is not claimed).
+    assert _RECOGNIZE_TIMEOUT_SECONDS == 30
+    loop, _state, _on_confirmed = make_loop()
+    assert loop.recognize_timeout == _RECOGNIZE_TIMEOUT_SECONDS
 
 
 def test_init_backend_rejects_an_unimplemented_backend():
