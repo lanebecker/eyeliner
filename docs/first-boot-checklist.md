@@ -24,6 +24,12 @@ above the traceback (ARCH-10). Two failure modes:
   (default `:0`) — the systemd unit sets `Environment="DISPLAY=:0"` and
   `Environment="XAUTHORITY=/home/pi/.Xauthority"`, so those must match your logged-in
   session; `echo $DISPLAY` in the Pi's desktop terminal confirms the value.
+  ⚠️ On current Raspberry Pi OS the default session is **Wayland** (labwc/wayfire):
+  `DISPLAY=:0` reaches it via Xwayland, but `/home/pi/.Xauthority` often doesn't
+  exist there, so if the unit can't open the display see the "Wayland note" beside
+  the systemd unit in `pi-setup-guide.md` §12 (point `XAUTHORITY` at the Xwayland
+  auth file, or use a systemd *user* service). Check the live mode with
+  `wlr-randr`, not `xrandr` (the latter shows only an XWAYLAND virtual output).
 - **"Failed to construct the application components … cover_art_cache_dir … not
   writable."** The on-disk cover cache directory can't be created. Check that
   `display.cover_art_cache_dir` in `config.yaml` points at a path the service

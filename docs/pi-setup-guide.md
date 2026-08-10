@@ -52,39 +52,44 @@ sudo apt update && sudo apt upgrade -y
 
 ## 3. Configure the Waveshare display
 
-The Waveshare 7" HDMI LCD (H) is plug-and-play over HDMI — no driver needed.
-You just need to tell the Pi to output at its native resolution.
+The Waveshare 7" HDMI LCD (H) is plug-and-play over HDMI — no driver needed. On
+current Raspberry Pi OS (Bookworm/Trixie, which use the **KMS** graphics driver),
+the panel's EDID normally negotiates 1024×600 with **zero configuration**. Boot
+with the panel connected and check *before* changing anything.
 
-Edit the boot config:
-
-```bash
-sudo nano /boot/config.txt
-```
-
-Find the `[all]` section (or add it at the bottom) and set:
-
-```ini
-# Waveshare 7" HDMI LCD (H) — 1024×600
-hdmi_group=2
-hdmi_mode=87
-hdmi_cvt=1024 600 60 6 0 0 0
-hdmi_drive=1
-```
-
-Save and reboot:
+Verify the current mode. On the default **Wayland** session use `wlr-randr`
+(the legacy `xrandr` reports only an "XWAYLAND" virtual output under Wayland, so
+it is misleading here):
 
 ```bash
+wlr-randr                       # Wayland session (labwc/wayfire — the default)
+# …or from a plain console with no graphical session:
+kmsprint | grep -i mode | head
+```
+
+You should see `1024x600`. If it's already correct, skip the rest of this section.
+
+**Only if the mode is wrong**, force it through the KMS driver on the kernel
+command line. Append this token to the *single* line in
+`/boot/firmware/cmdline.txt` (space-separated — do not add a newline):
+
+```
+video=HDMI-A-1:1024x600M@60D
+```
+
+```bash
+sudo nano /boot/firmware/cmdline.txt   # add the video= token to the one line
 sudo reboot
 ```
 
-After rebooting, SSH back in and verify the resolution:
+Re-check with `wlr-randr` after the reboot.
 
-```bash
-DISPLAY=:0 xrandr | head -5
-```
-
-You should see `1024x600` listed as the current mode. If the screen is blank,
-try `hdmi_drive=2` instead (some monitors need HDMI with audio signalling).
+> **Why not `hdmi_group`/`hdmi_mode`/`hdmi_cvt` in `/boot/config.txt`?** Those
+> legacy firmware options are ignored by the KMS driver — the default and only
+> supported graphics stack on Bookworm/Trixie — and on those images
+> `/boot/config.txt` is a do-not-edit stub anyway (the real file is
+> `/boot/firmware/config.txt`). The `video=` cmdline entry is the KMS-era
+> equivalent.
 
 ---
 
@@ -240,9 +245,12 @@ The script will:
 1. Prompt you to paste your API key and shared secret
 2. Open the Last.fm authorisation page in your browser
 3. Wait for you to approve access on the Last.fm site
-4. Print your session key to the terminal
+4. Write your session key to `lastfm_session_key.txt` (0600, owner-only) and
+   print the file's path — it does **not** print the key itself (it grants write
+   access to your Last.fm account, so it's kept out of terminal scrollback)
 
-Copy the session key into `config.yaml` under `lastfm.session_key`.
+Copy the file's contents into `config.yaml` under `lastfm.session_key`, then
+delete `lastfm_session_key.txt`.
 
 ### 8c. Complete the config.yaml lastfm section
 
@@ -279,7 +287,8 @@ print(f'Play count: {user.get_playcount()}')
 Replace the four placeholder values with your actual credentials. You should see
 your Last.fm username and total scrobble count printed. A `WSError` means
 something is wrong with the credentials — double-check that all three values
-were copied correctly from the API account page and the session key helper output.
+were copied correctly from the API account page and the file the session key
+helper wrote.
 
 ---
 
@@ -370,7 +379,7 @@ Description=vinyl-now-playing
 Wants=network-online.target
 After=network-online.target time-sync.target graphical.target
 StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -380,12 +389,23 @@ Environment="DISPLAY=:0"
 Environment="XAUTHORITY=/home/pi/.Xauthority"
 ExecStart=/home/pi/vinyl-now-playing/venv/bin/python3 main.py
 Restart=on-failure
-RestartSec=10
+RestartSec=15
 TimeoutStopSec=30
 
 [Install]
 WantedBy=graphical.target
 ```
+
+> ⚠️ **Wayland note (#200) — verify on your image.** This unit assumes the app can
+> reach an **X11** display via `DISPLAY=:0` + `~/.Xauthority`. The app uses
+> pygame/SDL2, which reaches the default Wayland session through Xwayland — but
+> `/home/pi/.Xauthority` may not exist on a Wayland session, in which case SDL2
+> can fail to open the display and the service won't start. After enabling the
+> unit, confirm it actually comes up: `journalctl -u vinyl-now-playing -n 50`. If
+> it can't open the display, the fix is session-specific (point `XAUTHORITY` at
+> the running Xwayland auth file, or run this as a systemd **user** service, which
+> inherits the session's `DISPLAY`/`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) — treat it
+> as a bring-up step, since the right value depends on your flashed image.
 
 `TimeoutStopSec=30` (CRIT-3) is the backstop for shutdown. On SIGTERM the app
 cancels its legs, drains any in-flight end-of-session Discogs credit (bounded to
@@ -397,13 +417,20 @@ process open until systemd's 90s default. `TimeoutStopSec=30` SIGKILLs at 30s
 instead: comfortably above the normal clean shutdown (drain + a ~15s socket
 timeout), far below the point where a power-cut owner assumes the Pi has wedged.
 
-`StartLimitIntervalSec=300` / `StartLimitBurst=5` (STAB-4) is the backstop for
-*startup*. `Restart=on-failure` will otherwise restart a crashing process every
-`RestartSec=10` **forever**, and each cold start rebuilds the Discogs collection
-index from scratch — one GET per 100 records — so a persistent crash (a config
-error that survives validation, a wedged dependency) turns into a permanent
-hammering of the collection API: a 1,000-record collection re-pages 60 GETs/minute,
-which is exactly the authenticated rate limit. (Note: a wrong or absent
+`StartLimitIntervalSec=300` / `StartLimitBurst=10` (STAB-4; widened from 5 for
+#201) is the backstop for *startup*. `Restart=on-failure` will otherwise restart
+a crashing process every `RestartSec=15` **forever**, and each cold start rebuilds
+the Discogs collection index from scratch — one GET per 100 records — so a
+persistent crash (a config error that survives validation, a wedged dependency)
+turns into a sustained hammering of the collection API that can sit on the
+authenticated rate limit. The burst is **10, not 5**, and `RestartSec` is **15,
+not 10**, for a reason beyond rate-limiting: the boot-time *session race* (#201).
+On a cold first boot the system service can start before the autologin graphical
+session is accepting display connections; at 5×10s the unit exhausted its retries
+in ~50s and dropped to `failed` while the session was still coming up. 10×15s
+covers ~2.5 minutes of session bring-up, so a slow SD-card boot recovers on its
+own, while a *genuinely* broken boot still trips the limit (just later) rather
+than pinning the API. (Note: a wrong or absent
 `audio.device_name` is **no longer** one of these startup-crash causes. Since #164
 the device lookup happens *inside* the capture retry loop, so a mistyped name or a
 turntable unplugged at boot degrades to the same in-process backoff-and-retry path
@@ -411,7 +438,7 @@ a mid-run unplug takes — the process stays up, re-resolving the device each at
 — rather than raising out of `run()` and crash-looping under systemd. The backstop
 below is therefore for genuinely fatal boots, not for a fixable audio-device typo.)
 These two directives tell systemd to stop
-retrying once the service has been started **more than 5 times within 300
+retrying once the service has been started **more than 10 times within 300
 seconds**: it refuses the next start, drops the unit into a `failed` state
 (`journalctl` shows `start-limit-hit`), and stops trying — so a genuinely broken
 boot goes quietly dark instead of pinning the API in 429 territory. An occasional one-off crash still
@@ -528,19 +555,20 @@ sudo raspi-config
 # System Options → Boot / Auto Login → Desktop Autologin
 ```
 
-**Disable the screensaver and power blanking** so the display stays on:
+**Disable screen blanking** so the display stays on. On current Raspberry Pi OS
+the default session is Wayland (labwc/wayfire), where the operative control is
+raspi-config — **not** `xset`:
 
 ```bash
-sudo nano /etc/xdg/lxsession/LXDE-pi/autostart
+sudo raspi-config
+# Display Options → Screen Blanking → No
 ```
 
-Add these lines:
-
-```
-@xset s off
-@xset -dpms
-@xset s noblank
-```
+> The old X11 recipe — `@xset s off / -dpms / s noblank` in
+> `/etc/xdg/lxsession/LXDE-pi/autostart` — only applies if you've switched the Pi
+> to an X11 session. On the default Wayland session that autostart file is never
+> read and `xset` doesn't control the compositor's blanking, so it's a silent
+> no-op there.
 
 The app runs fullscreen (set in config.yaml: `display.fullscreen: true`) so the
 desktop will be hidden behind it automatically once the service starts.
@@ -550,9 +578,13 @@ desktop will be hidden behind it automatically once the service starts.
 ## Troubleshooting
 
 **Display is blank / wrong resolution**
-Check `/boot/config.txt` — verify `hdmi_cvt=1024 600 60 6 0 0 0` is set and
-there are no conflicting `hdmi_mode` lines earlier in the file. Try swapping
-`hdmi_drive=1` to `hdmi_drive=2`.
+On current Raspberry Pi OS (KMS graphics) the panel's EDID usually negotiates
+1024×600 on its own — check the *live* mode with `wlr-randr` (Wayland) or
+`kmsprint`, not `xrandr` (which shows only an XWAYLAND virtual output). If the
+mode is wrong, append `video=HDMI-A-1:1024x600M@60D` to the single line in
+`/boot/firmware/cmdline.txt` and reboot (see §3). The legacy `hdmi_*` options are
+ignored under KMS, and `/boot/config.txt` is a stub on Bookworm/Trixie — the real
+file is `/boot/firmware/config.txt`.
 
 **`OSError: PortAudio library not found`**
 Run `sudo apt install -y libportaudio2` and try again.
@@ -584,6 +616,17 @@ Check `journalctl -u vinyl-now-playing -n 50` for the actual error. Common
 causes: `DISPLAY` not set (add `Environment="DISPLAY=:0"` to the service file),
 or the venv path is wrong (verify with `which python3` inside the activated venv).
 
-**App starts but pygame window is invisible**
-The service may be starting before the desktop is fully up. Add
-`After=graphical-session.target` to `[Unit]` in the service file and reload.
+**App starts but pygame window is invisible, or the unit lands in `failed`**
+The system service can start before the autologin *session* is up and accepting
+display connections — the boot-time session race. ⚠️ Adding
+`After=graphical-session.target` does **nothing** here (a common suggestion): that
+target exists only in the per-*user* systemd manager, and the system manager
+silently ignores ordering on units it doesn't have. The unit above already
+mitigates the race with `RestartSec=15` + `StartLimitBurst=10` (#201), retrying
+across ~2.5 min of session bring-up instead of exhausting five tries in ~50s. If a
+slow cold boot still outlasts that, either:
+- recover with `sudo systemctl reset-failed vinyl-now-playing && sudo systemctl start vinyl-now-playing`, or
+- make startup wait for the display socket by adding, under `[Service]`:
+  `ExecStartPre=/bin/sh -c 'until [ -S /tmp/.X11-unix/X0 ]; do sleep 1; done'`
+  (bounded by `TimeoutStartSec`; on the Wayland-default session the socket
+  appears once Xwayland is up).

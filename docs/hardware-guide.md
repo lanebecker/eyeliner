@@ -143,17 +143,15 @@ The exact index number will vary, but as long as "USB Audio Codec" appears with
 
 ## Verify the Display
 
-The Waveshare display should just work on Pi OS with HDMI. If it comes up at the wrong
-resolution, add these lines to `/boot/config.txt`:
-
-```
-hdmi_group=2
-hdmi_mode=87
-hdmi_cvt=1024 600 60 6 0 0 0
-hdmi_drive=1
-```
-
-Then reboot.
+The Waveshare display should just work on Pi OS with HDMI — on current images
+(Bookworm/Trixie, KMS graphics) the panel's EDID normally negotiates 1024×600 with
+no configuration. Check the live mode with `wlr-randr` (the default Wayland
+session; `xrandr` shows only an XWAYLAND virtual output). If it comes up at the
+wrong resolution, force it via the KMS driver by appending
+`video=HDMI-A-1:1024x600M@60D` to the single line in `/boot/firmware/cmdline.txt`,
+then reboot. See **pi-setup-guide.md §3** for the full procedure. (The old
+`hdmi_group`/`hdmi_mode`/`hdmi_cvt` options in `/boot/config.txt` are ignored by
+the KMS driver on these images and no longer apply.)
 
 ---
 

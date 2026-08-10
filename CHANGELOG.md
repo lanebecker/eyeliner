@@ -240,6 +240,35 @@ section accumulates the fixes.
     "config.yaml not found" for an operator whose config already existed. It now
     loads `config.yaml` from the repo root it already computes.
 
+- **First-boot docs and the Discogs check script corrected for the current Pi OS
+  stack (#199 / #200 / #201 / #205 — Wave 4 bundle 4).**
+  - **#199 (gap2-1, MEDIUM):** `scripts/discogs_live_check.py` verified only the
+    Play Count custom field, so a case-slip in `last_played_field_name` ("Last
+    played" vs "Last Played") passed every check green and then silently failed on
+    every session end. The field-map check now covers Last Played too (marking
+    each write target distinctly), fails on a mismatch with the same
+    case-sensitivity hint, and notes the field when it's intentionally unset.
+  - **#200 (ops-2, MEDIUM):** the display and screen-blanking instructions
+    targeted the legacy X11/firmware stack — inert on every image the guide can
+    flash (Trixie now, Bookworm as Legacy — both KMS/Wayland). §3 now leads with
+    EDID auto-negotiation verified via `wlr-randr`/`kmsprint` (not `xrandr`, which
+    shows only an XWAYLAND virtual output) and gives the KMS fallback
+    `video=HDMI-A-1:1024x600M@60D` in `/boot/firmware/cmdline.txt`; screen
+    blanking is disabled via raspi-config (the `xset`/LXDE recipe kept only as an
+    X11 footnote); and the systemd unit carries a Wayland/`XAUTHORITY` bring-up
+    caveat.
+  - **#201 (ops-3, MEDIUM):** the troubleshooting remedy for the boot-time session
+    race — `After=graphical-session.target` in a *system* unit — is a verified
+    no-op (that target exists only in the per-user manager). The unit's retry
+    window is widened to `RestartSec=15` + `StartLimitBurst=10` (~2.5 min of
+    session bring-up vs the old ~50s) so a slow cold boot recovers on its own,
+    while a genuinely broken boot still trips the limit; the troubleshooting entry
+    now explains the no-op and the real remedies.
+  - **#205 (ops-4, LOW):** the guide and `get_lastfm_session_key.py`'s docstring
+    still described the pre-S-3 "prints the session key to the terminal"
+    behaviour; the script now writes a 0600 file. Both are updated to match (write
+    the file → paste its contents → delete it).
+
 - **An ambiguous Play Count write can no longer double-credit one play
   (#186 — HIGH, `R4:data-1`, Wave 2 bundle 2).** The #163 bounded finalize
   retry re-ran the WHOLE read-modify-write on each attempt: read current →
