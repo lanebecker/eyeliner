@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.metadata.coverart import CoverArtFallback
 from src.metadata.errors import is_transient, http_status
+from src.util.cache import BoundedCache
 
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
@@ -79,10 +80,13 @@ class MetadataResolver:
         # ARCH-8: optional injection seam — defaults to the real CoverArtFallback,
         # but a test can pass a substitute instead of overwriting the attribute.
         self.coverart = coverart if coverart is not None else CoverArtFallback()
-        # (artist_lower, album_lower) → (MetadataSource, payload)
+        # (artist_lower, album_lower) → (MetadataSource, payload, stored_at)
         #   payload is the Discogs result dict for Discogs tiers,
         #   or the cover art URL (Optional[str]) for FALLBACK.
-        self._album_cache: dict = {}
+        # arch-4/#220: the ONE bounded-LRU implementation (src/util/cache.py),
+        # shared with the renderer's six caches rather than re-hand-rolled here.
+        # The #191 downgrade TTL lives on top of it in _cache_get/_cache_store.
+        self._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
         # #189: a dead Discogs credential (401/403) or wrong username (404) is a
         # PERMANENT error that recurs on EVERY track's resolve — so its
         # actionable warning is logged once and then suppressed until a Discogs
@@ -117,6 +121,7 @@ class MetadataResolver:
         position), or None. #191: a DATABASE/FALLBACK downgrade past
         _DOWNGRADE_TTL_SECONDS is treated as a miss and evicted, so the album
         re-resolves; a COLLECTION entry never expires."""
+        # BoundedCache.get already refreshes the entry's LRU position on a hit.
         entry = self._album_cache.get(key)
         if entry is None:
             return None
@@ -125,20 +130,16 @@ class MetadataResolver:
             time.monotonic() - stored_at >= _DOWNGRADE_TTL_SECONDS
         ):
             # Stale downgrade: drop it so the caller re-runs the lookup chain.
+            # (get() refreshed it a line ago; pop removes it outright — net gone.)
             self._album_cache.pop(key)
             return None
-        # LRU-ish refresh: pop and re-insert so this entry isn't first to evict.
-        self._album_cache.pop(key)
-        self._album_cache[key] = entry
         return (source, payload)
 
     def _cache_store(self, key: tuple, source: MetadataSource, payload):
         """Insert an entry, evicting oldest entries beyond _ALBUM_CACHE_MAX.
-        #191: stamps a monotonic timestamp for the downgrade TTL in _cache_get."""
-        self._album_cache[key] = (source, payload, time.monotonic())
-        while len(self._album_cache) > _ALBUM_CACHE_MAX:
-            # dict preserves insertion order — iter(...) yields oldest first
-            self._album_cache.pop(next(iter(self._album_cache)))
+        #191: stamps a monotonic timestamp for the downgrade TTL in _cache_get.
+        BoundedCache.put owns the insertion-order eviction (arch-4/#220)."""
+        self._album_cache.put(key, (source, payload, time.monotonic()))
 
     def _from_cache(self, raw: "RawRecognitionResult", entry: tuple) -> TrackMetadata:
         """Rebuild a per-track TrackMetadata from a cached album-level entry."""

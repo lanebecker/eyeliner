@@ -15,7 +15,8 @@ from src.audio.recognizer import RawRecognitionResult
 from src.metadata.models import (
     MetadataSource, TracklistEntry, TrackMetadata,
 )
-from src.metadata.resolver import MetadataResolver
+from src.metadata.resolver import MetadataResolver, _ALBUM_CACHE_MAX
+from src.util.cache import BoundedCache
 
 
 def md(title, tracklist):
@@ -123,7 +124,7 @@ def _resolver():
     r = MetadataResolver.__new__(MetadataResolver)
     r.reader = MagicMock()
     r.coverart = MagicMock()
-    r._album_cache = {}
+    r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
     r._logged_discogs_config = {}
     return r
 

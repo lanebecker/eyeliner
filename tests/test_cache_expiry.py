@@ -60,7 +60,8 @@ class _Clock:
 
 
 def _make_resolver(reader=None, coverart=None):
-    from src.metadata.resolver import MetadataResolver
+    from src.metadata.resolver import MetadataResolver, _ALBUM_CACHE_MAX
+    from src.util.cache import BoundedCache
     r = MetadataResolver.__new__(MetadataResolver)
     r.reader = reader or MagicMock()
     if reader is None:
@@ -70,7 +71,7 @@ def _make_resolver(reader=None, coverart=None):
         r.reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     r.coverart = coverart or MagicMock()
     r.coverart.get_cover_art_url.return_value = None
-    r._album_cache = {}
+    r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
     r._logged_discogs_config = {}
     return r
 

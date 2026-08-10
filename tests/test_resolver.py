@@ -80,10 +80,12 @@ def resolver(mock_discogs, mock_coverart):
     """Build a MetadataResolver with injected mock clients."""
     # Import here to avoid triggering real client instantiation at module load
     from src.metadata.resolver import MetadataResolver
+    from src.util.cache import BoundedCache
+    from src.metadata.resolver import _ALBUM_CACHE_MAX
     r = MetadataResolver.__new__(MetadataResolver)
     r.reader = mock_discogs
     r.coverart = mock_coverart
-    r._album_cache = {}  # Normally created in __init__ (bypassed via __new__)
+    r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)  # Normally created in __init__ (bypassed via __new__)
     r._logged_discogs_config = {}
     return r
 
