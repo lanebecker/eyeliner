@@ -142,14 +142,14 @@ async def test_tracker_failure_defers_the_scrobble_to_the_retry():
 
 @pytest.mark.asyncio
 async def test_needle_lift_during_tracker_does_not_advance_current_raw():
-    """B-19/LB-1: moving set_raw after the tracker await (per LB-1) means a needle
-    lift DURING on_track_identified (SESSION_ENDED → clear() bumps the epoch and
-    nulls current_raw) must not let set_raw resurrect the dead session's dedup
-    key.  The epoch guard on set_raw skips the advance, so current_raw stays null
-    and a re-drop of the same record can commit again.  (The end-state null holds
-    under the old order too — clear() nulled it after set_raw ran — so this test
-    pins the GUARD specifically: with the guard removed, set_raw runs
-    unconditionally and resurrects the key, which the mutation check confirms.)"""
+    """LB-1 + #196: a needle lift DURING on_track_identified (SESSION_ENDED →
+    clear() bumps the epoch and nulls current_raw) must not let the commit
+    resurrect the dead session's dedup key. The post-tracker epoch gate (#196)
+    sees the bumped epoch, discards the commit (returns False), and never reaches
+    set_raw — so current_raw stays null and a re-drop of the same record can
+    commit again. (set_raw also carries a defensive still-current guard, but the
+    #196 gate returns before it is reached, so this scenario is pinned by the gate
+    + the end-state, not by that now-redundant guard.)"""
     service, state, resolver, tracker = make_service()
     state.set_status(PlayerStatus.LISTENING)
     resolver.resolve = AsyncMock(return_value=MagicMock())
@@ -159,9 +159,10 @@ async def test_needle_lift_during_tracker_does_not_advance_current_raw():
 
     tracker.on_track_identified = AsyncMock(side_effect=end_during_tail)
 
-    await service.commit(make_raw(), state.session_epoch)
+    committed = await service.commit(make_raw(), state.session_epoch)
 
-    assert state.current_raw is None        # set_raw skipped; not resurrected
+    assert committed is False               # discarded at the #196 gate
+    assert state.current_raw is None        # not resurrected
     assert state.status == PlayerStatus.IDLE
 
 
