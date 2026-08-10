@@ -309,13 +309,22 @@ def extract_palette(image_path: Path) -> DisplayPalette:
         )
 
         # muted: medium gray, slightly tinted — then contrast-clamped to ≥4.5:1
-        # against the gradient's brightest pixel (Full-Opacity Rule guarantee).
+        # against SURFACE, the brightest thing muted text ever lands on (#206
+        # /disp-1). The status strip is filled with SOLID `surface`
+        # (renderer._draw_header), which is brighter than the gradient's
+        # text-background peak `tb`; clamping against `tb` left the strip labels
+        # ("NOW PLAYING", "SIDE A · NN OF MM") at ≈3.6–4.4:1 on bright covers —
+        # below the WCAG AA floor the design commits to. surface ≥ tb always, so
+        # clamping against surface subsumes the DISP-2 gradient-card guarantee in
+        # one move and brightens secondary text everywhere (Lane approved the
+        # global brightening, 2026-08-10). accent stays clamped on `tb` — the
+        # album title is only ever drawn on the gradient card, never the strip.
         muted = (
             min(200, 120 + int(dominant[0] * 0.08)),
             min(200, 118 + int(dominant[1] * 0.07)),
             min(200, 115 + int(dominant[2] * 0.06)),
         )
-        muted = ensure_contrast(muted, tb, min_ratio=4.5)
+        muted = ensure_contrast(muted, surface, min_ratio=4.5)
 
         return DisplayPalette(bg=bg, surface=surface, accent=accent, text=text, muted=muted)
 

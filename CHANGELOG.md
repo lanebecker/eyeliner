@@ -44,6 +44,32 @@ section accumulates the fixes.
 
 ### Fixed
 
+- **Display correctness — status-strip WCAG contrast, background-task exception
+  surfacing, and a settled-palette fix (#206 / #207 / #208 — Wave 5 bundle 5).**
+  - **#206 (disp-1, MEDIUM):** the status-strip labels ("NOW PLAYING",
+    "SIDE A · NN OF MM") are drawn in `muted` on the SOLID surface bar, but
+    `muted` was contrast-clamped only against the darker gradient-text peak, so on
+    most covers the labels measured ≈3.6–4.4:1 — below the WCAG AA 4.5:1 floor
+    the design commits to — for the entire record. `muted` is now clamped against
+    `surface` itself (the brightest thing it lands on) in both `extract_palette`
+    and the lerp re-clamp `_quantize_palette`, which subsumes the gradient-card
+    guarantee and brightens secondary text everywhere (Lane-approved global
+    brightening, 2026-08-10); `accent` — the album title, drawn only on the
+    gradient card — stays clamped on the gradient peak. New tests assert
+    muted-vs-surface ≥ 4.5 on both paths, including bright/cream covers.
+  - **#207 (arch-6, LOW):** `DisplayRenderer._spawn`'s done-callback discarded the
+    task ref but never retrieved its exception, so a raise escaping a display
+    background task surfaced only as a detached GC-time "Task exception was never
+    retrieved" with no context (the tracker's CONC-3 registry already handles this
+    correctly). The callback now discards, skips cancellation, and logs the
+    retrieved exception.
+  - **#208 (disp-2, LOW):** on a transition into a static screen (IDLE, ERROR, or
+    now-playing under `reduced_motion`) the render loop went quiet ~1ms before the
+    palette lerp reached its exact target, so the screen permanently held the
+    QUANTIZED lerp palette — e.g. background `(0,0,0)` instead of the intended
+    `(10,10,10)` the design's 8–10 floor guarantees. `run()` now forces one final
+    frame on the transition's True→False edge, composing the exact target palette.
+
 - **The transient/permanent error taxonomy is now honoured end-to-end
   (#188/#189/#190 — MEDIUM, Wave 2 bundle 1).** Three sites computed the
   transient-vs-permanent verdict and then discarded or misrouted it:

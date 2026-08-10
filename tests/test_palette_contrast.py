@@ -55,6 +55,10 @@ _COVERS = {
     "saturated_yellow": [(0.7, (150, 140, 10)), (0.3, (240, 225, 30))],
     "deep_red": [(0.8, (90, 10, 10)), (0.2, (210, 20, 25))],
     "pop_bright": [(0.5, (220, 90, 40)), (0.5, (240, 200, 60))],
+    # #206/disp-1: bright sleeves are the worst case for the status strip —
+    # surface is brightest and muted-on-surface fell to ≈3.6–3.9:1 pre-fix.
+    "white_sleeve": [(1.0, (250, 250, 250))],
+    "cream_sleeve": [(1.0, (245, 240, 225))],
 }
 
 
@@ -75,6 +79,17 @@ def test_muted_meets_AA_on_gradient(tmp_path, name):
     tb = text_background(pal.bg, pal.surface)
     ratio = contrast_ratio(pal.muted, tb)
     assert ratio >= AA, f"{name}: muted {pal.muted} vs gradient {tb} = {ratio:.2f}:1"
+
+
+@pytest.mark.parametrize("name", list(_COVERS))
+def test_muted_meets_AA_on_solid_surface(tmp_path, name):
+    # #206/disp-1: the status strip is filled with SOLID `surface` (brighter than
+    # the gradient's text-background peak), and draws muted labels on it. muted is
+    # now clamped against `surface` itself, so it must clear 4.5:1 there — the
+    # assertion that would have caught the strip failing at ≈3.6–4.4:1.
+    pal = extract_palette(_cover(tmp_path, _COVERS[name]))
+    ratio = contrast_ratio(pal.muted, pal.surface)
+    assert ratio >= AA, f"{name}: muted {pal.muted} vs surface {pal.surface} = {ratio:.2f}:1"
 
 
 def test_text_background_is_brighter_than_bg(tmp_path):
