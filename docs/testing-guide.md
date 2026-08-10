@@ -101,8 +101,9 @@ pytest
 ```
 
 pytest.ini points `testpaths = tests`, so this automatically picks up everything
-in the `tests/` directory and runs it in well under a second (no I/O, no
-hardware). The whole suite should report `… passed` with no failures.
+in the `tests/` directory and runs it in a few seconds on a laptop (tens of
+seconds on the Pi) — no I/O, no hardware. The whole suite should report
+`… passed` with no failures.
 
 The exact test count is **deliberately not pinned in docs** — it drifts every
 time a suite is added (T-8). For the current number, run:

@@ -877,7 +877,7 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `display.dynamic_theming` | `true` | Extract 5-color palette from album art via Pillow; set `false` for fixed neutral dark theme |
 | `display.reduced_motion` | `false` | Freezes the status-dot pulse and the boot-arc rotation; at steady state the render loop goes fully quiet (no per-frame redraw). Set `true` to quiet the display on a struggling Pi |
 | `display.cover_art_cache_dir` | `"src/display/assets/cache"` | MD5-keyed JPEG cache |
-| `recognition.backend` | `"shazamio"` | `"shazamio"` \| `"acrcloud"` \| `"audd"` |
+| `recognition.backend` | `"shazamio"` | `"shazamio"` only — `"acrcloud"`/`"audd"` are reserved in `config.example.yaml` but rejected at startup (CRIT-2) |
 | `recognition.confirmation_required` | `2` | Consecutive matching results before committing |
 | `recognition.error_after_misses` | `6` | Consecutive misses while LISTENING before the ERROR screen |
 | `recognition.poll_interval_seconds` | — _(required)_ | Timeout if recognition queue is empty |
