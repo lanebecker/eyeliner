@@ -16,14 +16,17 @@ def _page(releases, page, pages):
     return resp
 
 
-def _item(release_id, instance_id, title, artists):
+def _item(release_id, instance_id, title, artists, master_id=None):
+    basic = {
+        "id": release_id,
+        "title": title,
+        "artists": [{"name": a} for a in artists],
+    }
+    if master_id is not None:
+        basic["master_id"] = master_id
     return {
         "instance_id": instance_id,
-        "basic_information": {
-            "id": release_id,
-            "title": title,
-            "artists": [{"name": a} for a in artists],
-        },
+        "basic_information": basic,
     }
 
 
@@ -38,14 +41,20 @@ def test_index_built_once_paginated_and_cached():
     client = make_discogs_reader()
     client._collection_index = None
     client._http.request = MagicMock(side_effect=[
-        _page([_item(111, 42, "Sister", ["Sonic Youth"])], 1, 2),
+        _page([_item(111, 42, "Sister", ["Sonic Youth"], master_id=900)], 1, 2),
         _page([_item(222, 43, "Goo", ["Sonic Youth"])], 2, 2),
     ])
 
     idx = client._get_collection_index()
 
     assert set(idx.keys()) == {111, 222}
-    assert idx[111] == {"instance_id": 42, "title": "Sister", "artists": ["Sonic Youth"]}
+    # #226: master_id is captured from basic_information (present here) …
+    assert idx[111] == {
+        "instance_id": 42, "title": "Sister", "artists": ["Sonic Youth"],
+        "master_id": 900,
+    }
+    # … and defaults to None when the release carries no master.
+    assert idx[222]["master_id"] is None
     assert client._http.request.call_count == 2          # one GET per page
 
     # Second call is served from cache — no further HTTP.

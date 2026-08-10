@@ -40,8 +40,15 @@ def _reader_with_index(entries):
     """
     reader = make_discogs_reader()
     reader._collection_index = {
-        release_id: {"instance_id": instance_id, "title": title, "artists": artists}
-        for release_id, instance_id, title, artists in entries
+        e[0]: {
+            "instance_id": e[1],
+            "title": e[2],
+            "artists": e[3],
+            # Optional 5th element = master_id (#226); absent → None, matching
+            # the build's "no master" default and every pre-#226 4-tuple entry.
+            "master_id": e[4] if len(e) > 4 else None,
+        }
+        for e in entries
     }
     reader._database_search = MagicMock(return_value=[])   # strategy 1 misses
     reader._client.release = MagicMock(side_effect=lambda rid: MagicMock(id=rid))
@@ -518,3 +525,153 @@ def test_distinct_bracket_siblings_are_different_albums():
     ])
 
     assert reader.search_collection("Thin Lizzy", "Live [1975]") is None
+
+
+# ---------------------------------------------------------------------------
+# #225 — reader.py unified onto normalize.fold_text.  The one behavioural
+# WIDENING is the ``&``→``and`` fold at the ALBUM level (already present at the
+# track level via #180); the private reader fold did not do it.
+# ---------------------------------------------------------------------------
+
+def test_ampersand_album_title_folds_via_shared_fold_text():
+    """#225: the shared fold folds '&'→'and' in the ALBUM title too, so 'Songs
+    of Love & Hate' matches an owned 'Songs of Love and Hate' at tier 1 — the
+    exact symptom #180 fixed at the track level, now closed at the album level.
+    RED on the pre-#225 reader-local fold (which folded '&' only for artists)."""
+    reader = _reader_with_index([
+        (9500, 95, "Songs of Love and Hate", ["Leonard Cohen"]),
+    ])
+
+    result = reader.search_collection("Leonard Cohen", "Songs of Love & Hate")
+
+    assert result is not None
+    assert result["instance_id"] == 95
+
+
+def test_normalize_term_folds_ampersand_at_unit_level():
+    """#225 unit pin: the album-title normaliser now folds '&'→'and'
+    symmetrically, so the two renderings collapse to one key."""
+    from src.metadata.discogs.reader import _normalize_term
+
+    assert _normalize_term("Us & Them") == _normalize_term("Us and Them")
+    assert _normalize_term("R&B Classics") == _normalize_term("R and B Classics")
+
+
+# ---------------------------------------------------------------------------
+# #222 — tier-2 decoration strip is keyword-gated and bare-year-excluded, so a
+# decorated query can no longer collapse onto a plain-titled owned family
+# member.  The strip runs on FOLDED text, closing the fullwidth-paren miss too.
+# ---------------------------------------------------------------------------
+
+def test_decorated_query_does_not_credit_plain_owned_family_member():
+    """#222 repro 1 (executed in the #179 cold review): Discogs titles every
+    colour-era Weezer album 'Weezer'.  Playing 'Weezer (Blue Album)' while
+    owning ONLY the Green album must NOT credit Green — '(Blue Album)' is a
+    title distinguisher, not decoration.  RED on the ungated strip (which
+    stripped '(Blue Album)' → 'weezer' → credited Green)."""
+    reader = _reader_with_index([
+        (9600, 96, "Weezer", ["Weezer"]),   # the Green album
+    ])
+
+    assert reader.search_collection("Weezer", "Weezer (Blue Album)") is None
+
+
+def test_decorated_year_query_does_not_credit_plain_owned_member():
+    """#222 repro 2 (executed in the #179 second-pass review): owning plain
+    'Live' alongside 'Live (1980)', playing 'Live (1975)'.  A bare year is a
+    pressing DISTINGUISHER at the album level, so the query must not strip to
+    'live' and credit plain 'Live'.  RED on the ungated strip (stripped
+    '(1975)' → unique plain 'Live' match → wrong credit)."""
+    reader = _reader_with_index([
+        (9701, 97, "Live", ["Thin Lizzy"]),
+        (9702, 98, "Live (1980)", ["Thin Lizzy"]),
+    ])
+
+    assert reader.search_collection("Thin Lizzy", "Live (1975)") is None
+
+
+def test_genuine_edition_decoration_still_strips_new_keywords():
+    """#222 must not over-tighten: the added edition vocabulary
+    (expanded / anniversary) still strips so real decoration matches a plain
+    owned title."""
+    reader = _reader_with_index([
+        (9800, 99, "Nevermind", ["Nirvana"]),
+    ])
+    assert reader.search_collection("Nirvana", "Nevermind (Expanded Edition)") is not None
+    assert reader.search_collection("Nirvana", "Nevermind (30th Anniversary)") is not None
+
+
+def test_fullwidth_paren_decoration_strips_after_fold():
+    """#222 hypothesis-grade fix: the strip now runs on FOLDED text, so NFKC has
+    already mapped fullwidth parens '（）'→'()'.  'Rumours （Deluxe Edition）'
+    now credits an owned plain 'Rumours'.  RED on the old raw-text ASCII-paren
+    strip (which never saw the fullwidth parens → a tier-2 wrong-miss)."""
+    reader = _reader_with_index([
+        (9900, 100, "Rumours", ["Fleetwood Mac"]),
+    ])
+
+    result = reader.search_collection("Fleetwood Mac", "Rumours （Deluxe Edition）")
+
+    assert result is not None
+    assert result["instance_id"] == 100
+
+
+# ---------------------------------------------------------------------------
+# #226 — strategy 1 must not bypass strategy 2's refuse-to-guess for two
+# DISTINCT albums that share a normalised (artist, title) (the Peter Gabriel
+# self-titled family).  Pressings of ONE album (shared / absent master) stay a
+# valid strategy-1 target.
+# ---------------------------------------------------------------------------
+
+def test_strategy1_defers_to_refuse_for_distinct_same_titled_albums():
+    """#226: owning two DISTINCT 'Peter Gabriel' albums (different masters);
+    the loose search surfaces one of them.  Strategy 1 must NOT credit it — it
+    defers to strategy 2, which refuses (None).  RED on pre-#226 code (strategy
+    1 credited the surfaced member directly)."""
+    reader = _reader_with_candidates(
+        entries=[
+            (8001, 71, "Peter Gabriel", ["Peter Gabriel"], 111),   # PG I, master 111
+            (8002, 72, "Peter Gabriel", ["Peter Gabriel"], 222),   # PG III, master 222
+        ],
+        candidates=[(8002, "Peter Gabriel - Peter Gabriel")],       # search surfaces PG III
+    )
+
+    assert reader.search_collection("Peter Gabriel", "Peter Gabriel") is None
+
+
+def test_strategy1_still_credits_pressings_sharing_a_master():
+    """#226 must not over-refuse: two owned PRESSINGS of one album share a
+    master, so either is a valid write target — strategy 1 still credits the
+    surfaced pressing (the deliberate multi-pressing behaviour)."""
+    reader = _reader_with_candidates(
+        entries=[
+            (9001, 61, "Greatest Hits", ["Queen"], 500),   # pressing 1, master 500
+            (9002, 62, "Greatest Hits", ["Queen"], 500),   # pressing 2, master 500
+        ],
+        candidates=[(9001, "Queen - Greatest Hits")],
+    )
+
+    result = reader.search_collection("Queen", "Greatest Hits")
+
+    assert result is not None
+    assert result["instance_id"] == 61
+
+
+def test_strategy1_master_less_pressings_are_not_treated_as_distinct():
+    """#226 edge: two owned entries at one (artist, title) with NO master on
+    either (0 / missing → None) are treated as pressings, not distinct albums,
+    so strategy 1 still credits the surfaced one.  Pins that a missing master
+    does not arm the distinct-album refusal (which would break the common
+    multi-pressing case)."""
+    reader = _reader_with_candidates(
+        entries=[
+            (9101, 51, "Greatest Hits", ["Queen"]),   # master None
+            (9102, 52, "Greatest Hits", ["Queen"]),   # master None
+        ],
+        candidates=[(9101, "Queen - Greatest Hits")],
+    )
+
+    result = reader.search_collection("Queen", "Greatest Hits")
+
+    assert result is not None
+    assert result["instance_id"] == 51

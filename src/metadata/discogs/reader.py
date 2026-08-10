@@ -14,7 +14,6 @@ It has no knowledge of the write side (play-count / last-played) — that lives 
 import logging
 import re
 import time
-import unicodedata
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import quote
 
@@ -23,6 +22,7 @@ import discogs_client
 from src.metadata.models import TracklistEntry
 from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _HTTP_TIMEOUT
 from src.metadata.errors import is_transient
+from src.metadata.normalize import fold_text, strip_album_decoration
 
 if TYPE_CHECKING:
     from src.config import DiscogsConfig
@@ -66,46 +66,23 @@ _INDEX_REFRESH_COOLDOWN_SECONDS = 15 * 60
 # from INDEX artist names before comparison.  Titles never carry it.
 _ARTIST_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
 
-# #179 tier 2 / #183: a single trailing parenthetical OR square-bracket
-# qualifier — the dominant decoration divergences between Shazam's
-# Apple-Music-backed catalogue and Discogs vinyl titles ("Rumours (Deluxe
-# Edition)" / "Rumours [Deluxe Edition]" vs "Rumours"; brackets are a
-# standard iTunes/Apple Music form).  Deliberately anchored and single:
-# interior qualifiers are part of the title ("(What's the Story) Morning
-# Glory?" is untouched), and STACKED decorations ("Pet Sounds (Mono)
+# #179 tier 2 / #183 / #222: the album-level trailing-decoration strip now lives
+# in the shared ``normalize.strip_album_decoration`` (keyword-gated, paren- and
+# bracket-aware, bare-year-excluded).  It is applied ONE SIDE AT A TIME (stripped
+# query vs raw index title, or raw query vs stripped index title) — never both
+# sides in the same comparison, which would equate two DIFFERENT albums that each
+# carry a distinct trailing parenthetical ("Live (1975)" vs owned "Live (1980)"),
+# re-introducing the wrong-write-target class this exists to kill (#179 cold
+# review; regression-pinned).
+#
+# #222 closed the prior residual: an UNGATED strip credited a plain-titled owned
+# family member from a decorated query (Discogs titles every colour-era Weezer
+# album "Weezer", so "Weezer (Blue Album)" credited an owned Green "Weezer").
+# The keyword gate means "(Blue Album)" and a bare-year "(1975)" are no longer
+# treated as decoration, so the decorated query no longer collapses onto the
+# plain member; genuine edition decoration ("(Deluxe Edition)", "[30th
+# Anniversary]") still strips.  STACKED decorations ("Pet Sounds (Mono)
 # (Remastered)") remain a documented conservative miss (one strip only).
-#
-# The strip is applied ONE SIDE AT A TIME (stripped query vs raw index title,
-# or raw query vs stripped index title) — never both sides in the same
-# comparison.  A both-sides strip would equate two DIFFERENT albums that each
-# carry a distinct trailing parenthetical ("Live (1975)" vs an owned "Live
-# (1980)"), re-introducing the wrong-write-target class this fix exists to
-# kill (caught by the #179 cold review; regression-pinned).
-#
-# ACCEPTED RESIDUAL: a decorated query can still wrongly credit an owned
-# plain-titled member of a family distinguished only by parentheticals — e.g.
-# Discogs titles every colour-era Weezer album "Weezer", so playing "Weezer
-# (Blue Album)" while owning only the Green album credits Green.  Uniqueness
-# protects only when 2+ owned members MATCH THE QUERY under the one-side
-# strip; a plain-titled owned member alongside decorated siblings is still
-# credited (the siblings' distinct parentheticals disqualify them, so
-# ambiguity never arms).  The future
-# hardening is a decoration-keyword allowlist for the query-side strip
-# ("deluxe", "edition", "remaster(ed)", "expanded", "anniversary", …), tracked
-# as a follow-up issue rather than smuggled into #179.
-_TRAILING_PAREN_RE = re.compile(r"\s*(?:\([^()]*\)|\[[^\[\]]*\])\s*$")
-
-
-# #179: NFKC does NOT fold typographic punctuation to ASCII (U+2019 "’" stays
-# U+2019), and Shazam/Apple Music systematically use the typographic forms
-# where Discogs contributors typically type ASCII.  Fold the common variants
-# explicitly; everything here is a rendering choice, never a semantic one.
-_PUNCT_FOLD = str.maketrans({
-    "‘": "'", "’": "'", "ʼ": "'", "`": "'", "´": "'",
-    "“": '"', "”": '"',
-    "–": "-", "—": "-", "−": "-",
-    "…": "...",
-})
 
 
 def _reraise_if_transient(exc: BaseException) -> None:
@@ -137,13 +114,12 @@ def _normalize_artist(s: str) -> str:
     equal "Wall"); anything fuzzier stays out per the exact-or-nothing
     principle.  Symmetric edge: "The The" folds to "the" on both sides.
 
-    The ``&`` fold runs on BOTH sides of the NFKC inside ``_normalize_term``
-    (second-pass catch): a fullwidth ``＆`` (U+FF06) only becomes ``&`` via
-    NFKC, so a pre-normalize-only replace would miss it — the same ordering
-    discipline ``_normalize_term``'s own punctuation fold documents.
+    The ``&``→``and`` fold now lives in the shared :func:`fold_text` table
+    (#225), which runs it on BOTH sides of NFKC — so a fullwidth ``＆`` (U+FF06),
+    which only becomes ``&`` via NFKC, is still caught. Only the leading-``the``
+    strip is reader/artist-specific and stays here.
     """
-    s = _normalize_term(s.replace("&", " and "))
-    s = " ".join(s.replace("&", " and ").split())
+    s = fold_text(s)
     if s.startswith("the "):
         s = s[4:]
     return s
@@ -152,19 +128,14 @@ def _normalize_artist(s: str) -> str:
 def _normalize_term(s: str) -> str:
     """Normalise one side of a collection-match comparison (#179).
 
-    The explicit table folds typographic punctuation NFKC leaves alone (curly
-    quotes, en/em-dashes) and runs on BOTH sides of NFKC (#179 cold review +
-    second pass): before, because NFKC decomposes some table inputs (``´``
-    becomes space + combining acute) so a post-NFKC-only translate would never
-    see them; and again after, because some characters' NFKC *outputs* are
-    table keys (fullwidth grave U+FF40 folds to `````, ``ŉ`` to ``'n``).
-    The table's ASCII outputs are NFKC-stable, so the second pass cannot
-    regress the first.  casefold() is the aggressive Unicode lowercase, and
-    interior whitespace is collapsed so spacing differences can't defeat an
-    exact comparison.
+    Delegates to the shared :func:`src.metadata.normalize.fold_text` (#225) so
+    reader.py and ``SideIndex`` fold titles through ONE table that cannot drift.
+    This WIDENS the old reader-local fold by ``&``→``and`` (fold_text folds it;
+    the old private ``_PUNCT_FOLD`` did not), so an album titled "Us & Them Live"
+    now matches an owned "Us and Them Live" at the album level — the exact
+    symmetric, fail-safe fold #180 already applied at the track level.
     """
-    s = unicodedata.normalize("NFKC", s.translate(_PUNCT_FOLD)).translate(_PUNCT_FOLD).casefold()
-    return " ".join(s.split())
+    return fold_text(s)
 
 
 class DiscogsReader:
@@ -191,7 +162,7 @@ class DiscogsReader:
         self._client.set_timeout(connect=5, read=_HTTP_TIMEOUT)
 
         # Lazily-built index of the user's collection:
-        #   {release_id: {"instance_id", "title", "artists"}}.
+        #   {release_id: {"instance_id", "title", "artists", "master_id"}}.
         # Building this ONCE and matching locally replaces the per-candidate N+1
         # membership GETs (P-1). It carries a TTL (#191) so a record added during
         # a long uptime is eventually seen rather than pinned to a boot-time
@@ -281,6 +252,35 @@ class DiscogsReader:
                 for a in entry["artists"]
             )
 
+        # #226: does the collection hold TWO DISTINCT albums at this exact
+        # normalised (artist, title) — different, both-present master_ids, i.e.
+        # the Peter Gabriel self-titled family, NOT mere pressings of one album?
+        # If so there is no principled single write target, so strategy 1 must
+        # NOT credit whichever member the loose database search happens to
+        # surface; it defers to strategy 2, which refuses to guess.  Pressings of
+        # ONE album (shared master, or master absent on both) share a master
+        # key here, so either pressing stays a valid strategy-1 target — the
+        # deliberate multi-pressing behaviour is preserved.
+        #
+        # The master_id is the ONLY signal that separates "distinct works" from
+        # "pressings of one work"; two same-(artist, title) releases with NO
+        # master on either are data-indistinguishable, so two DOCUMENTED
+        # residuals remain (both accepted; surfaced by the Bundle-11 cold audit):
+        #   (1) two DISTINCT master-less same-titled albums still credit one of
+        #       them (a wrong write) — but the canonical self-titled families
+        #       (Peter Gabriel, Weezer) all carry distinct masters, so this bites
+        #       only for obscure master-less releases; preserving the tested
+        #       multi-pressing credit (tests 351/385) was chosen over refusing;
+        #   (2) two PRESSINGS of one work that Discogs happens to file under
+        #       DIFFERENT masters are refused (a missed credit — fail-safe).
+        same_key_masters = {
+            entry.get("master_id")
+            for entry in index.values()
+            if _normalize_term(entry["title"]) == album_key
+            and entry_artist_matches(entry)
+        }
+        same_title_is_distinct_albums = len({m for m in same_key_masters if m}) >= 2
+
         # Strategy 1: database candidates, matched locally against the index.
         # #183: ownership alone is NOT acceptance — the candidate's INDEX entry
         # (clean collection title/artists, no 'Artist - Album' search-title
@@ -298,6 +298,18 @@ class DiscogsReader:
             if entry is None:
                 continue
             if _normalize_term(entry["title"]) == album_key and entry_artist_matches(entry):
+                if same_title_is_distinct_albums:
+                    # #226: exact-matching AND owned, but ambiguous across
+                    # distinct same-titled albums — defer to strategy 2's
+                    # refuse-to-guess rather than credit this candidate.
+                    log.info(
+                        "Strategy 1: '%s / %s' matches owned release %d, but the "
+                        "collection holds ≥2 DISTINCT albums at this title "
+                        "(different masters); deferring to strategy 2 to refuse a "
+                        "guessed Play Count write target (#226).",
+                        artist, album, release.id,
+                    )
+                    break
                 log.debug(
                     f"Found in collection (strategy 1): '{release.title}' "
                     f"(release {release.id}, instance {entry['instance_id']})"
@@ -330,31 +342,36 @@ class DiscogsReader:
             and entry_artist_matches(entry)
         ]
 
-        # Tier 2: retry with a single trailing parenthetical stripped from ONE
-        # side at a time — the decorated-query direction (stripped query vs raw
-        # index title: "Rumours (Deluxe Edition)" → owned "Rumours") and the
+        # Tier 2: retry with a single trailing decoration stripped from ONE side
+        # at a time — the decorated-query direction (stripped query vs raw index
+        # title: "Rumours (Deluxe Edition)" → owned "Rumours") and the
         # decorated-index direction (raw query vs stripped index title:
-        # "The Wall" → owned "The Wall (UK)").  Never stripped-vs-stripped,
-        # which would equate two different parenthetical siblings (see the
-        # _TRAILING_PAREN_RE comment).  Only reached when tier 1 found nothing.
+        # "The Wall" → owned "The Wall (UK)").  Never stripped-vs-stripped, which
+        # would equate two different decorated siblings (see the trailing-strip
+        # comment above).  #222: the strip is keyword-gated and bare-year-
+        # excluded (``strip_album_decoration``), so "(Blue Album)" / "(1975)" are
+        # no longer stripped and a decorated query can't collapse onto a plain
+        # owned family member.  Keys are folded, so the strip runs on folded
+        # text.  Only reached when tier 1 found nothing.
         if not matches:
-            album_key_stripped = _normalize_term(_TRAILING_PAREN_RE.sub("", album))
-            if album_key_stripped:
-                def tier2_album_matches(index_title: str) -> bool:
-                    title_key = _normalize_term(index_title)
-                    if album_key_stripped == title_key:
-                        return True
-                    title_key_stripped = _normalize_term(
-                        _TRAILING_PAREN_RE.sub("", index_title)
-                    )
-                    return bool(title_key_stripped) and album_key == title_key_stripped
+            album_key_stripped = strip_album_decoration(album_key)
+            query_stripped = album_key_stripped != album_key
 
-                matches = [
-                    (release_id, entry)
-                    for release_id, entry in index.items()
-                    if tier2_album_matches(entry["title"])
-                    and entry_artist_matches(entry)
-                ]
+            def tier2_album_matches(index_title: str) -> bool:
+                title_key = _normalize_term(index_title)
+                # decorated-query direction: stripped query vs raw index title.
+                if query_stripped and album_key_stripped and album_key_stripped == title_key:
+                    return True
+                # decorated-index direction: raw query vs stripped index title.
+                title_key_stripped = strip_album_decoration(title_key)
+                return title_key_stripped != title_key and album_key == title_key_stripped
+
+            matches = [
+                (release_id, entry)
+                for release_id, entry in index.items()
+                if tier2_album_matches(entry["title"])
+                and entry_artist_matches(entry)
+            ]
 
         if not matches:
             return None
@@ -494,7 +511,7 @@ class DiscogsReader:
 
     def _get_collection_index(self) -> dict:
         """Build (once per session) and return an in-memory index of the user's
-        collection: ``{release_id: {"instance_id", "title", "artists"}}``.
+        collection: ``{release_id: {"instance_id", "title", "artists", "master_id"}}``.
 
         Replaces the old per-candidate membership GET (one per database
         candidate, up to 25) and the full re-walk with a single paginated fetch
@@ -562,6 +579,13 @@ class DiscogsReader:
                         "instance_id": item.get("instance_id"),
                         "title": basic.get("title", ""),
                         "artists": [a.get("name", "") for a in basic.get("artists", [])],
+                        # #226: the master groups a work's pressings.  Two owned
+                        # entries at the same (artist, title) with DIFFERENT
+                        # masters are distinct albums (Peter Gabriel I/III), not
+                        # pressings — strategy 1 defers to refuse-to-guess.  0 /
+                        # missing means "no master": treated as absent (pressings
+                        # of a master-less release stay a valid single target).
+                        "master_id": basic.get("master_id") or None,
                     }
 
             pagination = data.get("pagination", {})
