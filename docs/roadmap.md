@@ -384,7 +384,27 @@ test → mutation-check → independent cold-review discipline. By wave:
 
 See `CHANGELOG.md` for the full per-issue breakdown.
 
-### v1.5.8 — Code-review hardening, round 4 ✅ (current)
+### v1.5.9 — Round-4 follow-ups ✅ (current)
+
+**No new user-facing features.** The residuals the round-4 audit filed as
+separate follow-ups (#222–#230), remediated through the same implement → RED test
+→ mutation-check → independent cold-review discipline:
+
+- **Credit-the-right-record correctness** — the collection matcher's reader
+  normalization unified onto one shared fold table (#225); a decorated Shazam
+  album can no longer credit a plain-titled owned family member (#222); strategy 1
+  now defers to refuse-to-guess for distinct identically-titled albums (#226).
+- **Transient-outage & write resilience** — a non-JSON 429/5xx body is classified
+  transient (#228), and a long Discogs `Retry-After` on the Play Count credit is
+  honoured in the event loop instead of losing the credit (#229).
+- **Housekeeping** — in-uptime `.part` orphan sweep (#230) and a `side_position`
+  display fix for duplicated out-of-order titles (#224).
+
+#227 (reprise/bookend phantom double-credit) stays deferred with a trigger: it
+can't be separated from a genuine re-drop without the clock/counter dependency
+#185 rejected. See `CHANGELOG.md` for the full per-issue breakdown.
+
+### v1.5.8 — Code-review hardening, round 4 ✅
 
 **No new user-facing features** (one visible tweak: brighter status-strip text so
 the WCAG AA 4.5:1 promise holds on the strip too — #206). A fourth adversarial

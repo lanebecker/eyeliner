@@ -9,12 +9,66 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-**Round-4 follow-ups (milestone TBD).** The residuals the R4 cold audit filed as
-separate follow-ups (#222–#230), each through the same RED-test → mutation-check
-→ independent-audit discipline.
+Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
+seams) and #227 (reprise/bookend phantom double-credit — see below).
+
+## [1.5.9] — 2026-08-10
+
+**Round-4 follow-ups (#222–#230).** The residuals the R4 cold audit filed as
+separate follow-ups, each through the same RED-test → mutation-check →
+independent-audit discipline. #227 (reprise/bookend phantom double-credit) stays
+**deferred**: a genuine short re-drop and a reprise false-boundary both produce a
+2-row remainder session, so no rule separates them without the clock/counter
+dependency #185 deliberately rejected — a "fix" could only be bought at the cost
+of regressing #185's genuine re-drop crediting, so it remains documented (in
+`listen_tracker.py` and the #185 CHANGELOG entry) pending real hardware evidence.
+
+### Changed
+
+- **The reader's collection-match normalization is unified onto the shared
+  `normalize.fold_text` (#225 — LOW, tech debt).** #179 gave `reader.py` a private
+  `_PUNCT_FOLD` / `_normalize_term` / `_TRAILING_PAREN_RE`; #180 later created the
+  shared `normalize.py` for `SideIndex` but deliberately didn't refactor the
+  reader (cross-fix blast-radius control), leaving two fold tables that could
+  drift. The reader now folds through the one shared table, and the private
+  duplicates are deleted. The single behavioural change is a **widening**: the
+  `&`→`and` fold now applies to ALBUM titles too, so "Songs of Love & Hate"
+  matches an owned "Songs of Love and Hate" — the exact symptom #180 fixed at the
+  track level, now closed at the album level.
+- **A long Discogs `Retry-After` on the Play Count credit is now honoured instead
+  of losing the credit (#229 — enhancement).** On a `429 Retry-After: N` beyond
+  the transport's 10s in-thread cap, the credit's read-modify-write no longer
+  burns all three finalize attempts inside the same throttle window (≈3s, every
+  one a guaranteed 429). The transport raises a typed `DiscogsRateLimited` for the
+  opted-in idempotent write (and its reads), and the finalize layer waits the
+  server-requested backoff out **in the event loop** (`asyncio.sleep`, capped at
+  90s) before retrying — cancellable at shutdown (parks no worker thread) and,
+  since CONC-2/#96, outside the lifecycle lock (so it never stalls the next
+  record's session). #186's idempotent absolute-set means the honoured re-POST
+  writes the same value, so honouring the wait cannot double-credit.
 
 ### Fixed
 
+- **A decorated Shazam album no longer credits a plain-titled owned family member
+  (#222 — LOW, data-integrity).** The tier-2 collection-match strip is now
+  keyword-gated and bare-year-excluded: "(Blue Album)" and a distinguishing
+  "(1975)" are no longer treated as decoration, so playing "Weezer (Blue Album)"
+  while owning only the Green "Weezer", or "Live (1975)" against an owned plain
+  "Live" + "Live (1980)", now correctly refuses rather than crediting the wrong
+  record. Genuine edition decoration ("(Deluxe Edition)", "[30th Anniversary]")
+  still strips, brackets included, and — because the strip now runs on folded
+  text — fullwidth "（Deluxe Edition）" strips too.
+- **Strategy 1 no longer bypasses strategy 2's refuse-to-guess for distinct
+  identically-titled albums (#226 — LOW/MEDIUM, data-integrity).** Owning two
+  DISTINCT albums that share a normalised (artist, title) — the Peter Gabriel
+  self-titled family — strategy 2 correctly refused, but strategy 1 would credit
+  whichever the loose search surfaced. Strategy 1 now defers to strategy 2's
+  refusal when the collection holds ≥2 such entries with **distinct masters**
+  (distinct works), while still crediting genuine multi-**pressing** ownership
+  (shared or absent master). Documented residual (accepted): two distinct
+  same-titled albums that BOTH lack a Discogs master are data-indistinguishable
+  from pressings, so one is still credited — the canonical self-titled families
+  all carry masters, so this bites only for obscure master-less releases.
 - **`is_transient` now classifies a `JSONDecodeError` as transient (#228 —
   LOW).** python3-discogs-client calls `json.loads()` on the response body
   *before* building its `HTTPError`, so during a real outage a 429/5xx carrying a
