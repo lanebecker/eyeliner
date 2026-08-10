@@ -21,6 +21,8 @@ uniformly with our own raised errors.  The typed exceptions below are the
 vocabulary for code that wants to *signal* these conditions explicitly as
 adoption spreads.
 """
+import json
+
 import discogs_client.exceptions
 import musicbrainzngs
 import requests
@@ -52,10 +54,18 @@ class PermanentMetadataError(MetadataError):
 #    now," which is transient. Its sibling ResponseError / AuthenticationError
 #    (an invalid/parse-failed response, or a 401) are definitive for that request
 #    and are deliberately NOT listed here (#175).
+#  - json.JSONDecodeError: python3-discogs-client calls json.loads() on the
+#    response body BEFORE building its HTTPError, so during a real outage a
+#    429/5xx carrying a non-JSON body (a Cloudflare/HTML error page) raises
+#    JSONDecodeError instead of HTTPError — a genuine transient signal that was
+#    otherwise misclassified permanent (#228). Listed PRECISELY (it is a
+#    ValueError subclass; we do NOT broaden to all ValueError, which would sweep
+#    in real programming errors).
 TRANSIENT_EXTERNAL_ERRORS = (
     requests.exceptions.RequestException,
     discogs_client.exceptions.HTTPError,
     musicbrainzngs.NetworkError,
+    json.JSONDecodeError,
     ConnectionError,   # builtin (OSError subclass)
     TimeoutError,      # builtin
 )

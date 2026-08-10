@@ -215,11 +215,18 @@ class SideIndex:
         sorted_side = sorted(
             side_entries, key=lambda e: int(_SIDE_RE.match(e.position).group(2))
         )
-        side_position = None
-        for i, entry in enumerate(sorted_side):
-            if matcher(entry.title):
-                side_position = i + 1
-                break
+        # #224: locate side_position by `current`'s IDENTITY within sorted_side,
+        # not by re-matching the title. A duplicated title on one side with
+        # out-of-order rows ([("A2","Theme"),("A1","Theme")], query "Theme")
+        # would otherwise desync — track_display is the row-order first match
+        # ("A2") while a title re-match here picks the number-order first match
+        # (the OTHER "Theme" row), yielding an incoherent "A2 · 01 OF 02".
+        # `current` is a member of sorted_side (its side letter defined the set),
+        # so exactly one entry satisfies `is current`; None when current is None.
+        side_position = next(
+            (i + 1 for i, entry in enumerate(sorted_side) if entry is current),
+            None,
+        )
         side_total = len(side_entries) if side_entries else None
 
         # Global index anchor.  ``current`` is already the first tracklist row

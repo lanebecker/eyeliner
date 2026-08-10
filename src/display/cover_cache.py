@@ -100,6 +100,14 @@ _COVER_CONNECT_READ_TIMEOUT = 15     # seconds, per HTTP request
 # moves somewhere multi-tenant / pool-starvation-sensitive (#176 cold-review).
 _DOWNLOAD_DEADLINE_SECONDS = 45
 
+# #230: minimum age before the in-uptime periodic sweep (called from _prune,
+# i.e. after every download) will remove a ``.part`` orphan. A legitimately
+# in-flight download's tempfile can only be as old as _DOWNLOAD_DEADLINE_SECONDS
+# (45s); this is a comfortable multiple, so concurrent downloads on the shared
+# executor are never swept out from under each other, while genuine orphans
+# (minutes/hours/days old) are still cleared without waiting for the next boot.
+_PARTIAL_SWEEP_MIN_AGE_SECONDS = 300
+
 # R-2 disk-cache bounds.  A serious collection touches hundreds of covers; at
 # ~50-400 KB each these defaults (≈ a few hundred MB) hold a very large library
 # while still bounding unbounded growth on a small SD card.
@@ -320,26 +328,37 @@ class CoverArtCache:
 
     # -- hygiene -----------------------------------------------------------
 
-    def _sweep_partials(self) -> None:
+    def _sweep_partials(self, *, older_than_seconds: Optional[float] = None) -> None:
         """R-1: remove orphaned ``.cover-*.part`` tempfiles.
 
         A SIGKILL or power-loss between the tempfile write and the atomic rename
         strands a partial (download()'s own except-handler unlinks its tempfile
-        on an ordinary exception, so those do NOT strand). Swept once on
-        construction — which clears any partial left by the previous run's hard
-        kill (Restart=on-failure boots a fresh process, so a SIGKILL-stranded
-        partial is cleared at the next boot). #191: the appliance is NOT
-        restarted daily, so the rare partial stranded *within* one long uptime
-        (a cleanup unlink that itself failed) is not swept until the next boot; a
-        periodic in-uptime sweep is deferred to a follow-up. The *.jpg disk bound
-        itself is enforced continuously by _prune after every download, so cover
-        files never grow unbounded — only these rare .part orphans can.
+        on an ordinary exception, so those do NOT strand). Called with no age
+        filter on construction (no download can be in flight then, so sweep all —
+        this clears any partial left by the previous run's hard kill) and, per
+        #230, also from _prune() after every download so a partial stranded
+        *within* one long uptime is cleared without waiting for the next boot
+        (the appliance runs 24/7, #191 — it is NOT restarted daily).
+
+        ``older_than_seconds``: when set (the in-uptime call), only sweep
+        partials at least that old. Cover downloads run concurrently on the
+        shared executor, so a blanket sweep here would unlink a CONCURRENT
+        download's in-flight tempfile and fail it; a legitimately in-flight
+        partial can only be as old as _DOWNLOAD_DEADLINE_SECONDS, so the age gate
+        spares it while still clearing true orphans (#230).
         """
         try:
             partials = list(self.cache_dir.glob(".cover-*.part"))
         except OSError:
             return
+        now = time.time()
         for p in partials:
+            if older_than_seconds is not None:
+                try:
+                    if now - p.stat().st_mtime < older_than_seconds:
+                        continue   # too fresh — may be a concurrent in-flight download
+                except OSError:
+                    continue       # vanished / unstattable — skip
             try:
                 p.unlink()
             except OSError:
@@ -358,7 +377,8 @@ class CoverArtCache:
     def _prune(self, protect: Optional[Path] = None) -> None:
         """R-2: evict oldest covers until within both the file-count and total-
         byte bounds (mtime-LRU).  Cheap and bounded; called on init and after
-        each successful download.
+        each successful download.  Also runs the age-gated ``.part`` orphan sweep
+        (#230) so in-uptime orphans are cleared on the same cadence.
 
         ``protect`` (the path just written by :meth:`download`) is counted toward
         the bounds but is NEVER a candidate for eviction.  Without this, two
@@ -367,6 +387,11 @@ class CoverArtCache:
         the very file the triggering download just cached, forcing an immediate
         re-fetch.  Ties are otherwise broken by name so eviction is deterministic.
         """
+        # #230: also clear aged .part orphans in-uptime (age-gated so a
+        # concurrent in-flight download's fresh tempfile is spared). Cheap: one
+        # extra glob per prune, which already runs only after a download or at init.
+        self._sweep_partials(older_than_seconds=_PARTIAL_SWEEP_MIN_AGE_SECONDS)
+
         protect_name = protect.name if protect is not None else None
         candidates = []   # evictable: (mtime, name, size, path)
         file_count = 0

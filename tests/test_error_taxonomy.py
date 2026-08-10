@@ -19,6 +19,8 @@
   CoverArtFallback and then cached as the album's FALLBACK payload — see the
   additions in test_resolver_error_no_cache.py.
 """
+import json
+
 from unittest.mock import MagicMock, PropertyMock
 
 import discogs_client.exceptions
@@ -184,3 +186,20 @@ def test_build_result_degrades_year_on_transient_master_but_keeps_credit():
 
     assert result["instance_id"] == 42          # credit-capable, not discarded
     assert result["year"] == "1987"             # degraded to the pressing year
+
+
+def test_json_decode_error_is_transient():
+    # #228: python3-discogs-client json.loads() the response body BEFORE building
+    # its HTTPError, so a 429/5xx carrying a non-JSON body (Cloudflare/HTML error
+    # page) raises JSONDecodeError — a genuine transient outage that was otherwise
+    # misclassified permanent.
+    err = json.JSONDecodeError("Expecting value", "<html>503</html>", 0)
+    assert is_transient(err) is True
+
+
+def test_plain_value_error_is_not_transient():
+    # Scoped precisely: JSONDecodeError subclasses ValueError, but a BARE
+    # ValueError (a real programming error) must stay non-transient — we listed
+    # json.JSONDecodeError, not ValueError.
+    assert is_transient(ValueError("a real bug")) is False
+
