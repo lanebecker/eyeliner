@@ -15,6 +15,26 @@ section accumulates the fixes.
 
 ### Changed
 
+- **Shared `src/util/` extractions — one bounded-LRU cache and one log throttle,
+  no longer hand-rolled per module (#220 / #221 — Wave 7 bundle 8).** Both are
+  behaviour-preserving; every existing test stays green and each behaviour was
+  additionally mutation-verified.
+  - **#220 (arch-4):** `BoundedCache` moved to `src/util/cache.py` (re-exported
+    from `renderer.py` as `_BoundedCache` so the six renderer caches and all
+    importers keep resolving). `MetadataResolver`'s album cache — previously a
+    hand-rolled second copy of the same insertion-order/LRU-evict algorithm that
+    had already drifted on replace semantics — now uses it, with the #191
+    downgrade-TTL kept on top (a new `BoundedCache.pop` backs the stale eviction).
+    One algorithm, one test home (`tests/test_util_cache.py`).
+  - **#221 (arch-5):** the summarizing-log-throttle pattern (the `-inf` monotonic
+    seed was documented twice because it was re-derived twice) is now
+    `src/util/logthrottle.py` — one class with optional interval (None = pure
+    dedup, never periodic re-warn) and optional change-key. `capture.py`'s four
+    always-on log sites (PCONC-4 drop-warn, #178 error-log, and the two #164
+    device dedups) all route through it, so a future always-on site reuses it
+    instead of becoming copy #6. The three distinct contracts the sites need are
+    preserved exactly (verified: the capture suite plus mutation checks).
+
 - **A latched-release session must identify ≥2 tracks of that release to earn
   its Play Count / Last Played / love (#182 — MEDIUM, `R4:gap1-3`; behaviour
   change approved by Lane 2026-08-08).** A Shazam attribution swing —

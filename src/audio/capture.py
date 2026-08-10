@@ -32,6 +32,7 @@ import numpy as np
 import sounddevice as sd
 
 from src.audio.chunking import ChunkAssembler
+from src.util.logthrottle import LogThrottle
 
 if TYPE_CHECKING:
     from src.audio.silence import SilenceDetector
@@ -91,37 +92,32 @@ class AudioCapture:
         self._running = False
         self._blocks: Optional[asyncio.Queue] = None
 
-        # PCONC-4: drop-oldest bookkeeping. `_drop_count` accrues drops since the
-        # last warning; `_last_drop_warn` is the monotonic timestamp of that
-        # warning, so bursts collapse into one throttled health signal.
-        # Seeded to -inf (NOT 0.0) so the very first drop always reports,
-        # independent of the monotonic epoch: on the Pi CLOCK_MONOTONIC is
-        # uptime-based and resets to ~0 on reboot, so a 0.0 seed would swallow
-        # the first overflow warning during the first _DROP_WARN_INTERVAL_SECONDS
-        # of uptime — the exact early-boot window the signal matters most.
-        self._drop_count = 0
-        self._last_drop_warn = float("-inf")
+        # All four always-on log sites below share ONE throttle (arch-5/#221,
+        # src/util/logthrottle.py) instead of hand-rolling the -inf-seed pattern
+        # four times; the seed subtlety now lives in the LogThrottle docstring.
 
-        # #178: capture-loop error-log throttle bookkeeping. `_capture_error_
-        # suppressed` counts identical errors held back since the last logged line;
-        # `_last_capture_error_log` is that line's monotonic timestamp (seeded to
-        # -inf so the first error always reports, independent of the monotonic
-        # epoch); `_last_capture_error_msg` is the last message logged, so a CHANGED
-        # error surfaces immediately instead of waiting out the throttle window.
-        self._capture_error_suppressed = 0
-        self._last_capture_error_log = float("-inf")
-        self._last_capture_error_msg: Optional[str] = None
+        # PCONC-4: drop-oldest warning — a keyless interval summarizer (the message
+        # never changes, only its count), so bursts collapse into one throttled
+        # health signal per _DROP_WARN_INTERVAL_SECONDS.
+        self._drop_throttle = LogThrottle(interval=_DROP_WARN_INTERVAL_SECONDS)
 
-        # #164: the device lookup now runs on every stream rebuild (see run()), so
-        # its two logs are deduped to avoid re-emitting every iteration during a
-        # sustained rebuild/stall loop (the PCONC-4 flood class this module already
-        # fights). The two signals have DIFFERENT change keys: the "using device"
-        # INFO tracks the winning index (a re-plug to a new index re-logs — exactly
-        # the signal to surface); the multi-match WARNING tracks the full match SET,
-        # so a config that becomes NEWLY ambiguous (a second matching device
-        # appears) still warns even when the winning index is unchanged.
-        self._last_device_index: Optional[int] = None
-        self._last_match_key: Optional[tuple] = None
+        # #178: capture-loop error log — interval summarizer keyed on the error
+        # MESSAGE, so a CHANGED error surfaces immediately instead of waiting out
+        # the window, while identical repeats are counted and summarized.
+        self._capture_error_throttle = LogThrottle(
+            interval=_CAPTURE_ERROR_WARN_INTERVAL_SECONDS
+        )
+
+        # #164: the device lookup runs on every stream rebuild (see run()), so its
+        # two logs are deduped (interval=None → pure dedup, never periodic re-warn)
+        # to avoid re-emitting every iteration during a sustained rebuild/stall
+        # loop. The two signals key on DIFFERENT things: the "using device" INFO on
+        # the winning index (a re-plug to a new index re-logs — exactly the signal
+        # to surface); the multi-match WARNING on the full match SET, so a config
+        # that becomes NEWLY ambiguous (a second matching device appears) still
+        # warns even when the winning index is unchanged.
+        self._device_using_throttle = LogThrottle()
+        self._device_match_throttle = LogThrottle()
 
         self.sample_rate: int = config.sample_rate
         self.chunk_seconds: int = config.chunk_seconds
@@ -161,20 +157,24 @@ class AudioCapture:
             # the ambiguity itself changes (a newly-matching device appears), not
             # only when the winner moves — but stays quiet across a rebuild loop
             # that keeps seeing the same set (#164).
+            now = time.monotonic()  # unused by these dedup throttles (interval=None)
             match_key = tuple(idx for idx, _ in matches)
-            if len(matches) > 1 and match_key != self._last_match_key:
+            # Call should_log UNCONDITIONALLY so the match throttle's key advances
+            # on EVERY observation (#164: a set that drops to 1-match then becomes
+            # ambiguous again must re-warn) — gate the emit on len>1 afterwards.
+            match_emit, _ = self._device_match_throttle.should_log(now, key=match_key)
+            if len(matches) > 1 and match_emit:
                 others = ", ".join(f"[{j}] {d['name']}" for j, d in matches[1:])
                 log.warning(
                     f"Multiple input devices match '{self.device_name}'. "
                     f"Using the first; others were: {others}. "
                     f"Tighten audio.device_name in config.yaml if this is wrong."
                 )
-            self._last_match_key = match_key
             # "Using device" INFO: keyed on the winning index, so a re-plug to a
             # different index re-logs while a stable device stays quiet (#164).
-            if i != self._last_device_index:
+            using_emit, _ = self._device_using_throttle.should_log(now, key=i)
+            if using_emit:
                 log.info(f"Using audio device [{i}]: {device['name']}")
-                self._last_device_index = i
             return i
         available = [d["name"] for d in devices if d["max_input_channels"] > 0]
         raise ValueError(
@@ -250,17 +250,14 @@ class AudioCapture:
                 # journal (53 records in one turn was measured). The first drop
                 # after a quiet spell reports immediately (`_last_drop_warn`
                 # starts at -inf); a sustained backlog then reports periodically.
-                self._drop_count += 1
-                now = time.monotonic()
-                if now - self._last_drop_warn >= _DROP_WARN_INTERVAL_SECONDS:
+                emit, suppressed = self._drop_throttle.should_log(time.monotonic())
+                if emit:
                     log.warning(
                         "Audio block queue full; dropped %d block(s) since the "
                         "last report — the event loop is stalling (recent audio "
                         "wins).",
-                        self._drop_count,
+                        suppressed + 1,   # +1: this drop counts too (PCONC-4 aggregate)
                     )
-                    self._drop_count = 0
-                    self._last_drop_warn = now
         blocks.put_nowait(block)
 
     def _make_callback(self, loop: asyncio.AbstractEventLoop, blocks: asyncio.Queue):
@@ -298,21 +295,18 @@ class AudioCapture:
         leaves a periodic health line, not one record per backoff.
         """
         msg = str(error)
-        now = time.monotonic()
-        if (msg != self._last_capture_error_msg
-                or now - self._last_capture_error_log >= _CAPTURE_ERROR_WARN_INTERVAL_SECONDS):
-            if self._capture_error_suppressed > 0:
-                log.error(
-                    "Audio capture error: %s (%d further error(s) suppressed since "
-                    "the last report)", msg, self._capture_error_suppressed,
-                )
-            else:
-                log.error("Audio capture error: %s", msg)
-            self._capture_error_suppressed = 0
-            self._last_capture_error_log = now
-            self._last_capture_error_msg = msg
+        emit, suppressed = self._capture_error_throttle.should_log(
+            time.monotonic(), key=msg
+        )
+        if not emit:
+            return
+        if suppressed > 0:
+            log.error(
+                "Audio capture error: %s (%d further error(s) suppressed since "
+                "the last report)", msg, suppressed,
+            )
         else:
-            self._capture_error_suppressed += 1
+            log.error("Audio capture error: %s", msg)
 
     async def _silence_ticker(self):
         """Periodically poke the SilenceDetector so the end-of-session timer is

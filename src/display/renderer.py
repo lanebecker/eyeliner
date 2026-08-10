@@ -272,39 +272,12 @@ _EMPTY_STATES = {
 # (layouts.py) so a restyle is "edit layouts.py" — see tracking_* fields (A-14).
 
 
-class _BoundedCache:
-    """A small insertion-ordered cache with LRU-refresh-on-get and a size cap.
-
-    Python dicts preserve insertion order, so the eviction candidate is always
-    the first key.  get() re-inserts hits at the end ("LRU-ish"), matching the
-    strategy the palette cache has used since v1.3.2.  Pure Python, no pygame
-    dependency — unit-tested in tests/test_renderer_caches.py.
-    """
-
-    def __init__(self, max_entries: int):
-        self.max_entries = max_entries
-        self._data: dict = {}
-
-    def get(self, key):
-        """Return the cached value (refreshing its eviction position), or None."""
-        if key not in self._data:
-            return None
-        value = self._data.pop(key)
-        self._data[key] = value
-        return value
-
-    def put(self, key, value):
-        """Insert/replace a value, evicting oldest entries beyond the cap."""
-        self._data.pop(key, None)
-        self._data[key] = value
-        while len(self._data) > self.max_entries:
-            self._data.pop(next(iter(self._data)))
-
-    def __contains__(self, key) -> bool:
-        return key in self._data
-
-    def __len__(self) -> int:
-        return len(self._data)
+# _BoundedCache moved to src/util/cache.py (arch-4 / #220) so the resolver's
+# album cache shares the ONE implementation instead of a hand-rolled copy. Kept
+# as a module-level alias under the old private name so the six renderer caches
+# below and every `from src.display.renderer import _BoundedCache` importer
+# (tests/test_renderer_caches.py et al.) keep resolving unchanged.
+from src.util.cache import BoundedCache as _BoundedCache  # noqa: E402
 
 
 # _lerp_color / _lerp_palette / _quantize_palette / _PALETTE_LERP_QUANTIZE moved

@@ -12,7 +12,8 @@ import pytest
 
 from src.audio.recognizer import RawRecognitionResult
 from src.metadata.models import MetadataSource
-from src.metadata.resolver import MetadataResolver
+from src.metadata.resolver import MetadataResolver, _ALBUM_CACHE_MAX
+from src.util.cache import BoundedCache
 
 
 def make_raw():
@@ -31,7 +32,7 @@ def make_resolver():
     r.reader.refresh_index_and_research.return_value = None
     r.coverart = MagicMock()
     r.coverart.get_cover_art_url.return_value = "https://coverartarchive.org/x/front"
-    r._album_cache = {}
+    r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
     r._logged_discogs_config = {}
     return r
 
@@ -46,7 +47,7 @@ async def test_transient_collection_error_is_not_cached():
 
     assert result.source == MetadataSource.FALLBACK
     # Crucially: NOT cached, so the next track re-attempts the collection search.
-    assert r._album_cache == {}
+    assert len(r._album_cache) == 0
 
 
 @pytest.mark.asyncio
@@ -64,7 +65,7 @@ async def test_collection_error_then_database_hit_is_not_cached():
     result = await r.resolve(make_raw())
 
     assert result.source == MetadataSource.DISCOGS_DATABASE  # used for this track…
-    assert r._album_cache == {}                              # …but NOT cached → retries next track
+    assert len(r._album_cache) == 0                              # …but NOT cached → retries next track
 
 
 @pytest.mark.asyncio
@@ -98,7 +99,7 @@ async def test_transient_vs_unexpected_collection_errors_log_differently(caplog)
         await r1.resolve(make_raw())
     transient_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
     assert any("transient" in m for m in transient_msgs)
-    assert r1._album_cache == {}
+    assert len(r1._album_cache) == 0
 
     caplog.clear()
 
@@ -110,7 +111,7 @@ async def test_transient_vs_unexpected_collection_errors_log_differently(caplog)
         await r2.resolve(make_raw())
     warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("Unexpected" in m for m in warn_msgs)
-    assert r2._album_cache == {}          # unexpected also stays uncached
+    assert len(r2._album_cache) == 0          # unexpected also stays uncached
 
 
 @pytest.mark.asyncio
@@ -146,7 +147,7 @@ async def test_transient_coverart_outage_is_not_cached():
 
     assert result.source == MetadataSource.FALLBACK
     assert result.cover_art_url is None
-    assert r._album_cache == {}          # NOT cached — transient outage
+    assert len(r._album_cache) == 0          # NOT cached — transient outage
 
 
 @pytest.mark.asyncio
@@ -219,7 +220,7 @@ async def test_revoked_token_logs_actionable_error_not_transient(caplog):
     assert not any("transient" in rec.getMessage()
                    for rec in caplog.records if rec.levelno == logging.INFO
                    and "collection" in rec.getMessage())
-    assert r._album_cache == {}          # still uncached/retryable (no downgrade pinned)
+    assert len(r._album_cache) == 0          # still uncached/retryable (no downgrade pinned)
 
 
 @pytest.mark.asyncio
