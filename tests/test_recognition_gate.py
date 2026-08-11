@@ -336,22 +336,26 @@ def test_max_session_clock_resets_after_a_natural_silence(monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_recognition_without_a_music_transition_warns(caplog):
+async def test_recognition_without_a_music_transition_is_a_softened_tripwire(caplog):
     """Defense in depth: with the gate, MUSIC_STARTED always precedes recognition,
     so a session already exists when a track is confirmed. If on_track_identified
     has to CREATE the session itself, recognition happened without a music
-    transition (the #195 signature) — log a loud tripwire warning."""
+    transition (the #195 signature) — still surfaced, but R6-10 softened it from a
+    WARNING that cried 'check the wiring' every time to an INFO line naming the
+    KNOWN benign SESSION_ENDED/MUSIC_STARTED same-turn interleave (which
+    self-heals, no play lost)."""
     from tests.test_listen_tracker import make_tracker, make_track
 
     tracker, _ = make_tracker()
     # No on_silence_event(MUSIC_STARTED) → no session yet.
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         await tracker.on_track_identified(make_track("Master-Dik"))
 
     assert tracker._session is not None                       # still starts (no data lost)
-    assert any("without" in r.message.lower() and "music" in r.message.lower()
-               for r in caplog.records), \
-        "a track recognized without a music transition must warn (#195 tripwire)"
+    trip = [r for r in caplog.records
+            if "no active session" in r.message.lower() and "R6-10" in r.message]
+    assert len(trip) == 1, "the #195 tripwire must still surface (naming R6-10's benign case)"
+    assert trip[0].levelno == logging.INFO, "softened from WARNING to INFO (R6-10)"
 
 
 # ---------------------------------------------------------------------------

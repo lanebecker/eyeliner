@@ -474,3 +474,127 @@ def test_active_client_with_love_off_does_not_warn(caplog):
     with caplog.at_level(_logging.WARNING):
         ListenTracker(writer, lastfm)
     assert not any("love on completion" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# R6-07 (#272) — the single-track carve-out counts VINYL rows, not CD/bonus.
+# A hybrid LP+CD edition whose sole VINYL row is a side-long piece must be
+# creditable on a full vinyl play; len(tracklist) counted the never-playable
+# bonus-CD rows and suppressed it forever.
+# ---------------------------------------------------------------------------
+
+_HYBRID_TL = [
+    TracklistEntry("A1", "Side-Long Piece"),    # the only vinyl side
+    TracklistEntry("CD1", "Bonus Track One"),   # never plays on the platter
+    TracklistEntry("CD2", "Bonus Track Two"),
+]
+
+
+def _hybrid_closer():
+    return TrackMetadata(
+        title="Side-Long Piece", artist="Post Rock Band",
+        album="One Long Piece (+ Bonus CD)",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        discogs_release_id=700, discogs_instance_id=701, tracklist=_HYBRID_TL,
+    )
+
+
+def test_single_vinyl_row_hybrid_is_completion_supported():
+    """R6-07: the carve-out mirrors the R5-16(a) vinyl anchor — one VINYL row is
+    a complete play even when never-playable CD rows follow it. Pre-fix the
+    carve-out tested ``len(closer.tracklist) == 1`` (== 3 here) → the full vinyl
+    play was ALWAYS suppressed."""
+    closer = _hybrid_closer()
+    assert closer.is_last_track is True             # vinyl anchor → A1 is the closer
+    s = PlaySession()
+    s.album_release_id = closer.discogs_release_id
+    s.log_track(closer)
+    s.potential_last_track = True
+    s.closing_track = closer
+    assert s.supporting_row_count == 1              # only the one vinyl row exists
+    assert s.completion_supported is True
+
+
+@pytest.mark.asyncio
+async def test_single_vinyl_row_hybrid_full_play_credits():
+    """R6-07 end-to-end: the full vinyl play credits instead of being suppressed."""
+    tracker, writer, _ = _tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(_hybrid_closer())
+    await tracker._end_session()
+    writer.increment_play_count.assert_called_once_with(700, 701)
+
+
+def test_multi_vinyl_row_hybrid_still_needs_two_rows():
+    """Control: a hybrid with TWO vinyl rows is NOT a single-track release — a
+    closer-only needle drop stays suppressed (the carve-out must not fire just
+    because CD rows were dropped from the count)."""
+    tl = [
+        TracklistEntry("A1", "Movement I"), TracklistEntry("B1", "Movement II"),
+        TracklistEntry("CD1", "Bonus"),
+    ]
+    closer = TrackMetadata(
+        title="Movement II", artist="Band", album="Two Movements (+CD)",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        discogs_release_id=710, discogs_instance_id=711, tracklist=tl,
+    )
+    assert closer.is_last_track is True             # B1 is the last vinyl row
+    s = PlaySession()
+    s.album_release_id = closer.discogs_release_id
+    s.log_track(closer)
+    s.potential_last_track = True
+    s.closing_track = closer
+    assert s.supporting_row_count == 1
+    assert s.completion_supported is False          # two vinyl rows → needs the supporting one
+
+
+# ---------------------------------------------------------------------------
+# R6-06 (#271) — the love gate must not fire on a lone UNLATCHED (DB-tier) closer.
+# ---------------------------------------------------------------------------
+
+def _db_comp_closer():
+    """'The Hit' resolved at the DATABASE tier (unowned compilation): a release
+    id but NO instance id, so the session never latches ``album_release_id``."""
+    return TrackMetadata(
+        title="The Hit", artist="Sonic Youth", album="Greatest Hits",
+        source=MetadataSource.DISCOGS_DATABASE,
+        discogs_release_id=200, discogs_instance_id=None, tracklist=GH_TRACKLIST,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unlatched_db_closer_is_not_loved():
+    """R6-06: an unowned / DB-resolved album whose closer identifies ONCE, with
+    zero supporting rows, must NOT be Loved. The credit path already skips
+    unlatched sessions, but the love branch reused ``completion_supported``,
+    whose ``album_release_id is None`` escape hatch waved it through."""
+    tracker, writer, lastfm = _tracker(with_lastfm=True)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(_db_comp_closer())
+    assert tracker._session.album_release_id is None      # never latched (no instance id)
+    await tracker._end_session()
+    lastfm.love.assert_not_called()
+    writer.increment_play_count.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unlatched_db_full_side_is_still_loved():
+    """Control: an unlatched DB album whose side genuinely completed (≥2 distinct
+    resolved rows of the closer's release) is STILL loved — the tightening is
+    about EVIDENCE, not about refusing all unlatched loves."""
+    tracker, writer, lastfm = _tracker(with_lastfm=True)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+
+    def db(title):
+        return TrackMetadata(
+            title=title, artist="Sonic Youth", album="Greatest Hits",
+            source=MetadataSource.DISCOGS_DATABASE,
+            discogs_release_id=200, discogs_instance_id=None, tracklist=GH_TRACKLIST,
+        )
+
+    await tracker.on_track_identified(db("Early Single"))   # row 0 (support)
+    await tracker.on_track_identified(db("The Hit"))         # row 2 (closer)
+    assert tracker._session.album_release_id is None
+    await tracker._end_session()
+    assert lastfm.love.call_count == 1
+    assert lastfm.love.call_args[0][0].title == "The Hit"

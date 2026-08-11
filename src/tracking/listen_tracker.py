@@ -4,9 +4,14 @@ Logic:
   - Maintains a PlaySession from first track identification until SESSION_ENDED.
   - When the last track on the album is identified, sets potential_last_track = True.
   - On SESSION_ENDED (sustained silence), if potential_last_track is set:
-      1. Calls DiscogsCollectionWriter.increment_play_count for the release.
+      1. Credits the release's Play Count via the #186 read-once / idempotent-set
+         split (read_play_count then a retried set_play_count, in
+         _credit_completed_album) — NOT increment_play_count (R6-12): retrying the
+         whole read-modify-write double-credits an ambiguous-but-applied POST, so
+         increment_play_count has no production caller.
       2. Calls DiscogsCollectionWriter.update_last_played if last_played_field_name is configured.
-      3. Calls LastFmClient.love on the last track if love_on_completion is enabled.
+      3. Loves the closing_track on Last.fm if love_on_completion is enabled and
+         the completion is supported (love_supported, R6-06).
   - Conservative by design: if the last track was never identified (e.g. only
     Side A was played), none of the above updates are triggered.
 
@@ -42,21 +47,31 @@ complete playthroughs into one credit.  The album's OPENER (resolved row 0)
 arriving after potential_last_track armed (and not a consecutive
 re-identification) now splits exactly like a record change: the finished
 playthrough credits at the boundary and the replay earns its own session.
-Opener-only on purpose — a looser trigger let stale mid-album
-re-identifications mint a double credit for one playthrough.  Accepted
-conservative residuals: a re-drop straight into a later track still merges
-(the old undercount, for that slice); a replay of a WHOLLY DB-degraded
-playthrough is absorbed by the #184 suppression (costing at most one
-Last.fm love — the degraded playthrough was uncreditable anyway); and after
-a #184 tier upgrade the degraded DB row is not #182 support, so a SHORT
-album needs two collection-resolved rows after the blip to credit.  One
-KNOWN phantom residual survives opener-only (#227, LOW, accepted with Lane
-2026-08-08): on a reprise/bookend album whose closer musically echoes the
-opener, a late chunk of the still-playing closer can Shazam-resolve to the
-opener's row (global_index 0), tripping this boundary with no real re-drop
-and minting a second credit — distinguishing it from a genuine re-drop is
-not cheaply possible (both yield a 2-row remainder), so it is documented
-rather than fixed.
+Anchored on the release's FIRST VINYL row (R6-08), not tracklist row 0, so a
+hybrid whose vinyl opener trails a leading CD/file row still splits a genuine
+re-drop (the anchor falls back to row 0 for a plain numbered tracklist).  A
+single-(vinyl-)row release is EXEMPT (R6-05): there the opener IS the closer,
+so "replay" and "still playing" cannot be told apart, and a foreign
+mis-attribution mid-spin — which breaks the consecutive-dedup chain the guard
+relies on — would otherwise let the single's own re-id split, credit via the
+carve-out, then re-arm into a SECOND credit for one play.  Anchored to the
+opener (not any same-release track) on purpose — a looser trigger let stale
+mid-album re-identifications mint a double credit for one playthrough.
+Accepted conservative residuals: a re-drop straight into a later track still
+merges (the old undercount, for that slice); a replay of a WHOLLY DB-degraded
+playthrough is absorbed by the #184 suppression (costing at most one Last.fm
+love — the degraded playthrough was uncreditable anyway); after a #184 tier
+upgrade the degraded DB row is not #182 support, so a SHORT album needs two
+collection-resolved rows after the blip to credit; and two spins of a single /
+one-vinyl-row release in one sitting credit once (the singles analogue of #227,
+now that the exemption merges them).  One KNOWN phantom residual survives on
+MULTI-ROW albums (#227, LOW, accepted with Lane 2026-08-08): on a
+reprise/bookend album whose closer musically echoes the opener, a late chunk of
+the still-playing closer can Shazam-resolve to the opener's (first-vinyl) row,
+tripping this boundary with no real re-drop and minting a second credit —
+distinguishing it from a genuine re-drop is not cheaply possible (both yield a
+2-row remainder), so it is documented rather than fixed.  The SINGLES shape of
+that same mechanism is now handled by the single-row exemption above (R6-05).
 
 Tracks without a release_id (FALLBACK source) can't be distinguished and
 never trigger a split.
@@ -466,7 +481,9 @@ class ListenTracker:
         # love-side analogue of the B-8 credited/crediting guard above.
         if (
             session.potential_last_track
-            and session.completion_supported   # #182: same gate as the credit
+            and session.love_supported   # #182 gate + R6-06: unlatched DB-tier
+                                         # closers need ≥2 rows too (the credit
+                                         # path skips them; the love must as well)
             and not session.loved
             and not session.loving
             and self.lastfm
@@ -722,11 +739,21 @@ class ListenTracker:
                 # recognized without a music transition — the exact immortal-session
                 # signature — so surface it loudly (defense in depth; the session
                 # is still started so no play is lost).
-                log.warning(
-                    "Track '%s' was recognized without a preceding music "
-                    "transition (no active session) — starting one, but this "
-                    "should not happen with the recognition gate; check the "
-                    "silence detector / capture wiring (#195).",
+                # R6-10: softened from a WARNING that always cried "check the
+                # wiring". There is a KNOWN benign interleave that lands here with
+                # nothing wrong: a SESSION_ENDED task detached the previous session
+                # in the SAME event-loop turn that a MUSIC_STARTED had merged into
+                # it, so recognition finds no session and starts a fresh one — no
+                # play is lost. Name that case instead of alarming on every
+                # occurrence; a genuine wiring gap shows up as this recurring OUTSIDE
+                # a session end (plus other symptoms), not as one self-healing line.
+                log.info(
+                    "Track '%s' recognized with no active session — starting one "
+                    "(no play lost). Expected benign case (R6-10): a SESSION_ENDED "
+                    "detached the previous session in the same event-loop turn a "
+                    "MUSIC_STARTED merged into it. If this RECURS and not around a "
+                    "session end, it can indicate a silence-detector / capture "
+                    "wiring gap (#195).",
                     track.title,
                 )
                 self._start_session()
@@ -777,14 +804,35 @@ class ListenTracker:
                 # two genuine rows, passing the #182 gate for a second credit.
                 # The opener is the one row a genuine re-drop identifies first
                 # and chunk-overlap noise essentially never resurfaces late.
+                #
+                # R6-08: anchor on the release's FIRST VINYL row, not tracklist
+                # row 0.  R5-16(a) made only the CLOSER vinyl-aware; a hybrid
+                # whose vinyl opener follows a leading CD/file row (global_index
+                # 1+) never matched `== 0`, so a genuine re-drop merged (one
+                # credit for two plays).  `first_playable_index` falls back to 0,
+                # so a plain numbered/side-A-first tracklist is unchanged.
+                #
+                # R6-05: EXEMPT a single-playable-row release (`is_last_track` at
+                # the opener anchor → opener IS the closer).  There "replay" and
+                # "still playing" are indistinguishable, so a foreign
+                # mis-attribution mid-spin (which breaks the consecutive-dedup
+                # chain the guard below relies on) would otherwise let the
+                # single's own re-id split → carve-out credit → re-arm → a SECOND
+                # credit for ONE physical play (the #227 mechanism in singles
+                # shape).  Merging is the conservative posture the codebase takes
+                # for the analogous bookend-album residual (#227).
+                #
                 # Accepted conservative residuals: a re-drop straight into a
                 # LATER track (side-B replay, needle past the opener) still
-                # merges (the pre-#185 undercount, for that slice only).
+                # merges (the pre-#185 undercount, for that slice only); and two
+                # spins of a single/one-vinyl-row release in one sitting credit
+                # once (the singles analogue of #227).
                 # Release-less (FALLBACK) tracks keep never triggering splits.
                 self._session.potential_last_track
                 and track.discogs_release_id is not None
                 and track.discogs_release_id == self._session.last_release_id
-                and track.side_index.global_index == 0
+                and track.side_index.global_index == track.side_index.first_playable_index
+                and not track.is_last_track
                 and not self._is_consecutive_reidentification(track)
             ):
                 split_reason = (
@@ -847,7 +895,22 @@ class ListenTracker:
             task = asyncio.create_task(self._finalize_detached(detached))
             self._bg_tasks.add(task)
             task.add_done_callback(self._on_end_session_done)
-            await asyncio.shield(task)
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Shutdown cancelled the recognition leg mid-credit — propagate so
+                # the leg tears down cleanly. drain() still awaits the shielded
+                # task through _bg_tasks (that's what #187 registered it for).
+                raise
+            except Exception:
+                # R6-11: the task's done-callback (_on_end_session_done) already
+                # logs any exception from the detached finalize — at completion,
+                # attached to the SESSION_ENDED that caused it. Don't ALSO let it
+                # propagate through the recognition leg and get logged a second
+                # time as a recognition error; the credit already failed and was
+                # reported once. (A raise here is rare — _finalize_session contains
+                # its own write failures — so this is a backstop, not the norm.)
+                pass
         elif detached is not None:
             log.debug(
                 "Split-off session reached no last track — nothing to credit; "
