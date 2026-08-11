@@ -883,3 +883,55 @@ def test_backend_can_be_injected():
                       side_effect=AssertionError("_init_backend must not run when a backend is injected")):
         loop = RecognitionLoop(config, state, AsyncMock(), backend=fake_backend)
     assert loop.backend is fake_backend
+
+
+# ---------------------------------------------------------------------------
+# R5-04 (#233) — a current-track hit must clear a stale pending competitor
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_current_track_hit_clears_a_stale_pending_competitor():
+    """A single stray misrecognition of B while A plays must NOT survive to be
+    completed by a second isolated B hit much later. RED before R5-04: the
+    same-as-current branch reset miss/churn but left `_pending_result = B`, so
+    B (count 1) persisted through 20 correct A chunks and a later lone B hit
+    reached confirmation_required and committed the WRONG track."""
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
+    A = make_raw(title="A", album="Alb A")
+    B = make_raw(title="B", album="Alb B")
+
+    await loop._handle_result(A, 0)
+    await loop._handle_result(A, 0)          # A confirmed
+    state.current_raw = A
+    on_confirmed.reset_mock()
+
+    await loop._handle_result(B, 0)          # one stray B
+    for _ in range(20):
+        await loop._handle_result(A, 0)      # A keeps playing
+    assert loop._pending_result is None      # the stray B was cleared by the A hits
+    await loop._handle_result(B, 0)          # a lone later B must NOT complete
+
+    on_confirmed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rec1_alternating_recovery_survives_the_r5_04_fix():
+    """The R5-04 fix must not weaken REC-1: a NEW track identified on alternating
+    chunks (hit / miss / hit) still accumulates to a confirmation, because a
+    None miss does not clear the pending — only a hit on the *current* track
+    does."""
+    loop, state, on_confirmed = make_loop(confirmation_required=2)
+    A = make_raw(title="A", album="Alb A")
+    B = make_raw(title="B", album="Alb B")
+
+    await loop._handle_result(A, 0)
+    await loop._handle_result(A, 0)          # A current
+    state.current_raw = A
+    on_confirmed.reset_mock()
+
+    await loop._handle_result(B, 0)          # pending B (1)
+    await loop._handle_result(None, 0)       # miss — must NOT clear pending (REC-1)
+    await loop._handle_result(B, 0)          # pending B (2) → confirm B
+
+    on_confirmed.assert_awaited_once()
+    assert on_confirmed.await_args.args[0].title == "B"

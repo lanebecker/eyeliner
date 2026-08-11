@@ -528,6 +528,18 @@ class RecognitionLoop:
         if self._same_track(result, self.state.current_raw):
             self._miss_count = 0  # same track still playing — recognition works (B-7)
             self._churn_count = 0  # …and not churning (B-21)
+            # R5-04: a hit on the CURRENT track is positive evidence AGAINST any
+            # half-accumulated competitor, so discard the pending candidate here.
+            # Without this, a single stray misrecognition of B left B pending for
+            # the rest of the side (misses deliberately don't clear it, REC-1),
+            # and one more isolated B hit — even 20 correct A chunks later —
+            # reached confirmation_required and committed the wrong track. This is
+            # NOT the REC-1 case: REC-1 only requires that a None (miss) not clear
+            # the pending, preserving hit/miss/hit accumulation of the SAME track;
+            # a confirmed different current track is a stronger signal than a lone
+            # stale competitor and legitimately resets it.
+            self._pending_result = None
+            self._pending_count = 0
             return  # Same track still playing
 
         if self._same_track(result, self._pending_result):
