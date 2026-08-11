@@ -9,6 +9,44 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-5 audit — Wave 3: availability & input hardening (milestone #26).** Stay
+up, fail loud — each fix RED-test-first, mutation-checked, cold-reviewed.
+
+### Fixed
+
+- **The MusicBrainz cover-art lookup can no longer freeze the pipeline (#238 —
+  HIGH, `R5-08`).** musicbrainzngs is urllib-based and set no socket timeout, so
+  a stalled cover fetch froze `resolve()` — and, because resolves serialize, the
+  whole commit pipeline — until restart. coverart now sets a process-wide default
+  socket timeout (if unset), and the resolver wraps the call in `asyncio.wait_for`;
+  a timeout is treated as transient (fallback returned, not cached, retried next
+  track) so the pipeline never blocks.
+- **A non-string field in an untrusted Shazam payload no longer wedges the loop
+  (#239 — MEDIUM, `R5-10`).** A numeric title/subtitle/album/isrc crashed
+  `_norm().split()` every chunk (no miss counted, display stuck on IDENTIFYING);
+  all four are now `str()`-coerced at parse, and `_norm` is total.
+- **`audio.silence_threshold_rms` is domain-checked (#240 — MEDIUM, `R5-11`).**
+  0/negative made the silence test unreachable (idle chunks POSTed to Shazam,
+  the #193 class); NaN killed recognition silently. Now must be finite and > 0.
+- **Required config strings must be non-empty (#241 — MEDIUM, `R5-12`).** An
+  empty device_name silently bound the first input device; an empty user_token /
+  play_count_field_name failed only at runtime. All rejected at startup, with the
+  token's value never echoed (SEC-3).
+- **A transient index refresh no longer discards a good snapshot (#242 —
+  MEDIUM, `R5-18`).** `refresh_index_and_research` nulled the collection index
+  before rebuilding; a dropped GET left the reader index-less, forcing a full
+  re-page on every later resolve. It now rebuilds swap-on-success, restoring the
+  prior index if the rebuild raises.
+- **A failed/pending cover download no longer respawns a decode every frame
+  (#243 — MEDIUM, `R5-21`).** `_load_cover` now gates the off-loop decode on a
+  cover-readiness signal set once `_prefetch_cover` lands the file (~10 no-op
+  tasks/s + a blocking stat on the loop, for the whole track, are gone); a failed
+  download records a bounded tally and blacklists past the bound.
+- **http→https cover-URL upgrade drops the port (#244 — LOW, `R5-29`).**
+  `http://host:80/x` became `https://host:80/x` and dialed TLS to port 80 (cover
+  silently never loaded); the port (and userinfo) are now dropped so every fetch
+  resolves to 443, also closing a trusted-host port-probing vector.
+
 Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
 seams), #227 (reprise/bookend phantom double-credit), and #265 (Various
 compilations miss the collection).
