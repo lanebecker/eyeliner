@@ -350,6 +350,16 @@ class DisplayRenderer:
         # so the render path (which spawns a decode on each cache miss) can't
         # stack up duplicate load+scale tasks for the same cover.
         self._cover_decode_inflight: set = set()
+        # R5-21: urls whose cover file is CONFIRMED on disk this session.
+        # _load_cover only spawns an off-loop decode for a url in this set, so a
+        # cover whose download is still in flight OR failed never triggers a fresh
+        # decode task every render frame (a not-on-disk cover used to spawn ~10
+        # tasks/s for the whole track — each doing a blocking exists() stat on the
+        # loop and returning before the inflight guard could engage). _prefetch_cover
+        # adds the url once the download lands (and bumps _cover_version → repaint,
+        # so the gated decode then spawns); _on_state_change drops it for a NEW
+        # cover so a stale entry can't mislead the next track.
+        self._cover_on_disk: set = set()
         # True while the display surface is unavailable (video-mode loss);
         # suppresses per-frame "decode deferred" logging until a cover decodes.
         self._cover_decode_deferred: bool = False
@@ -492,6 +502,12 @@ class DisplayRenderer:
                 # bad cover can't be re-triggered into the loop by state churn.)
                 self._cover_bad_urls.discard(url)
                 self._cover_load_failures.pop(url, None)
+                self._cover_on_disk.discard(url)   # R5-21: re-confirm on this track's prefetch
+                # R5-21: bound _cover_on_disk — drop the OUTGOING cover's readiness
+                # marker. Its scaled surface is already in the (bounded) _cover_cache,
+                # so the gate is only consulted on a cache miss; keeping the marker
+                # would grow the set by one per distinct cover over 24/7 uptime.
+                self._cover_on_disk.discard(self._wanted_cover_url)
             self._wanted_cover_url = url
             self._queue_palette(url)
             if url:
@@ -499,6 +515,7 @@ class DisplayRenderer:
         elif state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR, PlayerStatus.LISTENING):
             # Empty states always use the fallback palette (DESIGN.md §2);
             # lerp back smoothly rather than jump-cutting.
+            self._cover_on_disk.discard(self._wanted_cover_url)   # R5-21: bound the set
             self._wanted_cover_url = None
             self._queue_palette(None)
 
@@ -1359,10 +1376,39 @@ class DisplayRenderer:
                     await loop.run_in_executor(None, self._cover_store.download, url)
                     log.debug(f"Cover art cached: {self._cover_store.path_for(url).name}")
                 except Exception as e:
-                    log.warning(f"Failed to download cover art from {url}: {e}")
+                    # R5-21 (b): a failed download must terminate, not silently
+                    # leave the cover un-ready forever. Record it in the shared
+                    # tally and blacklist past _COVER_MAX_LOAD_FAILURES (mirroring
+                    # the corrupt-decode path), so a repeatedly-failing url stops
+                    # being re-attempted until the track changes (which lifts the
+                    # blacklist). The url is NOT marked on-disk, so _load_cover
+                    # never spawns a decode for it — no per-frame churn.
+                    failures = self._cover_load_failures.get(url, 0) + 1
+                    self._cover_load_failures[url] = failures
+                    if failures > _COVER_MAX_LOAD_FAILURES:
+                        self._cover_bad_urls.add(url)
+                        log.error(
+                            f"Cover art download for {url} failed {failures} times "
+                            f"— giving up until the track changes: {e}"
+                        )
+                    else:
+                        log.warning(f"Failed to download cover art from {url} "
+                                    f"(attempt {failures}): {e}")
                     return
 
+            # R5-21: the file is now on disk (freshly downloaded or warm-cached),
+            # so _load_cover may decode it. Mark readiness before extraction so a
+            # frame rendered DURING it can already spawn the decode.
+            self._cover_on_disk.add(url)
             await self._extract_palette_async(url)
+            # Re-affirm readiness right before the repaint-triggering version bump:
+            # a rapid X->Y->X state flip DURING the await above runs
+            # _on_state_change, which discards X from _cover_on_disk, and the
+            # re-spawned prefetch(X) is deduped by _cover_prefetch_inflight so it
+            # would NOT re-add it — leaving the gate shut when this repaint lands
+            # and sticking the cover on the placeholder (cold-review LOW). The file
+            # is confirmed on disk here, so re-adding is always correct.
+            self._cover_on_disk.add(url)
             # A cover for `url` is now on disk — bump the version so the next
             # render recomposes the static frame and picks it up (B-22).
             self._cover_version += 1
@@ -1428,7 +1474,12 @@ class DisplayRenderer:
         # Not decoded yet — kick off the off-loop load+scale (deduped inside
         # _decode_cover_async and via the inflight guard here) and show the
         # placeholder until it lands.  _spawn no-ops without a running loop.
-        if (url, w, h) not in self._cover_decode_inflight:
+        # R5-21: only spawn a decode once the file is known on disk — otherwise a
+        # pending/failed download would respawn a (blocking-stat, no-op) decode
+        # task every frame for the whole track. _prefetch_cover marks readiness
+        # and bumps _cover_version, so a landed download triggers a repaint that
+        # reaches here with url in _cover_on_disk and the decode spawns once.
+        if url in self._cover_on_disk and (url, w, h) not in self._cover_decode_inflight:
             self._spawn(self._decode_cover_async(url, w, h))
         return None
 

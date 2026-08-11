@@ -43,6 +43,7 @@ def make_renderer():
     r._cover_bad_urls = set()
     r._cover_prefetch_inflight = set()
     r._cover_decode_inflight = set()
+    r._cover_on_disk = set()          # R5-21 cover-readiness gate
     r._cover_decode_deferred = False
     r._cover_version = 0
     return r
@@ -446,6 +447,7 @@ async def test_load_cover_does_not_decode_on_the_render_path(tmp_path, monkeypat
     r._bg_tasks = set()
     url = "https://i.discogs.com/x.jpg"
     Image.new("RGB", (80, 80), (40, 40, 40)).save(r._cover_store.path_for(url))
+    r._cover_on_disk.add(url)   # R5-21: prefetch would have marked it on disk
 
     import threading
     main_thread = threading.current_thread()
@@ -714,6 +716,7 @@ def test_static_frame_recomposes_when_cover_version_bumps(tmp_path):
     r._cover_bad_urls = set()
     r._cover_prefetch_inflight = set()
     r._cover_decode_inflight = set()
+    r._cover_on_disk = set()          # R5-21 cover-readiness gate
     r._cover_decode_deferred = False
     r._dirty = False
 
