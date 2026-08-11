@@ -80,94 +80,127 @@ class DiscogsCollectionWriter:
     # Public interface
     # -------------------------------------------------------------------------
 
+    def read_play_count(self, release_id: int, instance_id: int):
+        """Read the current Play Count and resolve the field id, in ONE step.
+
+        Returns ``(field_id, current_count)`` on success, or ``None`` when the
+        credit must be aborted WITHOUT writing:
+
+          * the ``Play Count`` custom field is not configured on the account;
+          * the current value is UNKNOWN (``_READ_FAILED`` — the GET failed or the
+            instance was absent/paged), so treating it as 0 would clobber the
+            owner's accumulated count (META-1);
+          * the value is present but non-integer real data (META-2).
+
+        A blank field (``None``) is a CONFIRMED zero.  This is the READ half of
+        the read-once/idempotent-set credit (#186): the caller reads ONCE, computes
+        ``current_count + 1``, and retries only the absolute POST — so an ambiguous
+        POST (applied server-side but response lost) can never be re-read and
+        double-credited.  A raised :class:`DiscogsRateLimited` propagates for the
+        #229 read-honor path.
+        """
+        fields = self._get_collection_fields()
+        field_id = fields.get(self.play_count_field_name)
+        if field_id is None:
+            log.error(
+                f"Custom field '{self.play_count_field_name}' not found in Discogs. "
+                f"Available fields: {list(fields.keys())}"
+            )
+            return None
+
+        raw_value = self._get_field_value(release_id, instance_id, field_id)
+        if raw_value is _READ_FAILED:
+            log.error(
+                f"Aborting Play Count increment for release {release_id} / instance "
+                f"{instance_id}: could not read the current value, so refusing to "
+                f"overwrite it (leaving the existing count intact)."
+            )
+            return None
+
+        # Coerce via str() before .strip(): a confirmed value is normally a
+        # string, but Discogs can return it as a JSON number, and calling
+        # .strip() on an int would raise (B-16). None / "" is a blank field.
+        text = str(raw_value).strip() if raw_value is not None else ""
+        if not text:
+            return field_id, 0  # confirmed-blank field == zero plays
+        try:
+            return field_id, int(text)
+        except (ValueError, TypeError):
+            # A present but non-integer value is real data we cannot safely
+            # increment; overwriting it with an absolute 1 would destroy it
+            # (META-2). Abort rather than clobber.
+            log.error(
+                f"Aborting Play Count increment for release {release_id} / instance "
+                f"{instance_id}: existing value {raw_value!r} is not an integer, so "
+                f"refusing to overwrite it with 1."
+            )
+            return None
+
+    def set_play_count(
+        self, release_id: int, instance_id: int, field_id: int,
+        current_count: int, new_count: int,
+    ) -> bool:
+        """POST an ABSOLUTE Play Count value.  Idempotent by construction: the
+        body is ``new_count`` (not an increment), so re-issuing the SAME call
+        writes the SAME value.  This is the retried unit of the #186 fix — the
+        finalize layer computes ``new_count`` once (from :meth:`read_play_count`)
+        and retries ONLY this, so an ambiguous POST that already landed is simply
+        overwritten with the same value, never doubled.
+
+        Returns True on HTTP 204, False on any other status.  Raises on transport
+        failure / :class:`DiscogsRateLimited` so the caller's bounded retry (and
+        the #229 honor path) can act; the caller treats a raise as one failed
+        attempt.
+        """
+        # Validate every ID before it lands in the write URL (S-5).
+        url = (
+            f"{_API_BASE}/users/{self._username_path}/collection"
+            f"/folders/0/releases/{_as_id(release_id, 'release_id')}"
+            f"/instances/{_as_id(instance_id, 'instance_id')}"
+            f"/fields/{_as_id(field_id, 'field_id')}"
+        )
+        # Idempotent absolute-set (writes new_count, not an increment), so a
+        # single 429 retry is safe (B-15).  #229: honor_long_retry_after opts THIS
+        # write in to the event-loop backoff — a long Retry-After raises
+        # DiscogsRateLimited instead of losing the credit.  The absolute-set means
+        # both the in-request 429 re-POST AND the finalize-layer retry (#186) write
+        # the SAME new_count, so neither can double-credit.
+        resp = self._http.request(
+            "POST", url, retry_on_429=True, honor_long_retry_after=True,
+            json={"value": str(new_count)},
+        )
+        if resp.status_code == 204:
+            log.info(
+                f"Play Count updated for release {release_id} / instance {instance_id}: "
+                f"{current_count} → {new_count}."
+            )
+            return True
+        # Log the status code only; the raw 4xx body is not logged (S-4).
+        log.error(f"Discogs field update returned {resp.status_code}.")
+        return False
+
     def increment_play_count(self, release_id: int, instance_id: int) -> bool:
         """Increment the 'Play Count' custom field by 1 for a collection item.
 
-        Reads the current value first (defaulting to 0 if blank, unreadable,
-        or unreachable), then POSTs the incremented value back.
+        A thin composition of :meth:`read_play_count` then :meth:`set_play_count`
+        for callers that want a single read-modify-write in one call (and the
+        existing unit tests).  Returns True on success (HTTP 204), False on any
+        failure.
 
-        Uses the Discogs collection field update endpoint:
-          POST /users/{username}/collection/folders/0/releases/{release_id}
-               /instances/{instance_id}/fields/{field_id}
-
-        Returns True on success (HTTP 204), False on any failure.
+        NOTE: this is NOT the unit the finalize layer retries.  Retrying the whole
+        read-modify-write double-credits an ambiguous-but-applied POST (#186); the
+        finalize path calls :meth:`read_play_count` once and retries only
+        :meth:`set_play_count`.  Kept idempotent-on-429 within a single call via
+        the absolute-set POST.
         """
         try:
-            fields = self._get_collection_fields()
-            field_id = fields.get(self.play_count_field_name)
-            if field_id is None:
-                log.error(
-                    f"Custom field '{self.play_count_field_name}' not found in Discogs. "
-                    f"Available fields: {list(fields.keys())}"
-                )
+            state = self.read_play_count(release_id, instance_id)
+            if state is None:
                 return False
-
-            # Read the current value. This is a read-modify-write ending in an
-            # ABSOLUTE set, so an untrusted read must never become a write:
-            # treating an unreadable value as 0 would reset the owner's
-            # accumulated Play Count to 1 (META-1). Only a CONFIRMED-blank field
-            # (None) is a safe 0; _READ_FAILED means "unknown — abort".
-            raw_value = self._get_field_value(release_id, instance_id, field_id)
-            if raw_value is _READ_FAILED:
-                log.error(
-                    f"Aborting Play Count increment for release {release_id} / instance "
-                    f"{instance_id}: could not read the current value, so refusing to "
-                    f"overwrite it (leaving the existing count intact)."
-                )
-                return False
-
-            # Coerce via str() before .strip(): a confirmed value is normally a
-            # string, but Discogs can return it as a JSON number, and calling
-            # .strip() on an int would raise (B-16). None / "" is a blank field.
-            text = str(raw_value).strip() if raw_value is not None else ""
-            if not text:
-                current_count = 0  # confirmed-blank field == zero plays
-            else:
-                try:
-                    current_count = int(text)
-                except (ValueError, TypeError):
-                    # A present but non-integer value is real data we cannot
-                    # safely increment; overwriting it with an absolute 1 would
-                    # destroy it (META-2). Abort rather than clobber.
-                    log.error(
-                        f"Aborting Play Count increment for release {release_id} / instance "
-                        f"{instance_id}: existing value {raw_value!r} is not an integer, so "
-                        f"refusing to overwrite it with 1."
-                    )
-                    return False
-
-            new_count = current_count + 1
-
-            # Validate every ID before it lands in the write URL (S-5).
-            url = (
-                f"{_API_BASE}/users/{self._username_path}/collection"
-                f"/folders/0/releases/{_as_id(release_id, 'release_id')}"
-                f"/instances/{_as_id(instance_id, 'instance_id')}"
-                f"/fields/{_as_id(field_id, 'field_id')}"
+            field_id, current_count = state
+            return self.set_play_count(
+                release_id, instance_id, field_id, current_count, current_count + 1
             )
-            # Idempotent absolute-set (writes new_count, not an increment), so a
-            # single 429 retry is safe (B-15).  #229: honor_long_retry_after opts
-            # THIS write in to the event-loop backoff — a long Retry-After raises
-            # DiscogsRateLimited (below) instead of losing the credit.  The
-            # absolute-set means the honored re-POST writes the same new_count, so
-            # honoring the wait cannot double-credit (#186): a 429 never applied
-            # the value, so the re-read on retry still sees current_count.
-            resp = self._http.request(
-                "POST", url, retry_on_429=True, honor_long_retry_after=True,
-                json={"value": str(new_count)},
-            )
-
-            if resp.status_code == 204:
-                log.info(
-                    f"Play Count updated for release {release_id} / instance {instance_id}: "
-                    f"{current_count} → {new_count}."
-                )
-                return True
-
-            # Log the status code only; the raw 4xx body is not logged (S-4).
-            log.error(f"Discogs field update returned {resp.status_code}.")
-            return False
-
         except DiscogsRateLimited:
             # #229: must PROPAGATE, not be swallowed to False by the broad handler
             # below — the async finalize layer catches it to honor the wait and

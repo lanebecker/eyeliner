@@ -43,7 +43,9 @@ async def test_conc2_slow_session_credit_does_not_block_recognition():
     release_write = asyncio.Event()
 
     async def gated_run(fn, *args):
-        if fn is writer.increment_play_count:
+        # #186: the retried WRITE is now set_play_count (read_play_count runs
+        # once, before it). Gate the set — that is the call CONC-2 serializes.
+        if fn is writer.set_play_count:
             entered_write.set()
             await release_write.wait()
         return fn(*args)
@@ -109,7 +111,8 @@ async def test_conc2_finalizes_are_serialized_no_concurrent_writer_calls():
 
     async def counting_run(fn, *args):
         nonlocal inside, max_inside
-        if fn is writer.increment_play_count:
+        # #186: set_play_count is the serialized write (read_play_count precedes it).
+        if fn is writer.set_play_count:
             inside += 1
             max_inside = max(max_inside, inside)
             await gate.wait()      # hold the write open so overlap would be visible
@@ -129,3 +132,4 @@ async def test_conc2_finalizes_are_serialized_no_concurrent_writer_calls():
     await asyncio.gather(t1, t2)
     assert max_inside == 1                    # never two writer calls at once
     assert writer.increment_play_count.call_count == 2  # both did credit, serially
+    assert writer.set_play_count.call_count == 2            # the serialized write ran twice

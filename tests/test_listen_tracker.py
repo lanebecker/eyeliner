@@ -46,6 +46,18 @@ def make_writer_mock(
     writer.increment_play_count.return_value = increment_play_count_return
     writer.last_played_field_name = last_played_field_name
     writer.update_last_played.return_value = update_last_played_return
+    # #186: the finalize path no longer retries increment_play_count (the whole
+    # read-modify-write); it reads ONCE then retries an absolute set. Model the
+    # split so existing credit assertions keep their meaning: read yields a fixed
+    # (field_id, current), and each set delegates to increment_play_count(release,
+    # instance) — so one credit landing == one increment_play_count call, and any
+    # return_value/side_effect a test configures on increment_play_count still
+    # drives the set's outcome (success, failure, raise, DiscogsRateLimited).
+    writer.read_play_count.return_value = (3, 0)
+    writer.set_play_count.side_effect = (
+        lambda release_id, instance_id, field_id, current, target:
+        writer.increment_play_count(release_id, instance_id)
+    )
     # #61: the tracker now dispatches the Play Count / Last Played writes through
     # writer.run(fn, …) (the dedicated-executor delegate) instead of
     # loop.run_in_executor(None, …). The mock's run awaits and calls the target,
@@ -516,9 +528,14 @@ async def test_discogs_writes_dispatch_through_the_dedicated_executor():
     await tracker._end_session()
 
     dispatched = [c.args[0] for c in writer.run.call_args_list]
-    assert writer.increment_play_count in dispatched
+    # #186: the credit is now a read-once + absolute-set pair (not a single
+    # increment_play_count), so the Discogs writes dispatched through the
+    # dedicated executor are read_play_count, set_play_count, and update_last_played.
+    assert writer.read_play_count in dispatched
+    assert writer.set_play_count in dispatched
     assert writer.update_last_played in dispatched
-    assert len(dispatched) == 2
+    assert writer.increment_play_count not in dispatched
+    assert len(dispatched) == 3
 
 
 @pytest.mark.asyncio

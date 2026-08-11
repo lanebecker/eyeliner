@@ -549,13 +549,42 @@ class ListenTracker:
             f"Last track confirmed for release {session.album_release_id} — "
             f"incrementing Play Count and updating Last Played in Discogs."
         )
-        success = await self._finalize_write_with_retry(
-            "Discogs Play Count increment",
-            lambda: self.writer.run(
-                self.writer.increment_play_count,
+        # #186: read the current count ONCE and compute the absolute target ONCE,
+        # then retry only the idempotent absolute POST. Retrying the whole
+        # read-modify-write (the pre-#186 shape) re-read an ambiguous-but-applied
+        # POST's new value and credited it AGAIN (+2 for one play). The read result
+        # is memoised across attempts in `plan`; a transient READ failure (None)
+        # leaves `plan` unset so the next attempt safely re-reads (the GET is
+        # idempotent), while a landed-but-unobserved POST re-POSTs the SAME target.
+        plan: dict = {}
+
+        async def _credit_attempt() -> bool:
+            if not plan:
+                state = await self.writer.run(
+                    self.writer.read_play_count,
+                    session.album_release_id,
+                    session.album_instance_id,
+                )
+                if state is None:
+                    # Field missing / unreadable / non-integer — abort WITHOUT
+                    # writing (META-1/META-2), already logged loud by the reader.
+                    # Treated as a failed attempt so a transient read is retried.
+                    return False
+                field_id, current_count = state
+                plan["field_id"] = field_id
+                plan["current"] = current_count
+                plan["target"] = current_count + 1
+            return await self.writer.run(
+                self.writer.set_play_count,
                 session.album_release_id,
                 session.album_instance_id,
-            ),
+                plan["field_id"],
+                plan["current"],
+                plan["target"],
+            )
+
+        success = await self._finalize_write_with_retry(
+            "Discogs Play Count increment", _credit_attempt
         )
         if success:
             session.credited = True  # committed ONLY after the write landed (#163)
@@ -779,7 +808,30 @@ class ListenTracker:
         # non-creditable case here and never touch the lock. A creditable split
         # (its closer played right before the swap — rare) still finalizes below.
         if detached is not None and detached.potential_last_track:
-            await self._finalize_detached(detached)
+            # #187: run the creditable split finalize as a TRACKED task and await it
+            # through asyncio.shield.  This method is awaited by the recognition
+            # pipeline leg, which run_pipeline CANCELS at shutdown BEFORE it calls
+            # drain(); the pre-#187 bare inline await meant a split credit mid-write
+            # (including one honouring a long Retry-After, #229) was torn up by that
+            # cancellation, and drain() — which waits only on _bg_tasks — never saw
+            # it, losing the completed play's credit.  Registering the task in
+            # _bg_tasks (with the same done-callback as a SESSION_ENDED credit) puts
+            # it under drain()'s bounded wait; `shield` lets the leg still await the
+            # credit inline in NORMAL operation (unchanged timing — the credit is
+            # complete when this returns, and _finalize_lock still serializes it,
+            # CONC-2) while DETACHING it from the leg's shutdown cancellation, so the
+            # task survives into drain() instead of dying with the leg.  A bare
+            # `await task` would NOT do this — cancelling the awaiter cancels the
+            # awaited task too; shield is what breaks that chain.  drain() keeps its
+            # short bound (Lane, 2026-08-11): the honoured-Retry-After sleep is a
+            # cancellable await, so at shutdown drain cancels a still-in-flight
+            # credit after _SHUTDOWN_DRAIN_SECONDS and the rare
+            # long-throttle-at-shutdown play is abandoned + logged LOST (the safe
+            # under-count direction) rather than stalling the Pi's power-cycle.
+            task = asyncio.create_task(self._finalize_detached(detached))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._on_end_session_done)
+            await asyncio.shield(task)
         elif detached is not None:
             log.debug(
                 "Split-off session reached no last track — nothing to credit; "
