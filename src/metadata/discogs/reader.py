@@ -103,6 +103,35 @@ def _reraise_if_transient(exc: BaseException) -> None:
         raise exc
 
 
+def _reconstruct_artist_credit(raw_artists: list) -> str:
+    """Rebuild the full multi-artist credit string Discogs displays, from the
+    ``basic_information.artists`` list — each entry's ``name`` plus its ``join``
+    connector to the next (`" & "`, `", "`, `" feat. "`, ...).
+
+    R5-07: the collection index stored only the list of individual names, and
+    ``entry_artist_matches`` required ONE name to equal the ENTIRE folded query
+    artist.  Shazam reports a joint credit as a single joined string ("Robert
+    Plant & Alison Krauss"), which equals no single element — so every
+    collaboration album owned silently missed the collection on every play
+    (metadata degraded to the database tier, no instance_id, no Play Count,
+    indistinguishable in the log from an ordinary not-owned miss).  Storing the
+    reconstructed credit lets the matcher compare the query against the whole
+    credit, exactly (after the shared fold), preserving the exact-or-nothing rule.
+    """
+    parts: list = []
+    for a in raw_artists:
+        # Strip the Discogs " (n)" disambiguator per NAME (the match-time strip
+        # is $-anchored, so it would only catch it on the LAST artist of a joint
+        # credit — a mid-string "John (2) & Jane" would otherwise never match a
+        # clean "John & Jane" query, R5-07 cold-review LOW).
+        parts.append(_ARTIST_DISAMBIG_RE.sub("", a.get("name", "")))
+        j = (a.get("join") or "").strip()
+        if not j:
+            continue
+        parts.append(", " if j == "," else f" {j} ")
+    return "".join(parts).strip()
+
+
 def _normalize_artist(s: str) -> str:
     """Normalise an artist name for collection matching (#223, via #183).
 
@@ -247,10 +276,32 @@ class DiscogsReader:
             # only — Discogs appends it to artist names, never to titles, and
             # Shazam never produces it (#179).  Artist comparison uses the
             # folded form (#223: leading-"the" + "&"/"and") on both sides.
-            return any(
+            if any(
                 _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", a)) == artist_key
                 for a in entry["artists"]
-            )
+            ):
+                return True
+            # R5-07: a joint credit ("Robert Plant & Alison Krauss") equals no
+            # single index name, so also match the reconstructed full credit
+            # string, exactly (after the same fold).  Falls back to an " and "
+            # join of the names when the entry predates artist_credit (e.g. a
+            # hand-built test index) — covering the common "&"/"and" case; a real
+            # build stores the exact credit (incl. comma/feat. separators).
+            credit = entry.get("artist_credit") or " and ".join(entry["artists"])
+            if bool(credit) and (
+                _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", credit)) == artist_key
+            ):
+                return True
+            # R5-07 residual (deliberately NOT fixed, Lane 2026-08-11): a "Various"
+            # compilation is indexed under the single artist "Various", so a track
+            # whose Shazam artist is the real performer still misses it. A wildcard
+            # here was declined: Shazam almost always reports a track's ORIGINAL
+            # album (not the comp title), so the exact-title gate makes it nearly
+            # inert — but on a generic-title collision (owning a Various "Greatest
+            # Hits") it would OVER-credit a comp for a track not on it, the META-4
+            # direction this codebase refuses. Tracked as a documented residual;
+            # revisit on real hardware evidence.
+            return False
 
         # #226: does the collection hold TWO DISTINCT albums at this exact
         # normalised (artist, title) — different, both-present master_ids, i.e.
@@ -579,6 +630,10 @@ class DiscogsReader:
                         "instance_id": item.get("instance_id"),
                         "title": basic.get("title", ""),
                         "artists": [a.get("name", "") for a in basic.get("artists", [])],
+                        # R5-07: the reconstructed multi-artist credit string, so a
+                        # Shazam joint credit ("A & B") can match a collaboration
+                        # album whose index names are ["A", "B"].
+                        "artist_credit": _reconstruct_artist_credit(basic.get("artists", [])),
                         # #226: the master groups a work's pressings.  Two owned
                         # entries at the same (artist, title) with DIFFERENT
                         # masters are distinct albums (Peter Gabriel I/III), not

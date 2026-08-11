@@ -51,6 +51,9 @@ def test_index_built_once_paginated_and_cached():
     # #226: master_id is captured from basic_information (present here) …
     assert idx[111] == {
         "instance_id": 42, "title": "Sister", "artists": ["Sonic Youth"],
+        # R5-07: the reconstructed multi-artist credit string (a single artist
+        # reconstructs to its own name).
+        "artist_credit": "Sonic Youth",
         "master_id": 900,
     }
     # … and defaults to None when the release carries no master.
