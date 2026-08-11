@@ -1116,7 +1116,7 @@ class DisplayRenderer:
 
     def _get_arc_segment(self, radius: int, color: tuple):
         """Pre-render the quarter-circle arc segment (dasharray 50/200 ≈ 89°
-        of a r=32 circle, round caps, 1.5px stroke), used static for error
+        of a r=32 circle, round caps, ~1.5px spec → 3px stamped band, R5-28), used static for error
         and rotated per frame for boot.  Stamped as small filled circles
         along the path — pygame.draw.arc moirés at thin widths.
         """
@@ -1130,7 +1130,15 @@ class DisplayRenderer:
         size = radius * 2 + 6
         surf = pygame.Surface((size, size), pygame.SRCALPHA)
         c = size // 2
-        stroke = max(1, round(radius / 21))   # ≈1.5px at the 32px reference
+        # R5-28: `stroke` is the RADIUS of each stamped circle, so a stamp radius
+        # of 2 produced a ~5px band (2*2+1) — over 3× the DESIGN.md:171 1.5px
+        # spec.  Halve it: a radius-1 stamp yields a 3px band, the closest a
+        # pygame integer-radius circle can approximate 1.5px while keeping the
+        # round-cap look (radius 0 would be a 1px aliased dot with no cap).  A
+        # true 1.5px would need an antialiased line-strip rewrite (deferred; the
+        # stamped-circle path exists specifically to avoid pygame.draw.arc's
+        # thin-width moiré).
+        stroke = max(1, round(radius / 21 / 2))   # ≈1.5px spec → 3px stamp at r=32
         for deg in range(0, 90):              # ~quarter circle
             a = math.radians(deg)
             x = c + radius * math.cos(a)
@@ -1222,12 +1230,20 @@ class DisplayRenderer:
 
             for i in range(steps, 0, -1):
                 t = i / steps
-                # Blend from surface (centre) toward bg (edge).  The 0.55 peak
-                # is GRADIENT_TEXT_PEAK — the SAME constant text roles are
-                # contrast-clamped against (palette.text_background), so the
-                # brightest pixel we draw is exactly the one we guarantee
-                # against (DISP-2).
-                color = _lerp_color(p.bg, p.surface, t * GRADIENT_TEXT_PEAK)
+                # R5-09: draw largest circle first (darkest, ~bg) and overpaint
+                # inward toward the surface-tinted PEAK at the centre, so the light
+                # emanates from BEHIND the record (origin 25%/35%) and fades to bg
+                # at the edges — the DESIGN.md:196 spec. The pre-R5-09 code tied
+                # brightness to the RADIUS (t), so the biggest circle (the edge)
+                # got the full peak and the centre ended at ~bg: the exact
+                # inversion. Brightness now decreases OUTWARD via (1-(i-1)/steps):
+                # the innermost circle (i=1) is exactly GRADIENT_TEXT_PEAK and the
+                # outermost (~i=steps) is ~bg. The brightest pixel we draw is still
+                # exactly GRADIENT_TEXT_PEAK (now at the origin, not the edge), so
+                # the DISP-2 contrast guarantee — text roles clamped against
+                # palette.text_background — is unchanged.
+                bright = 1 - (i - 1) / steps
+                color = _lerp_color(p.bg, p.surface, bright * GRADIENT_TEXT_PEAK)
                 r = int(max_r * t)
                 pygame.draw.circle(surface, color, (cx, cy), r)
 
