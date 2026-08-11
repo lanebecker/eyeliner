@@ -9,6 +9,11 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
+seams) and #227 (reprise/bookend phantom double-credit).
+
+## [1.5.10] — 2026-08-11
+
 **Round-5 audit — Wave 1: phantom remediation & the credit write path (milestone
 #24).** The fifth cold audit (`CODE_REVIEW_2026-08-10.md`) opened on a process
 failure: commit `f800bbd`, which closed #186/#187/#192, contained **no code** —
@@ -70,8 +75,6 @@ independently cold-reviewed -> narrow-second-passed:
   Count credit; they now name the single-shot (Last Played) vs finalize-retried
   (Play Count) distinction.
 
-Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
-seams) and #227 (reprise/bookend phantom double-credit — see below).
 
 ## [1.5.9] — 2026-08-10
 
