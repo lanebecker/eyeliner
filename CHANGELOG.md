@@ -9,6 +9,67 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-5 audit — Wave 1: phantom remediation & the credit write path (milestone
+#24).** The fifth cold audit (`CODE_REVIEW_2026-08-10.md`) opened on a process
+failure: commit `f800bbd`, which closed #186/#187/#192, contained **no code** —
+only two untracked helper scripts were staged, so the Wave-2-bundle-2 fixes those
+issues describe never shipped, while the v1.5.8 CHANGELOG and later v1.5.9 code
+comments asserted they had (R5-01). All three were re-reproduced live at v1.5.9
+and are now actually implemented, each RED-test-first -> mutation-checked ->
+independently cold-reviewed -> narrow-second-passed:
+
+### Fixed
+
+- **Play Count no longer double-credits a single play on an ambiguous POST
+  (#186 - HIGH, `R5-02`).** The end-of-session finalize retried the WHOLE
+  read-modify-write, so a POST applied server-side whose response was lost (read
+  timeout on flaky Pi Wi-Fi) made the retry re-read the incremented value and
+  post `current+1` again - one play credited +2. The writer is split into
+  `read_play_count` (read once) and an idempotent absolute `set_play_count`;
+  `_credit_completed_album` reads once, computes the target once (memoised across
+  attempts), and retries only the absolute set, so a re-POST writes the SAME value
+  and can never double. `increment_play_count` is recomposed from the two halves,
+  preserving its META-1/META-2/B-15/B-16 contract for its other callers.
+- **A creditable album-split credit is no longer lost at shutdown (#187 -
+  HIGH, `R5-03`).** The split finalize was awaited inline in the recognition
+  pipeline leg, which `run_pipeline` cancels BEFORE `drain()`; the bare await
+  propagated that cancellation into the credit and `drain()` (which waits only on
+  `_bg_tasks`) never saw it. It now runs as a tracked `_bg_tasks` task awaited via
+  `asyncio.shield`: normal operation still credits inline with unchanged timing
+  and serialization (`_finalize_lock`), but the task is detached from the leg's
+  shutdown cancellation so it survives into drain(). drain() keeps its short bound
+  - the honoured-Retry-After sleep is a cancellable await, so at shutdown a
+  still-in-flight credit is abandoned + logged LOST (the safe under-count
+  direction) rather than stalling the Pi's power-cycle.
+- **A second in-window 429 now honours a long Retry-After (#231 - HIGH,
+  `R5-06`).** `request()` consulted `honor_long_retry_after` only on the FIRST
+  429; a short first 429 slept once and retried, and when the retry ALSO 429'd
+  with a long wait (the normal case inside a real throttle window) that header was
+  dropped and the 429 returned - so the finalize layer fell back to its futile
+  in-window backoff, the loss #229 exists to prevent, one hop later. The
+  post-retry branch now parses the second Retry-After and raises
+  `DiscogsRateLimited` when it is beyond the cap and honoured, preserving the
+  at-most-one-retry contract and the non-honoured return path.
+- **`Retry-After` in HTTP-date form is parsed, not defaulted (#232 - LOW,
+  `R5-31`).** RFC 7231 allows an absolute HTTP-date; `int()` raised on it and the
+  code fell back to the 2s default, turning a two-minute server backoff into a 2s
+  in-window retry that just 429'd again. New `_parse_retry_after()` handles both
+  integer-seconds and HTTP-date, clamps a past/negative result to 0, and defaults
+  only when the header is absent or genuinely unparseable; used at both 429 parse
+  sites.
+
+### Changed
+
+- **#192 (`R5` reopen) - corrected stale comments and misleading logs on the
+  credit path.** The transport module comment still described `request()` as
+  running on the SHARED `run_in_executor(None,...)` pool and deferred long-wait
+  handling "to the dedicated executor (#61)" though #61 shipped and #229
+  superseded the deferral; it now states the post-#61/#229 reality. The two
+  "caller has no further retry, so the write (e.g. a Play Count credit) may be
+  lost" ERROR strings were false for the finalize-retried, honor-capable Play
+  Count credit; they now name the single-shot (Last Played) vs finalize-retried
+  (Play Count) distinction.
+
 Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
 seams) and #227 (reprise/bookend phantom double-credit — see below).
 
@@ -90,6 +151,14 @@ of regressing #185's genuine re-drop crediting, so it remains documented (in
   querying "Theme" reads a coherent "A2 · 02 OF 02" instead of "A2 · 01 OF 02".
 
 ## [1.5.8] — 2026-08-10
+
+> **Correction (R5-01, 2026-08-11):** the #186 / #187 / #192 entries below
+> describe fixes that were NOT actually committed — their closing commit
+> `f800bbd` staged only untracked helper scripts, no code. The described
+> behaviour did not ship in v1.5.8 or v1.5.9; it is implemented for real in the
+> next release (see the Round-5 Wave 1 entry under [Unreleased]). The entries are
+> left in place, struck through, as the historical record of the phantom
+> remediation.
 
 **Round-4 audit remediation — Waves 1–7 (milestones #17–#23).** The fourth cold
 audit (2026-08-07) filed #179–#221; this release lands the remediation, each fix
