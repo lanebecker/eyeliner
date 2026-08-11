@@ -675,3 +675,90 @@ def test_strategy1_master_less_pressings_are_not_treated_as_distinct():
 
     assert result is not None
     assert result["instance_id"] == 51
+
+
+# ---------------------------------------------------------------------------
+# R5-07 (#235) — joint-artist credits match the collaboration album.
+# ---------------------------------------------------------------------------
+
+def _reader_with_credit_index(entries):
+    """Like _reader_with_index but each entry is
+    (release_id, instance_id, title, [names], artist_credit)."""
+    reader = make_discogs_reader()
+    reader._collection_index = {
+        e[0]: {"instance_id": e[1], "title": e[2], "artists": e[3],
+               "artist_credit": e[4], "master_id": None}
+        for e in entries
+    }
+    reader._database_search = MagicMock(return_value=[])
+    reader._client.release = MagicMock(side_effect=lambda rid: MagicMock(id=rid))
+    reader._build_result = MagicMock(
+        side_effect=lambda release, instance_id: {
+            "release_id": release.id, "instance_id": instance_id}
+    )
+    return reader
+
+
+def test_joint_artist_ampersand_credit_matches():
+    """RED before R5-07: index names ["Robert Plant","Alison Krauss"] never
+    equalled the joined Shazam credit, so the owned album silently missed."""
+    reader = _reader_with_credit_index([
+        (1, 11, "Raising Sand", ["Robert Plant", "Alison Krauss"],
+         "Robert Plant & Alison Krauss"),
+    ])
+    assert reader.search_collection("Robert Plant & Alison Krauss", "Raising Sand") \
+        == {"release_id": 1, "instance_id": 11}
+
+
+def test_joint_artist_and_form_matches_the_ampersand_credit():
+    reader = _reader_with_credit_index([
+        (1, 11, "Raising Sand", ["Robert Plant", "Alison Krauss"],
+         "Robert Plant & Alison Krauss"),
+    ])
+    assert reader.search_collection("Robert Plant and Alison Krauss", "Raising Sand") \
+        == {"release_id": 1, "instance_id": 11}
+
+
+def test_three_artist_comma_and_credit_matches():
+    reader = _reader_with_credit_index([
+        (2, 22, "Album X", ["A", "B", "C"], "A, B & C"),
+    ])
+    assert reader.search_collection("A, B & C", "Album X") \
+        == {"release_id": 2, "instance_id": 22}
+
+
+def test_joint_credit_falls_back_to_and_join_without_stored_credit():
+    """A pre-artist_credit index entry (names only) still bridges the common
+    &/and joint case via the " and ".join fallback."""
+    reader = _reader_with_index([
+        (3, 33, "Raising Sand", ["Robert Plant", "Alison Krauss"]),
+    ])
+    assert reader.search_collection("Robert Plant & Alison Krauss", "Raising Sand") \
+        == {"release_id": 3, "instance_id": 33}
+
+
+def test_joint_credit_does_not_match_a_different_album():
+    """The joint-credit match is still EXACT: a joint query must not credit an
+    unrelated single-artist album."""
+    reader = _reader_with_credit_index([
+        (4, 44, "In Rainbows", ["Radiohead"], "Radiohead"),
+    ])
+    assert reader.search_collection("Robert Plant & Alison Krauss", "In Rainbows") is None
+
+
+def test_single_artist_matching_is_unchanged():
+    reader = _reader_with_credit_index([
+        (5, 55, "In Rainbows", ["Radiohead"], "Radiohead"),
+    ])
+    assert reader.search_collection("Radiohead", "In Rainbows") \
+        == {"release_id": 5, "instance_id": 55}
+
+
+def test_various_compilation_remains_a_documented_residual():
+    """R5-07 residual (Lane 2026-08-11): a Various comp is NOT wildcard-matched,
+    so a track by the real performer still misses it — accepted to avoid the
+    over-credit risk on generic-title collisions."""
+    reader = _reader_with_credit_index([
+        (6, 66, "Studio One Rockers", ["Various"], "Various"),
+    ])
+    assert reader.search_collection("The Skatalites", "Studio One Rockers") is None
