@@ -9,6 +9,54 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-5 audit — Wave 2: matching & recognition integrity (milestone #25).**
+The wrong-credit / lost-credit cluster, each fix RED-test-first -> mutation-checked
+-> independently cold-reviewed -> narrow-second-passed.
+
+### Fixed
+
+- **A stale mis-recognition can no longer commit a wrong track (#233 — HIGH,
+  `R5-04`).** A hit on the CURRENT track now clears any half-accumulated pending
+  competitor. Before, one stray misrecognition of B while A played left B pending
+  for the rest of the side (misses deliberately don't clear it, REC-1), and a
+  second isolated B hit — even 20 correct A chunks later — reached the
+  confirmation threshold and committed B: wrong card, wrong scrobble, wrong Discogs
+  credit. REC-1's alternating-recovery is preserved (only a current-track hit
+  clears the pending; a miss still does not).
+- **A foreign one-track single can no longer phantom-credit the latched album
+  (#234 — HIGH, `R5-05`).** The #182 completion gate's single-track carve-out
+  checked only the closer's tracklist length, not that the closer belonged to the
+  latched release — so a Shazam swing to any 1-track single (whose sole row is
+  is_last_track) passed the gate and credited the multi-track album it was latched
+  to. The carve-out now also requires `closer.discogs_release_id ==
+  album_release_id`; a genuine single-track release still credits.
+- **Joint-artist albums now match the collection (#235 — HIGH, `R5-07`).** The
+  index stored each release's artists as a list of individual names, and matching
+  required ONE name to equal the entire folded query — so a Shazam joint credit
+  ("Robert Plant & Alison Krauss") missed every collaboration album owned, on
+  every play, silently degrading to the database tier with no Play Count. The
+  index now also stores the reconstructed Discogs credit string (name + `join`,
+  per-name disambiguator stripped) and matches the query against it, exactly.
+  Compilations indexed under "Various" remain a documented residual (a wildcard
+  there risks over-crediting a generic-title collision — the direction this core
+  refuses).
+- **Hybrid LP+CD releases now credit on the vinyl closer (#236 — MEDIUM,
+  `R5-16`).** (b) `_match_side` requires a two-letter side label to be a DOUBLED
+  letter (AA/BB), so a bonus "CD1"/"LP1"/"DV1" row no longer renders a fabricated
+  "SIDE CD" caption. (a) `is_last_track` now anchors on the last VINYL-SIDE row,
+  not the last tracklist row — so a full vinyl play of a hybrid LP+CD (whose
+  tracklist appends bonus CD/digital rows) arms completion, where it previously
+  never could (a permanent lost Play Count for every hybrid edition owned). This
+  is a turntable tracker; the non-vinyl rows never play. A numbered/CD-only
+  tracklist with no vinyl sides falls back to the last row (B-10 unchanged).
+- **Invisible characters no longer defeat title matching (#237 — MEDIUM,
+  `R5-17`).** `fold_text` now drops Unicode format (Cf) characters that carry no
+  matching intent (zero-width space, soft hyphen, BOM, word joiner, bidi marks),
+  so a single invisible char in a community-edited title or Shazam string can't
+  make an owned album permanently — and undiagnosably — unmatchable. ZWNJ/ZWJ
+  (U+200C/D) are kept, being lexically load-bearing in some scripts (folding them
+  could merge genuinely different titles — the phantom direction).
+
 Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
 seams) and #227 (reprise/bookend phantom double-credit).
 
