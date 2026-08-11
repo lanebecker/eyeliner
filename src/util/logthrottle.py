@@ -68,6 +68,10 @@ class LogThrottle:
         # per_message state: key -> [last_emit, suppressed], LRU-ordered so
         # the map can be bounded by evicting the least-recently-touched key.
         self._per: OrderedDict = OrderedDict()
+        # R6-03: suppressed occurrences carried by keys that the LRU cap evicted
+        # before they could be flushed. Accumulated (not dropped) so the recovery
+        # flush can report them; cleared by reset().
+        self._evicted_suppressed = 0
 
     def should_log(self, now: float, key=None):
         """Decide whether to emit for this observation, updating throttle state.
@@ -96,13 +100,19 @@ class LogThrottle:
         new key past the cap evicts the least-recently-touched entry, so the map
         stays bounded regardless of how many distinct messages (with or without a
         pending tally) appear over 24/7 uptime. An evicted key that recurs is
-        treated as new and re-surfaces immediately — the correct signal.
+        treated as new and re-surfaces immediately — the correct signal. R6-03: if
+        the evicted entry still held suppressed occurrences, their count is folded
+        into ``_evicted_suppressed`` (surfaced by the recovery flush) rather than
+        silently discarded.
         """
         st = self._per.get(key)
         if st is None:
             # Never-seen key — surface at once (#178).
             if len(self._per) >= _PER_MESSAGE_MAX_KEYS:
-                self._per.popitem(last=False)   # evict least-recently-touched
+                # R6-03: keep the evicted key's held-back tally so the recovery
+                # summary doesn't understate reality.
+                _, evicted_state = self._per.popitem(last=False)  # least-recently-touched
+                self._evicted_suppressed += evicted_state[1]
             self._per[key] = [now, 0]
             return True, 0
         self._per.move_to_end(key)              # mark recently touched (LRU)
@@ -131,6 +141,16 @@ class LogThrottle:
         count rather than only the last-emitted one (R5-24)."""
         return [(k, sup) for k, (_, sup) in self._per.items() if sup > 0]
 
+    def evicted_suppressed(self) -> int:
+        """Total suppressed occurrences dropped by LRU eviction since the last
+        ``reset()`` (per_message mode).
+
+        Surfaced by :meth:`ThrottledLogger.reset` so a bounded key map never
+        *silently* understates how many repeated lines were swallowed during an
+        outage: the per-key attribution for an evicted message is gone, but its
+        count is not (R6-03)."""
+        return self._evicted_suppressed
+
     def reset(self) -> int:
         """Clear all throttle state and return the pending suppressed count.
 
@@ -138,11 +158,16 @@ class LogThrottle:
         outage (ThrottledLogger.reset). After this the NEXT observation (even the
         same key) emits immediately, and the interval seed is restored to ``-inf``
         (the early-boot epoch-independence guard). In per_message mode this
-        returns the TOTAL pending across all keys and clears the per-key map.
+        returns the TOTAL pending across all keys — INCLUDING any tally the LRU
+        cap evicted since the last reset (R6-03) — and clears the per-key map.
         """
         if self.per_message:
-            pending = sum(sup for _, sup in self._per.values())
-            self._per = {}
+            pending = sum(sup for _, sup in self._per.values()) + self._evicted_suppressed
+            # R6-01: clear() KEEPS ``self._per`` an OrderedDict. Reassigning it to
+            # a plain ``{}`` here dropped ``move_to_end`` / ``popitem(last=False)``,
+            # so the next repeated key crashed the recognition leg (and the app).
+            self._per.clear()
+            self._evicted_suppressed = 0
             return pending
         pending = self._suppressed
         self._last_key = _UNSET

@@ -494,6 +494,29 @@ def test_capture_error_changed_message_logs_immediately(monkeypatch, caplog):
     assert "stream stalled" in errors[1].message
 
 
+def test_capture_error_two_alternating_messages_do_not_defeat_the_throttle(
+    monkeypatch, caplog
+):
+    """R6-02: a device flapping between two failure shapes (~1 rebuild/s)
+    alternates the error message; in single-key mode every change — including
+    changing BACK — emits, so the 30s interval never engages and the journal/SD
+    card floods (the exact class R5-13 fixed for the recognizer sites). Keyed
+    per-message, the two conditions collapse to one emit each within the window.
+    """
+    import logging
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: 1000.0)  # frozen < interval
+    err_a = ValueError("Audio device 'X' not found. Available input devices: []")
+    err_b = RuntimeError("audio stream stalled: no block for 4.0s")
+    with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
+        for i in range(120):
+            cap._log_capture_error(err_a if i % 2 == 0 else err_b)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    # 2 immediate (one per distinct message); every repeat within the frozen
+    # window is suppressed. Single-key mode would emit all 120.
+    assert len(errors) == 2, f"expected 2 throttled errors, got {len(errors)}"
+
+
 # ---------------------------------------------------------------------------
 # TQ-7 — _silence_ticker and run()'s construction-retry path, headless.
 #

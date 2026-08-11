@@ -14,11 +14,13 @@ line plus a periodic summary, and flushes a final tally when it recovers.
 Design notes shared with the #178 original:
   * The FIRST occurrence, and any occurrence whose message CHANGED, log at once —
     a changed condition is worth surfacing immediately, not after the window.
-  * ``_last_log`` seeds to ``-inf`` (NOT ``0.0``) so the first call always
+  * The interval seed is ``-inf`` (NOT ``0.0``) so the first call always
     reports independent of the monotonic epoch: on the Pi CLOCK_MONOTONIC is
     uptime-based and resets to ~0 on reboot, so a ``0.0`` seed would swallow the
     first line during the first ``interval_seconds`` of uptime — the early-boot
-    window the signal matters most.
+    window the signal matters most. (Since R5-14 this seeding lives in the
+    delegated :class:`~src.util.logthrottle.LogThrottle` as ``_last_emit``, not
+    a local field here.)
   * ``time_source`` is injectable so tests drive the interval deterministically
     instead of sleeping.
 
@@ -28,7 +30,7 @@ Not thread-safe: intended for a single asyncio task's failure path, exactly as
 
 import logging
 import time
-from typing import Callable, Optional
+from typing import Callable
 
 from src.util.logthrottle import LogThrottle
 
@@ -66,8 +68,6 @@ class ThrottledLogger:
         # R5-13/R5-24: per_message so alternating error strings can't defeat
         # the throttle and each message reports its own suppressed tally.
         self._throttle = LogThrottle(interval=interval_seconds, per_message=True)
-        # The last message actually logged, for the recovery-flush line.
-        self._last_msg: Optional[str] = None
 
     def error(self, message: str) -> None:
         """Record a failure ``message``, logging or suppressing it per policy.
@@ -88,7 +88,6 @@ class ThrottledLogger:
             )
         else:
             self._log.log(self._level, "%s", message)
-        self._last_msg = message
 
     def reset(self) -> None:
         """Clear the streak after a success; flush any suppressed tally first.
@@ -109,5 +108,17 @@ class ThrottledLogger:
                 message,
                 count,
             )
+        # R6-03: the per-message key map is LRU-bounded, so a long outage that
+        # cycles through more than the cap's worth of distinct error strings can
+        # evict a key that still held suppressed occurrences. Their per-message
+        # attribution is gone, but their count is not — surface the aggregate so
+        # the recovery record doesn't understate how many lines were swallowed.
+        evicted = self._throttle.evicted_suppressed()
+        if evicted > 0:
+            self._log.log(
+                self._level,
+                "%d further suppressed occurrence(s) of other message(s) were "
+                "dropped when the throttle key cap was reached",
+                evicted,
+            )
         self._throttle.reset()
-        self._last_msg = None

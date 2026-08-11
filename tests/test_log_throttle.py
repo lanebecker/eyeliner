@@ -100,6 +100,25 @@ def test_reset_with_nothing_suppressed_is_silent(caplog):
     assert [r.getMessage() for r in caplog.records] == ["boom"]
 
 
+def test_reset_surfaces_suppressed_tally_dropped_by_the_key_cap(caplog):
+    """R6-03: if the per-message key cap evicts a message that still had
+    suppressed occurrences held back, ``reset()``'s recovery flush must report
+    that they were dropped, not silently omit them."""
+    from src.util.logthrottle import _PER_MESSAGE_MAX_KEYS
+    throttle, _clock, log = _make(interval=1000.0)
+    with caplog.at_level(logging.WARNING, logger=log.name):
+        throttle.error("victim")          # emits
+        throttle.error("victim")          # suppressed x1
+        throttle.error("victim")          # suppressed x2
+        for i in range(_PER_MESSAGE_MAX_KEYS + 5):
+            throttle.error(f"flood-{i}")  # floods the map → evicts "victim" (LRU)
+        caplog.clear()                    # isolate the reset() output
+        throttle.reset()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("dropped when the throttle key cap was reached" in m for m in msgs)
+    assert any("2 further" in m for m in msgs)
+
+
 def test_respects_configured_level(caplog):
     throttle, _clock, log = _make(level=logging.ERROR)
     with caplog.at_level(logging.ERROR, logger=log.name):
