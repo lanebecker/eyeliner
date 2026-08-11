@@ -114,3 +114,72 @@ def test_per_message_reset_flushes_total_pending_and_rearms():
     t.should_log(2.0, key="A")    # x2
     assert t.reset() == 2         # total pending flushed
     assert t.should_log(3.0, key="A")[0] is True   # re-armed: new again
+
+
+# ---------------------------------------------------------------------------
+# R6-01 (CRITICAL) — reset() must keep the per-key map an OrderedDict.
+# ---------------------------------------------------------------------------
+
+def test_per_message_reset_keeps_ordereddict_so_a_repeated_key_does_not_crash():
+    """R6-01: ``reset()`` replaced ``self._per`` with a plain ``dict``, so the
+    NEXT *repeated* key hit ``move_to_end`` / ``popitem(last=False)`` — methods a
+    plain dict lacks — and raised ``AttributeError`` inside the recognizer's
+    ``except`` handler, killing the recognition leg and (via FIRST_COMPLETED) the
+    whole process. Both recognizer throttles ``reset()`` on every successful turn
+    (including a plain miss), so this armed within one chunk of normal operation.
+
+    The pre-R6-01 reset test did exactly ONE ``should_log`` after ``reset()`` — a
+    NEW key, which a plain dict handles — so it never exercised the crash. This
+    test adds the second, REPEATED call that a plain dict cannot serve, plus a
+    direct type assertion.
+    """
+    from collections import OrderedDict
+    t = LogThrottle(interval=30.0, per_message=True)
+    t.should_log(0.0, key="A")
+    t.should_log(1.0, key="A")        # A suppressed x1
+    t.reset()
+    assert t.should_log(2.0, key="A")[0] is True     # new-again after reset
+    # The REPEATED key is the one that hit move_to_end on the corrupted map:
+    assert t.should_log(3.0, key="A")[0] is False    # within interval → suppressed, must not raise
+    assert isinstance(t._per, OrderedDict)           # never downgraded to a plain dict
+
+
+def test_per_message_lru_eviction_still_works_after_a_reset():
+    """R6-01 corollary: ``popitem(last=False)`` (the 64-key LRU cap) is also an
+    OrderedDict-only method, so a map corrupted by ``reset()`` would crash at the
+    cap too. Fill past the cap AFTER a reset and confirm it stays bounded."""
+    from src.util.logthrottle import _PER_MESSAGE_MAX_KEYS
+    t = LogThrottle(interval=10.0, per_message=True)
+    t.should_log(0.0, key="seed")
+    t.should_log(1.0, key="seed")     # give the map a suppressed entry
+    t.reset()
+    for i in range(_PER_MESSAGE_MAX_KEYS * 3):
+        t.should_log(float(i) * 100.0, key=f"post-reset-{i}")   # must not raise at the cap
+    assert len(t._per) <= _PER_MESSAGE_MAX_KEYS
+
+
+# ---------------------------------------------------------------------------
+# R6-03 (LOW) — LRU eviction must not silently drop the evicted key's tally.
+# ---------------------------------------------------------------------------
+
+def test_per_message_eviction_does_not_silently_drop_the_suppressed_tally():
+    """R6-03: when the LRU cap evicts a key that still held suppressed
+    occurrences, that count must be surfaced (folded into the reset total and an
+    ``evicted_suppressed`` accessor), not silently lost — otherwise a post-outage
+    recovery summary understates how many lines were swallowed."""
+    from src.util.logthrottle import _PER_MESSAGE_MAX_KEYS
+    t = LogThrottle(interval=1000.0, per_message=True)
+    # Give the FIRST key a real suppressed tally, then never touch it again so it
+    # is the least-recently-used and gets evicted first.
+    t.should_log(0.0, key="victim")    # emit
+    t.should_log(0.5, key="victim")    # suppressed x1 (within the 1000s interval)
+    t.should_log(0.6, key="victim")    # suppressed x2
+    # Flood the map with brand-new keys until "victim" is evicted.
+    for i in range(_PER_MESSAGE_MAX_KEYS + 5):
+        t.should_log(1.0, key=f"flood-{i}")
+    assert "victim" not in t._per                  # evicted
+    assert t.evicted_suppressed() == 2             # its tally was kept, not dropped
+    # reset()'s reported total folds in the evicted tally (honest recovery count),
+    # then clears it.
+    assert t.reset() == 2
+    assert t.evicted_suppressed() == 0

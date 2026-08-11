@@ -9,6 +9,49 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.14] — 2026-08-11
+
+**Round-6 audit — Wave 1: stop the crash (log-throttle integrity, milestone
+#31).** Ships the round's one CRITICAL — a process-killing regression introduced
+by the R5 log-throttle consolidation — plus the three same-subsystem findings
+around it. RED-repro-first, every fix mutation-pinned, cold "break-this" reviewed
+(SPEC + QUALITY pass).
+
+### Fixed
+
+- **`LogThrottle.reset()` no longer crashes the process on the next repeated
+  error (#266 — CRITICAL, `R6-01`).** In `per_message` mode `reset()` replaced
+  the per-key `OrderedDict` with a plain `dict`, so the next *repeated* message
+  hit `move_to_end` / `popitem(last=False)` — methods a plain dict lacks — and
+  raised `AttributeError` inside the recognizer's `except` handler, killing the
+  recognition leg and (via the `FIRST_COMPLETED` design) the whole app. Both
+  recognizer throttles call `reset()` on every successful turn — including a
+  plain miss — so ~2 identical errors after any success (ordinary flaky wifi)
+  took the appliance down within a minute. `reset()` now clears the map in place
+  (`.clear()`), preserving its `OrderedDict` type. Regression test drives a
+  *repeated* key after `reset()`; the pre-fix test made only one *new*-key call,
+  which a plain dict served, so it never caught the crash.
+- **The capture-loop error log can't be flooded by two alternating messages
+  (#267 — MEDIUM, `R6-02`).** `_capture_error_throttle` ran single-key, where any
+  message change — including changing *back* — emits, so a device flapping
+  between two failure shapes (~1 rebuild/s) defeated the 30s throttle and wrote
+  ~1 journal/SD-card line per second. It is now `per_message` (the mode R5-13
+  already applied to the recognizer sites), so each distinct error is
+  rate-limited on its own interval. Lands with #266 so the mode's `reset()` is
+  safe.
+- **LRU eviction no longer silently discards an evicted message's suppressed
+  tally (#268 — LOW, `R6-03`).** At the 64-key `per_message` cap, evicting a key
+  dropped its held-back count, so a post-outage recovery summary understated how
+  many repeated lines were swallowed. The count is now accumulated
+  (`evicted_suppressed()`) and surfaced by `ThrottledLogger.reset()`.
+
+### Removed
+
+- **Dead `ThrottledLogger._last_msg` field (#269 — NIT, `R6-04`).** Written but
+  never read since the R5-14 delegation moved the recovery flush onto
+  `pending_items()`. Deleted, along with its now-unused `Optional` import and a
+  stale `_last_log` docstring reference.
+
 ## [1.5.13] — 2026-08-11
 
 **Round-5 audit — Wave 7: hardening & CI (milestone #30).** Close the round —

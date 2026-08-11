@@ -101,11 +101,27 @@ class AudioCapture:
         # health signal per _DROP_WARN_INTERVAL_SECONDS.
         self._drop_throttle = LogThrottle(interval=_DROP_WARN_INTERVAL_SECONDS)
 
-        # #178: capture-loop error log — interval summarizer keyed on the error
+        # #178: capture-loop error log — per_message summarizer keyed on the error
         # MESSAGE, so a CHANGED error surfaces immediately instead of waiting out
-        # the window, while identical repeats are counted and summarized.
+        # the window, while identical repeats are counted and summarized. R6-02:
+        # per_message (not single-key) so a device flapping between TWO failure
+        # shapes (~1 rebuild/s) can't defeat the throttle — in single-key mode
+        # every message change, including changing back, emits, so alternating
+        # errors flood the journal/SD card (the class R5-13 fixed for the
+        # recognizer sites). Each distinct message is now rate-limited on its own
+        # interval and carries its own tally. (Depends on R6-01: per_message
+        # reset() must not corrupt the key map — this site never calls reset(),
+        # but the mode's correctness rests on that fix.)
+        # Accepted tradeoff (R6-02 cold-review F1/F2, follow-up filed): because
+        # this raw throttle has no recovery point (capture never calls reset()
+        # or evicted_suppressed(), unlike ThrottledLogger), a stale message's
+        # repeat-COUNT can go unsurfaced — buried in the per-key map or dropped
+        # by the LRU cap. Every distinct error's FIRST occurrence still logs at
+        # once, so no error is silenced; only the tally of a since-stopped repeat
+        # is under-reported. Strictly less harm than the alternating-message
+        # flood this replaces.
         self._capture_error_throttle = LogThrottle(
-            interval=_CAPTURE_ERROR_WARN_INTERVAL_SECONDS
+            interval=_CAPTURE_ERROR_WARN_INTERVAL_SECONDS, per_message=True
         )
 
         # #164: the device lookup runs on every stream rebuild (see run()), so its
