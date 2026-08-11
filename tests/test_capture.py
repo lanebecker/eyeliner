@@ -386,7 +386,9 @@ def test_callback_error_is_logged_not_raised(caplog):
     with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
         callback(indata, 2, None, None)   # must NOT raise
 
+    rec = next(r for r in caplog.records if "callback" in r.message.lower())
     assert any("callback" in r.message.lower() for r in caplog.records)
+    assert rec.exc_info is not None          # R5-26: traceback attached
 
 
 # ---------------------------------------------------------------------------

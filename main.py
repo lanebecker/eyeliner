@@ -342,7 +342,14 @@ async def run_pipeline(tasks, capture, display, tracker, discogs_http, io_execut
         )
         for t in pending:
             t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        # R5-25: a pending leg can raise a NON-CancelledError while unwinding its
+        # cancellation (e.g. a finally that awaits a ticker or closes a resource)
+        # — exactly the path where cleanup bugs live. The results were discarded,
+        # so such a fault vanished silently. Log any non-cancellation exception;
+        # the CancelledError from the cancel we just issued is expected and skipped.
+        for r in await asyncio.gather(*pending, return_exceptions=True):
+            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                log.error("Pipeline leg raised while unwinding shutdown: %r", r)
         # Log EVERY faulted leg before re-raising the first (B-14).  Previously
         # `t.result()` re-raised on the first done task and left the loop, so if
         # several legs died simultaneously only one exception was ever surfaced.

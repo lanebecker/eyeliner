@@ -248,6 +248,31 @@ async def test_run_pipeline_still_drains_when_a_leg_faults():
 
 
 @pytest.mark.asyncio
+async def test_run_pipeline_logs_a_pending_leg_that_raises_while_unwinding(caplog):
+    """R5-25: a pending leg that raises a NON-CancelledError while unwinding its
+    cancellation (e.g. a finally that fails during shutdown) was captured by the
+    gather and silently discarded. It must be logged."""
+    import logging as _logging
+    capture, display = MagicMock(), MagicMock()
+
+    async def finisher():
+        return None                      # completes first → triggers shutdown
+
+    async def bad_on_cancel():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise RuntimeError("cleanup exploded")   # non-cancel error while unwinding
+
+    done_leg = asyncio.create_task(finisher())
+    pending_leg = asyncio.create_task(bad_on_cancel())
+    with caplog.at_level(_logging.ERROR):
+        await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
+
+    assert any("unwinding shutdown" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
     capture, display = MagicMock(), MagicMock()
 
