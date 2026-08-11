@@ -279,7 +279,7 @@ class AudioCapture:
                 # with NO exception surfacing in run(), so capture would silently
                 # die. Swallow + log so the stream keeps running; a genuinely dead
                 # stream is then caught by the block-stall timeout in run().
-                log.error(f"Audio callback error: {e}")
+                log.error("Audio callback error: %s", e, exc_info=True)  # R5-26
 
         return callback
 
@@ -327,7 +327,7 @@ class AudioCapture:
                 # permanently disable the session-end safety net this task
                 # exists to provide.  (CancelledError is BaseException and is
                 # intentionally NOT caught, so shutdown still propagates.)
-                log.error(f"Silence ticker tick failed: {e}")
+                log.error("Silence ticker tick failed: %s", e, exc_info=True)  # R5-26
 
     async def _dispatch_chunk(self, chunk: np.ndarray, sample_rate: int):
         """Classify one chunk and dispatch it for recognition ONLY while music

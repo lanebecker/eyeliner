@@ -37,7 +37,7 @@ class Signal(Generic[T]):
             try:
                 listener(value)
             except Exception as e:
-                log.error(f"Signal({self._name}) listener error: {e}")
+                log.error("Signal(%s) listener error: %s", self._name, e, exc_info=True)  # R5-26
 
     def __len__(self) -> int:
         return len(self._listeners)

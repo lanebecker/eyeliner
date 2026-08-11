@@ -39,6 +39,11 @@ def test_signal_logs_and_continues_on_listener_error(caplog):
 
     assert delivered == ["x"]                       # 2nd listener still ran
     assert any("listener boom" in r.getMessage() for r in caplog.records)
+    # R5-26: the log-and-continue record carries the TRACEBACK (exc_info), so a
+    # swallowed listener bug on the headless appliance is diagnosable.
+    err = next(r for r in caplog.records if "listener boom" in r.getMessage())
+    assert err.exc_info is not None
+    assert err.exc_info[0] is RuntimeError
 
 
 # ---------------------------------------------------------------------------
