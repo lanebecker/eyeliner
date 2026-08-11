@@ -9,6 +9,31 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-5 audit — Wave 6: efficiency (milestone #29).** Spend the API budget
+once — behaviour-preserving reader.py refactors, RED-cost repros, cold-reviewed
+(differential harness: 0 change to any match decision).
+
+### Changed
+
+- **A resolved album is fetched from Discogs once, not twice (#256 — MEDIUM,
+  `R5-19`).** `_build_result` re-fetched `/releases/{id}` just to read the
+  tracklist; it now parses the tracklist off the already-fetched release object
+  (via a new `_parse_tracklist`), halving the per-album enrichment spend against
+  the 60/min budget. `get_tracklist(release_id)` remains the standalone entry
+  point; transient propagation is unchanged.
+- **The same database search is issued once per resolve (#257 — MEDIUM,
+  `R5-20`).** An unowned album ran the identical `(artist, album)` search 2–3×
+  (strategy 1, the database tier, the staleness refresh). A one-entry memo fetches
+  the page once and slices to each caller's limit; a different query replaces it.
+- **The collection index folds its match keys once, at build (#258 — LOW,
+  `R5-27`).** `search_collection` re-folded every index title/artist on every
+  call (~8ms/miss at 3k records, worse on the Pi). The folded keys are precomputed
+  at index-build time; the match logic reads them (falling back to on-the-fly
+  folding for a hand-built index). Match decisions are byte-identical.
+- **ChunkAssembler rolling-buffer copy accepted as-is (#259 — NIT, `R5-36`,
+  closed won't-fix).** The ~7 MB/s `np.concatenate` memcpy is <1% of Pi 4 memory
+  bandwidth; a ring buffer isn't worth the complexity. Documented for the record.
+
 **Round-5 audit — Wave 5: observability (milestone #28).** Logs that tell the
 truth — RED-test-first, mutation-checked, cold-reviewed.
 
