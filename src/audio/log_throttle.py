@@ -30,6 +30,8 @@ import logging
 import time
 from typing import Callable, Optional
 
+from src.util.logthrottle import LogThrottle
+
 __all__ = ["ThrottledLogger"]
 
 
@@ -42,6 +44,13 @@ class ThrottledLogger:
     ``reset()`` clears the streak after a success and flushes any pending count,
     so the journal records how many failures preceded the recovery and the next
     failure reports at once.
+
+    R5-14: the throttle DECISION (first/changed-message emit, interval re-log,
+    the -inf seed, the suppressed counter) is no longer re-implemented here — it
+    is delegated to the shared :class:`~src.util.logthrottle.LogThrottle` (keyed
+    on the message).  This class owns only the logging + the recovery-flush
+    ``reset()`` surface the recognizer depends on, so a fix to the throttle
+    policy (R5-13/R5-24) lands ONCE in LogThrottle and both call sites inherit it.
     """
 
     def __init__(
@@ -52,16 +61,12 @@ class ThrottledLogger:
         time_source: Callable[[], float] = time.monotonic,
     ):
         self._log = log
-        self._interval = interval_seconds
         self._level = level
         self._now = time_source
-        # Count of identical messages held back since the last line was logged.
-        self._suppressed = 0
-        # Monotonic timestamp of the last line logged; -inf so the first always
-        # reports (see module docstring on the epoch-independence rationale).
-        self._last_log = float("-inf")
-        # The last message actually logged, so a CHANGED message surfaces at once
-        # instead of waiting out the throttle window.
+        # R5-13/R5-24: per_message so alternating error strings can't defeat
+        # the throttle and each message reports its own suppressed tally.
+        self._throttle = LogThrottle(interval=interval_seconds, per_message=True)
+        # The last message actually logged, for the recovery-flush line.
         self._last_msg: Optional[str] = None
 
     def error(self, message: str) -> None:
@@ -71,22 +76,19 @@ class ThrottledLogger:
         as a format string) so a literal ``%`` in exception text can't blow up
         logging — safer than the f-string call sites this replaces.
         """
-        now = self._now()
-        if message != self._last_msg or now - self._last_log >= self._interval:
-            if self._suppressed > 0:
-                self._log.log(
-                    self._level,
-                    "%s (%d further occurrence(s) suppressed since the last report)",
-                    message,
-                    self._suppressed,
-                )
-            else:
-                self._log.log(self._level, "%s", message)
-            self._suppressed = 0
-            self._last_log = now
-            self._last_msg = message
+        emit, suppressed = self._throttle.should_log(self._now(), key=message)
+        if not emit:
+            return
+        if suppressed > 0:
+            self._log.log(
+                self._level,
+                "%s (%d further occurrence(s) suppressed since the last report)",
+                message,
+                suppressed,
+            )
         else:
-            self._suppressed += 1
+            self._log.log(self._level, "%s", message)
+        self._last_msg = message
 
     def reset(self) -> None:
         """Clear the streak after a success; flush any suppressed tally first.
@@ -97,13 +99,15 @@ class ThrottledLogger:
         summary line recording how many failures were swallowed before recovery,
         instead of dropping that count silently.
         """
-        if self._suppressed > 0:
+        # R5-24: flush a recovery line for EVERY message with a held-back tally,
+        # not just the last one emitted — otherwise the counts for other messages
+        # suppressed during the outage are silently dropped (cold-review LOW).
+        for message, count in self._throttle.pending_items():
             self._log.log(
                 self._level,
                 "%s (recovered after %d further suppressed occurrence(s))",
-                self._last_msg,
-                self._suppressed,
+                message,
+                count,
             )
-        self._suppressed = 0
+        self._throttle.reset()
         self._last_msg = None
-        self._last_log = float("-inf")
