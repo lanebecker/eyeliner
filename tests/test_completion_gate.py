@@ -355,3 +355,67 @@ async def test_two_track_release_side_flip_still_credits():
     await tracker._end_session()
 
     writer.increment_play_count.assert_called_once_with(400, 401)
+
+
+# ---------------------------------------------------------------------------
+# R5-05 (#234) — the single-track carve-out must check the closer's RELEASE.
+# ---------------------------------------------------------------------------
+
+from src.metadata.models import PlaySession   # noqa: E402
+
+_ALBUM_TL = [
+    TracklistEntry("A1", "One"), TracklistEntry("A2", "Two"),
+    TracklistEntry("A3", "Three"), TracklistEntry("B1", "Four"),
+]
+_SINGLE_TL = [TracklistEntry("A", "Foreign Hit")]
+
+
+def _album_track(title):
+    return TrackMetadata(
+        title=title, artist="Band", album="Real Album",
+        source=MetadataSource.DISCOGS_COLLECTION, discogs_release_id=100,
+        discogs_instance_id=1, tracklist=_ALBUM_TL,
+    )
+
+
+def _foreign_single():
+    return TrackMetadata(
+        title="Foreign Hit", artist="Someone Else", album="Foreign Hit",
+        source=MetadataSource.DISCOGS_COLLECTION, discogs_release_id=200,
+        discogs_instance_id=2, tracklist=_SINGLE_TL,
+    )
+
+
+def test_foreign_single_track_release_does_not_satisfy_the_carve_out():
+    """RED before R5-05: a multi-track album latched with only ONE supporting
+    row, plus a Shazam swing to a DIFFERENT one-track single (whose sole row is
+    is_last_track), passed the len==1 carve-out and phantom-credited the album."""
+    s = PlaySession()
+    first = _album_track("One")
+    s.album_release_id = first.discogs_release_id
+    s.log_track(first)
+    foreign = _foreign_single()
+    s.log_track(foreign)
+    s.potential_last_track = True
+    s.closing_track = foreign
+
+    assert s.supporting_row_count == 1
+    assert s.completion_supported is False
+
+
+def test_genuine_single_track_release_still_credits():
+    """The carve-out still fires for a real one-row release: closer IS the
+    latched release."""
+    tl = [TracklistEntry("A", "Only Track")]
+    t = TrackMetadata(
+        title="Only Track", artist="Band", album="The Single",
+        source=MetadataSource.DISCOGS_COLLECTION, discogs_release_id=300,
+        discogs_instance_id=3, tracklist=tl,
+    )
+    s = PlaySession()
+    s.album_release_id = t.discogs_release_id
+    s.log_track(t)
+    s.potential_last_track = True
+    s.closing_track = t
+
+    assert s.completion_supported is True

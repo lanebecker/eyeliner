@@ -30,6 +30,28 @@ class MetadataSource(Enum):
 # letter "A" (no number) and CD-style "1-01" (leading digit) already do.
 _SIDE_RE = re.compile(r"^\s*([A-Za-z]{1,2})\s*[.\-]?\s*(\d+)\s*$")
 
+
+def _match_side(position: str):
+    """Return the :data:`_SIDE_RE` match for *position* ONLY when its letter
+    label is a real vinyl side, else ``None``.
+
+    R5-16(b): ``_SIDE_RE`` allows one OR two letters, the two-letter form for
+    the doubled ``AA``/``BB`` sides of multi-disc pressings (per its own
+    comment).  But ``"CD1"``/``"LP1"``/``"DV1"``/``"Cd2"`` also matched, so a
+    bonus-CD / DVD / LP-label row rendered a fabricated ``SIDE CD · 01 OF 02``
+    caption AND (via the completion anchor, R5-16(a)) counted as a vinyl side.
+    A genuine doubled side always repeats ONE letter, so require the two-letter
+    form to be the SAME letter twice; a single letter is always fine.  Bounding
+    to real sides is exactly what the regex comment promised.
+    """
+    m = _SIDE_RE.match(position)
+    if m is None:
+        return None
+    letters = m.group(1)
+    if len(letters) == 2 and letters[0].lower() != letters[1].lower():
+        return None
+    return m
+
 # NOTE: DisplayPalette + FALLBACK_PALETTE moved to src/display/palette.py (ARCH-7)
 # — they are pure display types with no consumer in src/metadata, so they belong
 # in the display layer beside extract_palette(), not up here in the model layer.
@@ -196,7 +218,7 @@ class SideIndex:
         # Side letter from the position prefix (None for numbered tracklists).
         side_letter = None
         if current is not None:
-            m = _SIDE_RE.match(current.position)
+            m = _match_side(current.position)
             side_letter = m.group(1).upper() if m else None
 
         # All entries sharing this side letter, in tracklist order.
@@ -204,7 +226,7 @@ class SideIndex:
         if side_letter:
             side_entries = [
                 e for e in tracklist
-                if (m := _SIDE_RE.match(e.position)) and m.group(1).upper() == side_letter
+                if (m := _match_side(e.position)) and m.group(1).upper() == side_letter
             ]
 
         # 1-indexed ordinal within the side, and the side's length.  The ordinal
@@ -213,7 +235,7 @@ class SideIndex:
         # rank A1 as "01 OF 02", keeping the "NN OF MM" caption coherent (N<=M).
         # Every side entry matched _SIDE_RE by construction, so group(2) is safe.
         sorted_side = sorted(
-            side_entries, key=lambda e: int(_SIDE_RE.match(e.position).group(2))
+            side_entries, key=lambda e: int(_match_side(e.position).group(2))
         )
         # #224: locate side_position by `current`'s IDENTITY within sorted_side,
         # not by re-matching the title. A duplicated title on one side with
@@ -268,7 +290,26 @@ class SideIndex:
         # of position strings: Discogs positions are community-edited free text
         # and NOT guaranteed unique, so a mid-album track that merely SHARES the
         # closer's position string must not be flagged the last track (META-4).
-        is_last_track = global_index is not None and global_index == len(tracklist) - 1
+        #
+        # R5-16(a): the anchor is the last VINYL-SIDE row, not the last tracklist
+        # ROW.  On a hybrid LP+CD (or LP+digital) release the vinyl closer is
+        # followed by bonus CD/DVD/file rows, so a last-ROW anchor never armed
+        # completion for a full vinyl play — a permanent lost Play Count for every
+        # hybrid edition owned.  This is a TURNTABLE tracker: the non-vinyl rows
+        # never play on the platter, so "album complete" is the end of the vinyl
+        # (Lane approved 2026-08-11).  When the tracklist has NO vinyl sides at all
+        # (a numbered or CD-only tracklist, e.g. "1".."12" or "1-01"), fall back to
+        # the last row — preserving the B-10 numbered-tracklist behaviour unchanged.
+        # This relies on the R5-16(b) _match_side tightening so trailing "CD1"/"DV1"
+        # rows are NOT counted as vinyl sides.
+        last_vinyl_index = None
+        for i, e in enumerate(tracklist):
+            if _match_side(e.position) is not None:
+                last_vinyl_index = i
+        completion_anchor = (
+            last_vinyl_index if last_vinyl_index is not None else len(tracklist) - 1
+        )
+        is_last_track = global_index is not None and global_index == completion_anchor
 
         prev_title = None
         next_title = None
@@ -465,8 +506,19 @@ class PlaySession:
             return True
         if self.supporting_row_count >= 2:
             return True
+        # Single-track carve-out: a genuine one-row release IS complete on its
+        # sole row.  R5-05: the closer must be a track OF THE LATCHED RELEASE —
+        # a Shazam swing to a FOREIGN one-track single (its own tracklist is one
+        # row, so that row is is_last_track and it becomes closing_track) would
+        # otherwise pass this carve-out and phantom-credit the multi-track album
+        # it was latched to.  Require the closer's release id to equal the
+        # latched release before trusting its length.
         closer = self.closing_track
-        return closer is not None and len(closer.tracklist) == 1
+        return (
+            closer is not None
+            and closer.discogs_release_id == self.album_release_id
+            and len(closer.tracklist) == 1
+        )
 
     @property
     def supporting_row_count(self) -> int:
