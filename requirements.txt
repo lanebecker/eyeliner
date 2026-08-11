@@ -8,7 +8,7 @@ numpy>=1.24.0
 soundfile>=0.12.1
 
 # Music recognition
-shazamio>=0.6.0
+shazamio>=0.8.1
 # #198 (ops-1): PEP 594 removed the stdlib `audioop` module in Python 3.13, which
 # is what the current DEFAULT Raspberry Pi OS image ("trixie") ships. shazamio's
 # transitive dep `pydub` imports `audioop` at import time, so on 3.13 `pip install`
