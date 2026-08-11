@@ -1,15 +1,28 @@
 name: tests
 
-# TQ-9: run the test suite on every push / PR so a regression is caught before
-# it reaches the appliance. Pinned to Python 3.11 — the Raspberry Pi OS bookworm
-# system Python and the version the app targets.
+# TQ-9: run the test suite on every push / PR so a regression is caught before it
+# reaches the appliance. R5-33: matrix over BOTH supported Pythons — 3.11 (the
+# Raspberry Pi OS bookworm/Legacy system Python and the version the app targets)
+# AND 3.13 (the current default Pi OS "trixie" image, via the audioop-lts backport
+# in requirements.txt). The 3.13 leg is what would have caught #198 — audioop
+# removal breaking `import shazamio` at runtime — before it reached the appliance.
 on:
   push:
   pull_request:
 
+# R5-35 (TQ-5 parity with sync-version-badge.yml): scope the token to read-only.
+# This job installs the full pip dependency tree on every push/PR, so it must not
+# run with the repository-default GITHUB_TOKEN write permissions.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
     env:
       # Make pygame headless: SDL needs no real video/audio device in CI. The
       # sounddevice import is stubbed by tests/conftest.py before any test module
@@ -17,11 +30,14 @@ jobs:
       SDL_VIDEODRIVER: dummy
       SDL_AUDIODRIVER: dummy
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      # R5-35: third-party actions SHA-pinned (not floating tags), mirroring the
+      # badge workflow's hardening. Update the SHA + the trailing version comment
+      # together when bumping.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
         run: |

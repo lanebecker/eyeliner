@@ -126,10 +126,44 @@ def _as_id(value, name: str) -> int:
     (finding S-5).  They are normally well-formed, but a corrupt or unexpected
     API response could otherwise build a surprising request path silently.
     Coercing here makes a malformed value fail loudly at the boundary instead.
+
+    R5-37 (#263): the coercion must reject values that ``int()`` would *silently
+    reshape* rather than reject — otherwise the "fail loudly" guarantee leaks.
+    Two such inputs get through a bare ``int(value)``:
+
+    * ``bool`` — ``True``/``False`` are ``int`` subclasses, so ``int(True)`` is
+      ``1``. A stray boolean would build the path ``…/instances/1/…`` instead of
+      failing, writing to a real, wrong record.
+    * non-integer ``float`` — ``int(3.9)`` truncates to ``3``, so a corrupt
+      ``3.9`` would silently target release ``3``.
+
+    So accept only a genuine integer (explicitly excluding ``bool``) or a string
+    that is *exactly* an integer literal; reject everything else — including any
+    ``float`` — at the boundary.
     """
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
+        # bool is a subclass of int; int(True) == 1 would pass silently.
+        raise ValueError(f"{name} must be an integer, got bool {value!r}")
+    if isinstance(value, int):
+        coerced = value
+    elif isinstance(value, str):
+        text = value.strip()
+        # Accept only a clean integer literal (optional leading sign). Reject
+        # floats ("3.9"), separators, and anything non-numeric. The <= 0 check
+        # below then rejects "0"/"-5".
+        sign, digits = ("", text)
+        if text[:1] in "+-":
+            sign, digits = text[:1], text[1:]
+        # ASCII-only: str.isdigit() is True for fullwidth ("４２") and other
+        # Unicode digit forms, and superscripts ("²") are isdigit()-True but
+        # int()-unparseable (would leak a raw "invalid literal" ValueError past
+        # the tidy boundary message). Require plain ASCII 0-9 so this is a
+        # genuinely CLEAN integer literal.
+        if not (digits.isascii() and digits.isdigit()):
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+        coerced = int(sign + digits)
+    else:
+        # float, Decimal, None, arbitrary objects — no silent int() reshaping.
         raise ValueError(f"{name} must be an integer, got {value!r}")
     if coerced <= 0:
         raise ValueError(f"{name} must be a positive integer, got {coerced}")

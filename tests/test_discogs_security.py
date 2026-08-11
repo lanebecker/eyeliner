@@ -38,6 +38,38 @@ def test_as_id_rejects_non_positive(bad):
         _as_id(bad, "release_id")
 
 
+# R5-37 (#263): int() silently reshapes bool and float — these must be REJECTED,
+# not coerced, or a corrupt value builds a valid-but-wrong write path.
+@pytest.mark.parametrize("bad", [True, False])
+def test_as_id_rejects_bool(bad):
+    # int(True) == 1 / int(False) == 0 would otherwise pass or hit the <=0 guard
+    # for the wrong reason; reject as a bool at the boundary.
+    with pytest.raises(ValueError):
+        _as_id(bad, "instance_id")
+
+
+@pytest.mark.parametrize("bad", [3.9, 42.0, 1.0, "3.9", "42.0", float("nan")])
+def test_as_id_rejects_float(bad):
+    # int(3.9) truncates to 3; a float ID is itself a corruption signal.
+    with pytest.raises(ValueError):
+        _as_id(bad, "release_id")
+
+
+def test_as_id_accepts_signed_numeric_string():
+    # A leading '+' is a clean integer literal; '-5' parses but fails the <=0 guard.
+    assert _as_id("+7", "field_id") == 7
+    with pytest.raises(ValueError):
+        _as_id("-5", "field_id")
+
+
+@pytest.mark.parametrize("bad", ["４２", "３４２", "²", "٤٢", "1_000", "0x10"])
+def test_as_id_rejects_non_ascii_and_nonliteral_digit_strings(bad):
+    # str.isdigit() is True for fullwidth/superscript/other-script digits; require
+    # a plain ASCII 0-9 literal so only a clean integer string is accepted.
+    with pytest.raises(ValueError):
+        _as_id(bad, "release_id")
+
+
 # ---------------------------------------------------------------------------
 # S-4 — _redact_url
 # ---------------------------------------------------------------------------

@@ -9,6 +9,47 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-5 audit — Wave 7: hardening & CI (milestone #30).** Close the round —
+RED-repro-first, cold-reviewed (SPEC + QUALITY pass on every change).
+
+### Fixed
+
+- **The Discogs ID guard rejects silently-reshaped inputs (#263 — LOW,
+  `R5-37`).** `_as_id`, which vets a release/instance/field ID before it is
+  interpolated into a write URL, used a bare `int(value)` — so `bool`
+  (`int(True) == 1`) and non-integer `float` (`int(3.9) == 3`) slipped through
+  and built a valid-but-WRONG write path instead of failing loudly. It now
+  accepts only a genuine `int` (bool explicitly excluded) or a clean ASCII
+  integer string, rejecting bool, float, float-like and non-ASCII-digit strings,
+  `Decimal`, and bytes at the boundary. Positive-only (`<= 0`) is unchanged.
+- **Cover-art IP pinning prefers a reachable IPv4 address (#264 — LOW,
+  `R5-32`).** `_validated_public_ip` pinned the FIRST resolved address; a
+  dual-stack CDN that lists its AAAA record first would pin an IPv6 the appliance
+  (a Pi on a frequently IPv4-only LAN) cannot route, so the cover silently never
+  loaded. It now pins the first vetted IPv4, falling back to IPv6 only for a
+  v6-only host. The SSRF guarantee is untouched — every resolved address is still
+  vetted and the whole hop still fails closed if ANY address is non-public.
+
+### Changed
+
+- **CI runs on Python 3.11 AND 3.13, with a hardened workflow (#261 — MEDIUM,
+  `R5-33`; #262 — LOW, `R5-35`).** `tests.yml` gained a `['3.11', '3.13']`
+  matrix (`fail-fast: false`) so the audioop-lts / trixie path (#198) is exercised
+  in CI, not just on the Pi. The workflow now declares `permissions: contents:
+  read` and SHA-pins `actions/checkout` (v4.2.2) and `actions/setup-python`
+  (v5.3.0) instead of floating tags — parity with the badge workflow's TQ-5
+  hardening.
+
+### Tests
+
+- **Two latch-pair regression tests are no longer vacuous (#260 — MEDIUM,
+  `R5-23`).** `test_reentrant_finalize_while_crediting_does_not_double_increment`
+  and its loving twin set the re-entrancy latch but never armed the #182
+  completion gate, so the guarded branch was never reached and both survived a
+  mutation to the guard. Each now identifies a supporting track and asserts
+  `completion_supported` before setting the latch; both previously-surviving guard
+  mutations are now killed.
+
 **Round-5 audit — Wave 6: efficiency (milestone #29).** Spend the API budget
 once — behaviour-preserving reader.py refactors, RED-cost repros, cold-reviewed
 (differential harness: 0 change to any match decision).
