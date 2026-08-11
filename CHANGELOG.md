@@ -9,6 +9,50 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-5 audit — Wave 5: observability (milestone #28).** Logs that tell the
+truth — RED-test-first, mutation-checked, cold-reviewed.
+
+### Changed
+
+- **The two log-throttle implementations are consolidated (#249 — MEDIUM,
+  `R5-14`).** `ThrottledLogger` (the recognizer's error-log helper) was a full
+  parallel re-implementation of `LogThrottle`; it now delegates its throttle
+  decision to the shared `LogThrottle` and keeps only the logging + recovery
+  flush, so a throttle-policy fix lands once instead of drifting between two
+  copies (the #220/#221 drift).
+
+### Fixed
+
+- **Alternating error messages can no longer defeat the SD-card flood
+  protection (#250 — MEDIUM, `R5-13`; #252 — LOW, `R5-24`).** The throttle keyed
+  on the last message with one message of memory, so two alternating conditions
+  emitted a line per observation (~8,640/day) instead of a handful. A new opt-in
+  per-message mode throttles EACH distinct message independently — a genuinely new
+  message still surfaces at once (#178), but oscillation collapses to one line per
+  message per interval, and each message reports its OWN suppressed tally (R5-24),
+  never the previous message's. The per-key map is LRU-bounded so it stays bounded
+  over 24/7 uptime.
+- **A disabled Last.fm client no longer reports a false love (#251 — MEDIUM,
+  `R5-22`).** `love()` is a graceful no-op returning True when the client is
+  disabled (scrobble off, missing creds, pylast absent), so the completion gate
+  logged "✅ Last.fm loved" and latched `loved=True` while nothing was sent. The
+  gate now also requires the client to be enabled, and a one-time startup warning
+  flags the love-wanted-but-disabled combo.
+- **A leg that raises while unwinding shutdown is no longer swallowed (#253 —
+  LOW, `R5-25`).** `run_pipeline`'s shutdown `gather` discarded results, so a
+  non-cancellation exception during a pending leg's teardown vanished — exactly
+  where cleanup bugs live. Such faults are now logged.
+- **Log-and-continue boundaries carry a traceback (#254 — LOW, `R5-26`).** The
+  Signal delivery guard and capture's callback / ticker error handlers logged
+  only `str(e)`; they now pass `exc_info=True` so a swallowed exception on the
+  headless appliance is diagnosable.
+
+### Docs
+
+- **love-on-completion is documented as targeting the album's closing track
+  (#255 — LOW, `R5-34`).** config.example.yaml and architecture.md said "last
+  identified track", contradicting the #181 behavior (`closing_track`).
+
 **Round-5 audit — Wave 4: display fidelity (milestone #27, Lane-approved visual
 changes).** Paint it right — RED-test-first, mutation-checked, cold-reviewed.
 
