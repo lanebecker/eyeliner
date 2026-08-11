@@ -282,6 +282,30 @@ def test_validate_upgrades_http_to_https_for_allowlisted_host(monkeypatch):
     )
 
 
+def test_validate_drops_port_on_http_to_https_upgrade(monkeypatch):
+    """R5-29: `http://host:80/x` must NOT become `https://host:80/x` (which would
+    dial TLS to port 80 and always fail). The explicit port is dropped so the
+    fetch resolves to 443."""
+    monkeypatch.setattr(cc, "_validated_public_ip", lambda h: "93.184.216.34")
+    out = cc._validate_cover_url("http://coverartarchive.org:80/release/x/front")
+    assert out[0] == "https://coverartarchive.org/release/x/front"
+
+
+def test_validate_drops_explicit_non_443_port_on_https(monkeypatch):
+    """R5-29: a poisoned metadata URL can't steer the fetch to an arbitrary port
+    on the allow-listed host's pinned IP — any explicit port is dropped."""
+    monkeypatch.setattr(cc, "_validated_public_ip", lambda h: "93.184.216.34")
+    out = cc._validate_cover_url("https://i.discogs.com:22/cover.jpg")
+    assert out[0] == "https://i.discogs.com/cover.jpg"
+
+
+def test_validate_drops_userinfo(monkeypatch):
+    """netloc=host also strips any userinfo from the fetch URL."""
+    monkeypatch.setattr(cc, "_validated_public_ip", lambda h: "93.184.216.34")
+    out = cc._validate_cover_url("https://user:pw@i.discogs.com/cover.jpg")
+    assert out[0] == "https://i.discogs.com/cover.jpg"
+
+
 def test_validate_rejects_non_http_scheme(monkeypatch):
     monkeypatch.setattr(cc, "_validated_public_ip", lambda h: "1.2.3.4")
     with pytest.raises(ValueError):

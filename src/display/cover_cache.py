@@ -245,8 +245,17 @@ def _validate_cover_url(url: str) -> Tuple[str, str, str]:
     pinned_ip = _validated_public_ip(host)
     if pinned_ip is None:
         raise ValueError(f"cover URL host resolves to a non-public address: {host!r}")
+    # R5-29: upgrade http→https AND drop any explicit port (and userinfo).
+    # Preserving the port let `http://host:80/x` become `https://host:80/x` and
+    # then dial TLS to port 80 (a guaranteed failure → the cover silently never
+    # loads); more generally a poisoned metadata URL could steer the TLS dial to
+    # ANY port on the allow-listed host's pinned IP (port-probing — the IP pin
+    # holds, but a non-443 port is never legitimate for a cover CDN). netloc=host
+    # is hostname-only, so `_open_cover_stream`'s `parts.port or 443` resolves to
+    # 443 for every hop.
     if parts.scheme == "http":
-        url = parts._replace(scheme="https").geturl()
+        parts = parts._replace(scheme="https")
+    url = parts._replace(netloc=host).geturl()
     return url, host, pinned_ip
 
 
