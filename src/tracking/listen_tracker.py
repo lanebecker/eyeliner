@@ -137,6 +137,18 @@ class ListenTracker:
         # to just the collection writer.
         self.writer = writer
         self.lastfm = lastfm
+        # R5-22: love-on-completion needs a WORKING Last.fm client. If the user
+        # asked for it but the client is disabled (scrobble_enabled off, missing
+        # creds, pylast absent, or init failure), warn ONCE at startup — otherwise
+        # the feature silently does nothing while every album still logs a ✅
+        # (the false-success this guard removes).
+        if lastfm is not None and getattr(lastfm, "love_on_completion", False) \
+                and not getattr(lastfm, "enabled", False):
+            log.warning(
+                "Last.fm 'love on completion' is enabled but the Last.fm client "
+                "is not active (check scrobble_enabled and credentials) — no track "
+                "will actually be loved."
+            )
         self._session: Optional[PlaySession] = None
         # Strong references to in-flight _end_session tasks.  asyncio only
         # keeps weak references to tasks, so a fire-and-forget create_task()
@@ -458,6 +470,10 @@ class ListenTracker:
             and not session.loved
             and not session.loving
             and self.lastfm
+            # R5-22: require an ENABLED client. A disabled client's love() is a
+            # graceful no-op returning True, so entering this branch would log a
+            # false "✅ Last.fm loved" and latch loved=True while nothing was sent.
+            and self.lastfm.enabled
             and self.lastfm.love_on_completion
         ):
             last_track = session.closing_track or (

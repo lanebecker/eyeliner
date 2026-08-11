@@ -871,7 +871,7 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `lastfm.api_key` | — | From last.fm/api/account/create |
 | `lastfm.api_secret` | — | From last.fm/api/account/create |
 | `lastfm.session_key` | — | Generated once via `python get_lastfm_session_key.py`; does not expire |
-| `lastfm.love_on_completion` | `false` | If `true`, marks the last identified track as Loved on album completion |
+| `lastfm.love_on_completion` | `false` | If `true`, marks the album's closing track (#181) as Loved on album completion |
 | `display.width` / `height` | `1024` / `600` | Waveshare 7" HDMI LCD (H) native resolution |
 | `display.fullscreen` | `true` | |
 | `display.dynamic_theming` | `true` | Extract 5-color palette from album art via Pillow; set `false` for fixed neutral dark theme |
