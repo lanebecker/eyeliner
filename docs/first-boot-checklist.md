@@ -153,12 +153,16 @@ renderer's **runtime title push-down** (long track titles shrinking/wrapping in
 
 ## Watch-fors / known deferrals (revisit only if observed)
 
-- **Executor contention (issue #61, deferred).** All blocking work (cover
-  download, palette extract, 3× Discogs, scrobble, play-count/last-played/love,
-  WAV encode) shares one default thread pool. It's deferred on purpose — the
-  consumers are bursty, mostly serialized, and I/O-bound. **Signal to revisit:**
-  cover prefetch or scrobbles feeling sluggish *during* a Discogs rate-limit (429)
-  event. Until then, the 10s 429 backoff cap is the proportionate mitigation.
+- **Executor contention (issue #61, shipped — R6-32).** Blocking work is split
+  across two thread pools: Discogs has its own dedicated **2-worker** pool
+  (`transport.py`), and everything else — cover download, palette extract,
+  scrobble, play-count/last-played/love, WAV encode — runs on an owned **8-worker**
+  I/O pool (`main.py`, `_IO_EXECUTOR_MAX_WORKERS = 8`), both shut down with
+  `cancel_futures` at exit. So a long Discogs 429 backoff parks at most one of the
+  two Discogs workers and never blocks cover/scrobble work. **Signal to revisit:**
+  cover prefetch or scrobbles feeling sluggish under a *burst* (many slow network
+  calls at once) — i.e. contention *within* the 8-worker pool, no longer the old
+  single-pool serialization.
 - **Hue-Diversity Rule (issue #73, deferred non-feature).** The accent is the
   authentic most-saturated cover color, in isolation — no cross-album separation.
   **Signal to revisit:** back-to-back albums with similar dominant colors looking

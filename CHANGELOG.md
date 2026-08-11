@@ -9,6 +9,57 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.19] — 2026-08-11
+
+**Round-6 audit — Wave 6: docs, CI & supply chain (milestone #36) — completes
+Round 6.** Documentation accuracy, setup-guide secret hygiene, and CI /
+supply-chain hardening. Cold-reviewed (SPEC + QUALITY pass; doc claims
+grep-verified against the code, workflow logic executed).
+
+### Fixed
+
+- **The setup guide no longer instructs pasting Last.fm secrets onto the shell
+  command line (#294 — MEDIUM, security, `R6-29`).** §8d's connection check now
+  reads the three credentials from `config.yaml` (like the Discogs check) instead
+  of taking them as `python -c` arguments, so they never land in `~/.bash_history`,
+  scrollback, or `ps`.
+- **Supply-chain drift is caught in CI, not at bring-up (#295 — MEDIUM, security,
+  `R6-30`).** `requirements.txt` is floor-pinned (`>=`), so a breaking/compromised
+  release lands on the Pi silently. `tests.yml` now runs on a weekly schedule, and
+  a new `dependabot.yml` opens weekly update PRs for both pip and the SHA-pinned
+  GitHub Actions.
+- **`config.yaml`'s two write-scope secrets get file permissions (#301 — LOW,
+  security, `R6-36`).** `chmod 600 config.yaml` added to the setup guide §7 and the
+  README quick start — `cp` leaves it world-readable under the default umask.
+- **Release consistency is enforced (#299 — LOW, `R6-34`).** A new
+  `release-consistency.yml` fails a `v*` tag push unless the tag, `VERSION`, and
+  the `CHANGELOG.md` heading all agree (read-only, injection-safe) — the guard the
+  2026-08-10 badge-rot incident showed was missing.
+- **CI runs once per change and Python 3.12 is actually tested (#298, #302 — LOW,
+  `R6-33` / `R6-37`).** `tests.yml` narrows `push` to `main` (+ `pull_request`),
+  adds a `concurrency` group that cancels superseded runs, and adds `3.12` to the
+  version matrix (the setup guide claimed 3.12 works but it was tested nowhere).
+- **The `_SecretRedactingFilter` "never drop a record" comment corrected (#303 —
+  NIT, `R6-38`).** A malformed-format record IS deliberately dropped three lines
+  above; the comment now says so.
+
+### Documentation
+
+- **Stale and missing operational notes corrected (#296, #297, #300 — LOW,
+  `R6-31` / `R6-32` / `R6-35`).** Documented the #229 long-Retry-After × 10s-drain
+  shutdown interaction beside the `TimeoutStopSec` prose; corrected the
+  first-boot-checklist and `architecture.md` wording that still called the #61
+  executor work "deferred" / a "shared pool" (it shipped a dedicated 2-worker
+  Discogs pool + an 8-worker I/O pool); and added a troubleshooting note that a
+  clean ESC / window-close exit under `Restart=on-failure` leaves the screen dark
+  until a manual restart.
+
+---
+
+_Round 6 complete: all 38 findings (#266–#303) remediated across six waves
+(v1.5.14–v1.5.19), each RED-repro-first, mutation-pinned where code, and
+cold-reviewed._
+
 ## [1.5.18] — 2026-08-11
 
 **Round-6 audit — Wave 5: ops hardening (milestone #35).** Config diagnostics,

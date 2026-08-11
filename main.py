@@ -164,7 +164,11 @@ class _SecretRedactingFilter(logging.Filter):
         if scrubbed != rendered:
             record.msg = scrubbed
             record.args = ()
-        return True  # never drop a record — only sanitise it
+        # R6-38: this record IS renderable, so keep it (sanitised). A record that
+        # could NOT render was already dropped above (the except → return False) —
+        # so "never drop a record" was wrong; the drop path is deliberate and the
+        # only safe handling of a malformed %-format call on this security filter.
+        return True
 
     def scrub(self, text: str) -> str:
         """Apply the same redaction to an arbitrary string — used both by
