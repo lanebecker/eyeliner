@@ -28,9 +28,12 @@ log = logging.getLogger(__name__)
 # wait_for guarantees the pipeline never freezes even if a socket somehow evades
 # this floor, while the floor ensures the abandoned thread eventually dies rather
 # than leaking a default-pool worker over 24/7 uptime.
+# R6-21: the floor is APPLIED in CoverArtFallback.__init__ (below), NOT here at
+# import time. Setting the process-wide default socket timeout as an import side
+# effect silently changed socket behaviour for every module imported after this
+# one, in import order — invisible action-at-a-distance. The class that actually
+# issues the timeout-less MusicBrainz calls is the honest, explicit place for it.
 _MB_SOCKET_TIMEOUT_SECONDS = 15
-if socket.getdefaulttimeout() is None:
-    socket.setdefaulttimeout(_MB_SOCKET_TIMEOUT_SECONDS)
 
 # Identify our app to MusicBrainz (required by their API policy)
 musicbrainzngs.set_useragent(
@@ -42,6 +45,15 @@ musicbrainzngs.set_useragent(
 
 class CoverArtFallback:
     """Fetches cover art URLs from the MusicBrainz Cover Art Archive."""
+
+    def __init__(self):
+        # R6-21: apply the R5-08 socket-timeout floor on CONSTRUCTION rather than
+        # at import. musicbrainzngs uses the process-global default socket timeout;
+        # constructing this fallback is what precedes the timeout-less MB calls, so
+        # it is the right moment to bound them. Guarded (only when still unset) so
+        # it never clobbers a default the app or another component already chose.
+        if socket.getdefaulttimeout() is None:
+            socket.setdefaulttimeout(_MB_SOCKET_TIMEOUT_SECONDS)
 
     def get_cover_art_url(self, artist: str, album: str) -> Optional[str]:
         """Search MusicBrainz for the release and return a front cover image URL."""

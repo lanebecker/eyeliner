@@ -221,6 +221,7 @@ async def test_prefetch_cover_bumps_cover_version(tmp_path):
     r._cover_version = 0
     r._dirty = False
     url = "https://i.discogs.com/c.jpg"
+    r._wanted_cover_url = url                   # R6-22: it's the cover we want on screen
     _write_cover(r._cover_store, url)          # warm cache: file already on disk
 
     await r._prefetch_cover(url)

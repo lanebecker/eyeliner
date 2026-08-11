@@ -9,6 +9,56 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.17] — 2026-08-11
+
+**Round-6 audit — Wave 4: cover pipeline resilience (milestone #34).** How cover
+art and its palette recover from transient failures, a decompression-bomb
+tightening, and an import side-effect. Design signed off (time-based download
+backoff; ~10 MP cap). RED-repro-first, mutation-pinned, cold "break-this" reviewed
+(one HIGH caught in review, fixed + regression-tested; final SPEC + QUALITY pass).
+
+### Fixed
+
+- **A transiently unreadable cover no longer poisons its palette to FALLBACK for
+  the whole session (#282 — MEDIUM, `R6-17`).** `extract_palette` returned
+  `FALLBACK_PALETTE` on any error and `_extract_palette_async` cached it, so the
+  cache-hit short-circuit never re-extracted — even after the corrupt-cover
+  refetch landed good bytes. `extract_palette` now returns `None` on failure and
+  the failure is not cached, so dynamic theming recovers on the refetch.
+- **A transient download blip no longer blanks the cover for the rest of the album
+  (#283 — MEDIUM, `R6-18`).** Every track on an album shares one cover URL, so the
+  old "blacklist until the track changes" never lifted within the album. A
+  download failure now backs off (~30s) and retries — the render loop re-attempts
+  once the window elapses — and only a persistently-dead URL (5 failures) is given
+  up on. Decode failures keep their existing bounded unlink→refetch→blacklist.
+- **The corrupt-cover refetch no longer reopens the per-frame decode churn (#284 —
+  LOW, `R6-19`).** `_handle_corrupt_cover` discards the URL from the on-disk
+  readiness set right after unlinking, so no decode task is spawned during the
+  refetch window; the refetch re-adds it when good bytes land.
+- **A decompression bomb can no longer OOM the Pi (#285 — MEDIUM, `R6-20`).**
+  `MAX_IMAGE_PIXELS` lowered from 36 MP to ~10 MP (3200×3200); `cover_cache`
+  validates at cache-write, so an oversized image is rejected before it is ever
+  stored, decoded (×3), or rendered. Real covers (~9 MP) are unaffected.
+- **A cover abandoned mid-download no longer leaks a readiness marker (#287 — NIT,
+  `R6-22`).** `_prefetch_cover` marks readiness / repaints only when the finished
+  download is still the wanted cover; a download that completed for a
+  since-changed track no longer adds an on-disk marker that would never be
+  discarded.
+- **Download and decode failures no longer share one tally (#288 — NIT, `R6-23`).**
+  Separate tallies so a download blip can't consume the corrupt-decode path's
+  bounded retry budget. A cold-review catch: a clean download must NOT reset the
+  decode tally — a download-clean / decode-corrupt cover (Pillow-accepts,
+  SDL-rejects) would otherwise loop the unlink→download→decode-fail storm forever;
+  the decode bound now persists across refetches.
+
+### Changed
+
+- **The MusicBrainz socket-timeout floor is applied on construction, not at import
+  (#286 — LOW, `R6-21`).** `socket.setdefaulttimeout` moved from `coverart.py`'s
+  import into `CoverArtFallback.__init__` (guarded), so importing the module no
+  longer silently changes process-wide socket behaviour for every module imported
+  after it.
+
 ## [1.5.16] — 2026-08-11
 
 **Round-6 audit — Wave 3: matching reach (milestone #33).** Systematic missed

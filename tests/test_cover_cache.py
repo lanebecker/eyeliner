@@ -549,6 +549,24 @@ def test_image_validation_rejects_disallowed_format(tmp_path):
         palette.validate_image_file(str(p))
 
 
+def test_r6_20_pixel_cap_lowered_blocks_the_oom_bomb(tmp_path):
+    """R6-20: the decompression-bomb cap is ~10 MP (3200x3200), not 36 MP, so a
+    ~0.7 MB smooth-gradient JPEG can no longer decode to ~400 MB (x3) and OOM the
+    Pi. cover_cache validates at cache-WRITE, so an oversized image is rejected
+    before it is ever stored, decoded, or rendered. Real covers (~9 MP) pass."""
+    assert palette.MAX_IMAGE_PIXELS <= 3300 * 3300, "cap must be ~10 MP, not 36 MP"
+    # A 4000x4000 (16 MP) image — comfortably UNDER the old 36 MP cap — is now
+    # rejected at the header-size gate (before any full decode).
+    big = tmp_path / "big.png"
+    Image.new("RGB", (4000, 4000), (30, 60, 90)).save(big)
+    with pytest.raises(ValueError, match="image dimensions out of bounds"):
+        palette.validate_image_file(str(big))
+    # A real-cover-sized image (~9 MP) still passes cleanly.
+    ok = tmp_path / "ok9mp.png"
+    Image.new("RGB", (3000, 3000), (30, 60, 90)).save(ok)
+    palette.validate_image_file(str(ok))   # must not raise
+
+
 def test_image_validation_rejects_dimension_bomb_below_pillow_backstop(tmp_path, monkeypatch):
     # The 1x-2x "bomb" band MUT-2 flags: an image whose pixel count exceeds our
     # MAX_IMAGE_PIXELS but stays under Pillow's own 2x DecompressionBomb *error*
