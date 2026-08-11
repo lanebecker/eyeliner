@@ -1026,3 +1026,42 @@ async def test_run_treats_a_none_block_as_a_stop_sentinel_not_a_chunk(monkeypatc
     # was the None sentinel — i.e. `if block is None: continue` held.
     assert fed, "run() never fed the assembler — the block did not flow through"
     assert all(isinstance(b, np.ndarray) for b in fed)
+
+
+# ---------------------------------------------------------------------------
+# R6-28 — the PortAudio input-status warning is off the realtime thread + throttled.
+# ---------------------------------------------------------------------------
+
+def test_r6_28_audio_status_warning_is_throttled(monkeypatch, caplog):
+    """R6-28: identical status flags log once per interval, not once per callback
+    (a persistent overflow raises the flag ~4×/s)."""
+    import logging
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: 1000.0)  # frozen < interval
+    with caplog.at_level(logging.WARNING, logger="src.audio.capture"):
+        for _ in range(50):
+            cap._log_audio_status("input overflow")
+    warns = [r for r in caplog.records if "input overflow" in r.getMessage()]
+    assert len(warns) == 1, f"status must be throttled, got {len(warns)} lines"
+
+
+def test_r6_28_callback_marshals_status_off_the_realtime_thread():
+    """R6-28: the PortAudio callback does NOT log on its realtime thread — it
+    marshals the status onto the loop via call_soon_threadsafe (where the
+    non-thread-safe throttle is safe to touch)."""
+    cap = make_capture()
+    calls = []
+
+    class _Loop:
+        def call_soon_threadsafe(self, fn, *a):
+            calls.append(fn)
+
+    class _Status:  # a truthy PortAudio CallbackFlags stand-in
+        def __bool__(self):
+            return True
+        def __str__(self):
+            return "input overflow"
+
+    callback = cap._make_callback(_Loop(), MagicMock())
+    callback(np.zeros((10, 1), dtype="float32"), 10, None, _Status())
+    assert cap._log_audio_status in calls   # status marshaled to the loop, not logged inline

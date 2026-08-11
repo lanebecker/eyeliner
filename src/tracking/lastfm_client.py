@@ -23,6 +23,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# R6-25: the literal credential placeholders shipped in config.example.yaml. They
+# pass the non-empty credential check but are not real values, so pylast would
+# "initialise" and then 401 on every scrobble/love — the likeliest half-done-setup
+# state. Detect them and disable with a clear warning instead of a false success.
+_LASTFM_PLACEHOLDERS = frozenset({
+    "YOUR_LASTFM_API_KEY",
+    "YOUR_LASTFM_API_SECRET",
+    "YOUR_LASTFM_SESSION_KEY",
+})
+
 
 class LastFmClient:
     """Wraps pylast to scrobble tracks and optionally mark them as Loved.
@@ -50,7 +60,10 @@ class LastFmClient:
         self._lock = threading.Lock()
 
         if not config.scrobble_enabled:
-            log.debug("Last.fm scrobbling is disabled (scrobble_enabled: false).")
+            # R6-24: INFO (was DEBUG) so the disabled state is visible at the
+            # shipped log level — otherwise a typo'd `scrobble_enable:` silently
+            # defaults scrobbling OFF with zero journal evidence.
+            log.info("Last.fm scrobbling is disabled (scrobble_enabled: false).")
             return
 
         api_key    = config.api_key.strip()
@@ -62,6 +75,18 @@ class LastFmClient:
                 "Last.fm scrobbling is enabled but credentials are incomplete. "
                 "Set api_key, api_secret, and session_key in config.yaml. "
                 "Run get_lastfm_session_key.py to generate a session key."
+            )
+            return
+
+        # R6-25: reject the config.example.yaml placeholders — they are non-empty
+        # (so they passed the check above) but would 401 at runtime while this
+        # __init__ logged a misleading "scrobbling initialised" success.
+        if _LASTFM_PLACEHOLDERS & {api_key, api_secret, session_key}:
+            log.warning(
+                "Last.fm scrobbling is enabled but the credentials are still the "
+                "config.example.yaml placeholders — disabling scrobbling. Replace "
+                "api_key, api_secret, and session_key in config.yaml with real "
+                "values (run get_lastfm_session_key.py for the session key)."
             )
             return
 

@@ -427,7 +427,6 @@ def test_unimplemented_backend_aggregates_with_other_errors():
 # R5-11 (#240) — silence_threshold_rms domain check
 # ---------------------------------------------------------------------------
 
-import math  # noqa: E402
 import pytest  # noqa: E402
 
 
@@ -487,3 +486,42 @@ def test_empty_user_token_error_does_not_leak_a_value():
     msg = str(ei.value)
     assert "discogs.user_token" in msg
     assert "''" not in msg   # no raw value echoed
+
+
+# ---------------------------------------------------------------------------
+# R6-24 (#289) — unknown/typo'd keys are tolerated but WARNED (with a did-you-mean).
+# ---------------------------------------------------------------------------
+
+def test_r6_24_unknown_key_in_a_section_warns_with_did_you_mean(caplog):
+    """A typo'd implemented key stays tolerated (config still parses) but a WARNING
+    surfaces it with a did-you-mean, so the silent behaviour change is diagnosable."""
+    import logging
+    raw = _valid_raw()
+    raw["lastfm"]["scrobble_enable"] = True   # typo: missing trailing 'd'
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        AppConfig.from_dict(raw)              # must NOT raise — unknown keys tolerated
+    assert any("scrobble_enable" in m.getMessage() and "scrobble_enabled" in m.getMessage()
+               for m in caplog.records), "typo'd key must warn with a did-you-mean"
+
+
+def test_r6_24_typo_top_level_section_warns(caplog):
+    import logging
+    raw = _valid_raw()
+    raw["lastfmm"] = {"scrobble_enabled": True}   # a misspelled SECTION
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        AppConfig.from_dict(raw)
+    assert any("lastfmm" in m.getMessage() and "top level" in m.getMessage()
+               for m in caplog.records)
+
+
+def test_r6_24_reserved_recognition_subsections_do_not_warn(caplog):
+    """The schema-ahead-of-code reserved acrcloud/audd sub-sections must stay
+    silent — the warning is for typos, not for deliberately-reserved schema."""
+    import logging
+    raw = _valid_raw()
+    raw["recognition"]["acrcloud"] = {"access_key": "x"}
+    raw["recognition"]["audd"] = {"token": "y"}
+    with caplog.at_level(logging.WARNING, logger="src.config"):
+        AppConfig.from_dict(raw)
+    assert not any("acrcloud" in m.getMessage() or "audd" in m.getMessage()
+                   for m in caplog.records)

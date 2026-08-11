@@ -9,6 +9,47 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.18] — 2026-08-11
+
+**Round-6 audit — Wave 5: ops hardening (milestone #35).** Config diagnostics,
+credential + secret hygiene, and a realtime-thread logging fix. RED-repro-first,
+every fix mutation-pinned, cold "break-this" reviewed (SPEC + QUALITY pass).
+
+### Fixed
+
+- **Typo'd config keys are surfaced instead of silently ignored (#289 — MEDIUM,
+  `R6-24`).** A misspelled key (`scrobble_enable`, `lastfmm`, `overlap_secondss`)
+  was accepted, the field silently took its default, and nothing said so — for
+  Last.fm that meant zero scrobbles with zero journal evidence. Each config
+  section (and the top-level section list) now logs a WARNING for any unrecognised
+  key with a did-you-mean; the keys stay tolerated (the reserved
+  `recognition.acrcloud`/`audd` sub-sections don't warn). The "scrobbling
+  disabled" notice is promoted DEBUG→INFO so it's visible at the shipped log level.
+- **Placeholder Last.fm credentials no longer log a false success (#290 — LOW,
+  `R6-25`).** With the `config.example.yaml` placeholders and
+  `scrobble_enabled: true`, the client logged "scrobbling initialised" and then
+  every scrobble failed at runtime. Placeholder credentials are now detected and
+  scrobbling is disabled with a clear warning.
+- **Unhandled-exception tracebacks are scrubbed of secrets (#291 — LOW, security,
+  `R6-26`).** The #202 redaction filter covers log records, but an uncaught
+  exception's traceback bypasses logging entirely (Python prints it raw to stderr
+  → journald) — and discogs-client carries the token in request URLs. The entry
+  point now renders any uncaught traceback through the same secret scrub before it
+  reaches stderr, then exits non-zero. `SystemExit` / `KeyboardInterrupt` pass
+  through untouched.
+- **A permanently-bad config parks instead of crash-looping (#292 — LOW,
+  `R6-27`).** A `ConfigError` (missing/typo'd key, out-of-range value, an
+  unimplemented backend, or the recognition backend failing to import) now exits
+  `78` (`EX_CONFIG`), and the documented systemd unit gains
+  `RestartPreventExitStatus=78` — so systemd stops restarting a fault that can
+  never self-heal (each cold start re-pages the whole Discogs collection index). A
+  transient crash still restarts as before.
+- **The PortAudio input-status warning is off the realtime thread and throttled
+  (#293 — LOW, `R6-28`).** A persistent input-overflow flag logged ~4×/second on
+  the realtime audio callback thread, where blocking log I/O can itself worsen the
+  overrun. The status is now marshalled onto the event loop and throttled there
+  (per distinct flag), like the drop-oldest warning.
+
 ## [1.5.17] — 2026-08-11
 
 **Round-6 audit — Wave 4: cover pipeline resilience (milestone #34).** How cover

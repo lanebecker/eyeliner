@@ -477,8 +477,10 @@ async def test_install_io_executor_routes_default_run_in_executor():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_main_exits_1_on_config_error(monkeypatch):
-    """A ConfigError from load_config must become sys.exit(1), not a traceback."""
+async def test_main_exits_ex_config_78_on_config_error(monkeypatch):
+    """R6-27: a ConfigError from load_config becomes sys.exit(78) (EX_CONFIG), not a
+    traceback and not exit 1 — so the unit's RestartPreventExitStatus=78 parks a
+    permanently-bad config instead of crash-looping it."""
     from src.config import ConfigError
 
     def boom():
@@ -487,7 +489,8 @@ async def test_main_exits_1_on_config_error(monkeypatch):
     monkeypatch.setattr(main_module, "load_config", boom)
     with pytest.raises(SystemExit) as exc_info:
         await main()
-    assert exc_info.value.code == 1
+    assert exc_info.value.code == 78
+    assert exc_info.value.code == main_module._EXIT_CONFIG_ERROR
 
 
 @pytest.mark.asyncio
@@ -637,3 +640,50 @@ async def test_main_normal_path_does_not_double_close_pools(monkeypatch):
     for t in recorded["tasks"]:          # tidy the still-pending legs
         t.cancel()
     await asyncio.gather(*recorded["tasks"], return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# R6-26 (#291) — an uncaught exception's traceback is scrubbed (last secret sink).
+# ---------------------------------------------------------------------------
+
+def test_r6_26_redactor_scrub_redacts_arbitrary_text():
+    """R6-26: the redactor exposes scrub() for non-log text — a crash traceback,
+    which bypasses the logging filter entirely."""
+    f = main_module._SecretRedactingFilter(["SUPERSECRETTOKEN"])
+    out = f.scrub("HTTPError url: /database/search?token=SUPERSECRETTOKEN&q=x SUPERSECRETTOKEN")
+    assert "SUPERSECRETTOKEN" not in out
+    assert "<redacted>" in out
+
+
+def test_r6_26_run_scrubbed_redacts_an_uncaught_traceback(monkeypatch, capsys):
+    """R6-26: an uncaught exception's traceback is rendered through the scrub before
+    it reaches stderr/journald, and the process exits non-zero."""
+    monkeypatch.setattr(
+        main_module, "_REDACTOR", main_module._SecretRedactingFilter(["LEAKY_TOKEN_123"])
+    )
+    monkeypatch.setattr(main_module, "main", lambda: None)   # no un-awaited coroutine
+
+    def _boom(_coro):
+        raise RuntimeError("crash with token=LEAKY_TOKEN_123 in the url")
+    monkeypatch.setattr(main_module.asyncio, "run", _boom)
+
+    with pytest.raises(SystemExit) as ei:
+        main_module._run_scrubbed()
+    assert ei.value.code == 1
+    err = capsys.readouterr().err
+    assert "LEAKY_TOKEN_123" not in err       # scrubbed before stderr
+    assert "<redacted>" in err
+
+
+def test_r6_26_run_scrubbed_passes_system_exit_through(monkeypatch):
+    """A clean SystemExit (the ConfigError EX_CONFIG path) must pass through
+    untouched — its exit code and the parked-service behaviour are preserved."""
+    monkeypatch.setattr(main_module, "main", lambda: None)
+
+    def _cfg_exit(_coro):
+        raise SystemExit(78)
+    monkeypatch.setattr(main_module.asyncio, "run", _cfg_exit)
+
+    with pytest.raises(SystemExit) as ei:
+        main_module._run_scrubbed()
+    assert ei.value.code == 78

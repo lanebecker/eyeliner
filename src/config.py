@@ -30,8 +30,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import difflib
+import logging
 import math
 import yaml
+
+log = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -141,6 +145,29 @@ def _check(ok: bool, message: str, errors: list) -> None:
         errors.append(message)
 
 
+def _warn_unknown_keys(section: str, data: dict, known, *, tolerated=frozenset()) -> None:
+    """R6-24: warn (do NOT fail) on keys the section doesn't recognise.
+
+    Unknown keys stay *tolerated* — the schema is allowed to run ahead of the
+    code (the reserved ``recognition.acrcloud`` / ``audd`` sub-sections), so this
+    never adds to ``errors``. But a TYPO in an implemented key
+    (``scrobble_enable`` for ``scrobble_enabled``, ``overlap_secondss``,
+    ``lastfmm``) previously produced a silent behaviour change with zero evidence
+    anywhere — the field fell back to its default and nothing said so. Log one
+    WARNING per unrecognised key with a did-you-mean, so the typo is diagnosable
+    from the journal. *tolerated* names the deliberately-reserved sub-sections
+    that must not warn.
+    """
+    for key in data:
+        if key in known or key in tolerated:
+            continue
+        suggestion = difflib.get_close_matches(str(key), sorted(known), n=1)
+        hint = f" (did you mean '{suggestion[0]}'?)" if suggestion else ""
+        log.warning(
+            "Unknown key '%s' in [%s] of config.yaml — ignored%s", key, section, hint
+        )
+
+
 # ---------------------------------------------------------------------------
 # Section schemas
 # ---------------------------------------------------------------------------
@@ -158,6 +185,7 @@ class AudioConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "AudioConfig":
         s = "audio"
+        _warn_unknown_keys(s, data, set(cls.__dataclass_fields__))
         device_name = _field(data, "device_name", str, _REQUIRED, section=s, errors=errors)
         sample_rate = _field(data, "sample_rate", int, _REQUIRED, section=s, errors=errors)
         chunk_seconds = _field(data, "chunk_seconds", int, _REQUIRED, section=s, errors=errors)
@@ -226,6 +254,7 @@ class DiscogsConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "DiscogsConfig":
         s = "discogs"
+        _warn_unknown_keys(s, data, set(cls.__dataclass_fields__))
         user_token = _field(data, "user_token", str, _REQUIRED, section=s, errors=errors)
         username = _field(data, "username", str, _REQUIRED, section=s, errors=errors)
         play_count_field_name = _field(data, "play_count_field_name", str, _REQUIRED, section=s, errors=errors)
@@ -266,6 +295,7 @@ class DisplayConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "DisplayConfig":
         s = "display"
+        _warn_unknown_keys(s, data, set(cls.__dataclass_fields__))
         width = _field(data, "width", int, _REQUIRED, section=s, errors=errors)
         height = _field(data, "height", int, _REQUIRED, section=s, errors=errors)
         fullscreen = _field(data, "fullscreen", bool, True, section=s, errors=errors)
@@ -302,6 +332,7 @@ class LastFmConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "LastFmConfig":
         s = "lastfm"
+        _warn_unknown_keys(s, data, set(cls.__dataclass_fields__))
         return cls(
             scrobble_enabled=_field(data, "scrobble_enabled", bool, False, section=s, errors=errors),
             api_key=_field(data, "api_key", str, "", section=s, errors=errors),
@@ -334,6 +365,10 @@ class RecognitionConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "RecognitionConfig":
         s = "recognition"
+        # The reserved acrcloud / audd sub-sections in config.example.yaml are
+        # tolerated (schema-ahead-of-code); every other unknown key warns (R6-24).
+        _warn_unknown_keys(s, data, set(cls.__dataclass_fields__),
+                           tolerated={"acrcloud", "audd"})
         poll_interval_seconds = _field(data, "poll_interval_seconds", int, _REQUIRED, section=s, errors=errors)
         backend = _field(data, "backend", str, "shazamio", section=s, errors=errors)
         confirmation_required = _field(data, "confirmation_required", int, 2, section=s, errors=errors)
@@ -385,6 +420,14 @@ class AppConfig:
             )
 
         errors: list = []
+
+        # R6-24: warn on a misspelled top-level SECTION ('lastfmm', 'audioo') —
+        # otherwise the section is silently ignored and every field in it takes
+        # its default with no evidence anywhere.
+        _warn_unknown_keys(
+            "(top level)", raw,
+            {"audio", "discogs", "display", "recognition", "lastfm"},
+        )
 
         def parse(name: str, parser, *, required: bool):
             """Parse one section, or record a single section-level error.
