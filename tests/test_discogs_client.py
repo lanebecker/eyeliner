@@ -233,6 +233,20 @@ def test_field_not_found_returns_false_no_post():
     client._http.session.post.assert_not_called()
 
 
+def test_field_not_found_drops_the_cache_for_next_credit():
+    """R6-09: a Play Count field created on Discogs AFTER boot must be picked up
+    without a restart. The field-not-found abort left the fieldless map cached,
+    so every later credit re-aborted against the stale cache and never re-hit the
+    endpoint. The abort must invalidate the cache."""
+    client = make_client()
+    client._collection_fields = {}          # field absent, as at boot before it was created
+    client._http.session.post = MagicMock()
+
+    assert client.increment_play_count(release_id=111, instance_id=42) is False
+    client._http.session.post.assert_not_called()
+    assert client._collection_fields is None    # dropped → next credit re-fetches
+
+
 # ---------------------------------------------------------------------------
 # increment_play_count — UNTRUSTED READ must abort, never clobber (META-1)
 #
@@ -671,6 +685,17 @@ def test_update_last_played_field_not_found_returns_false():
 
     assert result is False
     client._http.session.post.assert_not_called()
+
+
+def test_last_played_field_not_found_drops_the_cache_for_next_write():
+    """R6-09: same recovery for the Last Played field — a field created after
+    boot must be picked up without a restart."""
+    client = make_client_with_last_played()
+    client._collection_fields = {"Play Count": _FIELD_ID}   # no Last Played yet
+    client._http.session.post = MagicMock()
+
+    assert client.update_last_played(release_id=111, instance_id=42) is False
+    assert client._collection_fields is None
 
 
 # ---------------------------------------------------------------------------

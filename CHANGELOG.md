@@ -9,6 +9,75 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.15] — 2026-08-11
+
+**Round-6 audit — Wave 2: credit correctness — write path & session state
+(milestone #32).** Data-integrity fixes to when a Play Count is credited and a
+Last.fm love fires, plus session-state and observability nits. RED-repro-first
+(the HIGH double-credit reproduced before the fix), every behavior fix
+mutation-pinned, cold "break-this" reviewed (SPEC + QUALITY pass, no introduced
+defect).
+
+### Fixed
+
+- **Single-(vinyl-)row release: one physical play no longer credits the Play
+  Count TWICE (#270 — HIGH, `R6-05`).** On a one-row release the sole row is both
+  opener and closer, so a confirmed foreign mis-attribution mid-spin — which
+  breaks the consecutive-dedup chain — let the still-playing single's own
+  re-identification trip the #185 replay boundary → split → carve-out credit →
+  re-arm → a SECOND credit for ONE spin. Single-playable-row releases are now
+  EXEMPT from the replay split (opener and closer are indistinguishable there); two
+  spins of a single in one sitting credit once, the singles analogue of the
+  accepted #227 bookend residual.
+- **The Last.fm love no longer fires on a lone unlatched (DB-tier) closer (#271 —
+  MEDIUM, `R6-06`).** The love reused `completion_supported`, whose
+  `album_release_id is None` escape hatch — there for the credit fallback branch —
+  returned True, so an unowned / DB-resolved album whose closer identified once,
+  with zero supporting rows, got Loved on session end. A new `love_supported` gate
+  requires ≥2 distinct resolved rows of the closer's own release when unlatched
+  (keeping the genuine single-row carve-out); latched sessions defer to
+  `completion_supported` unchanged.
+- **A hybrid LP+CD with one side-long vinyl piece can be credited again (#272 —
+  MEDIUM, `R6-07`).** The single-track completion carve-out tested
+  `len(closer.tracklist) == 1`, which counted never-playable bonus-CD rows, so an
+  owned edition with one vinyl row + bonus CD was suppressed forever (its
+  supporting-row count maxes at 1). The carve-out now counts VINYL rows, mirroring
+  the R5-16(a) completion anchor.
+- **The #185 replay boundary anchors on the first VINYL row, not tracklist row 0
+  (#273 — LOW, `R6-08`).** R5-16(a) made only the closer vinyl-aware; a hybrid
+  whose vinyl opener trails a leading CD/file row (global_index 1+) never matched
+  the row-0 anchor, so a genuine re-drop merged into one credit for two plays. The
+  anchor falls back to row 0, so a plain numbered / side-A-first tracklist is
+  unchanged.
+- **A custom field created on Discogs after boot is picked up without a restart
+  (#274 — LOW, `R6-09`).** The field-not-found abort left the fieldless
+  collection-fields map cached, so every later credit re-aborted against the stale
+  cache and never re-hit the endpoint. Both the Play Count and Last Played aborts
+  now drop the cache so the next write re-fetches (one extra GET per failed credit,
+  paid only while misconfigured).
+- **A raising detached split-finalize is reported once, not twice (#276 — NIT,
+  `R6-11`).** The task's done-callback already logs any exception; the shielded
+  await now contains a non-Cancelled raise instead of also propagating it through
+  the recognition leg. Shutdown cancellation still propagates.
+
+### Changed
+
+- **The #195 "recognized with no active session" tripwire is softened (#275 —
+  LOW, `R6-10`).** It flagged a benign same-turn SESSION_ENDED/MUSIC_STARTED
+  interleave (which self-heals, no play lost) as a WARNING telling the operator to
+  "check the wiring" on every occurrence. It is now an INFO line naming that
+  benign case; a genuine wiring gap shows up as this recurring outside a session
+  end.
+
+### Documentation
+
+- **Module docstring + dead-code notes corrected (#277 `R6-12`, #278 `R6-13` —
+  NITs).** `listen_tracker`'s module docstring now describes the #186 read/set
+  credit path (not `increment_play_count`, marked as having no production caller —
+  routing the tracker back through it would reintroduce the #186 double-credit);
+  and `track_commit_service`'s always-True `still_current()` re-check is documented
+  as a defensive guard, not a live race.
+
 ## [1.5.14] — 2026-08-11
 
 **Round-6 audit — Wave 1: stop the crash (log-throttle integrity, milestone

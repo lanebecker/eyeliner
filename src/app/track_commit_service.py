@@ -155,6 +155,15 @@ class TrackCommitService:
         #     rather than being suppressed by a resurrected dead-session dedup key.
         # Still satisfies B-11: set_track ran first, so current_raw never leads
         # current_track.
+        #
+        # R6-13: this ``still_current()`` re-check is presently ALWAYS True — the
+        # ``is_stale()`` gate above returns for a stale session and nothing awaits
+        # between it and here, so the epoch cannot change in the gap (``is_stale``
+        # and ``still_current`` are exact negations). It is kept as a defensive
+        # belt-and-suspenders: if a future edit inserts an await between that gate
+        # and this line, a session that ends in that window must NOT have its
+        # dedup key advanced. It is NOT (as an earlier comment implied) guarding a
+        # live race that exists today.
         if guard.still_current():
             self.state.set_raw(raw)
         log.info(

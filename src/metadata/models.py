@@ -52,6 +52,20 @@ def _match_side(position: str):
         return None
     return m
 
+
+def _playable_row_count(tracklist) -> int:
+    """Number of PLAYABLE rows on *tracklist* for completion arithmetic (R6-07).
+
+    Mirrors the R5-16(a) completion anchor: on a hybrid LP+CD (or LP+file)
+    release the never-playable bonus rows must not inflate the count, so count
+    the VINYL side rows (per :func:`_match_side`).  For a side-letter-less list
+    (a numbered or CD-only tracklist, where NO row matches a vinyl side) fall
+    back to every row — preserving the B-10 numbered-tracklist behaviour, exactly
+    as the anchor falls back to the last row there.
+    """
+    vinyl = sum(1 for e in tracklist if _match_side(e.position) is not None)
+    return vinyl if vinyl > 0 else len(tracklist)
+
 # NOTE: DisplayPalette + FALLBACK_PALETTE moved to src/display/palette.py (ARCH-7)
 # — they are pure display types with no consumer in src/metadata, so they belong
 # in the display layer beside extract_palette(), not up here in the model layer.
@@ -92,11 +106,22 @@ class SideIndex:
     is_last_track: bool                # True iff this is the album's final track
     prev_track_title: Optional[str]    # neighbour by global-tracklist adjacency
     next_track_title: Optional[str]
+    first_vinyl_index: Optional[int]   # global index of the release's FIRST vinyl row (R6-08)
 
     @classmethod
     def empty(cls) -> "SideIndex":
         """The neutral SideIndex for an empty tracklist / unmatched title."""
-        return cls("", None, None, None, None, False, None, None)
+        return cls("", None, None, None, None, False, None, None, None)
+
+    @property
+    def first_playable_index(self) -> int:
+        """Global index of the release's FIRST playable (vinyl) row — the opener a
+        genuine re-drop identifies first, which the #185 replay boundary anchors
+        on (R6-08).  Falls back to 0 for a side-letter-less (numbered / CD-only)
+        list, mirroring the completion anchor's own fallback to the last row, so
+        a plain numbered tracklist behaves exactly as the pre-R6-08 ``== 0``
+        anchor did."""
+        return self.first_vinyl_index if self.first_vinyl_index is not None else 0
 
     @classmethod
     def from_tracklist(cls, tracklist: list["TracklistEntry"], title: str) -> "SideIndex":
@@ -303,8 +328,11 @@ class SideIndex:
         # This relies on the R5-16(b) _match_side tightening so trailing "CD1"/"DV1"
         # rows are NOT counted as vinyl sides.
         last_vinyl_index = None
+        first_vinyl_index = None
         for i, e in enumerate(tracklist):
             if _match_side(e.position) is not None:
+                if first_vinyl_index is None:
+                    first_vinyl_index = i   # R6-08: the replay-boundary opener anchor
                 last_vinyl_index = i
         completion_anchor = (
             last_vinyl_index if last_vinyl_index is not None else len(tracklist) - 1
@@ -328,6 +356,11 @@ class SideIndex:
             is_last_track=is_last_track,
             prev_track_title=prev_title,
             next_track_title=next_title,
+            # Part of the track's positional picture: None when the title does
+            # not place on this tracklist, so an unmatched title still collapses
+            # to SideIndex.empty() (the replay boundary only reads this on a
+            # track that HAS a global_index, so gating it here loses nothing).
+            first_vinyl_index=(first_vinyl_index if global_index is not None else None),
         )
 
 
@@ -513,25 +546,69 @@ class PlaySession:
         # otherwise pass this carve-out and phantom-credit the multi-track album
         # it was latched to.  Require the closer's release id to equal the
         # latched release before trusting its length.
+        #
+        # R6-07: count PLAYABLE (vinyl) rows, not len(tracklist).  A hybrid LP+CD
+        # edition whose only vinyl side is a single side-long piece has ONE
+        # playable row but len(tracklist) > 1 (the bonus-CD rows), so the old
+        # len==1 test suppressed its full vinyl play forever — while
+        # supporting_row_count maxes at 1 because only that one vinyl row can ever
+        # be identified.  Counting vinyl rows mirrors the R5-16(a) anchor, so a
+        # one-vinyl-row release is treated as the single-track release it plays as.
         closer = self.closing_track
         return (
             closer is not None
             and closer.discogs_release_id == self.album_release_id
-            and len(closer.tracklist) == 1
+            and _playable_row_count(closer.tracklist) == 1
         )
+
+    def _distinct_row_count(self, release_id: Optional[int]) -> int:
+        """Distinct resolved tracklist rows of *release_id* identified this
+        session (0 when *release_id* is None). An identification whose title
+        resolves to NO row (global_index None) contributes nothing — it cannot
+        vouch for a completed side."""
+        if release_id is None:
+            return 0
+        return len({
+            t.side_index.global_index
+            for t in self.identified_tracks
+            if t.discogs_release_id == release_id
+            and t.side_index.global_index is not None
+        })
 
     @property
     def supporting_row_count(self) -> int:
         """#182: distinct resolved tracklist rows of the latched release
         identified this session (0 when no release is latched)."""
-        if self.album_release_id is None:
-            return 0
-        return len({
-            t.side_index.global_index
-            for t in self.identified_tracks
-            if t.discogs_release_id == self.album_release_id
-            and t.side_index.global_index is not None
-        })
+        return self._distinct_row_count(self.album_release_id)
+
+    @property
+    def love_supported(self) -> bool:
+        """R6-06: the gate for the Last.fm love.
+
+        The love has no separate unlatched-skip branch (the Play Count credit
+        does — a session with no latched release logs "release not in collection,
+        skipping" and never writes), yet it reused :attr:`completion_supported`,
+        whose ``album_release_id is None`` escape hatch returns True — so a lone
+        DB-tier closer identification (an unowned compilation, or an owned record
+        during a degraded blip that never latched) got Loved on session end with
+        ZERO supporting rows.
+
+        Latched sessions defer to :attr:`completion_supported` unchanged.  For an
+        UNLATCHED session whose closer nonetheless carries a release id and a
+        tracklist, require the SAME evidence of a completed side: ≥2 distinct
+        resolved rows of the CLOSER's own release, or a genuine single-(vinyl-)row
+        release.  A closer with no release id (a pure FALLBACK closer, no
+        tracklist to verify against) preserves the prior love-the-closer
+        behaviour — there is nothing to count.
+        """
+        if self.album_release_id is not None:
+            return self.completion_supported
+        closer = self.closing_track
+        if closer is None or closer.discogs_release_id is None:
+            return True
+        if self._distinct_row_count(closer.discogs_release_id) >= 2:
+            return True
+        return _playable_row_count(closer.tracklist) == 1
 
     def log_track(self, track: TrackMetadata):
         """Record a newly identified track in this session."""

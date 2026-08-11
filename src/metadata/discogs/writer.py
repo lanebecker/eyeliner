@@ -102,6 +102,11 @@ class DiscogsCollectionWriter:
         fields = self._get_collection_fields()
         field_id = fields.get(self.play_count_field_name)
         if field_id is None:
+            # R6-09: a custom field created on Discogs AFTER boot must be picked
+            # up without a restart. Drop the cached (fieldless) map so the NEXT
+            # credit re-fetches instead of re-aborting forever against the stale
+            # cache — one extra GET per failed credit, paid only while broken.
+            self._collection_fields = None
             log.error(
                 f"Custom field '{self.play_count_field_name}' not found in Discogs. "
                 f"Available fields: {list(fields.keys())}"
@@ -187,11 +192,14 @@ class DiscogsCollectionWriter:
         existing unit tests).  Returns True on success (HTTP 204), False on any
         failure.
 
-        NOTE: this is NOT the unit the finalize layer retries.  Retrying the whole
-        read-modify-write double-credits an ambiguous-but-applied POST (#186); the
-        finalize path calls :meth:`read_play_count` once and retries only
-        :meth:`set_play_count`.  Kept idempotent-on-429 within a single call via
-        the absolute-set POST.
+        NOTE: this is NOT the unit the finalize layer retries, and has NO
+        production caller (R6-12) — the tracker credits via
+        ``_credit_completed_album``, which calls :meth:`read_play_count` once and
+        retries only :meth:`set_play_count`.  Retrying the whole read-modify-write
+        double-credits an ambiguous-but-applied POST (#186), so do NOT route the
+        tracker back through this method.  Retained as a tested single-call
+        convenience (kept idempotent-on-429 within one call via the absolute-set
+        POST) for operator tooling and the unit tests.
         """
         try:
             state = self.read_play_count(release_id, instance_id)
@@ -246,6 +254,9 @@ class DiscogsCollectionWriter:
             fields = self._get_collection_fields()
             field_id = fields.get(self.last_played_field_name)
             if field_id is None:
+                # R6-09: drop the cached map so a Last Played field created after
+                # boot is picked up on the next write instead of aborting forever.
+                self._collection_fields = None
                 log.error(
                     f"Custom field '{self.last_played_field_name}' not found in Discogs. "
                     f"Available fields: {list(fields.keys())}"

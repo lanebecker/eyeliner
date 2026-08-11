@@ -333,3 +333,134 @@ async def test_unarmed_session_opener_reid_is_not_a_boundary():
     await tracker.on_track_identified(coll_track("Catholic Block"))  # stale opener re-id
 
     assert tracker._session is session              # no split (not armed)
+
+
+# ---------------------------------------------------------------------------
+# R6-05 (#270) — single-(vinyl-)row release: opener IS the closer, so a foreign
+# mis-attribution mid-spin must NOT let the single's own re-id fire the replay
+# boundary and double-credit one physical play.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_single_row_foreign_sandwich_does_not_double_credit():
+    """R6-05 (HIGH): the #227 mechanism in SINGLES shape. On a one-row release
+    the sole row is BOTH opener (row 0) and closer (is_last_track). A confirmed
+    FALLBACK mis-attribution mid-spin breaks the consecutive-dedup chain, so the
+    still-playing single's own re-identification is row 0 AND non-consecutive →
+    the #185 boundary declared a re-drop → split → carve-out credit → the
+    restarted session re-armed and credited AGAIN at SESSION_ENDED: ONE physical
+    play, TWO Play Count increments. Unlike the chunk-overlap case this needs no
+    consecutive re-id, so the consecutive guard can't catch it — the
+    single-playable-row exemption must."""
+    from src.metadata.models import TracklistEntry
+    tl = [TracklistEntry("A1", "One Long Piece")]
+
+    def single():
+        return make_track("One Long Piece", release_id=300, instance_id=301,
+                          tracklist=tl, resolve_key=("some artist", "single lp"))
+
+    foreign = TrackMetadata(
+        title="Someone Else's Hit", artist="Another Band", album="A Compilation",
+        source=MetadataSource.FALLBACK,
+        discogs_release_id=None, discogs_instance_id=None, tracklist=[],
+    )
+    tracker, writer = _tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(single())     # arms (opener == closer)
+    await tracker.on_track_identified(foreign)      # FALLBACK sandwich breaks the dedup chain
+    await tracker.on_track_identified(single())     # single re-id: row 0, non-consecutive
+    await tracker._end_session()
+
+    assert writer.increment_play_count.call_count == 1, (
+        f"one physical play double-credited: {writer.increment_play_count.call_count}"
+    )
+    writer.increment_play_count.assert_called_with(300, 301)
+
+
+# ---------------------------------------------------------------------------
+# R6-08 (#273) — the replay boundary anchors on the FIRST VINYL row, not row 0,
+# so a hybrid with leading non-vinyl rows still splits a genuine re-drop.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_hybrid_leading_nonvinyl_rows_still_fires_replay_boundary():
+    """R6-08: R5-16(a) made only the CLOSER vinyl-aware. On a hybrid whose vinyl
+    opener isn't tracklist row 0 (a leading CD/file row), the boundary — anchored
+    on global_index==0 — never fired, so a genuine re-drop merged into one credit
+    for two plays. Anchoring on the first VINYL row fixes it."""
+    from src.metadata.models import TracklistEntry
+    tl = [
+        TracklistEntry("CD1", "Bonus Track"),   # leading non-vinyl row (global_index 0)
+        TracklistEntry("A1", "Opener"),         # first VINYL row (global_index 1)
+        TracklistEntry("A2", "Closer"),         # last vinyl row → the closer
+    ]
+
+    def t(title):
+        return make_track(title, release_id=800, instance_id=801, tracklist=tl,
+                          resolve_key=("band", "hybrid lp"))
+
+    tracker, writer = _tracker()
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(t("Opener"))   # A1 (global_index 1)
+    await tracker.on_track_identified(t("Closer"))   # A2 closer arms
+    await tracker.on_track_identified(t("Opener"))   # genuine re-drop of the vinyl opener
+    await tracker.on_track_identified(t("Closer"))
+    await tracker._end_session()
+
+    assert writer.increment_play_count.call_count == 2, (
+        f"hybrid re-drop merged instead of splitting: {writer.increment_play_count.call_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# R6-10 (#275) — the #195 tripwire is softened for the benign same-turn
+# SESSION_ENDED + MUSIC_STARTED interleave.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tripwire_no_session_is_softened_and_names_the_benign_interleave(caplog):
+    """R6-10: recognition with no active session self-heals (a session is
+    started, no play lost). The tripwire must NAME the benign
+    SESSION_ENDED/MUSIC_STARTED interleave at INFO instead of crying
+    'check the wiring' at WARNING on every occurrence."""
+    import logging
+    tracker, writer = _tracker()
+    # No MUSIC_STARTED → _session is None when the track arrives (tripwire path).
+    with caplog.at_level(logging.INFO):
+        await tracker.on_track_identified(coll_track("Catholic Block"))
+    assert tracker._session is not None                    # started (defense in depth)
+    trip = [r for r in caplog.records if "R6-10" in r.message]
+    assert len(trip) == 1                                  # names the benign case
+    assert trip[0].levelno == logging.INFO                 # softened from WARNING
+
+
+# ---------------------------------------------------------------------------
+# R6-11 (#276) — a raising detached split-finalize is reported ONCE.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_split_finalize_raise_is_reported_once_not_twice(caplog, monkeypatch):
+    """R6-11: a rare raise past the detached finalize's own containment is logged
+    by its done-callback (_on_end_session_done); it must NOT also propagate
+    through the shielded await in the recognition leg and be re-raised / logged a
+    second time."""
+    import asyncio
+    import logging
+    tracker, writer = _tracker()
+
+    async def boom(session):
+        raise RuntimeError("kaboom in finalize")
+
+    monkeypatch.setattr(tracker, "_finalize_detached", boom)
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(coll_track("Catholic Block"))
+    await tracker.on_track_identified(coll_track("Master-Dik"))     # closer arms
+    other = make_track("So What", release_id=555, instance_id=556,
+                       resolve_key=("miles davis", "kind of blue"))
+    with caplog.at_level(logging.ERROR):
+        # Album-change split → creditable detached finalize (which now raises).
+        # Must NOT propagate out of on_track_identified.
+        await tracker.on_track_identified(other)
+        await asyncio.sleep(0)                                      # let the done-callback run
+    errors = [r for r in caplog.records if "kaboom" in r.message]
+    assert len(errors) == 1, f"expected one report, got {len(errors)}"
