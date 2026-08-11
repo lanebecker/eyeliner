@@ -9,6 +9,39 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.16] — 2026-08-11
+
+**Round-6 audit — Wave 3: matching reach (milestone #33).** Systematic missed
+collection matches + memo staleness. RED-repro-first, every fix mutation-pinned,
+cold "break-this" reviewed (SPEC + QUALITY pass).
+
+### Fixed
+
+- **Apple/Shazam's "Title - Single" dash form now matches an owned 45 (#279 —
+  MEDIUM, `R6-14`).** `strip_album_decoration` iterated only the paren and bracket
+  forms, so the standard dash rendering Apple uses for singles/EPs
+  ("Blinding Lights - Single") never stripped — even though "single" is already in
+  the album decoration vocabulary — and a whole class of owned 7"/12" records was
+  never matched (no instance_id → no Play Count, ever). The keyword-gated dash form
+  now strips like the paren/bracket ones; "- EP" is deliberately left alone ("ep"
+  isn't in the vocabulary — an album can be titled "... EP"), and a dash segment
+  with no decoration keyword ("Money - It's a Gas") is untouched. This extends the
+  same bounded, uniqueness-gated decorated-query residual as the paren/bracket
+  forms (#222) to the dash form.
+- **The one-entry database-search memo expires (#280 — LOW, `R6-15`).** The R5-20
+  memo that collapses the 2–3 identical searches within one resolve had no TTL, so
+  on a 24/7 appliance re-playing the same record hours later it replayed a stale
+  (possibly empty) page — pinning a coverless FALLBACK result past the record's
+  later addition to the Discogs database. It now expires after 60s (well beyond any
+  single resolve, so the intra-resolve dedup is fully preserved) and re-fetches.
+- **Names-only credit-key fallback strips the disambiguator per name (#281 — NIT,
+  `R6-16`).** A hand-built (pre-precompute) index entry's credit key joined raw
+  names then applied only the end-anchored "(n)" strip, so a mid-string
+  "John (2) and Jane" kept its disambiguator where the precompute path yields
+  "john and jane". The fallback now strips per name before joining, mirroring the
+  precompute path the two are documented to share. (Production always precomputes;
+  this aligns the test-only fallback.)
+
 ## [1.5.15] — 2026-08-11
 
 **Round-6 audit — Wave 2: credit correctness — write path & session state

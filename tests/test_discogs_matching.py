@@ -762,3 +762,57 @@ def test_various_compilation_remains_a_documented_residual():
         (6, 66, "Studio One Rockers", ["Various"], "Various"),
     ])
     assert reader.search_collection("The Skatalites", "Studio One Rockers") is None
+
+
+# ---------------------------------------------------------------------------
+# R6-14 (#279) — the album decoration strip handles Apple's "X - Single" dash form.
+# ---------------------------------------------------------------------------
+
+def test_r6_14_album_dash_form_strips_only_when_keyword_gated():
+    """R6-14: `strip_album_decoration` iterated only paren/bracket, so Apple's
+    standard "Title - Single" dash form never stripped even though "single" is
+    already in the album vocabulary. It must strip the keyword-gated dash form,
+    while leaving a dash segment WITHOUT a keyword (title content) untouched."""
+    from src.metadata.normalize import strip_album_decoration, fold_text
+    assert strip_album_decoration(fold_text("Blinding Lights - Single")) == "blinding lights"
+    # Keyword gate holds: no decoration keyword in the last dash segment → not stripped.
+    assert strip_album_decoration(fold_text("Money - It's a Gas")) == "money - it's a gas"
+    # "- EP" is deliberately NOT stripped ("ep" is not in the vocabulary; "EP" as
+    # title content is a real risk) — scope note, left for a separate decision.
+    assert strip_album_decoration(fold_text("Getting Into Knives - EP")) \
+        == "getting into knives - ep"
+
+
+def test_r6_14_dash_single_query_credits_the_owned_45():
+    """R6-14 end-to-end: an owned 7" titled "Blinding Lights" is matched when the
+    Shazam/Apple query arrives as "Blinding Lights - Single" — previously a
+    permanent missed collection match (no instance_id, no Play Count) for the
+    whole singles/EP class."""
+    reader = _reader_with_index([
+        (9600, 96, "Blinding Lights", ["The Weeknd"]),
+    ])
+    assert reader.search_collection("The Weeknd", "Blinding Lights - Single") == {
+        "release_id": 9600, "instance_id": 96}
+
+
+# ---------------------------------------------------------------------------
+# R6-16 (#281) — names-only credit-key fallback strips the disambiguator per name.
+# ---------------------------------------------------------------------------
+
+def test_r6_16_names_only_credit_key_strips_disambiguator_per_name():
+    """R6-16: the names-only credit-key fallback joined RAW names then applied only
+    the $-anchored disambiguator strip, so a mid-string "John (2) and Jane"
+    survived — while the precompute path (via `_reconstruct_artist_credit`) strips
+    per name to "john and jane". The paths are documented as mirrors; align them."""
+    from src.metadata.discogs.reader import _entry_credit_key
+    assert _entry_credit_key({"artists": ["John (2)", "Jane"]}) == "john and jane"
+
+
+def test_r6_16_names_only_fallback_bridges_a_mid_string_disambiguator():
+    """End-to-end: a hand-built (names-only) index whose FIRST artist carries a
+    mid-string "(2)" disambiguator still bridges the joint Shazam credit."""
+    reader = _reader_with_index([
+        (9500, 95, "Raising Sand", ["Robert Plant (2)", "Alison Krauss"]),
+    ])
+    assert reader.search_collection("Robert Plant and Alison Krauss", "Raising Sand") == {
+        "release_id": 9500, "instance_id": 95}

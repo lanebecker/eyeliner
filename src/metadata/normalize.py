@@ -165,9 +165,14 @@ def strip_album_decoration(folded: str) -> str:
     Distinct from :func:`strip_title_decoration` in two deliberate ways the
     collection matcher (reader.py) needs and the track-level matcher does not:
 
-    * **Bracket forms.** Shazam/iTunes render album decoration in brackets
-      ("Rumours [Deluxe Edition]", "Nevermind [30th Anniversary]"); the
-      track-level strip handles paren/dash only.
+    * **Bracket AND dash forms.** Shazam/iTunes render album decoration in
+      brackets ("Rumours [Deluxe Edition]", "Nevermind [30th Anniversary]") and,
+      for singles/EPs, in the trailing dash form ("Blinding Lights - Single") —
+      "single" is already in the vocabulary, so the dash candidate is stripped
+      exactly like the paren/bracket ones (R6-14). Without the dash pattern an
+      owned 7"/12" was never matched by its "- Single" query — a permanent missed
+      collection match for a whole record class. (The track-level strip handles
+      paren/dash; this one adds bracket + dash on top of the album vocabulary.)
     * **Bare-year exclusion.** A trailing "(1975)" on an ALBUM is a pressing
       distinguisher, not decoration (see ``_ALBUM_DECORATION_WORD_RE``), so it
       is never stripped — otherwise a decorated query collapses onto a plain
@@ -177,9 +182,12 @@ def strip_album_decoration(folded: str) -> str:
     "（）"→"()" — closing #222's fullwidth wrong-miss for free.  LOSSY: the caller
     must apply it ONE SIDE AT A TIME and require a unique match (the #179/#180
     refuse-to-guess discipline).  Returns *folded* unchanged when no
-    keyword-gated trailing paren/bracket suffix is present.
+    keyword-gated trailing paren/bracket/dash suffix is present.  Note "- EP" is
+    NOT stripped: "ep" is deliberately absent from the vocabulary (an album can
+    legitimately be titled "... EP"), so only "- Single" and other keyworded dash
+    forms strip.
     """
-    for pattern in (_TRAILING_PAREN_RE, _TRAILING_BRACKET_RE):
+    for pattern in (_TRAILING_PAREN_RE, _TRAILING_BRACKET_RE, _TRAILING_DASH_RE):
         m = pattern.search(folded)
         if m and _ALBUM_DECORATION_WORD_RE.search(m.group(1)):
             return folded[: m.start()].rstrip()

@@ -52,6 +52,16 @@ _MAX_COLLECTION_PAGES = 1000
 # before it elapses.
 _COLLECTION_INDEX_TTL_SECONDS = 12 * 3600
 
+# R6-15: the R5-20 one-entry (artist, album) database-search memo exists to
+# collapse the 2–3 identical /database/search GETs a SINGLE resolve issues
+# (strategy 1, the database tier, the staleness refresh) into one. A whole
+# resolve completes in well under this, so a short TTL preserves 100% of that
+# intra-resolve dedup — but on a 24/7 appliance that re-plays the SAME record
+# hours apart, an untimed memo would replay an hours-old (possibly empty) page,
+# pinning a FALLBACK/coverless result past the record's later addition to the
+# Discogs DB. Past the TTL the memo is treated as a miss and the query re-fetches.
+_DB_SEARCH_MEMO_TTL_SECONDS = 60.0
+
 # #191 (C): a collection miss whose album the Discogs DATABASE does know is the
 # signature of a just-added record (or simply one the user does not own). The
 # resolver asks the reader to force-refresh the index and re-check ownership;
@@ -83,6 +93,17 @@ _ARTIST_DISAMBIG_RE = re.compile(r"\s*\(\d+\)\s*$")
 # plain member; genuine edition decoration ("(Deluxe Edition)", "[30th
 # Anniversary]") still strips.  STACKED decorations ("Pet Sounds (Mono)
 # (Remastered)") remain a documented conservative miss (one strip only).
+#
+# R6-14 extends the same keyword-gated strip to the trailing DASH form ("Blinding
+# Lights - Single", "... - Live"), so the SAME bounded decorated-query residual
+# now applies to it (R6-14 cold-review Finding 1, accepted): a query for a
+# decorated PRODUCT the user may not own — the "- Single" 45, a "- Live" album —
+# can credit an owned plain-titled same-BASE record when that base is the UNIQUE
+# match.  This is the intended reach (own "X", the Shazam string is "X - Single"),
+# it fails toward a plausible owned record of the same title (never cross-artist),
+# and it is still refused when two owned entries share the base — identical in
+# kind and bound to the paren/bracket residual above, only more frequent because
+# "- Live"/"- Remastered"/"- Acoustic" are common dash subtitles.
 
 
 def _reraise_if_transient(exc: BaseException) -> None:
@@ -125,7 +146,14 @@ def _entry_credit_key(entry: dict) -> str:
     k = entry.get("_credit_key")
     if k is not None:
         return k
-    credit = entry.get("artist_credit") or " and ".join(entry["artists"])
+    credit = entry.get("artist_credit")
+    if credit is None:
+        # R6-16: mirror the precompute / _reconstruct_artist_credit path — strip
+        # the Discogs "(n)" disambiguator PER NAME before joining, not once on the
+        # joined string. _ARTIST_DISAMBIG_RE is $-anchored, so a single outer strip
+        # only catches the LAST name; a mid-string "John (2) and Jane" would keep
+        # its "(2)" and no longer mirror the precompute key "john and jane".
+        credit = " and ".join(_ARTIST_DISAMBIG_RE.sub("", a) for a in entry["artists"])
     return _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", credit)) if credit else ""
 
 
@@ -235,9 +263,12 @@ class DiscogsReader:
         # strategy 1 (limit 25), the database tier (limit 3), and the staleness
         # refresh's re-run — each an identical /database/search GET. Cache the
         # fetched page keyed by (artist, album) and slice to the requested limit;
-        # the next resolve's different query replaces it (no cross-track staleness).
+        # the next resolve's different query replaces it (no cross-track
+        # staleness). R6-15: it also EXPIRES after _DB_SEARCH_MEMO_TTL_SECONDS, so
+        # a 24/7 same-record repeat re-fetches instead of replaying a stale page.
         self._db_search_key = None
         self._db_search_page: list = []
+        self._db_search_stamp: float = 0.0
 
     async def run(self, fn, *args):
         """Dispatch one of this reader's blocking methods on the shared,
@@ -598,13 +629,18 @@ class DiscogsReader:
         let an owned album be cached as a database/fallback downgrade.
         """
         key = (artist, album)
-        if self._db_search_key != key:
-            # R5-20: fetch the page ONCE per distinct (artist, album). page(1) is
-            # materialised so the later slice-to-limit is free and no second GET
-            # is triggered; the memo is a single entry, replaced on the next query.
+        now = time.monotonic()
+        # R5-20: fetch the page ONCE per distinct (artist, album). page(1) is
+        # materialised so the later slice-to-limit is free and no second GET is
+        # triggered; the memo is a single entry, replaced on the next query.
+        # R6-15: also expire it after the TTL so a same-record repeat hours later
+        # re-fetches rather than replaying a stale/empty page.
+        if (self._db_search_key != key
+                or now - self._db_search_stamp >= _DB_SEARCH_MEMO_TTL_SECONDS):
             results = self._client.search(album, artist=artist, type="release")
             self._db_search_page = list(results.page(1))
             self._db_search_key = key
+            self._db_search_stamp = now
         return self._db_search_page[:limit]
 
     def _get_collection_index(self) -> dict:

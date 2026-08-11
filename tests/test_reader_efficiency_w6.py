@@ -117,3 +117,27 @@ def test_r5_27_index_titles_are_not_refolded_on_every_search():
         reader_mod._normalize_term = orig
 
     assert folds["n"] <= 5                    # RED before R5-27: ~601 (fold per entry per tier)
+
+
+def test_r6_15_memo_expires_after_its_ttl(monkeypatch):
+    """R6-15: the R5-20 one-entry memo must not replay a stale (possibly empty)
+    page for a 24/7 SAME-record repeat. Within the TTL the intra-resolve dedup is
+    preserved (one fetch); past the TTL the same (artist, album) re-fetches."""
+    reader = make_discogs_reader()
+    calls = {"n": 0}
+
+    def fake_search(album, artist=None, type=None):
+        calls["n"] += 1
+        m = MagicMock(); m.page = MagicMock(return_value=[])
+        return m
+
+    reader._client.search = MagicMock(side_effect=fake_search)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(reader_mod.time, "monotonic", lambda: clock["t"])
+
+    reader._database_search("A", "one")                       # fetch 1
+    reader._database_search("A", "one")                       # within TTL → memo hit
+    assert calls["n"] == 1
+    clock["t"] += reader_mod._DB_SEARCH_MEMO_TTL_SECONDS + 1
+    reader._database_search("A", "one")                       # past TTL → re-fetch
+    assert calls["n"] == 2
