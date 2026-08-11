@@ -177,6 +177,29 @@ def test_refresh_and_research_upgrades_a_just_added_record(monkeypatch):
     assert upgraded["instance_id"] == 77          # the just-added record's instance
 
 
+def test_refresh_preserves_the_prior_index_on_a_transient_rebuild_failure(monkeypatch):
+    """R5-18: a transient failure DURING the forced rebuild must not leave the
+    reader index-less. Before the fix, refresh_index_and_research nulled the
+    index up front, so a dropped GET during the re-page discarded a
+    seconds-old snapshot and forced a full re-page on every later resolve."""
+    import src.metadata.discogs.reader as reader_mod
+    clock = _Clock()
+    monkeypatch.setattr(reader_mod.time, "monotonic", clock)
+
+    reader = make_discogs_reader()
+    good = {111: {"instance_id": 42, "title": "Goo", "artists": ["Sonic Youth"],
+                  "artist_credit": "Sonic Youth", "master_id": None}}
+    reader._collection_index = dict(good)
+    reader._collection_index_built_at = clock.t
+    reader._http.request = MagicMock(side_effect=ConnectionError("blip"))
+
+    with pytest.raises(ConnectionError):
+        reader.refresh_index_and_research("Someone", "New Album")
+
+    # The previously-valid index survived; the error still propagated (B-4).
+    assert reader._collection_index == good
+
+
 def test_refresh_and_research_respects_cooldown(monkeypatch):
     """A second refresh within the cooldown does NOT re-page Discogs — the
     cooldown bounds the speculative re-fetch triggered by every unowned record."""
