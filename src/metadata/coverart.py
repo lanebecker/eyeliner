@@ -5,6 +5,7 @@ Free, open, and covers most commercially released albums.
 """
 
 import logging
+import socket
 from typing import Optional
 
 import musicbrainzngs
@@ -12,6 +13,24 @@ import musicbrainzngs
 from src.metadata.errors import is_transient
 
 log = logging.getLogger(__name__)
+
+# R5-08: musicbrainzngs is urllib-based and sets NO socket timeout, and the app
+# leaves socket.getdefaulttimeout() at None — so a MusicBrainz/CAA socket that
+# accepts the connection but never responds parks the executor thread FOREVER
+# (Discogs traffic is timeout-disciplined twice over; this fallback tier was the
+# gap).  Set the process-wide default socket timeout (only if it is still unset)
+# so any socket created without an explicit timeout is bounded.  In this app that
+# is effectively just the musicbrainzngs urllib path: the Discogs transport
+# (requests / discogs-client) and the cover fetch (urllib3) pass timeout=
+# explicitly, and Shazam (aiohttp) and Last.fm (pylast, which uses httpx) manage
+# their own — none of them are loosened by this default.
+# The resolver ALSO wraps the call in asyncio.wait_for (belt and braces): the
+# wait_for guarantees the pipeline never freezes even if a socket somehow evades
+# this floor, while the floor ensures the abandoned thread eventually dies rather
+# than leaking a default-pool worker over 24/7 uptime.
+_MB_SOCKET_TIMEOUT_SECONDS = 15
+if socket.getdefaulttimeout() is None:
+    socket.setdefaulttimeout(_MB_SOCKET_TIMEOUT_SECONDS)
 
 # Identify our app to MusicBrainz (required by their API policy)
 musicbrainzngs.set_useragent(
