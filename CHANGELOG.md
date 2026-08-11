@@ -9,6 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+
+## [1.5.12] — 2026-08-11
+
 **Round-5 audit — Wave 3: availability & input hardening (milestone #26).** Stay
 up, fail loud — each fix RED-test-first, mutation-checked, cold-reviewed.
 
