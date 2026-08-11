@@ -36,12 +36,24 @@ def _resolver(cover_fn):
     return r
 
 
-def test_coverart_module_sets_a_socket_timeout_floor():
-    """Importing coverart bounds any socket created without an explicit timeout
-    (the MB urllib path, pylast) — it must not leave the process default at None."""
-    import src.metadata.coverart  # noqa: F401
-    assert socket.getdefaulttimeout() is not None
-    assert socket.getdefaulttimeout() > 0
+def test_cover_art_fallback_sets_a_socket_timeout_floor_on_construction(monkeypatch):
+    """R6-21: the socket-timeout floor is applied when CoverArtFallback is
+    CONSTRUCTED (the thing that issues the timeout-less MB calls), not as an import
+    side effect. Guarded so it never clobbers a default already chosen."""
+    from src.metadata.coverart import CoverArtFallback
+
+    # Unset → construction sets the floor.
+    captured = {}
+    monkeypatch.setattr(socket, "getdefaulttimeout", lambda: None)
+    monkeypatch.setattr(socket, "setdefaulttimeout", lambda v: captured.__setitem__("v", v))
+    CoverArtFallback()
+    assert captured.get("v") is not None and captured["v"] > 0
+
+    # Already set → construction must NOT clobber it.
+    captured.clear()
+    monkeypatch.setattr(socket, "getdefaulttimeout", lambda: 42.0)
+    CoverArtFallback()
+    assert "v" not in captured
 
 
 @pytest.mark.asyncio

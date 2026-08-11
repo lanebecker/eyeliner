@@ -39,13 +39,16 @@ def make_renderer():
     r._label_cache = _BoundedCache(64)
     r._dot_cache = _BoundedCache(64)
     # STAB-1 cover-loop state (mirrors DisplayRenderer.__init__)
-    r._cover_load_failures = {}
+    r._cover_decode_failures = {}
+    r._cover_download_failures = {}       # R6-18/R6-23
+    r._cover_download_retry_after = {}    # R6-18
     r._cover_bad_urls = set()
     r._cover_prefetch_inflight = set()
     r._cover_decode_inflight = set()
     r._cover_on_disk = set()          # R5-21 cover-readiness gate
     r._cover_decode_deferred = False
     r._cover_version = 0
+    r._wanted_cover_url = None        # R6-22: prefetch marks readiness only if wanted
     return r
 
 
@@ -142,6 +145,30 @@ async def test_corrupt_cached_cover_triggers_refetch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_r6_19_corrupt_cover_discards_the_on_disk_marker(tmp_path):
+    """R6-19: _handle_corrupt_cover unlinks the file AND drops the _cover_on_disk
+    readiness marker, so _load_cover stops spawning a (no-op, blocking-stat) decode
+    every frame during the refetch window — the per-frame churn R5-21 closed."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/cover.jpg"
+    cache_path = r._cover_store.path_for(url)
+    cache_path.write_bytes(b"this is not a valid image")   # corrupt cover
+    r._cover_on_disk.add(url)                              # readiness had been marked
+
+    async def _noop_prefetch(u):
+        return None
+    r._prefetch_cover = _noop_prefetch
+
+    await r._decode_cover_async(url, 100, 100)             # corrupt → _handle_corrupt_cover
+
+    assert url not in r._cover_on_disk        # R6-19: marker dropped with the file
+    assert not cache_path.exists()            # file unlinked for the refetch
+
+
+@pytest.mark.asyncio
 async def test_missing_cover_does_not_refetch(tmp_path):
     """A simply-absent cover (not yet downloaded) must NOT trigger a re-fetch —
     the off-loop decode early-returns on a missing file; the download path is
@@ -197,7 +224,7 @@ async def test_stab1_undecodable_cover_stops_after_one_refetch(tmp_path):
     assert url in r._cover_bad_urls           # negative-cached → loop stopped
     # Once blacklisted, later frames early-return BEFORE re-attempting the decode,
     # so the failure tally stops climbing (no per-frame load / log.error spam).
-    assert r._cover_load_failures.get(url) == _COVER_MAX_LOAD_FAILURES + 1
+    assert r._cover_decode_failures.get(url) == _COVER_MAX_LOAD_FAILURES + 1
 
 
 @pytest.mark.asyncio
@@ -321,7 +348,7 @@ async def test_stab1_transient_decode_failure_still_recovers(tmp_path):
         await r._decode_cover_async(url, 100, 100)      # now decodes cleanly
         assert r._cover_cache.get((url, 100, 100)) is not None
         assert url not in r._cover_bad_urls             # a transient glitch is NOT permanent
-        assert url not in r._cover_load_failures        # tally cleared on a clean load
+        assert url not in r._cover_decode_failures        # tally cleared on a clean load
     finally:
         pygame.display.quit()
 
@@ -513,7 +540,7 @@ def test_stab1_new_cover_state_change_lifts_blacklist(tmp_path):
 
     url = "https://i.discogs.com/bad.jpg"
     r._cover_bad_urls.add(url)
-    r._cover_load_failures[url] = _COVER_MAX_LOAD_FAILURES + 1
+    r._cover_decode_failures[url] = _COVER_MAX_LOAD_FAILURES + 1
 
     st = PlayerState()
     st.current_track = TrackMetadata(
@@ -525,7 +552,7 @@ def test_stab1_new_cover_state_change_lifts_blacklist(tmp_path):
     r._on_state_change(st)
 
     assert url not in r._cover_bad_urls            # new wanted cover → blacklist lifted
-    assert url not in r._cover_load_failures       # …and its failure tally reset
+    assert url not in r._cover_decode_failures       # …and its failure tally reset
 
 
 # ---------------------------------------------------------------------------
@@ -712,12 +739,15 @@ def test_static_frame_recomposes_when_cover_version_bumps(tmp_path):
     r._target_palette = FALLBACK_PALETTE
     r._transition_start = 0.0
     r._cover_version = 0
-    r._cover_load_failures = {}          # STAB-1 cover-loop state
+    r._cover_decode_failures = {}          # STAB-1 cover-loop state
+    r._cover_download_failures = {}        # R6-18/R6-23
+    r._cover_download_retry_after = {}     # R6-18
     r._cover_bad_urls = set()
     r._cover_prefetch_inflight = set()
     r._cover_decode_inflight = set()
     r._cover_on_disk = set()          # R5-21 cover-readiness gate
     r._cover_decode_deferred = False
+    r._wanted_cover_url = None        # R6-22
     r._dirty = False
 
     state = PlayerState()

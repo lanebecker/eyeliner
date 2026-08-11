@@ -13,6 +13,7 @@ import colorsys
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -47,8 +48,13 @@ FALLBACK_PALETTE = DisplayPalette(
 )
 
 # Reject images larger than this many total pixels (decompression-bomb guard,
-# S-2).  6000×6000 ≈ 36 MP comfortably exceeds any real album-cover scan.
-MAX_IMAGE_PIXELS = 6000 * 6000
+# S-2).  R6-20: lowered from 6000×6000 (36 MP) to 3200×3200 (~10 MP). Real album
+# covers top out ~9 MP, but a 36 MP cap let a ~0.7 MB smooth-gradient JPEG off a
+# (compromised/MITM'd) allow-listed CDN decode to ~400 MB transient RSS — three
+# times over (validate / palette / pygame) — which is OOM-killer / SD-swap
+# territory on a 512 MB–1 GB Pi. cover_cache validates at cache-WRITE, so an
+# oversized image is now rejected before it is ever stored, decoded, or rendered.
+MAX_IMAGE_PIXELS = 3200 * 3200
 
 
 # ---------------------------------------------------------------------------
@@ -223,13 +229,21 @@ def ensure_contrast_hue_preserving(color: tuple, bg: tuple, min_ratio: float = 4
 # Palette factory
 # ---------------------------------------------------------------------------
 
-def extract_palette(image_path: Path) -> DisplayPalette:
+def extract_palette(image_path: Path) -> Optional[DisplayPalette]:
     """Extract a 5-color DisplayPalette from a cached cover image.
 
     Quantizes the cover, derives (bg, surface, accent, text, muted), and
     GUARANTEES both text roles pass the Full-Opacity Rule (≥4.5:1) against the
     gradient's brightest pixel: `muted` (secondary text) and `accent` (the album
-    title, DISP-1).  Falls back to FALLBACK_PALETTE on any error.
+    title, DISP-1).
+
+    R6-17: returns None on ANY failure (a malformed/undecodable image, or a
+    quantize that yields no colors) rather than FALLBACK_PALETTE. Its sole caller,
+    ``DisplayRenderer._extract_palette_async``, treats None as "don't cache this
+    URL's palette" — otherwise a transient decode error poisoned the URL to
+    FALLBACK for the whole session and the corrupt-cover refetch's good bytes never
+    re-themed. Callers wanting a guaranteed palette use ``extract_palette(p) or
+    FALLBACK_PALETTE``.
     """
     try:
         from PIL import Image
@@ -254,7 +268,7 @@ def extract_palette(image_path: Path) -> DisplayPalette:
         raw = quantized.getpalette() or []
         n_colors = len(raw) // 3
         if n_colors == 0:
-            return FALLBACK_PALETTE
+            return None   # R6-17: signal failure (not FALLBACK) so it isn't cached
 
         # Count palette-index frequency via numpy.bincount instead of a
         # 6,400-iteration Python loop; np.asarray reads indices directly,
@@ -330,4 +344,4 @@ def extract_palette(image_path: Path) -> DisplayPalette:
 
     except Exception as e:
         log.warning(f"Palette extraction failed for {image_path}: {e}")
-        return FALLBACK_PALETTE
+        return None   # R6-17: signal failure (not FALLBACK) so it isn't cached
