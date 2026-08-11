@@ -52,7 +52,7 @@ lastfm:
   api_key: "YOUR_LASTFM_API_KEY"
   api_secret: "YOUR_LASTFM_API_SECRET"
   session_key: "YOUR_LASTFM_SESSION_KEY"
-  # Optional: mark the last identified track as Loved when a full side completes.
+  # Optional: mark the album's closing track as Loved when a full side completes.
   # Off by default — enable if you want album completions reflected in your Last.fm Loved tracks.
   love_on_completion: false
 

@@ -54,6 +54,7 @@ def _tracker(with_lastfm=False):
     lastfm = None
     if with_lastfm:
         lastfm = MagicMock()
+        lastfm.enabled = True                       # R5-22: an ACTIVE client
         lastfm.love_on_completion = True
         lastfm.love = MagicMock(return_value=True)
     tracker = ListenTracker(writer, lastfm)
@@ -419,3 +420,57 @@ def test_genuine_single_track_release_still_credits():
     s.closing_track = t
 
     assert s.completion_supported is True
+
+
+
+# ---------------------------------------------------------------------------
+# R5-22 (#251) — a DISABLED Last.fm client must not report a false love
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_disabled_lastfm_client_does_not_falsely_love(caplog):
+    """love_on_completion=True but the client is disabled (scrobble off / bad
+    creds): love() is a graceful no-op returning True, so the pre-R5-22 gate
+    logged '✅ Last.fm loved' and latched loved=True while nothing was sent."""
+    import logging as _logging
+    writer = make_writer_mock()
+    lastfm = MagicMock()
+    lastfm.enabled = False
+    lastfm.love_on_completion = True
+    lastfm.love = MagicMock(return_value=True)
+    tracker = ListenTracker(writer, lastfm)
+
+    tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
+    await tracker.on_track_identified(make_track("Cotton Crown"))
+    await tracker.on_track_identified(make_track("Master-Dik"))
+    session = tracker._session
+    with caplog.at_level(_logging.INFO):
+        await tracker._finalize_session(session)
+
+    lastfm.love.assert_not_called()          # never entered the love branch
+    assert session.loved is False            # no false latch
+    assert not any("✅ Last.fm loved" in r.message for r in caplog.records)
+
+
+def test_disabled_love_warns_once_at_startup(caplog):
+    """The misconfigured combo (love wanted, client disabled) surfaces one
+    startup warning rather than silently doing nothing."""
+    import logging as _logging
+    writer = make_writer_mock()
+    lastfm = MagicMock()
+    lastfm.enabled = False
+    lastfm.love_on_completion = True
+    with caplog.at_level(_logging.WARNING):
+        ListenTracker(writer, lastfm)
+    assert any("love on completion" in r.message.lower() for r in caplog.records)
+
+
+def test_active_client_with_love_off_does_not_warn(caplog):
+    import logging as _logging
+    writer = make_writer_mock()
+    lastfm = MagicMock()
+    lastfm.enabled = True
+    lastfm.love_on_completion = False
+    with caplog.at_level(_logging.WARNING):
+        ListenTracker(writer, lastfm)
+    assert not any("love on completion" in r.message.lower() for r in caplog.records)
