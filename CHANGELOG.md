@@ -9,6 +9,33 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+**Round-5 audit — Wave 4: display fidelity (milestone #27, Lane-approved visual
+changes).** Paint it right — RED-test-first, mutation-checked, cold-reviewed.
+
+### Fixed
+
+- **The ambient gradient now glows from behind the record (#245 — HIGH,
+  `R5-09`).** It had been painted INVERTED since v1.2.0 — darkest at the 25%/35%
+  origin (behind the cover), brightest at the screen edges — the opposite of the
+  DESIGN.md spec. Brightness now decreases outward, so the surface-tinted peak
+  sits at the origin and fades to bg at the edges. The brightest pixel drawn is
+  still exactly GRADIENT_TEXT_PEAK (relocated, not raised), so the WCAG
+  text-contrast guarantee is unchanged.
+- **The boot/error arc is a fine hairline (#246 — LOW, `R5-28`).** The stamped
+  stroke rendered ~5px (its stamp RADIUS was used as the width) vs the 1.5px
+  spec; halved to a 3px band — the closest a pygame integer-radius circle
+  approximates 1.5px while keeping the round-cap look.
+- **`ellipsize` returns "" instead of an overflowing ellipsis (#247 — NIT,
+  `R5-38`).** At a width narrower than the ellipsis glyph it returned "…" wider
+  than the box; it now returns "" (caller shows nothing). Unreachable at
+  1024×600; a correct backstop at degenerate widths.
+
+### Changed
+
+- **Docs: corrected the legibility-floor scale thresholds (#248 — LOW,
+  `R5-30`).** CLAUDE.md claimed the floors bind at a single `s≈0.33`; in fact
+  they bind per role (header `s≈0.82` … hero `s≈0.33`). None bind at the shipped
+  1024×600.
 
 ## [1.5.12] — 2026-08-11
 
