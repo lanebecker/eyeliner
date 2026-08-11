@@ -206,9 +206,11 @@ def test_bool_is_rejected_for_int_field():
 
 def test_int_is_widened_to_float():
     raw = _valid_raw()
-    raw["audio"]["silence_threshold_rms"] = 0   # int where float expected
+    # R5-11: use a positive int (0 is now a rejected threshold); this test pins
+    # the int->float WIDENING, not the value.
+    raw["audio"]["silence_threshold_rms"] = 1   # int where float expected
     cfg = AppConfig.from_dict(raw)
-    assert cfg.audio.silence_threshold_rms == 0.0
+    assert cfg.audio.silence_threshold_rms == 1.0
     assert isinstance(cfg.audio.silence_threshold_rms, float)
 
 
@@ -419,3 +421,69 @@ def test_unimplemented_backend_aggregates_with_other_errors():
         AppConfig.from_dict(raw)
     msg = str(exc.value)
     assert "recognition.backend" in msg and "audio.sample_rate" in msg
+
+
+# ---------------------------------------------------------------------------
+# R5-11 (#240) — silence_threshold_rms domain check
+# ---------------------------------------------------------------------------
+
+import math  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.5, float("nan"), float("inf"), float("-inf")])
+def test_silence_threshold_must_be_finite_and_positive(bad):
+    raw = _valid_raw()
+    raw["audio"]["silence_threshold_rms"] = bad
+    with pytest.raises(ConfigError) as ei:
+        AppConfig.from_dict(raw)
+    assert "silence_threshold_rms" in str(ei.value)
+
+
+def test_valid_silence_threshold_still_accepted():
+    raw = _valid_raw()
+    raw["audio"]["silence_threshold_rms"] = 0.02
+    cfg = AppConfig.from_dict(raw)
+    assert cfg.audio.silence_threshold_rms == 0.02
+
+
+# ---------------------------------------------------------------------------
+# R5-12 (#241) — required strings must not be empty
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("section,key", [
+    ("audio", "device_name"),
+    ("discogs", "user_token"),
+    ("discogs", "username"),
+    ("discogs", "play_count_field_name"),
+])
+def test_empty_required_string_is_rejected(section, key):
+    raw = _valid_raw()
+    raw[section][key] = ""
+    with pytest.raises(ConfigError) as ei:
+        AppConfig.from_dict(raw)
+    assert f"{section}.{key}" in str(ei.value)
+
+
+@pytest.mark.parametrize("section,key", [
+    ("audio", "device_name"),
+    ("discogs", "username"),
+    ("discogs", "play_count_field_name"),
+])
+def test_whitespace_only_required_string_is_rejected(section, key):
+    raw = _valid_raw()
+    raw[section][key] = "   "
+    with pytest.raises(ConfigError) as ei:
+        AppConfig.from_dict(raw)
+    assert f"{section}.{key}" in str(ei.value)
+
+
+def test_empty_user_token_error_does_not_leak_a_value():
+    """SEC-3: the empty-token message names the field but never echoes a value."""
+    raw = _valid_raw()
+    raw["discogs"]["user_token"] = ""
+    with pytest.raises(ConfigError) as ei:
+        AppConfig.from_dict(raw)
+    msg = str(ei.value)
+    assert "discogs.user_token" in msg
+    assert "''" not in msg   # no raw value echoed

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import math
 import yaml
 
 
@@ -168,6 +169,10 @@ class AudioConfig:
         # chunk_frames <= 0; a NEGATIVE overlap makes hop = chunk - overlap >
         # chunk_frames — both are rejected by ChunkAssembler and would otherwise
         # crash the capture leg into a systemd crash loop.
+        # R5-12: device_name "" substring-matches EVERY input device and silently
+        # binds the first — a wrong-capture footgun. Require a non-empty value.
+        _check(device_name is None or device_name.strip() != "",
+               f"  • {s}.device_name: must not be empty", errors)
         _check(sample_rate is None or sample_rate > 0,
                f"  • {s}.sample_rate: must be > 0, got {sample_rate!r}", errors)
         _check(chunk_seconds is None or chunk_seconds > 0,
@@ -187,6 +192,18 @@ class AudioConfig:
         # aggregated block, rather than letting it silently mis-behave at runtime.
         _check(session_end_silence_seconds is None or session_end_silence_seconds > 0,
                f"  • {s}.session_end_silence_seconds: must be > 0, got {session_end_silence_seconds!r}", errors)
+        # R5-11: silence_threshold_rms is THE recognition gate. 0 / negative make
+        # the "rms < threshold" silence test unreachable, so a session never ends
+        # and every idle chunk is POSTed to Shazam (~8,640/day, the #193 class);
+        # NaN makes BOTH comparisons false, so the detector never transitions and
+        # recognition is dead — silently, with no warning. It's the one audio
+        # field CRIT-1/#168 didn't domain-check. Require finite and > 0.
+        _check(
+            silence_threshold_rms is None
+            or (math.isfinite(silence_threshold_rms) and silence_threshold_rms > 0),
+            f"  • {s}.silence_threshold_rms: must be a finite number > 0, "
+            f"got {silence_threshold_rms!r}", errors,
+        )
 
         return cls(
             device_name=device_name,
@@ -209,11 +226,30 @@ class DiscogsConfig:
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "DiscogsConfig":
         s = "discogs"
+        user_token = _field(data, "user_token", str, _REQUIRED, section=s, errors=errors)
+        username = _field(data, "username", str, _REQUIRED, section=s, errors=errors)
+        play_count_field_name = _field(data, "play_count_field_name", str, _REQUIRED, section=s, errors=errors)
+        last_played_field_name = _field(data, "last_played_field_name", str, None, section=s, errors=errors)
+
+        # R5-12: an empty required string passes the type check but fails at
+        # runtime exactly when it matters — an empty user_token 401s every
+        # request, and an empty play_count_field_name makes the end-of-session
+        # credit fail the instant a play completes. Reject blanks here so the one
+        # friendly startup ConfigError names them, rather than a silent runtime
+        # failure. user_token's VALUE is never echoed (SEC-3); the message names
+        # only the field.
+        _check(user_token is None or user_token.strip() != "",
+               f"  • {s}.user_token: must not be empty", errors)
+        _check(username is None or username.strip() != "",
+               f"  • {s}.username: must not be empty", errors)
+        _check(play_count_field_name is None or play_count_field_name.strip() != "",
+               f"  • {s}.play_count_field_name: must not be empty", errors)
+
         return cls(
-            user_token=_field(data, "user_token", str, _REQUIRED, section=s, errors=errors),
-            username=_field(data, "username", str, _REQUIRED, section=s, errors=errors),
-            play_count_field_name=_field(data, "play_count_field_name", str, _REQUIRED, section=s, errors=errors),
-            last_played_field_name=_field(data, "last_played_field_name", str, None, section=s, errors=errors),
+            user_token=user_token,
+            username=username,
+            play_count_field_name=play_count_field_name,
+            last_played_field_name=last_played_field_name,
         )
 
 
