@@ -103,6 +103,32 @@ def _reraise_if_transient(exc: BaseException) -> None:
         raise exc
 
 
+def _entry_title_key(entry: dict) -> str:
+    """Folded album-title match key for an index entry — precomputed at build
+    time (R5-27) and read here, falling back to an on-the-fly fold for a
+    hand-built test index that predates the precompute."""
+    k = entry.get("_title_key")
+    return k if k is not None else _normalize_term(entry["title"])
+
+
+def _entry_artist_keys(entry: dict) -> list:
+    """Folded, disambiguation-stripped per-name artist keys (R5-27 precompute)."""
+    k = entry.get("_artist_keys")
+    if k is not None:
+        return k
+    return [_normalize_artist(_ARTIST_DISAMBIG_RE.sub("", a)) for a in entry["artists"]]
+
+
+def _entry_credit_key(entry: dict) -> str:
+    """Folded, disambiguation-stripped full-credit key (R5-27 precompute); the
+    fallback mirrors the reader's on-the-fly join for a pre-precompute entry."""
+    k = entry.get("_credit_key")
+    if k is not None:
+        return k
+    credit = entry.get("artist_credit") or " and ".join(entry["artists"])
+    return _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", credit)) if credit else ""
+
+
 def _reconstruct_artist_credit(raw_artists: list) -> str:
     """Rebuild the full multi-artist credit string Discogs displays, from the
     ``basic_information.artists`` list — each entry's ``name`` plus its ``join``
@@ -204,6 +230,14 @@ class DiscogsReader:
         # #191 (C): monotonic timestamp of the last forced staleness-refresh,
         # for the cooldown. -inf so the first refresh always runs.
         self._last_index_refresh_at: float = float("-inf")
+        # R5-20: one-entry memo of the last database search. Within a single
+        # resolve the SAME (artist, album) query is issued up to 3 times —
+        # strategy 1 (limit 25), the database tier (limit 3), and the staleness
+        # refresh's re-run — each an identical /database/search GET. Cache the
+        # fetched page keyed by (artist, album) and slice to the requested limit;
+        # the next resolve's different query replaces it (no cross-track staleness).
+        self._db_search_key = None
+        self._db_search_page: list = []
 
     async def run(self, fn, *args):
         """Dispatch one of this reader's blocking methods on the shared,
@@ -276,10 +310,7 @@ class DiscogsReader:
             # only — Discogs appends it to artist names, never to titles, and
             # Shazam never produces it (#179).  Artist comparison uses the
             # folded form (#223: leading-"the" + "&"/"and") on both sides.
-            if any(
-                _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", a)) == artist_key
-                for a in entry["artists"]
-            ):
+            if artist_key in _entry_artist_keys(entry):
                 return True
             # R5-07: a joint credit ("Robert Plant & Alison Krauss") equals no
             # single index name, so also match the reconstructed full credit
@@ -287,10 +318,8 @@ class DiscogsReader:
             # join of the names when the entry predates artist_credit (e.g. a
             # hand-built test index) — covering the common "&"/"and" case; a real
             # build stores the exact credit (incl. comma/feat. separators).
-            credit = entry.get("artist_credit") or " and ".join(entry["artists"])
-            if bool(credit) and (
-                _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", credit)) == artist_key
-            ):
+            credit_key = _entry_credit_key(entry)
+            if credit_key and credit_key == artist_key:
                 return True
             # R5-07 residual (deliberately NOT fixed, Lane 2026-08-11): a "Various"
             # compilation is indexed under the single artist "Various", so a track
@@ -327,7 +356,7 @@ class DiscogsReader:
         same_key_masters = {
             entry.get("master_id")
             for entry in index.values()
-            if _normalize_term(entry["title"]) == album_key
+            if _entry_title_key(entry) == album_key
             and entry_artist_matches(entry)
         }
         same_title_is_distinct_albums = len({m for m in same_key_masters if m}) >= 2
@@ -348,7 +377,7 @@ class DiscogsReader:
             entry = index.get(release.id)
             if entry is None:
                 continue
-            if _normalize_term(entry["title"]) == album_key and entry_artist_matches(entry):
+            if _entry_title_key(entry) == album_key and entry_artist_matches(entry):
                 if same_title_is_distinct_albums:
                     # #226: exact-matching AND owned, but ambiguous across
                     # distinct same-titled albums — defer to strategy 2's
@@ -389,7 +418,7 @@ class DiscogsReader:
         matches = [
             (release_id, entry)
             for release_id, entry in index.items()
-            if _normalize_term(entry["title"]) == album_key
+            if _entry_title_key(entry) == album_key
             and entry_artist_matches(entry)
         ]
 
@@ -408,8 +437,11 @@ class DiscogsReader:
             album_key_stripped = strip_album_decoration(album_key)
             query_stripped = album_key_stripped != album_key
 
-            def tier2_album_matches(index_title: str) -> bool:
-                title_key = _normalize_term(index_title)
+            def tier2_album_matches(entry: dict) -> bool:
+                # R5-27: use the precomputed folded title key (no per-call re-fold
+                # of every index entry on the common miss path, which is where the
+                # cost was measured); only the decoration strip runs per entry.
+                title_key = _entry_title_key(entry)
                 # decorated-query direction: stripped query vs raw index title.
                 if query_stripped and album_key_stripped and album_key_stripped == title_key:
                     return True
@@ -420,7 +452,7 @@ class DiscogsReader:
             matches = [
                 (release_id, entry)
                 for release_id, entry in index.items()
-                if tier2_album_matches(entry["title"])
+                if tier2_album_matches(entry)
                 and entry_artist_matches(entry)
             ]
 
@@ -485,23 +517,31 @@ class DiscogsReader:
         """
         try:
             release = self._client.release(release_id)
-            entries = []
-            for track in release.tracklist:
-                # Headings have type_ == 'heading' and typically no position
-                if getattr(track, "type_", None) == "heading":
-                    continue
-                if not track.position:
-                    continue
-                entries.append(TracklistEntry(
-                    position=track.position,
-                    title=track.title,
-                    duration=track.duration or None,
-                ))
-            return entries
+            return self._parse_tracklist(release)
         except Exception as e:
             _reraise_if_transient(e)
             log.warning(f"Failed to fetch tracklist for release {release_id}: {e}")
             return []
+
+    @staticmethod
+    def _parse_tracklist(release) -> list:
+        """Parse a Discogs Release's ``.tracklist`` into TracklistEntry rows,
+        dropping heading pseudo-tracks and positionless entries. Pure — takes an
+        ALREADY-FETCHED release object, so `_build_result` can reuse the release
+        it already loaded instead of paying a second GET for the same id (R5-19).
+        """
+        entries = []
+        for track in release.tracklist:
+            if getattr(track, "type_", None) == "heading":
+                continue
+            if not track.position:
+                continue
+            entries.append(TracklistEntry(
+                position=track.position,
+                title=track.title,
+                duration=track.duration or None,
+            ))
+        return entries
 
     def get_original_year(self, release) -> Optional[str]:
         """Fetch the ORIGINAL release year from the pressing's master.
@@ -557,8 +597,15 @@ class DiscogsReader:
         used to make every track fall through to the slow collection walk and
         let an owned album be cached as a database/fallback downgrade.
         """
-        results = self._client.search(album, artist=artist, type="release")
-        return list(results.page(1)[:limit])
+        key = (artist, album)
+        if self._db_search_key != key:
+            # R5-20: fetch the page ONCE per distinct (artist, album). page(1) is
+            # materialised so the later slice-to-limit is free and no second GET
+            # is triggered; the memo is a single entry, replaced on the next query.
+            results = self._client.search(album, artist=artist, type="release")
+            self._db_search_page = list(results.page(1))
+            self._db_search_key = key
+        return self._db_search_page[:limit]
 
     def _get_collection_index(self) -> dict:
         """Build (once per session) and return an in-memory index of the user's
@@ -634,6 +681,18 @@ class DiscogsReader:
                         # Shazam joint credit ("A & B") can match a collaboration
                         # album whose index names are ["A", "B"].
                         "artist_credit": _reconstruct_artist_credit(basic.get("artists", [])),
+                        # R5-27: precompute the folded match keys ONCE at build,
+                        # so search_collection's #226 distinct-albums scan and
+                        # tier-1 comparisons don't re-fold every index entry on
+                        # every call (~8ms/miss at 3k records on x86, ~4-5x on the
+                        # Pi). Behaviour-identical to folding on the fly.
+                        "_title_key": _normalize_term(basic.get("title", "")),
+                        "_artist_keys": [
+                            _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", a.get("name", "")))
+                            for a in basic.get("artists", [])
+                        ],
+                        "_credit_key": _normalize_artist(_ARTIST_DISAMBIG_RE.sub(
+                            "", _reconstruct_artist_credit(basic.get("artists", [])))),
                         # #226: the master groups a work's pressings.  Two owned
                         # entries at the same (artist, title) with DIFFERENT
                         # masters are distinct albums (Peter Gabriel I/III), not
@@ -767,8 +826,17 @@ class DiscogsReader:
             except Exception as e:
                 _reraise_if_transient(e)
 
-        # Tracklist — fetch separately; log but don't fail on error
-        tracklist = self.get_tracklist(release.id)
+        # Tracklist — read off the ALREADY-FETCHED release (R5-19: get_tracklist
+        # would construct a fresh lazy Release and re-GET the same /releases/{id},
+        # doubling enrichment spend against the 60/min budget). Transient
+        # propagation is preserved: a transient blip parsing the credit-critical
+        # tracklist re-raises so the album stays uncached/retryable (B-4).
+        try:
+            tracklist = self._parse_tracklist(release)
+        except Exception as e:
+            _reraise_if_transient(e)
+            log.warning(f"Failed to parse tracklist for release {release.id}: {e}")
+            tracklist = []
 
         # Genres and styles — styles are more specific so they come first.
         # Both are already present in the release object; no extra API call needed.
