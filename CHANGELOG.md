@@ -9,6 +9,12 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
+seams), #227 (reprise/bookend phantom double-credit), and #265 (Various
+compilations miss the collection).
+
+## [1.5.11] — 2026-08-11
+
 **Round-5 audit — Wave 2: matching & recognition integrity (milestone #25).**
 The wrong-credit / lost-credit cluster, each fix RED-test-first -> mutation-checked
 -> independently cold-reviewed -> narrow-second-passed.
@@ -57,8 +63,6 @@ The wrong-credit / lost-credit cluster, each fix RED-test-first -> mutation-chec
   (U+200C/D) are kept, being lexically load-bearing in some scripts (folding them
   could merge genuinely different titles — the phantom direction).
 
-Deferred follow-ups carried with triggers: #218 / #219 (v1.6 / v1.7 roadmap
-seams) and #227 (reprise/bookend phantom double-credit).
 
 ## [1.5.10] — 2026-08-11
 
