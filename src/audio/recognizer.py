@@ -195,7 +195,12 @@ class ShazamIOBackend(RecognizerBackend):
         # half of REC-2).  `or ""` coerces a JSON-null title to a string so the
         # emptiness check is None-safe.  Returning None makes the loop count it
         # as a miss instead of a candidate.
-        title = track.get("title") or ""
+        # R5-10: str()-coerce — an untrusted payload can carry a NUMBER title/
+        # subtitle/album, which passes the `or ""` truthiness as a non-string and
+        # later crashes `.strip()`/`_norm().split()` on EVERY chunk (no miss
+        # counted, display stuck on IDENTIFYING). `str(x or "")` maps null/0/""
+        # to "" and any other value to its text form.
+        title = str(track.get("title") or "")
         if not title.strip():
             return None
 
@@ -218,7 +223,7 @@ class ShazamIOBackend(RecognizerBackend):
             for section in track.get("sections") or []:
                 for meta in section.get("metadata") or []:
                     if (meta.get("title") or "").lower() == "album":
-                        album = meta.get("text") or ""
+                        album = str(meta.get("text") or "")
                         break
                 if album:
                     break
@@ -231,11 +236,12 @@ class ShazamIOBackend(RecognizerBackend):
         # _handle_result, which escapes to run()'s handler so NO miss is counted
         # and the display sits on IDENTIFYING forever.  (title is already coerced +
         # emptiness-guarded above, REC-3.)
+        isrc = track.get("isrc")
         return RawRecognitionResult(
             title=title,
-            artist=track.get("subtitle") or "",
+            artist=str(track.get("subtitle") or ""),   # R5-10: numeric subtitle -> str
             album=album,
-            isrc=track.get("isrc"),
+            isrc=str(isrc) if isrc is not None else None,  # R5-10: numeric isrc -> str
         )
 
     @staticmethod
@@ -451,7 +457,10 @@ class RecognitionLoop:
         # coerces both (title via REC-3, artist here), but a None slipping in from
         # any future source must compare as empty, never crash the dedup.
         def _norm(s: Optional[str]) -> str:
-            return " ".join((s or "").split()).casefold()
+            # R5-10: str()-coerce so a non-string value (a numeric field that
+            # slipped past the parser) can never AttributeError here — the parser
+            # already coerces, this is the defense-in-depth backstop.
+            return " ".join(str(s or "").split()).casefold()
 
         return (
             _norm(a.title) == _norm(b.title)

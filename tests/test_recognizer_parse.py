@@ -141,3 +141,53 @@ def test_parse_non_dict_track_is_a_clean_none_not_a_raise():
     the fix, track.get('title') raised AttributeError out of _parse_shazam."""
     assert ShazamIOBackend._parse_shazam({"track": ["not", "a", "dict"]}) is None
     assert ShazamIOBackend._parse_shazam({"track": 42}) is None
+
+
+# ---------------------------------------------------------------------------
+# R5-10 (#239) — non-string fields in an untrusted Shazam payload must not
+# crash the recognition loop.
+# ---------------------------------------------------------------------------
+
+from src.audio.recognizer import RecognitionLoop  # noqa: E402
+from tests.factories import make_recognition_config  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
+import pytest  # noqa: E402
+
+
+def test_numeric_subtitle_is_coerced_to_string():
+    parsed = ShazamIOBackend._parse_shazam({"track": {"title": "Song", "subtitle": 12345}})
+    assert parsed is not None
+    assert parsed.artist == "12345"
+    assert isinstance(parsed.artist, str)
+
+
+def test_numeric_title_and_album_and_isrc_are_coerced():
+    resp = {"track": {
+        "title": 777, "subtitle": "Band", "isrc": 42,
+        "sections": [{"metadata": [{"title": "Album", "text": 2020}]}],
+    }}
+    parsed = ShazamIOBackend._parse_shazam(resp)
+    assert parsed.title == "777"
+    assert parsed.album == "2020"
+    assert parsed.isrc == "42"
+    assert all(isinstance(x, str) for x in (parsed.title, parsed.artist, parsed.album, parsed.isrc))
+
+
+def _loop(cr=2):
+    cfg = make_recognition_config(confirmation_required=cr)
+    st = MagicMock(); st.current_raw = None; st.current_track = None; st.session_epoch = 0
+    with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
+        return RecognitionLoop(cfg, st, AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_numeric_subtitle_result_does_not_crash_the_loop():
+    """RED before R5-10: a numeric subtitle produced artist=<int>, and the second
+    identical result hit _norm(<int>).split() → AttributeError every chunk, so
+    the track never confirmed and no miss was counted."""
+    loop = _loop(2)
+    r = ShazamIOBackend._parse_shazam({"track": {"title": "Song", "subtitle": 12345}})
+    await loop._handle_result(r, 0)
+    await loop._handle_result(r, 0)   # must not raise
+    # two identical valid results confirm normally
+    assert loop.on_confirmed.await_count == 1
