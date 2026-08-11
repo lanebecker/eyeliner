@@ -389,6 +389,7 @@ Environment="DISPLAY=:0"
 Environment="XAUTHORITY=/home/pi/.Xauthority"
 ExecStart=/home/pi/vinyl-now-playing/venv/bin/python3 main.py
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=15
 TimeoutStopSec=30
 
@@ -416,6 +417,14 @@ deadline (a slow cover download, a hung Last.fm POST) could otherwise hold the
 process open until systemd's 90s default. `TimeoutStopSec=30` SIGKILLs at 30s
 instead: comfortably above the normal clean shutdown (drain + a ~15s socket
 timeout), far below the point where a power-cut owner assumes the Pi has wedged.
+
+`RestartPreventExitStatus=78` (R6-27) makes a **configuration** error terminal: on
+a bad `config.yaml` (missing/typo'd required key, out-of-range value, an
+unimplemented `recognition.backend`, or the recognition backend failing to import)
+`main.py` exits `78` (`EX_CONFIG` from `sysexits.h`), and systemd then does **not**
+restart — the service parks in `failed` so `journalctl` shows the one friendly
+error, instead of crash-looping a fault that can never self-heal. A *transient*
+crash still exits with a different non-zero code and restarts as normal.
 
 `StartLimitIntervalSec=300` / `StartLimitBurst=10` (STAB-4; widened from 5 for
 #201) is the backstop for *startup*. `Restart=on-failure` will otherwise restart

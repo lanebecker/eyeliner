@@ -44,6 +44,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+# EX_CONFIG (sysexits.h): a configuration error that will NOT self-heal on a
+# restart. main() exits with this so the systemd unit's RestartPreventExitStatus=78
+# can park the service instead of crash-looping a permanently-bad config (R6-27).
+_EXIT_CONFIG_ERROR = 78
+
+# R6-26: the installed secret-redacting filter, exposed at module scope so the
+# __main__ crash handler can scrub an uncaught exception's traceback (which
+# bypasses the logging filter). Set by install_secret_redaction once the config
+# is loaded. It is None only during load_config + verify_recognition_backend_
+# importable; a crash in that window IS written unscrubbed, but it carries no
+# secret to leak — those steps make no token-bearing call, and a rendered
+# traceback prints source + the exception message, never frame locals, so the
+# token held in `config` is not emitted.
+_REDACTOR = None
+
 # CRIT-3: workers for the owned shared I/O pool (the loop's default executor).
 # It serves every run_in_executor(None, …) blocking call that is NOT a Discogs
 # write (which keeps its own dedicated 2-worker pool, #61): Last.fm scrobble/love,
@@ -145,15 +160,20 @@ class _SecretRedactingFilter(logging.Filter):
             # journal sink this filter exists to protect. Dropping is safe on both
             # axes: nothing renderable is lost, and nothing unredacted is emitted.
             return False
-        scrubbed = rendered
-        for secret in self._secrets:
-            if secret in scrubbed:
-                scrubbed = scrubbed.replace(secret, "<redacted>")
-        scrubbed = self._TOKEN_QUERY_RE.sub(r"\1<redacted>", scrubbed)
+        scrubbed = self.scrub(rendered)
         if scrubbed != rendered:
             record.msg = scrubbed
             record.args = ()
         return True  # never drop a record — only sanitise it
+
+    def scrub(self, text: str) -> str:
+        """Apply the same redaction to an arbitrary string — used both by
+        :meth:`filter` (log records) and by the R6-26 crash handler (a rendered
+        traceback, which bypasses logging entirely). Returns the scrubbed text."""
+        for secret in self._secrets:
+            if secret in text:
+                text = text.replace(secret, "<redacted>")
+        return self._TOKEN_QUERY_RE.sub(r"\1<redacted>", text)
 
 
 def install_secret_redaction(config) -> _SecretRedactingFilter:
@@ -174,6 +194,10 @@ def install_secret_redaction(config) -> _SecretRedactingFilter:
     log_filter = _SecretRedactingFilter(secrets)
     for handler in logging.getLogger().handlers:
         handler.addFilter(log_filter)
+    # R6-26: also make it reachable from the __main__ crash handler, which scrubs
+    # an uncaught traceback (a sink the log filter does not cover).
+    global _REDACTOR
+    _REDACTOR = log_filter
     return log_filter
 
 
@@ -406,7 +430,12 @@ async def main():
         verify_recognition_backend_importable(config)
     except ConfigError as e:
         log.error(f"Configuration error:\n{e}")
-        sys.exit(1)
+        # R6-27: exit EX_CONFIG (78), not 1 — a config error can never self-heal on
+        # a restart, so the unit's RestartPreventExitStatus=78 parks the service
+        # instead of churning Restart=on-failure through StartLimitBurst (each cold
+        # start re-pages the whole Discogs collection index). A transient crash
+        # still exits non-zero-but-not-78 and restarts as before.
+        sys.exit(_EXIT_CONFIG_ERROR)
 
     # #202: install the credential-redaction filter on the root log handler as
     # early as possible — before any component can log a token-bearing exception
@@ -493,5 +522,31 @@ async def main():
             io_executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _run_scrubbed() -> None:
+    """__main__ entry: run main(), and if it crashes with an UNHANDLED exception,
+    render the traceback through the secret scrub before it reaches stderr/journald.
+
+    R6-26: the #202 log filter scrubs LOG records, but an uncaught exception's
+    traceback bypasses logging entirely — Python's default excepthook writes it raw
+    to stderr → journald. discogs-client carries the token in request URLs, so a
+    requests-level error that escaped every catch layer would leak it to exactly the
+    journal sink #202 exists to protect. Scrub the rendered traceback at this last
+    boundary, then exit non-zero. SystemExit (the ConfigError path's clean
+    EX_CONFIG exit, and KeyboardInterrupt's default) is re-raised untouched so exit
+    codes and Ctrl+C behaviour are preserved.
+    """
+    import traceback
+    try:
+        asyncio.run(main())
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:
+        rendered = traceback.format_exc()
+        if _REDACTOR is not None:
+            rendered = _REDACTOR.scrub(rendered)
+        sys.stderr.write(rendered)
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_scrubbed()

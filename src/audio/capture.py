@@ -82,6 +82,13 @@ _STREAM_RETRY_BACKOFF_SECONDS = 1.0
 # identical repeats are counted and summarized at most once per this interval.
 _CAPTURE_ERROR_WARN_INTERVAL_SECONDS = 30.0
 
+# R6-28: minimum wall-clock gap between PortAudio-status warnings (input overflow /
+# underflow etc.). A persistent status flag is raised on EVERY callback (~4×/s), and
+# the flag most often means the loop can't keep up — so logging (blocking handler
+# I/O) ON the realtime callback thread can itself worsen the overrun. The status is
+# marshalled onto the event loop and throttled there, per distinct flag string.
+_AUDIO_STATUS_WARN_INTERVAL_SECONDS = 30.0
+
 
 class AudioCapture:
     """Wraps sounddevice to stream overlapping audio chunks from the USB interface."""
@@ -134,6 +141,14 @@ class AudioCapture:
         # warns even when the winning index is unchanged.
         self._device_using_throttle = LogThrottle()
         self._device_match_throttle = LogThrottle()
+
+        # R6-28: PortAudio input-status warning, marshalled off the realtime
+        # callback thread onto the loop and throttled per distinct flag string so a
+        # persistent overflow can't write ~4 journal lines/second (and can't add
+        # blocking log I/O to the realtime thread and worsen the overrun).
+        self._status_throttle = LogThrottle(
+            interval=_AUDIO_STATUS_WARN_INTERVAL_SECONDS, per_message=True
+        )
 
         self.sample_rate: int = config.sample_rate
         self.chunk_seconds: int = config.chunk_seconds
@@ -286,7 +301,10 @@ class AudioCapture:
         def callback(indata, frames, time_info, status):
             try:
                 if status:
-                    log.warning(f"Audio input status: {status}")
+                    # R6-28: do NOT log on this realtime thread — marshal the status
+                    # onto the loop, where _log_audio_status throttles it. Blocking
+                    # handler I/O here can itself cause further overflows (feedback).
+                    loop.call_soon_threadsafe(self._log_audio_status, str(status))
                 # Copy: PortAudio reuses the indata buffer after the callback returns.
                 block = indata[:, 0].copy()
                 loop.call_soon_threadsafe(self._enqueue_block, blocks, block)
@@ -323,6 +341,23 @@ class AudioCapture:
             )
         else:
             log.error("Audio capture error: %s", msg)
+
+    def _log_audio_status(self, status_str: str) -> None:
+        """Log a PortAudio input-status flag, throttled (R6-28). Runs ON the event
+        loop (marshalled from the realtime callback via call_soon_threadsafe), so
+        the LogThrottle — which is not thread-safe — is only ever touched here."""
+        emit, suppressed = self._status_throttle.should_log(
+            time.monotonic(), key=status_str
+        )
+        if not emit:
+            return
+        if suppressed > 0:
+            log.warning(
+                "Audio input status: %s (%d further occurrence(s) suppressed since "
+                "the last report)", status_str, suppressed,
+            )
+        else:
+            log.warning("Audio input status: %s", status_str)
 
     async def _silence_ticker(self):
         """Periodically poke the SilenceDetector so the end-of-session timer is

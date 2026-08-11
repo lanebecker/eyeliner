@@ -333,3 +333,34 @@ def test_scrobble_and_love_are_mutually_exclusive():
     tl.join(2.0)
     assert order[0] == "scrobble-start"
     assert order[-1] == "love-get_track"   # love proceeded only after scrobble finished
+
+
+def test_r6_24_disabled_notice_is_info_not_debug(caplog):
+    """R6-24: the 'scrobbling disabled' notice logs at INFO (was DEBUG), so a
+    typo'd scrobble_enable that silently defaults scrobbling OFF leaves visible
+    journal evidence at the shipped log level."""
+    import logging
+    with caplog.at_level(logging.INFO, logger="src.tracking.lastfm_client"):
+        client = LastFmClient(_DISABLED_CONFIG)
+    assert client.enabled is False
+    disabled = [r for r in caplog.records if "disabled" in r.getMessage()]
+    assert disabled and disabled[0].levelno == logging.INFO
+
+
+def test_r6_25_placeholder_credentials_disable_with_a_warning(caplog):
+    """R6-25: the config.example.yaml placeholders pass the non-empty credential
+    check but are not real — the client must DISABLE (not falsely 'initialise')
+    and warn, so the operator sees why scrobbling isn't happening."""
+    import logging
+    config = make_lastfm_config(
+        scrobble_enabled=True,
+        api_key="YOUR_LASTFM_API_KEY",
+        api_secret="YOUR_LASTFM_API_SECRET",
+        session_key="YOUR_LASTFM_SESSION_KEY",
+    )
+    with caplog.at_level(logging.INFO, logger="src.tracking.lastfm_client"):
+        client = LastFmClient(config)          # returns before importing pylast
+    assert client.enabled is False
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("placeholder" in m.lower() for m in msgs)
+    assert not any("initialised" in m for m in msgs)   # no false success
