@@ -10,8 +10,10 @@ other's caches or methods.
 """
 
 import asyncio
+import datetime as _dt
 import logging
 import time
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from urllib.parse import urlsplit
@@ -33,18 +35,62 @@ _HTTP_TIMEOUT = 15
 # honours the header for a single retry — but ONLY when the requested wait fits
 # within the cap below.
 #
-# The cap is 10s: request() runs on the SHARED run_in_executor(None,…) pool,
-# which also serves cover downloads and Last.fm scrobbles, so a long sleep here
-# parks a worker those tasks could use (P-2).  A Retry-After WITHIN the cap is
-# honoured and retried once.  A Retry-After BEYOND the cap is NOT retried — a
-# retry inside the cap would land in the same throttle window and 429 again
-# (META-10) — so the futile retry is skipped and a distinct, loud error is
-# logged instead.  Actually waiting out a long Retry-After (so the write still
-# lands) needs Discogs off the shared pool and is deferred to the dedicated
-# executor (#61).  The P-1 collection index slashed Discogs request volume,
+# The cap is 10s: request() runs on the DEDICATED 2-worker Discogs executor (#61,
+# constructed below), so a long in-thread sleep here parks one of only two workers
+# that serve every Discogs read+write (P-2).  A Retry-After WITHIN the cap is
+# honoured and retried once, in-thread.  A Retry-After BEYOND the cap is NOT slept
+# in-thread — a retry inside the cap would land in the same throttle window and 429
+# again (META-10).  Beyond the cap the behaviour forks on honor_long_retry_after
+# (#229): an opted-in idempotent write (the Play Count credit) raises
+# DiscogsRateLimited so the ASYNC finalize layer waits the server-requested backoff
+# out in the EVENT LOOP (cancellable, parking no thread) and re-issues the write —
+# so a long Retry-After no longer loses the credit, and the futile in-window retry
+# #163 used to fire is gone (this is the post-#229 reality that superseded the old
+# "deferred to the dedicated executor" note).  Every other caller (all GETs, the
+# single-shot Last Played write) gets the futile retry skipped and a distinct, loud
+# error logged instead.  The P-1 collection index slashed Discogs request volume,
 # making 429 bursts far less likely in the first place.
 _RATE_LIMIT_MAX_WAIT = 10
 _RATE_LIMIT_DEFAULT_WAIT = 2
+
+
+def _parse_retry_after(resp, default: int = _RATE_LIMIT_DEFAULT_WAIT) -> int:
+    """Parse an HTTP ``Retry-After`` header into whole seconds.
+
+    RFC 7231 allows TWO forms and Discogs sends the first today, but a fronting
+    CDN can legitimately send either:
+
+      * ``delay-seconds`` — a non-negative integer (``"60"``).
+      * ``HTTP-date`` — an absolute time (``"Wed, 21 Oct 2026 07:28:00 GMT"``);
+        the wait is that instant minus now.
+
+    ``int()`` alone raised on the date form and the caller fell back to the tiny
+    ``_RATE_LIMIT_DEFAULT_WAIT`` — turning a two-minute server backoff into a 2s
+    in-window retry that just 429s again (R5-31/#232).  This handles both, clamps
+    a past/negative result to 0, and returns ``default`` only when the header is
+    absent or genuinely unparseable.
+    """
+    raw = resp.headers.get("Retry-After")
+    if raw is None:
+        return default
+    raw = str(raw).strip()
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(raw)  # tz-aware or naive-UTC per RFC
+    except (TypeError, ValueError, IndexError):
+        return default
+    if when is None:
+        return default
+    # parsedate_to_datetime yields a tz-aware datetime for a conforming GMT/offset
+    # header; some non-conforming inputs come back naive, which per RFC 7231 we
+    # read as UTC. Compare in the datetime's own awareness to avoid a naive/aware
+    # subtraction TypeError, and use timezone-aware UTC (utcnow() is deprecated on
+    # the 3.13 target).
+    now = _dt.datetime.now(when.tzinfo) if when.tzinfo else _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    return max(0, int((when - now).total_seconds()))
 
 
 class DiscogsRateLimited(Exception):
@@ -201,10 +247,7 @@ class DiscogsHttp:
             raise ValueError(f"unsupported HTTP method: {method!r}")
         resp = send(url, **kwargs)
         if resp.status_code == 429 and retry_on_429:
-            try:
-                retry_after = int(resp.headers.get("Retry-After", _RATE_LIMIT_DEFAULT_WAIT))
-            except (TypeError, ValueError):
-                retry_after = _RATE_LIMIT_DEFAULT_WAIT
+            retry_after = _parse_retry_after(resp)
 
             if retry_after > _RATE_LIMIT_MAX_WAIT:
                 # Discogs is asking us to back off LONGER than we are willing to
@@ -231,9 +274,12 @@ class DiscogsHttp:
                 # apart from a generic failure.
                 log.error(
                     "Discogs rate limit (429) for %s %s: server asked to wait %ss, "
-                    "beyond our %ss cap — NOT retrying (it would still be throttled). "
-                    "This request fails now and its caller has no further retry, so "
-                    "the write (e.g. a Play Count credit) may be lost.",
+                    "beyond our %ss cap — NOT retrying in-thread (it would still be "
+                    "throttled). This attempt fails now; whether it is re-tried is the "
+                    "caller's: a single-shot write (e.g. Last Played) has no further "
+                    "retry and may be lost, while the finalize-retried, honor-capable "
+                    "Play Count credit is re-attempted (and a long wait is honored via "
+                    "#229, so it does not reach this branch).",
                     method, _redact_url(url), retry_after, _RATE_LIMIT_MAX_WAIT,
                 )
                 return resp
@@ -247,13 +293,34 @@ class DiscogsHttp:
             time.sleep(wait)
             resp = send(url, **kwargs)
             if resp.status_code == 429:
-                # Still throttled after our one retry: a DISTINCT, LOUD outcome so
+                # Still throttled after our one in-thread retry.  The second 429
+                # carries its OWN Retry-After, and inside a real throttle window
+                # that is often the LONG one — so an opted-in idempotent write must
+                # honor it here too, exactly as the first-429 branch does.  Before
+                # R5-06/#231 this branch ignored both the header and
+                # honor_long_retry_after and just returned the 429, so the finalize
+                # layer fell back to its short in-window backoff — the futile-retry
+                # loss #229 exists to prevent, one hop later.
+                retry_after = _parse_retry_after(resp)
+                if retry_after > _RATE_LIMIT_MAX_WAIT and honor_long_retry_after:
+                    log.warning(
+                        "Discogs STILL rate-limiting (429) after the retry for %s %s: "
+                        "server now asks to wait %ss (beyond the %ss in-thread cap); "
+                        "deferring the wait to the event loop so the credit can still "
+                        "land (#229/#231).",
+                        method, _redact_url(url), retry_after, _RATE_LIMIT_MAX_WAIT,
+                    )
+                    raise DiscogsRateLimited(retry_after, method, _redact_url(url))
+                # Not opted in, or a short second wait: a DISTINCT, LOUD outcome so
                 # a lost credit is not silently conflated with a generic failure
-                # (META-10).  Recovery (deferring the credit) is out of scope here.
+                # (META-10).  We have already spent our one in-thread retry, so we
+                # do NOT sleep-and-retry a second time here.
                 log.error(
-                    "Discogs STILL rate-limiting (429) after the retry for %s %s — "
-                    "this request cannot complete and its caller has no further "
-                    "retry, so the write (e.g. a Play Count credit) may be lost.",
+                    "Discogs STILL rate-limiting (429) after the one in-thread retry "
+                    "for %s %s — this attempt cannot complete. Whether it is re-tried "
+                    "is the caller's: a single-shot write (e.g. Last Played) has none "
+                    "and may be lost; the finalize-retried Play Count credit is "
+                    "re-attempted (and a long second wait is honored via #229/#231).",
                     method, _redact_url(url),
                 )
         return resp

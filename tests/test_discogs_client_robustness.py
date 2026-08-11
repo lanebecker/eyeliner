@@ -199,3 +199,103 @@ def test_cold_fields_cache_read_also_honors_the_wait():
     with patch("src.metadata.discogs.transport.time.sleep"):
         with pytest.raises(DiscogsRateLimited):
             client.increment_play_count(release_id=111, instance_id=42)
+
+
+# ---------------------------------------------------------------------------
+# R5-06 (#231) — a SECOND in-window 429 must also honor a long Retry-After
+# ---------------------------------------------------------------------------
+import time as _time_mod
+
+
+def test_second_429_after_retry_raises_when_long_and_honored():
+    """A SHORT first 429 sleeps once and retries; the retry then 429s again with a
+    LONG Retry-After. Before R5-06/#231 the second header + honor flag were ignored
+    and the 429 was returned, so the finalize layer fell back to a futile in-window
+    backoff. Now the long second wait is honored: DiscogsRateLimited is raised
+    carrying the SECOND server wait, and no third POST is fired."""
+    client = make_client()
+    client._http.session.post = MagicMock(side_effect=[
+        make_429_response("1"),      # short first 429 → one in-thread retry
+        make_429_response(_LONG),    # retry still throttled, now a long wait
+    ])
+    with patch("src.metadata.discogs.transport.time.sleep") as sleep:
+        with pytest.raises(DiscogsRateLimited) as ei:
+            client._http.request(
+                "POST", "https://api.discogs.com/x",
+                retry_on_429=True, honor_long_retry_after=True, json={"value": "1"},
+            )
+    assert ei.value.retry_after == _RATE_LIMIT_MAX_WAIT + 50   # the SECOND header
+    assert client._http.session.post.call_count == 2           # no third POST
+    sleep.assert_called_once_with(1)                            # only the first, short wait
+
+
+def test_second_429_short_wait_does_not_raise_or_retry_again():
+    """A short second 429 (within cap) keeps the at-most-one-retry contract: it is
+    NOT honored (no raise) and NOT slept-and-retried a second time — the 429 is
+    returned for the caller's own bounded retry."""
+    client = make_client()
+    client._http.session.post = MagicMock(side_effect=[
+        make_429_response("1"), make_429_response("2"),
+    ])
+    with patch("src.metadata.discogs.transport.time.sleep") as sleep:
+        resp = client._http.request(
+            "POST", "https://api.discogs.com/x",
+            retry_on_429=True, honor_long_retry_after=True, json={"value": "1"},
+        )
+    assert resp.status_code == 429
+    assert client._http.session.post.call_count == 2   # one retry only
+    sleep.assert_called_once_with(1)                    # no second in-thread sleep
+
+
+def test_second_429_long_but_not_honored_returns_429():
+    """Not opted in: a long second 429 keeps the loud log-and-return path (no raise),
+    so non-honored writes/GETs are unaffected by #231."""
+    client = make_client()
+    client._http.session.post = MagicMock(side_effect=[
+        make_429_response("1"), make_429_response(_LONG),
+    ])
+    with patch("src.metadata.discogs.transport.time.sleep"):
+        resp = client._http.request(
+            "POST", "https://api.discogs.com/x", retry_on_429=True, json={"value": "1"},
+        )
+    assert resp.status_code == 429
+    assert client._http.session.post.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# R5-31 (#232) — Retry-After in HTTP-date form must be parsed, not defaulted
+# ---------------------------------------------------------------------------
+
+def test_retry_after_http_date_form_is_parsed_as_long_and_honored():
+    """An RFC 7231 HTTP-date Retry-After ~2 minutes ahead must be read as a long
+    wait (and thus raise for an opted-in write), NOT silently treated as the 2s
+    default and retried in-window (the R5-31/#232 bug)."""
+    future = _time_mod.strftime(
+        "%a, %d %b %Y %H:%M:%S GMT", _time_mod.gmtime(_time_mod.time() + 120)
+    )
+    client = make_client()
+    client._http.session.post = MagicMock(return_value=make_429_response(future))
+    with patch("src.metadata.discogs.transport.time.sleep") as sleep:
+        with pytest.raises(DiscogsRateLimited) as ei:
+            client._http.request(
+                "POST", "https://api.discogs.com/x",
+                retry_on_429=True, honor_long_retry_after=True, json={"value": "1"},
+            )
+    assert ei.value.retry_after > _RATE_LIMIT_MAX_WAIT     # recognised as long, not 2s
+    assert client._http.session.post.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_parse_retry_after_handles_all_forms():
+    from src.metadata.discogs.transport import _parse_retry_after, _RATE_LIMIT_DEFAULT_WAIT
+
+    def h(val=None):
+        r = MagicMock(); r.headers = {} if val is None else {"Retry-After": val}; return r
+
+    assert _parse_retry_after(h("45")) == 45                       # integer seconds
+    assert _parse_retry_after(h()) == _RATE_LIMIT_DEFAULT_WAIT     # missing → default
+    assert _parse_retry_after(h("garbage")) == _RATE_LIMIT_DEFAULT_WAIT  # unparseable → default
+    past = _time_mod.strftime("%a, %d %b %Y %H:%M:%S GMT", _time_mod.gmtime(_time_mod.time() - 60))
+    assert _parse_retry_after(h(past)) == 0                        # past date clamps to 0
+    future = _time_mod.strftime("%a, %d %b %Y %H:%M:%S GMT", _time_mod.gmtime(_time_mod.time() + 100))
+    assert _parse_retry_after(h(future)) > _RATE_LIMIT_MAX_WAIT    # future date → long
