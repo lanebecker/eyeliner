@@ -161,6 +161,44 @@ def test_validated_public_ip_normalizes_ipv4_mapped_public(monkeypatch):
     assert cc._validated_public_ip("i.discogs.com") == "93.184.216.34"
 
 
+# R5-32 (#264): on a dual-stack host, prefer a vetted IPv4 to any IPv6, because
+# the appliance (a Pi on a very-often IPv4-only home LAN) may have no route to the
+# public v6 address a CDN typically lists first.
+def test_validated_public_ip_prefers_ipv4_when_ipv6_listed_first(monkeypatch):
+    # getaddrinfo commonly returns the AAAA record first; the reachable A record
+    # must still be the one we pin.
+    monkeypatch.setattr(
+        cc.socket, "getaddrinfo",
+        lambda *a, **k: [
+            (10, 1, 6, "", ("2606:2800:220:1:248:1893:25c8:1946", 0, 0, 0)),
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+        ],
+    )
+    assert cc._validated_public_ip("i.discogs.com") == "93.184.216.34"
+
+
+def test_validated_public_ip_falls_back_to_ipv6_when_v6_only(monkeypatch):
+    # A v6-only host has no A record; the public v6 address is still returned.
+    monkeypatch.setattr(
+        cc.socket, "getaddrinfo",
+        lambda *a, **k: [(10, 1, 6, "", ("2606:2800:220:1:248:1893:25c8:1946", 0, 0, 0))],
+    )
+    assert cc._validated_public_ip("i.discogs.com") == "2606:2800:220:1:248:1893:25c8:1946"
+
+
+def test_validated_public_ip_family_preference_still_vets_every_address(monkeypatch):
+    # The v4 preference must NOT let an internal v6 in the same answer slip by: a
+    # mixed public-v4 + internal-v6 set still fails the whole hop closed (S-7).
+    monkeypatch.setattr(
+        cc.socket, "getaddrinfo",
+        lambda *a, **k: [
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+            (10, 1, 6, "", ("::1", 0, 0, 0)),
+        ],
+    )
+    assert cc._validated_public_ip("i.discogs.com") is None
+
+
 def test_validated_public_ip_fails_closed_on_dns_error(monkeypatch):
     def boom(*a, **k):
         raise cc.socket.gaierror("no such host")

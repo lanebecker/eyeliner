@@ -187,7 +187,18 @@ def _validated_public_ip(host: str) -> Optional[str]:
         return None
     if not infos:
         return None
-    pinned: Optional[str] = None
+    # R5-32 (#264): pin the first vetted IPv4 in preference to any IPv6. A
+    # dual-stack CDN frequently lists its AAAA record first, but the appliance
+    # (a Raspberry Pi on a home LAN that is very often IPv4-only, with no route
+    # to the public v6 internet) cannot reach that address — so pinning it would
+    # make the cover silently never load while a perfectly reachable A record sat
+    # unused later in the list. EVERY resolved address is still vetted below and
+    # a single non-public answer still fails the whole hop closed (the S-7 / SEC-5
+    # guarantee is unchanged); the family preference only decides WHICH vetted
+    # public address we hand back to dial. IPv6 remains the fallback when the host
+    # is v6-only.
+    pinned_v4: Optional[str] = None
+    pinned_v6: Optional[str] = None
     for info in infos:
         ip_str = info[4][0]
         try:
@@ -207,9 +218,14 @@ def _validated_public_ip(host: str) -> Optional[str]:
         embedded = _embedded_ipv4(ip)
         if embedded is not None and _is_disallowed_ip(embedded):
             return None
-        if pinned is None:
-            pinned = str(ip)
-    return pinned
+        # Classify by the NORMALIZED address's family: an IPv4-mapped v6 answer
+        # has already become v4 above and is preferred like any other A record.
+        if ip.version == 4:
+            if pinned_v4 is None:
+                pinned_v4 = str(ip)
+        elif pinned_v6 is None:
+            pinned_v6 = str(ip)
+    return pinned_v4 or pinned_v6
 
 
 def _host_resolves_to_public_ip(host: str) -> bool:

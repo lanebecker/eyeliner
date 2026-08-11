@@ -440,11 +440,21 @@ async def test_increment_raising_on_every_attempt_loses_credit_without_propagati
 @pytest.mark.asyncio
 async def test_reentrant_finalize_while_crediting_does_not_double_increment():
     """B-8 preserved: a finalize of a session whose credit is already in flight
-    (crediting latched) must NOT issue a second increment."""
+    (crediting latched) must NOT issue a second increment.
+
+    R5-23: the session must actually REACH the credit branch, or the test is
+    vacuous. Identify a supporting tracklist row plus the closer so the #182
+    completion gate (>=2 distinct rows) is open; otherwise the gate suppresses
+    the credit regardless of the `crediting` latch and the guard under test is
+    never evaluated (both `if session.crediting:` mutations previously survived
+    this test)."""
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
-    await tracker.on_track_identified(make_track("Master-Dik"))
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # supporting row (B2)
+    await tracker.on_track_identified(make_track("Master-Dik"))    # closer (B4) arms last-track
     session = tracker._session
+    assert session.completion_supported   # #182 gate open → credit branch reachable
+    assert session.potential_last_track
     session.crediting = True   # a concurrent finalize already owns the credit
     await tracker._finalize_session(session)
     writer.increment_play_count.assert_not_called()
@@ -1154,11 +1164,20 @@ async def test_raising_update_last_played_still_runs_the_lastfm_love():
 @pytest.mark.asyncio
 async def test_reentrant_finalize_while_loving_does_not_double_love():
     """B-23 preserved: a finalize of a session whose love is already in flight
-    (loving latched) must NOT issue a second love."""
+    (loving latched) must NOT issue a second love.
+
+    R5-23: identify a supporting tracklist row plus the closer so the #182
+    completion gate (shared by the love path) is open and the love branch is
+    actually reached; otherwise the gate suppresses the love regardless of the
+    `loving` latch and the guard under test is never evaluated (deleting
+    `and not session.loving` previously survived this test)."""
     tracker, lastfm = _make_love_tracker(love_return=True)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
-    await tracker.on_track_identified(make_track("Master-Dik"))
+    await tracker.on_track_identified(make_track("Cotton Crown"))  # supporting row (B2)
+    await tracker.on_track_identified(make_track("Master-Dik"))    # closer (B4) arms last-track
     session = tracker._session
+    assert session.completion_supported   # #182 gate open → love branch reachable
+    assert session.potential_last_track
     session.loving = True   # a concurrent finalize already owns the love
     await tracker._finalize_session(session)
     lastfm.love.assert_not_called()
