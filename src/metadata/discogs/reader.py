@@ -692,11 +692,29 @@ class DiscogsReader:
         if now - self._last_index_refresh_at < _INDEX_REFRESH_COOLDOWN_SECONDS:
             return None
         self._last_index_refresh_at = now
-        # Invalidate so search_collection's _get_collection_index rebuilds from
-        # the API rather than serving the stale snapshot.
+        # R5-18: force a rebuild WITHOUT discarding the current index up front.
+        # Invalidating before the re-page meant a transient failure mid-rebuild
+        # (a dropped GET) left the reader with NO index at all, forcing a full
+        # re-page on every subsequent resolve until the next success — throwing
+        # away a snapshot that was fine seconds ago. Save the current snapshot,
+        # invalidate to force _get_collection_index to rebuild, and restore it if
+        # the rebuild raises (swap-on-success). The error still propagates so the
+        # resolver leaves the album uncached/retryable (B-4).
+        saved_index = self._collection_index
+        saved_built_at = self._collection_index_built_at
         self._collection_index = None
         self._collection_index_built_at = None
-        return self.search_collection(artist, album)
+        try:
+            return self.search_collection(artist, album)
+        except Exception:
+            # _get_collection_index assigns the new index only after a fully
+            # successful re-page, so on a raise self._collection_index is still
+            # None here — restore the previously-valid snapshot rather than
+            # leaving the reader index-less.
+            if self._collection_index is None:
+                self._collection_index = saved_index
+                self._collection_index_built_at = saved_built_at
+            raise
 
     def _build_result(self, release, instance_id: Optional[int]) -> dict:
         """Build a standardised result dict from a Discogs Release object.
