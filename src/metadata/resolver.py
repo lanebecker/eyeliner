@@ -68,6 +68,18 @@ _ALBUM_CACHE_MAX = 64
 # expires. monotonic for the same reason as the index TTL (reboot-safe).
 _DOWNGRADE_TTL_SECONDS = 3600
 
+# R5-08: hard ceiling on the MusicBrainz cover-art await.  The call runs on the
+# shared default executor and MusicBrainz sets no socket timeout, so without this
+# a stalled socket froze resolve() — and, because resolves serialize through
+# TrackCommitService, the whole commit pipeline — until restart.  asyncio.wait_for
+# ABANDONS (does not kill) the executor thread on timeout, so the pipeline
+# continues immediately; the coverart module's socket-timeout floor then lets that
+# abandoned thread die instead of leaking a pool worker.  Set above the socket
+# floor (15s) so the socket-level error, when it fires, is the one that surfaces
+# (as a transient), keeping the retry/caching semantics below; wait_for is the
+# backstop for a socket that evades the floor entirely.
+_COVER_ART_TIMEOUT_SECONDS = 20
+
 
 class MetadataResolver:
     """Resolves a RawRecognitionResult into a full TrackMetadata."""
@@ -286,8 +298,24 @@ class MetadataResolver:
         # negative result is load-bearing for MusicBrainz rate limits.
         cover_completed = True
         try:
-            cover_url = await loop.run_in_executor(
-                None, self.coverart.get_cover_art_url, raw.artist, raw.album
+            cover_url = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, self.coverart.get_cover_art_url, raw.artist, raw.album
+                ),
+                timeout=_COVER_ART_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # R5-08: the cover-art call outran its ceiling. Treat it like any
+            # transient outage — return the fallback for THIS track but DON'T
+            # cache, so the next track retries — and let the abandoned executor
+            # thread wind down on the coverart socket-timeout floor. The pipeline
+            # is unblocked NOW rather than frozen until restart.
+            cover_url = None
+            cover_completed = False
+            log.warning(
+                "Cover art lookup exceeded %ss for '%s / %s'; abandoning it and "
+                "continuing (the commit pipeline is not blocked).",
+                _COVER_ART_TIMEOUT_SECONDS, raw.artist, raw.album,
             )
         except Exception as e:
             cover_url = None
