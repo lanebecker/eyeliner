@@ -54,6 +54,10 @@ def test_index_built_once_paginated_and_cached():
         # R5-07: the reconstructed multi-artist credit string (a single artist
         # reconstructs to its own name).
         "artist_credit": "Sonic Youth",
+        # R5-27: folded match keys precomputed at build time.
+        "_title_key": "sister",
+        "_artist_keys": ["sonic youth"],
+        "_credit_key": "sonic youth",
         "master_id": 900,
     }
     # … and defaults to None when the release carries no master.

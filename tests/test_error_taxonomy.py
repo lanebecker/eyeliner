@@ -118,10 +118,8 @@ def test_build_result_propagates_a_transient_tracklist_fetch():
     rel = _release_raising_on_tracklist(
         discogs_client.exceptions.HTTPError("rate limited", 429)
     )
-    # get_tracklist re-fetches via the client; make that raise transiently too.
-    reader._client.release = MagicMock(
-        side_effect=discogs_client.exceptions.HTTPError("rate limited", 429)
-    )
+    # R5-19: _build_result reads tracklist off the ALREADY-FETCHED release, so
+    # the transient must come from `rel.tracklist` (set above); no second fetch.
     with pytest.raises(discogs_client.exceptions.HTTPError):
         reader._build_result(rel, instance_id=99)
 
@@ -177,10 +175,8 @@ def test_build_result_degrades_year_on_transient_master_but_keeps_credit():
     type(rel).master = PropertyMock(
         side_effect=discogs_client.exceptions.HTTPError("rate limited", 429)
     )
-    # get_tracklist (separate fetch) succeeds
-    tl_release = MagicMock()
-    tl_release.tracklist = []
-    reader._client.release = MagicMock(return_value=tl_release)
+    # R5-19: tracklist is read off `rel` directly; a clean (empty) tracklist here.
+    rel.tracklist = []
 
     result = reader._build_result(rel, instance_id=42)
 
