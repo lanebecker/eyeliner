@@ -1,0 +1,44 @@
+name: Release consistency
+
+# R6-34: on a version-tag push, FAIL unless the tag, the VERSION file, and the
+# CHANGELOG.md heading all agree. Nothing examined tags before (sync-version-badge
+# only warns on a missing CHANGELOG bump), and the 2026-08-10 badge-rot incident
+# showed that tag / VERSION / CHANGELOG can silently drift apart. Read-only.
+#
+# Security (mirrors sync-version-badge.yml / TQ-5): the tag and the VERSION bytes
+# are untrusted repo input. VERSION is validated against a strict semver pattern,
+# and both values are passed to the shell via env: (referenced as "$TAG" / built
+# into a plain variable), NEVER textually interpolated into the run script with
+# ${{ }} — so a crafted tag or VERSION cannot inject shell.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Tag == VERSION == CHANGELOG heading
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          file_ver="$(cat VERSION)"
+          if ! printf '%s' "$file_ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::VERSION '$file_ver' is not a valid MAJOR.MINOR.PATCH semver"
+            exit 1
+          fi
+          tag_ver="${TAG#v}"
+          if [ "$tag_ver" != "$file_ver" ]; then
+            echo "::error::tag '$TAG' (=$tag_ver) does not match the VERSION file ($file_ver)"
+            exit 1
+          fi
+          if ! grep -q "^## \[$file_ver\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$file_ver]' heading for this release"
+            exit 1
+          fi
+          echo "OK: tag, VERSION, and CHANGELOG all agree on $file_ver"

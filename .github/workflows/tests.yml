@@ -7,8 +7,17 @@ name: tests
 # in requirements.txt). The 3.13 leg is what would have caught #198 — audioop
 # removal breaking `import shazamio` at runtime — before it reached the appliance.
 on:
+  # R6-37: run on main pushes + every PR (not every branch push), so a push to a
+  # PR branch triggers ONE run via pull_request instead of both push and
+  # pull_request. R6-30: a weekly scheduled run catches a drifted/compromised
+  # floor-pinned dependency in CI within a week, rather than at Pi bring-up between
+  # pushes (requirements.txt is `>=`-pinned, so a new upstream release lands
+  # silently).
   push:
+    branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
 
 # R5-35 (TQ-5 parity with sync-version-badge.yml): scope the token to read-only.
 # This job installs the full pip dependency tree on every push/PR, so it must not
@@ -16,13 +25,19 @@ on:
 permissions:
   contents: read
 
+# R6-37: keep only the newest run per ref alive — a fresh push / PR-sync cancels
+# the superseded matrix instead of running two full matrices to completion.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.13']
+        python-version: ['3.11', '3.12', '3.13']   # R6-33: 3.12 now tested (pi-setup-guide claims it)
     env:
       # Make pygame headless: SDL needs no real video/audio device in CI. The
       # sounddevice import is stubbed by tests/conftest.py before any test module

@@ -267,8 +267,9 @@ and injects each half.
 plus a rate-limit-aware `request()`. All direct REST calls route through it; it
 retries exactly once on HTTP 429, sleeping for the server-suggested
 `Retry-After` (clamped to **10s** — lowered from 30s in P-2 so a long back-off
-can't park a shared executor worker; 2s default when the header is missing or
-unparseable). The sleep runs on an executor thread, never the event loop. Calls
+can't park one of the dedicated Discogs pool's two workers (#61); 2s default when
+the header is missing or unparseable). The sleep runs on an executor thread, never
+the event loop. Calls
 the high-level `python3-discogs-client` library makes internally
 (search/release/master) are NOT routed through here — 429s there surface as
 exceptions and fall through the resolver's fallback chain. Also home to `_as_id`

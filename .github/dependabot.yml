@@ -1,0 +1,20 @@
+# R6-30: automated dependency-update PRs so a floor-pinned (`>=`) dependency's new
+# release is surfaced and reviewed HERE, not discovered on the Pi at bring-up
+# between pushes. Weekly, for both the pip requirements and the SHA-pinned GitHub
+# Actions (Dependabot keeps the pin a full commit SHA and updates the version
+# comment). The floors in requirements.txt stay the abstract spec.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5

@@ -192,8 +192,14 @@ fix; `pip install -r requirements.txt` inside the venv resolves it.
 
 ```bash
 cp config.example.yaml config.yaml
+chmod 600 config.yaml   # holds your Discogs token + Last.fm session key — keep it owner-only
 nano config.yaml
 ```
+
+> 🔒 `config.yaml` holds two write-scope secrets (the Discogs user token and the
+> Last.fm session key). `cp` creates it world-readable (`644`) under the default
+> umask, so `chmod 600` restricts it to your user — matching the `0600` the
+> session-key helper already used for its own output.
 
 Key values to fill in:
 
@@ -267,16 +273,20 @@ lastfm:
 
 ### 8d. Verify the connection
 
-Confirm all three credentials are valid and talking to the Last.fm API:
+Confirm the three credentials are valid and talking to the Last.fm API. This
+check **reads them from `config.yaml`** — never type or paste secrets onto the
+command line, where they would land in `~/.bash_history`, terminal scrollback,
+and any `ps`/`/proc` listing (which is why §8b wrote the session key to a `0600`
+file and the Discogs check in §9 reads the config too):
 
 ```bash
-python -c "
-import pylast
+python3 -c "
+import yaml, pylast
+lastfm = yaml.safe_load(open('config.yaml'))['lastfm']
 network = pylast.LastFMNetwork(
-    api_key='YOUR_API_KEY',
-    api_secret='YOUR_API_SECRET',
-    session_key='YOUR_SESSION_KEY',
-    username='YOUR_LASTFM_USERNAME'
+    api_key=lastfm['api_key'],
+    api_secret=lastfm['api_secret'],
+    session_key=lastfm['session_key'],
 )
 user = network.get_authenticated_user()
 print(f'Authenticated as: {user.get_name()}')
@@ -284,11 +294,10 @@ print(f'Play count: {user.get_playcount()}')
 "
 ```
 
-Replace the four placeholder values with your actual credentials. You should see
-your Last.fm username and total scrobble count printed. A `WSError` means
-something is wrong with the credentials — double-check that all three values
-were copied correctly from the API account page and the file the session key
-helper wrote.
+You should see your Last.fm username and total scrobble count printed. A
+`WSError` means something is wrong with the credentials — double-check that
+`config.yaml`'s `lastfm.api_key` / `api_secret` / `session_key` were copied
+correctly from the API account page and the file the session-key helper wrote.
 
 ---
 
@@ -418,6 +427,15 @@ process open until systemd's 90s default. `TimeoutStopSec=30` SIGKILLs at 30s
 instead: comfortably above the normal clean shutdown (drain + a ~15s socket
 timeout), far below the point where a power-cut owner assumes the Pi has wedged.
 
+> **Long 429 backoff at shutdown (#229 × the 10s drain, R6-31).** The drain is
+> bounded to ~10s. If a SIGTERM arrives while an end-of-session Play Count credit is
+> waiting out a *server-requested* Retry-After longer than 10s (a Discogs 429 asking
+> for a longer wait), that credit can't fit inside the drain window — it is logged as
+> abandoned and retries only when the record next plays. This is the accepted
+> shutdown behaviour (a prompt power-cycle beats holding the process open for an
+> unbounded server backoff), not a bug: the credit is idempotent and lands on the
+> next spin.
+
 `RestartPreventExitStatus=78` (R6-27) makes a **configuration** error terminal: on
 a bad `config.yaml` (missing/typo'd required key, out-of-range value, an
 unimplemented `recognition.backend`, or the recognition backend failing to import)
@@ -425,6 +443,14 @@ unimplemented `recognition.backend`, or the recognition backend failing to impor
 restart — the service parks in `failed` so `journalctl` shows the one friendly
 error, instead of crash-looping a fault that can never self-heal. A *transient*
 crash still exits with a different non-zero code and restarts as normal.
+
+> **A clean exit leaves the screen dark until you restart the service (R6-35).**
+> `Restart=on-failure` restarts a *crash* (non-zero exit) but NOT a clean exit (`0`)
+> — and closing the display window or pressing **ESC** quits the app cleanly. So a
+> stray keyboard tap or an accidental window close stops the service until you run
+> `sudo systemctl restart vinyl-now-playing` (or `--user` for a user unit). If this
+> bites in practice, avoid ESC on the appliance; the window is fullscreen, so an
+> accidental close is unlikely.
 
 `StartLimitIntervalSec=300` / `StartLimitBurst=10` (STAB-4; widened from 5 for
 #201) is the backstop for *startup*. `Restart=on-failure` will otherwise restart
