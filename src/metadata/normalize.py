@@ -96,6 +96,23 @@ def fold_text(s: str) -> str:
     the first.
     """
     s = unicodedata.normalize("NFKC", s.translate(_PUNCT_FOLD)).translate(_PUNCT_FOLD)
+    # R5-17: drop Unicode format (Cf) characters that carry no matching intent —
+    # zero-width space (U+200B), soft hyphen (U+00AD), zero-width no-break space /
+    # BOM (U+FEFF), word joiner (U+2060), the bidi marks, etc.  NFKC does NOT
+    # remove them, so a single invisible character in a community-edited Discogs
+    # title or a Shazam string made an owned album permanently unmatchable — and,
+    # being invisible, undiagnosable from a log where both sides print
+    # identically.  This WIDENS folding (it can merge two strings that differed
+    # ONLY by such a char) — acceptable because these characters are accidental
+    # copy-paste contaminants with no lexical meaning in this domain.  ZWNJ
+    # (U+200C) and ZWJ (U+200D) are the exception: they ARE lexically
+    # load-bearing in Persian/Arabic/Indic scripts (they can distinguish
+    # different words), so they are KEPT — folding them away could merge two
+    # genuinely different titles into a wrong match (the phantom-credit direction
+    # this core refuses).  Keeping them means a title contaminated with a ZWNJ
+    # still misses — the fail-safe (missed-credit) direction (cold-review LOW).
+    _KEEP = {"\u200c", "\u200d"}
+    s = "".join(c for c in s if c in _KEEP or unicodedata.category(c) != "Cf")
     return " ".join(s.casefold().split())
 
 
