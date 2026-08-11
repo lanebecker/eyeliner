@@ -205,6 +205,12 @@ class TextRenderer:
         if font.size(text)[0] <= max_width:
             return text
         ell = "…"
+        # R5-38: if even the ellipsis alone overflows the box, return "" rather
+        # than a "…" wider than max_width (the caller shows nothing instead of an
+        # overhang). Unreachable at 1024×600 where the PREV/NEXT panel is wide,
+        # but the correct backstop at degenerate widths.
+        if font.size(ell)[0] > max_width:
+            return ""
         lo, hi = 0, len(text)
         while lo < hi:
             mid = (lo + hi + 1) // 2

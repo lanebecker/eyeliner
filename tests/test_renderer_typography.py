@@ -153,6 +153,17 @@ def test_ellipsize_truncates_with_ellipsis_and_fits():
     assert font.size(out)[0] <= 120
 
 
+def test_ellipsize_returns_empty_when_even_the_ellipsis_overflows():
+    """R5-38: at a width narrower than the ellipsis glyph, return "" instead of
+    a "…" wider than the box (unreachable at 1024×600; correct backstop)."""
+    r = make_renderer()
+    font = r._font("text", 14)
+    narrow = font.size("…")[0] - 2
+    out = r._ellipsize("Some Long Track Title", font, narrow)
+    assert out == ""
+    assert font.size(out)[0] <= narrow
+
+
 # ---------------------------------------------------------------------------
 # Contrast clamp (DESIGN.md Full-Opacity Rule)
 # ---------------------------------------------------------------------------
