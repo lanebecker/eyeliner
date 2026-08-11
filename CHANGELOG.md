@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.13] — 2026-08-11
+
 **Round-5 audit — Wave 7: hardening & CI (milestone #30).** Close the round —
 RED-repro-first, cold-reviewed (SPEC + QUALITY pass on every change).
 
