@@ -257,11 +257,11 @@ def build_components(config, state: PlayerState) -> "Components":
         discogs_http = DiscogsHttp(config.discogs.user_token)
         resolver = MetadataResolver(DiscogsReader(discogs_http, config.discogs))
         lastfm = LastFmClient(config.lastfm)
+        # R8-02: the credited-memory is silence-BOUNDARY keyed (cleared when a
+        # terminal genuine-silence finalize completes), not wall-clock windowed,
+        # so the tracker no longer needs the silence timeout injected.
         tracker = ListenTracker(
             DiscogsCollectionWriter(discogs_http, config.discogs), lastfm,
-            # R7-02: the credited-memory suppression window is the audio silence
-            # timeout — a genuine second spin cannot complete inside it.
-            session_end_silence_seconds=config.audio.session_end_silence_seconds,
         )
         # A-9: the application-layer commit service owns resolve → state → track →
         # scrobble; the recognition loop just confirms a result and hands it off.
@@ -331,12 +331,19 @@ def apply_state_silence_effect(event: AudioEvent, state: PlayerState):
         active session (e.g. a side flip) keep the now-playing card on screen
         instead of dropping to the IDENTIFYING spinner; from ERROR,
         "REPOSITION NEEDLE TO RETRY" recovers when music returns.
-      - SESSION_ENDED: clear() → IDLE (and bumps the session epoch, B-1).
+      - SESSION_ENDED / SESSION_ENDED_FORCED: clear() → IDLE (and bumps the
+        session epoch, B-1).  R8-16 cold-review F1: the forced end MUST take
+        this branch too — the forced/genuine distinction matters only to the
+        tracker's per-spin credit memory; the player-state half is identical
+        for both (card cleared, epoch bumped so an in-flight commit for the
+        force-ended session is discarded, IDLE shown).  Missing it stranded
+        the card on screen indefinitely and let a stale commit pass every
+        epoch check.
     """
     if event == AudioEvent.MUSIC_STARTED:
         if state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR):
             state.set_status(PlayerStatus.LISTENING)
-    elif event == AudioEvent.SESSION_ENDED:
+    elif event in (AudioEvent.SESSION_ENDED, AudioEvent.SESSION_ENDED_FORCED):
         state.clear()
 
 

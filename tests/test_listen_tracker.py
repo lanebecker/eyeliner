@@ -864,7 +864,7 @@ async def test_conc3_raising_end_session_task_logs_the_failure(caplog):
 
     # An unexpected raise anywhere in the fire-and-forget task must still reach
     # the done-callback and be logged.
-    async def _boom(session):
+    async def _boom(session, credited_memory=None):   # R8-02: matches _finalize_session
         raise RuntimeError("unexpected finalize error")
     tracker._finalize_session = _boom
 
@@ -893,7 +893,7 @@ async def test_conc3_cancelled_end_session_task_is_not_logged_as_error(caplog):
     tracker = ListenTracker(make_writer_mock())
     started = asyncio.Event()
 
-    async def slow(expected=None):
+    async def slow(expected=None, boundary=True):   # R8-02: matches _end_session
         started.set()
         await asyncio.sleep(3600)
 

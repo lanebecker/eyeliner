@@ -448,7 +448,7 @@ async def test_split_finalize_raise_is_reported_once_not_twice(caplog, monkeypat
     import logging
     tracker, writer = _tracker()
 
-    async def boom(session):
+    async def boom(session, credited_memory=None):   # R8-02: matches _finalize_detached
         raise RuntimeError("kaboom in finalize")
 
     monkeypatch.setattr(tracker, "_finalize_detached", boom)

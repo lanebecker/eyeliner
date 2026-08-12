@@ -163,10 +163,14 @@ _SPLIT_CREDIT_INLINE_WAIT_SECONDS = 5.0
 
 # R7-03 (flip-resume): how far back a newly-armed session may reach to inherit an
 # immediately-prior UNARMED session's closing-side rows (Lane, 2026-08-11: fixed
-# 5-minute wall-clock, same closing side only, measured off the prior session's
-# started_at).  A full play of a multi-row closing side split by a mid-side
-# silence gap resumes within this window; a genuinely separate later listening
-# does not.
+# 5-minute wall-clock, same closing side only).  R8-01 (#345, Lane 2026-08-12):
+# the window is the GAP between the sessions — `new_session.started_at -
+# prev.ended_at` — NOT the elapsed time since the prior session STARTED.  The
+# started_at anchor made the feature inert: fragment play + gap + tail play +
+# trailing silence always exceeded 300s for real music, so the exact credit the
+# feature shipped to save (a full play split by a sleeve-cleaning pause) was
+# still lost every time.  A full play split by a mid-side gap resumes within
+# this window; a genuinely separate later listening does not.
 _FLIP_RESUME_WINDOW_SECONDS = 300.0
 
 
@@ -177,7 +181,6 @@ class ListenTracker:
         self,
         writer: "DiscogsCollectionWriter",
         lastfm: Optional["LastFmClient"] = None,
-        session_end_silence_seconds: float = 45.0,
     ):
         # A-4: depend only on the Discogs WRITE half (Play Count / Last Played),
         # injected at the composition root (main.py).  A-3 had already moved this
@@ -198,27 +201,48 @@ class ListenTracker:
                 "will actually be loved."
             )
         self._session: Optional[PlaySession] = None
-        # R7-02: silence-window credited-memory.  Maps release_id → the
-        # monotonic time its Play Count was last credited.  One physical spin
-        # whose Shazam attribution ping-pongs between two releases splits
-        # repeatedly, and each split detaches the SAME armed release — without
-        # this memory each split credits it AGAIN (+N Play Count for ONE play;
-        # the #185 replay boundary and #186 idempotency guard only protect
-        # WITHIN one session / one finalize, not across the fresh sessions a
-        # split mints).  A split-path credit for a release credited within
-        # `session_end_silence_seconds` is suppressed unless the split was a
-        # genuine #185 replay boundary (a real re-drop of the same record, which
-        # earns its own credit).  The window is the silence timeout because a
-        # genuine second spin cannot complete inside it (a side is minutes long).
-        self._session_end_silence_seconds = float(session_end_silence_seconds)
-        self._credited_at: dict[int, float] = {}
+        # R8-02 (#346, Lane 2026-08-12): SILENCE-BOUNDARY credited-memory,
+        # replacing the R7-02 wall-clock window.  Maps release_id → the monotonic
+        # time its Play Count was credited SINCE THE LAST PHYSICAL SPIN BOUNDARY
+        # (a terminal, genuine-silence SESSION_ENDED finalize completing — see
+        # ``_finalize_detached``).  One physical spin whose Shazam attribution
+        # ping-pongs between two releases splits repeatedly, and each split
+        # detaches the SAME armed release; without this memory each split
+        # credits it again (+N Play Count for ONE play).  The R7-02 window
+        # (45s) bounded the WRONG quantity: the gap it measured — credit #1
+        # landing → the next split's finalize — is two confirmation cycles of
+        # the ping-pong (~50–70s at the real 15s-chunk / 10s-hop / 2-confirm
+        # cadence), so the guard expired and the double-credit returned (R8-02).
+        # "One physical spin" is delimited by what actually delimits it — real
+        # silence — so the memory is a per-spin set (with the credit time kept
+        # for logging), cleared ONLY when a terminal genuine-silence finalize
+        # completes.  NOT cleared by the #195 forced end (SESSION_ENDED_FORCED,
+        # R8-16: music never stopped, so a still-identified locked groove can't
+        # re-credit hourly) nor by split-path finalizes (same spin continues).
+        # A #185 replay-boundary session (a real re-drop) stays EXEMPT.
+        # Bounded: at most the handful of releases credited within one spin,
+        # emptied at every real silence boundary.
+        self._credited_this_spin: dict[int, float] = {}
+        # R8-09 (#348): the scrobble-side spin memory — (title, artist,
+        # release_id) keys scrobbled since the last spin boundary, maintained
+        # here (same boundary, same clearing) but written/read via
+        # :meth:`should_scrobble` / :meth:`record_scrobble` from the commit
+        # service, whose per-track scrobble the ping-pong also duplicates (a
+        # swing-back re-commits the same physical play; Last.fm timestamps
+        # differ so its server-side dedup does not collapse them).  A #185
+        # replay-boundary split clears the re-dropped release's keys — a real
+        # replay legitimately scrobbles its tracks again.
+        self._scrobbled_this_spin: set[tuple] = set()
         # R7-03 (flip-resume): the immediately-prior session that ended WITHOUT
         # arming a completion (a played side that never reached its closer, or
         # the first part of a closing side interrupted by a mid-side silence
         # gap).  The next armed session may inherit its closing-side rows if it
         # cannot cover the side alone — see :meth:`_apply_flip_resume`.  Holds at
-        # most one session; overwritten each unarmed end, cleared on any armed
-        # end (a completion, suppression, or unlatched close ends the chain).
+        # most one session.  R8-15 (#349): overwritten on each unarmed TERMINAL
+        # end, cleared on any armed end (completion, suppression, or unlatched
+        # close) AND on an unarmed SPLIT-detach (the #166 short-circuit): a split
+        # is attribution noise inside continuous music, not a flip, so it ends
+        # the chain conservatively rather than leaving a stale session behind.
         self._prev_unarmed: Optional[PlaySession] = None
         # Strong references to in-flight _end_session tasks.  asyncio only
         # keeps weak references to tasks, so a fire-and-forget create_task()
@@ -244,12 +268,23 @@ class ListenTracker:
         """Receive silence events from SilenceDetector (wired up in main.py)."""
         if event == AudioEvent.MUSIC_STARTED:
             self._start_session()
-        elif event == AudioEvent.SESSION_ENDED:
+        elif event in (AudioEvent.SESSION_ENDED, AudioEvent.SESSION_ENDED_FORCED):
             # Bind this end to the session that is active *now*.  If an album
             # split later replaces it, the task below sees the session changed
             # and becomes a no-op instead of ending the new session (B-2).
+            #
+            # R8-16 (#350): only a GENUINE-silence SESSION_ENDED is a physical
+            # spin boundary.  The #195 forced end (SESSION_ENDED_FORCED — locked
+            # groove / stuck input, music never stopped) still ends and credits
+            # the session identically, but must NOT clear the per-spin
+            # credit/scrobble memory: the groove's still-identified closer would
+            # otherwise re-arm a fresh session and mint one phantom credit per
+            # hour until the needle lifts.
             target = self._session
-            task = asyncio.create_task(self._end_session(expected=target))
+            boundary = event is AudioEvent.SESSION_ENDED
+            task = asyncio.create_task(
+                self._end_session(expected=target, boundary=boundary)
+            )
             self._bg_tasks.add(task)
             task.add_done_callback(self._on_end_session_done)
 
@@ -305,7 +340,40 @@ class ListenTracker:
         Bounded by ``timeout`` so a stuck write cannot hang shutdown past
         systemd's stop timeout; a task still running afterwards is left for loop
         teardown to cancel, with a warning. Never raises — shutdown must proceed.
+
+        R8-17 (#351, Lane 2026-08-12): a live ARMED session — closer played,
+        coverage complete, merely waiting out the 45s silence window — used to be
+        silently discarded here (drain only awaited already-created tasks), so a
+        ``systemctl stop`` right after a record finished ate the credit with no
+        log stronger than "Pipeline stopped".  Drain now detaches such a session
+        and finalizes it behind the SAME gates as any end (completion gate,
+        duplicate-credit memory, idempotent latches — ``_finalize_session`` is
+        unchanged), as a tracked ``_bg_tasks`` task inside the same bounded wait.
+        Treated as a spin boundary (the process is ending).  An UNARMED live
+        session still has nothing to credit and is discarded (debug-logged).
         """
+        armed = None
+        async with self._lifecycle_lock:
+            if self._session is not None and self._session.potential_last_track:
+                armed = self._detach_session_locked()
+            elif self._session is not None:
+                log.debug(
+                    "drain(): discarding a live UNARMED session (nothing to credit)."
+                )
+        if armed is not None:
+            log.info(
+                "R8-17: finalizing a live armed session at shutdown (release %s) — "
+                "the closer played; the credit is not discarded.",
+                armed.album_release_id,
+            )
+            # A boundary (the process is ending): swap the spin memory NOW and
+            # judge the shutdown finalize against the outgoing dict (R8-02/F3).
+            spin_memory = self._begin_new_spin()
+            task = asyncio.create_task(
+                self._finalize_detached(armed, credited_memory=spin_memory)
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._on_end_session_done)
         pending = [t for t in self._bg_tasks if not t.done()]
         if not pending:
             return
@@ -352,7 +420,7 @@ class ListenTracker:
             self._session = PlaySession()
             log.info("Play session started.")
 
-    async def _end_session(self, expected=_CURRENT_SESSION):
+    async def _end_session(self, expected=_CURRENT_SESSION, boundary: bool = True):
         """End the active session: detach it under the lifecycle lock, then credit
         it OUTSIDE the lock (CONC-2).
 
@@ -361,6 +429,13 @@ class ListenTracker:
         new session, ending is skipped.  The default sentinel means "end
         whatever session is current" (used by the direct-await callers and the
         existing test suite).
+
+        ``boundary`` (R8-02/R8-16): True for a genuine-silence SESSION_ENDED —
+        a physical spin boundary, after whose finalize the per-spin
+        credit/scrobble memory is cleared.  False for the #195 forced end
+        (SESSION_ENDED_FORCED): the session ends and credits identically, but
+        the spin memory survives (music never stopped).  Defaults True — the
+        direct-await test callers simulate genuine silence.
 
         The crediting work (up to three executor-dispatched HTTP round trips with
         bounded retry) must NOT run under `_lifecycle_lock`: `on_track_identified`
@@ -372,8 +447,20 @@ class ListenTracker:
         """
         async with self._lifecycle_lock:
             detached = self._detach_session_locked(expected=expected)
+        # R8-02/F3: the spin-memory swap is SYNCHRONOUS with the boundary (no
+        # await since the detach), never deferred to the finalize's completion —
+        # a slow terminal finalize (honoured Retry-After) must not wipe keys the
+        # NEXT spin records in the meantime.  Swap when a session was actually
+        # detached, or when genuine silence arrived with NO session at all (the
+        # F2 shape: a forced end whose input then decayed without ever
+        # re-entering music — the re-armed detector delivers this boundary and
+        # the memory must clear even though there is nothing to finalize).  A
+        # STALE end (a split already replaced the session — music continuing)
+        # swaps nothing: it is not a boundary of the CURRENT spin.
+        boundary_effective = boundary and (detached is not None or self._session is None)
+        spin_memory = self._begin_new_spin() if boundary_effective else self._credited_this_spin
         if detached is not None:
-            await self._finalize_detached(detached)
+            await self._finalize_detached(detached, credited_memory=spin_memory)
 
     def _is_consecutive_reidentification(self, track) -> bool:
         """#185: is *track* the same physical identification as the last logged
@@ -410,34 +497,82 @@ class ListenTracker:
 
         session = self._session
         self._session = None
+        # R8-01 (#345): stamp the detach moment — the far edge of the flip-resume
+        # gap.  For a terminal end this is when SESSION_ENDED fired (i.e. the
+        # gap's start as #316 defined it); for a split it marks the swap.
+        session.ended_at = time.monotonic()
         return session
 
-    def _is_duplicate_credit(self, session: PlaySession) -> bool:
-        """R7-02: True when *session*'s Play Count credit must be suppressed as a
-        duplicate of one already made, for the SAME release, within the silence
-        window during the SAME physical spin.
+    def _is_duplicate_credit(
+        self, session: PlaySession, credited_memory: Optional[dict] = None
+    ) -> bool:
+        """R8-02 (#346): True when *session*'s Play Count credit must be
+        suppressed as a duplicate of one already made for the SAME release
+        during the SAME physical spin.
+
+        ``credited_memory`` is the spin memory to judge against — a boundary
+        finalize's OUTGOING dict, or (default) the live dict (F3; see
+        :meth:`_begin_new_spin`).
 
         Checked in :meth:`_finalize_session`, so it guards BOTH the split-path
         credit (an attribution ping-pong re-arming an already-credited release)
         AND the terminal SESSION_ENDED credit (the spin ends on the re-armed
-        release) — the R7-02 double-credit reproduces via either.  A session
-        opened by a genuine #185 replay boundary is a real second spin and is
-        NEVER suppressed (``opened_by_replay_boundary``).  A release absent from
-        the credited-memory, or last credited at least
-        ``session_end_silence_seconds`` ago, is likewise creditable: a genuine
-        later play, since a real second spin cannot COMPLETE inside that window
-        (a side runs minutes).  Read-only — the memory is written only when a
-        credit actually lands, in :meth:`_credit_completed_album`.
+        release).  A session opened by a genuine #185 replay boundary is a real
+        second spin and is NEVER suppressed (``opened_by_replay_boundary``).
+
+        Membership, not a wall-clock window (the R7-02 45s window expired
+        between two confirmation cycles of the ping-pong and let the
+        double-credit back in — R8-02): a release is a duplicate iff it was
+        credited since the last physical spin boundary.  The memory is cleared
+        only when a terminal genuine-silence finalize completes
+        (:meth:`_finalize_detached`), so the guard is timing-independent by
+        construction — one spin = no intervening silence boundary.  Read-only —
+        the memory is written only when a credit actually lands, in
+        :meth:`_credit_completed_album`.
         """
         if session.opened_by_replay_boundary:
             return False
         rid = session.album_release_id
         if rid is None:
             return False
-        last = self._credited_at.get(rid)
-        if last is None:
-            return False
-        return (time.monotonic() - last) < self._session_end_silence_seconds
+        memory = credited_memory if credited_memory is not None else self._credited_this_spin
+        return rid in memory
+
+    @staticmethod
+    def _scrobble_key(track: "TrackMetadata") -> tuple:
+        """R8-09: per-spin scrobble identity — case-folded title/artist plus the
+        release id (kept as element [2]: the replay-boundary clear filters on
+        it).  Documented residual (cold-review F4): FALLBACK metadata
+        (release_id None) can never earn the #185 replay exemption (release-less
+        tracks never trigger splits), so a genuine same-spin REPLAY of a
+        FALLBACK-resolved record has its repeat scrobbles suppressed until the
+        next silence boundary — the release-less analogue of the accepted #185
+        conservative residuals (fail toward missed, never phantom)."""
+        return (track.title.casefold(), track.artist.casefold(),
+                track.discogs_release_id)
+
+    def should_scrobble(self, track: "TrackMetadata") -> bool:
+        """R8-09 (#348): False when *track* was already scrobbled during this
+        physical spin — the attribution ping-pong's swing-back re-commits the
+        same play (the foreign confirmation broke the consecutive-dedup chain),
+        and Last.fm's server-side dedup does not collapse the two scrobbles
+        because their timestamps differ.
+
+        Same boundary as the credit memory: the set clears only at a terminal
+        genuine-silence finalize (not on the #195 forced end, not on splits),
+        and a #185 replay-boundary split drops the re-dropped release's keys so
+        a real replay scrobbles again.  Called by TrackCommitService before its
+        scrobble step; pair with :meth:`record_scrobble`.
+        """
+        return self._scrobble_key(track) not in self._scrobbled_this_spin
+
+    def record_scrobble(self, track: "TrackMetadata") -> None:
+        """R8-09: record *track* as scrobbled this spin.  Recorded at DISPATCH
+        (before the scrobble awaits), the #163 in-flight-latch pattern: a
+        re-commit racing the in-flight scrobble must be suppressed, and a failed
+        scrobble has no retry path for the record to distort (per-track
+        scrobbles are one-shot by design)."""
+        self._scrobbled_this_spin.add(self._scrobble_key(track))
 
     def _apply_flip_resume(self, session: PlaySession) -> None:
         """R7-03: when *session* armed a completion its OWN identifications cannot
@@ -446,13 +581,20 @@ class ListenTracker:
         side split across sessions by a mid-side silence gap (or a long flip)
         still credits, instead of being suppressed as a mis-attributed single.
 
-        Bounded (Lane, 2026-08-11): only the immediately-prior unarmed session,
-        only if it started within ``_FLIP_RESUME_WINDOW_SECONDS``, only rows on
-        the closing side.  Cannot manufacture a phantom: it adds only rows the
-        prior session GENUINELY identified for THIS release AND that lie on the
-        closing side, so a compilation's foreign/off-side rows never join the
-        set.  A one-row closing side never reaches here (the closer covers it,
-        so ``completion_supported`` is already True).  Mutates only
+        Bounded (Lane, 2026-08-11; window re-anchored Lane, 2026-08-12, R8-01):
+        only the immediately-prior unarmed session, only if the GAP between the
+        sessions — this session's ``started_at`` minus the prior session's
+        ``ended_at`` — is within ``_FLIP_RESUME_WINDOW_SECONDS``, only rows on
+        the closing side.  The prior anchor (elapsed since ``prev.started_at``,
+        measured at THIS session's finalize) summed fragment play + gap + tail
+        play + trailing silence and always exceeded 300s for real music, so the
+        feature never fired (#345).  ``prev.started_at`` is kept only as a
+        fallback for hand-built sessions that were never detached.  Cannot
+        manufacture a phantom: it adds only rows the prior session GENUINELY
+        identified for THIS release AND that lie on the closing side, so a
+        compilation's foreign/off-side rows never join the set.  A one-row
+        closing side never reaches here (the closer covers it, so
+        ``completion_supported`` is already True).  Mutates only
         ``session.inherited_side_rows`` (the completion gate re-reads it below);
         the love target is untouched.
         """
@@ -463,8 +605,11 @@ class ListenTracker:
             return
         if session.completion_supported:
             return  # already covered on its own — nothing to inherit
-        if time.monotonic() - prev.started_at > _FLIP_RESUME_WINDOW_SECONDS:
-            return  # the prior unarmed session is too old to be one flip away
+        # R8-01 (#345): the window bounds the GAP, per #316's original text —
+        # "when MUSIC_STARTED follows a SESSION_ENDED … bounded window".
+        gap_anchor = prev.ended_at if prev.ended_at is not None else prev.started_at
+        if session.started_at - gap_anchor > _FLIP_RESUME_WINDOW_SECONDS:
+            return  # the gap was longer than one flip — a separate listening
         closer = session.closing_track
         if closer is None or closer.discogs_release_id != session.album_release_id:
             return
@@ -486,7 +631,35 @@ class ListenTracker:
                 len(inherited), sorted(inherited), session.album_release_id,
             )
 
-    async def _finalize_detached(self, session: PlaySession):
+    def _begin_new_spin(self) -> dict:
+        """R8-02 (cold-review F3): SYNCHRONOUSLY swap out the per-spin memory at
+        a physical spin boundary, returning the OUTGOING credited memory.
+
+        Called (no await between the detach and this) on every boundary path —
+        terminal genuine-silence SESSION_ENDED, R8-17 drain — so keys recorded
+        by the NEXT spin can never be wiped by the old spin's finalize
+        completing late (a terminal finalize legally takes minutes on the
+        honoured-Retry-After path; the previous design cleared the LIVE sets in
+        that finalize's ``finally``, wiping whatever a new spin had recorded in
+        the meantime).  The boundary finalize itself still checks and writes
+        against the returned OUTGOING dict, so a ping-ponged spin's terminal
+        credit stays suppressed while its landed credit dies with the spin —
+        exactly right, since the next spin must not be suppressed by it.
+        """
+        outgoing = self._credited_this_spin
+        if outgoing or self._scrobbled_this_spin:
+            log.debug(
+                "Spin boundary: retiring per-spin memory "
+                "(%d credited release(s), %d scrobble key(s)).",
+                len(outgoing), len(self._scrobbled_this_spin),
+            )
+        self._credited_this_spin = {}
+        self._scrobbled_this_spin = set()
+        return outgoing
+
+    async def _finalize_detached(
+        self, session: PlaySession, credited_memory: Optional[dict] = None
+    ):
         """Credit an already-detached session, serialized against every other
         finalize (CONC-2).
 
@@ -499,17 +672,33 @@ class ListenTracker:
         for two different detached sessions can never hit the writer concurrently.
         The two locks are never held at the same time, so there is no ordering
         deadlock.
+
+        ``credited_memory`` (R8-02): the per-spin credited memory THIS finalize
+        checks and records into.  Boundary callers (terminal SESSION_ENDED,
+        drain) pass the OUTGOING dict returned by :meth:`_begin_new_spin` — the
+        swap already happened synchronously at the boundary, so this finalize
+        judges against its own spin's memory while the live memory starts
+        fresh.  Split-path and forced-end callers pass (or default to) the LIVE
+        dict — their spin continues.  ``None`` → the live dict.
         """
         async with self._finalize_lock:
-            await self._finalize_session(session)
+            await self._finalize_session(session, credited_memory)
 
-    async def _finalize_session(self, session: PlaySession):
+    async def _finalize_session(
+        self, session: PlaySession, credited_memory: Optional[dict] = None
+    ):
         """Do the end-of-session crediting work for an already-detached session.
 
         Operates on a local `session` reference (self._session has already been
         cleared by the caller), so it is safe to await the Discogs/Last.fm
         executor calls here without another coroutine mutating it.
+
+        ``credited_memory`` (R8-02/F3): the per-spin credited memory this
+        finalize checks against and records a landed credit into — the OUTGOING
+        dict on boundary paths, the live dict otherwise (None → live).
         """
+        if credited_memory is None:
+            credited_memory = self._credited_this_spin
         # Idempotency guard: never credit one session's Play Count twice, even
         # if a re-entrant end somehow finalizes the same session object again
         # (B-8).  Pairs with the B-2 lifecycle lock as defense-in-depth.
@@ -540,7 +729,7 @@ class ListenTracker:
         # once and applied to BOTH the Play Count credit and the Last.fm love, so
         # neither double-fires for one physical spin regardless of whether that
         # spin ends via a split or a terminal SESSION_ENDED.
-        duplicate_credit = self._is_duplicate_credit(session)
+        duplicate_credit = self._is_duplicate_credit(session, credited_memory)
 
         if (
             session.potential_last_track
@@ -569,22 +758,24 @@ class ListenTracker:
                 session.supporting_row_count,
             )
         elif session.potential_last_track and session.album_release_id and duplicate_credit:
-            # R7-02: this release was credited within the silence window during
-            # the SAME physical spin (an attribution ping-pong re-armed an
-            # already-credited release), and this session was NOT opened by a
-            # genuine #185 re-drop — suppress the duplicate Play Count credit AND
-            # the love (the love gate below also honours `duplicate_credit`).
-            # Loud on purpose so a real edge case is diagnosable.  Reaches here on
-            # EITHER path: a split-detached re-arm, or the terminal SESSION_ENDED
-            # credit of a spin that ends on the re-armed release.
+            # R8-02 (#346): this release was already credited during the SAME
+            # physical spin (an attribution ping-pong re-armed an
+            # already-credited release; no silence boundary has intervened), and
+            # this session was NOT opened by a genuine #185 re-drop — suppress
+            # the duplicate Play Count credit AND the love (the love gate below
+            # also honours `duplicate_credit`).  Loud on purpose so a real edge
+            # case is diagnosable.  Reaches here on ANY finalize path: a
+            # split-detached re-arm, the terminal SESSION_ENDED credit of a spin
+            # that ends on the re-armed release, or a #195 forced end whose
+            # groove re-armed an hour later (R8-16 — the memory survives forced
+            # ends precisely so this fires).
             rid = session.album_release_id
             log.info(
-                "R7-02: suppressing a duplicate credit for release %s — it was "
-                "credited %.1fs ago (< %.0fs silence window) and this session was "
-                "not opened by a #185 replay boundary; one physical play must not "
-                "be double-credited.",
-                rid, time.monotonic() - self._credited_at[rid],
-                self._session_end_silence_seconds,
+                "R8-02: suppressing a duplicate credit for release %s — it was "
+                "credited %.1fs ago within this same physical spin (no silence "
+                "boundary since) and this session was not opened by a #185 "
+                "replay boundary; one physical play must not be double-credited.",
+                rid, time.monotonic() - credited_memory[rid],
             )
         elif session.potential_last_track and session.album_release_id:
             if session.crediting:
@@ -603,7 +794,7 @@ class ListenTracker:
                 # uncommitted and is bounded-retried instead of silently lost.
                 session.crediting = True
                 try:
-                    await self._credit_completed_album(session)
+                    await self._credit_completed_album(session, credited_memory)
                 except Exception as e:
                     # #171: the Last.fm love below "runs independently of Discogs"
                     # — but a Discogs write that RAISES (concretely the SINGLE,
@@ -747,13 +938,22 @@ class ListenTracker:
                 await asyncio.sleep(backoff)
         return False
 
-    async def _credit_completed_album(self, session: PlaySession):
+    async def _credit_completed_album(
+        self, session: PlaySession, credited_memory: Optional[dict] = None
+    ):
         """Credit a completed album: increment Play Count (bounded retry, #163)
         and update Last Played. The caller has already set ``session.crediting``
         (in-flight) after confirming it was not already set, so this runs exactly
         once per session. Commits ``session.credited`` ONLY when the increment
         actually lands, leaving a transient failure uncommitted (and logged loud).
+
+        ``credited_memory`` (R8-02/F3): the spin memory a landed credit is
+        recorded into — the caller's OUTGOING dict on boundary paths (the record
+        dies with the spin, correctly leaving the NEXT spin unsuppressed), the
+        live dict otherwise (None → live).
         """
+        if credited_memory is None:
+            credited_memory = self._credited_this_spin
         log.info(
             f"Last track confirmed for release {session.album_release_id} — "
             f"incrementing Play Count and updating Last Played in Discogs."
@@ -797,21 +997,17 @@ class ListenTracker:
         )
         if success:
             session.credited = True  # committed ONLY after the write landed (#163)
-            # R7-02: remember WHEN this release was credited so a subsequent
-            # split-path credit for the same release inside the silence window
-            # (an attribution ping-pong, not a genuine re-drop) is suppressed.
-            # Recorded only on a landed credit, keyed by release.  Prune entries
-            # older than the window opportunistically so the map stays bounded on
-            # a long-running appliance (an entry older than the window can never
-            # suppress again).
-            now = time.monotonic()
+            # R8-02 (#346): remember that this release was credited THIS SPIN so
+            # any subsequent credit for it before the next silence boundary (an
+            # attribution ping-pong re-arm, or a forced-end locked-groove re-arm,
+            # R8-16 — not a genuine #185 re-drop) is suppressed.  Recorded only
+            # on a landed credit, keyed by release; the timestamp is for the
+            # suppression log line only.  No time-based pruning — the memory is
+            # emptied wholesale at each terminal genuine-silence finalize
+            # (:meth:`_finalize_detached`), which also bounds it (a spin credits
+            # at most a handful of releases).
             if session.album_release_id is not None:
-                self._credited_at[session.album_release_id] = now
-            self._credited_at = {
-                rid: t
-                for rid, t in self._credited_at.items()
-                if now - t < self._session_end_silence_seconds
-            }
+                credited_memory[session.album_release_id] = time.monotonic()
             log.info("✅ Discogs Play Count incremented successfully.")
         else:
             log.error(
@@ -1055,6 +1251,16 @@ class ListenTracker:
                 # second spin earns its own credit.  An attribution-swing (album
                 # change) split leaves this False, so its credit is guarded.
                 self._session.opened_by_replay_boundary = replay_boundary_split
+                if replay_boundary_split:
+                    # R8-09 (#348): a genuine re-drop REPLAYS the record, so its
+                    # tracks legitimately scrobble again — drop the re-dropped
+                    # release's keys from the per-spin scrobble memory (the
+                    # credit side needs no analogue: the replay session carries
+                    # the opened_by_replay_boundary exemption).
+                    rid = track.discogs_release_id
+                    self._scrobbled_this_spin = {
+                        k for k in self._scrobbled_this_spin if k[2] != rid
+                    }
 
             self._session.log_track(track)
             if track.is_last_track:
@@ -1096,7 +1302,15 @@ class ListenTracker:
             # credit completes well inside the bound, so common-case timing is
             # unchanged; only a honoured-Retry-After tail is deferred to the
             # background.
-            task = asyncio.create_task(self._finalize_detached(detached))
+            # R8-02/F3: bind the LIVE spin memory at task creation — the split's
+            # spin is the CURRENT one, and if a boundary swap happened before
+            # this task ran, defaulting at run time would judge against the
+            # wrong (new) spin's memory.
+            task = asyncio.create_task(
+                self._finalize_detached(
+                    detached, credited_memory=self._credited_this_spin
+                )
+            )
             self._bg_tasks.add(task)
             task.add_done_callback(self._on_end_session_done)
             try:
@@ -1134,3 +1348,11 @@ class ListenTracker:
                 "Split-off session reached no last track — nothing to credit; "
                 "skipping finalize and its lock (#166)."
             )
+            # R8-15 (#349): this unarmed split-detach bypasses _finalize_session,
+            # which is where the _prev_unarmed chain is normally maintained — so
+            # without this line a STALE prior-unarmed session survived here,
+            # falsifying the documented invariant.  End the chain rather than
+            # seed it: a split is attribution noise inside CONTINUOUS music, not
+            # a flip (flip-resume's scenario is a real silence gap), so the
+            # conservative, missed-over-phantom choice is to clear.
+            self._prev_unarmed = None

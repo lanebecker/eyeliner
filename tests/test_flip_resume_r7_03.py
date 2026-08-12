@@ -15,8 +15,6 @@ prior unarmed session's closing-side rows, bounded to a 5-minute window
 dead state) and to the SAME closing side, so the split play credits once while a
 genuinely separate later listening, or a compilation's foreign rows, cannot.
 """
-import time
-
 import pytest
 
 from src.audio.silence import AudioEvent
@@ -63,17 +61,25 @@ async def test_mid_side_gap_full_play_credits_via_flip_resume():
 
 @pytest.mark.asyncio
 async def test_flip_resume_respects_the_5_minute_window():
-    """Control: if the prior unarmed session is older than the flip-resume
-    window, its rows are NOT inherited — the split play stays suppressed
-    (conservative missed-over-phantom)."""
+    """Control: if the GAP between the prior unarmed session's end and the new
+    session's start exceeds the flip-resume window, rows are NOT inherited —
+    the split play stays suppressed (conservative missed-over-phantom).
+
+    R8-01 (#345): the window bounds the GAP (`new.started_at - prev.ended_at`),
+    not the elapsed time since the prior session STARTED — the old anchor made
+    the feature inert at real track lengths.  Aging `ended_at` simulates a
+    301s-old gap; scenario coverage at the real cadence lives in
+    test_credit_cadence_r8.py.
+    """
     tracker, writer = make_tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(_t("B-One"))
     await tracker.on_track_identified(_t("B-Two"))
     await tracker._end_session()
 
-    # Age the prior unarmed session past the 5-minute window.
-    tracker._prev_unarmed.started_at -= 301.0
+    # Age the prior session's END past the 5-minute window: the gap between
+    # its detach and the new session's start is now > 300s.
+    tracker._prev_unarmed.ended_at -= 301.0
 
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
     await tracker.on_track_identified(_t("B-Closer"))

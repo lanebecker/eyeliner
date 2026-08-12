@@ -319,13 +319,31 @@ Key cases — Play Count:
 - **Compilation two-rows-of-owned-album (R7-01):** a Best-Of playing two rows of
   an owned album with its closer among them → NOT credited (closing side not
   covered)
-- **Attribution ping-pong (R7-02):** one physical spin swinging between two
+- **Attribution ping-pong (R8-02):** one physical spin swinging between two
   releases → the armed release credited exactly once, duplicate suppressed with
-  `R7-02` in the message (both split and terminal SESSION_ENDED paths); a genuine
-  #185 re-drop still credits each spin — see `test_credit_memory_r7_02.py`
-- **Mid-side gap flip-resume (R7-03):** a multi-row closing side split by a
-  silence gap credits once via inherited rows; a >5-min gap or a different-side/
-  different-release prior session does not — see `test_flip_resume_r7_03.py`
+  `R8-02` in the message (split, terminal SESSION_ENDED, forced-end, and drain
+  paths).  The memory is silence-boundary keyed (a per-spin set, cleared only
+  when a terminal genuine-silence finalize completes) — NOT wall-clock windowed,
+  so it holds at any confirmation cadence; a genuine #185 re-drop still credits
+  each spin — see `test_credit_memory_r7_02.py` (mechanism) and
+  `test_credit_cadence_r8.py` (the realistic 15s/10s/2-confirm/45s timelines)
+- **Mid-side gap flip-resume (R8-01):** a multi-row closing side split by a
+  silence gap credits once via inherited rows; a >5-min GAP (measured
+  `new.started_at - prev.ended_at` — the code now implements exactly the gap
+  semantics this guide always described) or a different-side/different-release
+  prior session does not — see `test_flip_resume_r7_03.py` and the realistic
+  timelines in `test_credit_cadence_r8.py`
+- **Locked-groove forced ends (R8-16):** the #195 hourly forced end credits the
+  side ONCE; subsequent forced re-arms are suppressed until a real silence
+  boundary — see `test_credit_cadence_r8.py`
+- **Shutdown with an armed session (R8-17):** `drain()` finalizes it behind the
+  normal gates (credit kept, phantom still suppressed) — see
+  `test_credit_cadence_r8.py`
+- **CADENCE HARNESS RULES (R8-04):** patch the clock as
+  `src.tracking.listen_tracker.time` (a `SimpleNamespace(monotonic=fake)`) —
+  patching `time.monotonic` globally freezes asyncio's loop clock and hangs
+  every await; and stamp `session.started_at` explicitly (the dataclass
+  default_factory bound the real function at class definition)
 - **Only Side A:** session ends before last track → NOT called
 - **Missed recognition:** all tracks except the last identified → NOT called
 - **Fallback metadata:** last track reached but `discogs_release_id = None` → NOT called
