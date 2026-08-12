@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency floors raised to the currently-tested releases (Dependabot
+  #309–#313).** `requirements.txt` `>=` floors bumped to match what a fresh install
+  already resolves and what the suite validates: `sounddevice>=0.5.5`,
+  `shazamio>=0.8.1`, `urllib3>=2.7.0,<3.0.0` (the `<3` S-7 cap retained),
+  `pylast>=7.1.0`, `pytest>=9.1.1`. No install-time change (the floors were already
+  satisfied by the newest release); this documents the tested minimum and lets pip
+  fail-closed if a newest release is ever yanked. Full suite green on these exact
+  versions. The five Dependabot pip PRs are bundled here and auto-close on the floor
+  bump; the two GitHub-Actions SHA bumps (checkout, setup-python) are merged
+  separately.
+
 ## [1.5.26] — 2026-08-12
 
 **Round-8 cleanup wave — the backlog opened during Rounds 6–7 (#304, #305, #306,

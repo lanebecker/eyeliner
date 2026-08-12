@@ -3,12 +3,12 @@
 # "trixie" image) via the audioop-lts backport below. (TQ-9, #198)
 
 # Audio capture
-sounddevice>=0.4.6
+sounddevice>=0.5.5
 numpy>=1.24.0
 soundfile>=0.12.1
 
 # Music recognition
-shazamio>=0.6.0
+shazamio>=0.8.1
 # #198 (ops-1): PEP 594 removed the stdlib `audioop` module in Python 3.13, which
 # is what the current DEFAULT Raspberry Pi OS image ("trixie") ships. shazamio's
 # transitive dep `pydub` imports `audioop` at import time, so on 3.13 `pip install`
@@ -40,17 +40,17 @@ Pillow>=10.0.0
 # fail-closed, but the suite's MOCKED pool would still pass, so
 # test_cover_cache.py builds a real HTTPSConnectionPool to catch it in CI, not
 # on the Pi (TQ-4, #116).
-urllib3>=2.0.0,<3.0.0
+urllib3>=2.7.0,<3.0.0
 certifi>=2023.7.22
 
 # Config
 PyYAML>=6.0.1
 
 # Last.fm scrobbling
-pylast>=5.1.0
+pylast>=7.1.0
 
 # Testing
-pytest>=7.4.0
+pytest>=9.1.1
 pytest-asyncio>=0.23.0
 pytest-cov>=4.1.0  # used by the documented `pytest --cov` coverage command (TQ-9)
 pytest-timeout>=2.1.0  # global per-test timeout so an infinite-loop regression fails fast, not hangs CI (#174)
