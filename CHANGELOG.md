@@ -9,6 +9,48 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.23] — 2026-08-12
+
+**Round-7 audit — Wave 4: cover state machine (milestone "R7 Wave 4",
+#325–#328).** Stops a per-frame decode-spawn + blocking-stat churn when a cached
+cover vanishes from disk, hardens the prune race, and pins the R6-18 self-heal
+driver against a surviving mutant. RED-first with an executed churn repro;
+independent break-this cold review (SPEC + QUALITY pass, no introduced bugs); the
+two code fixes mutation-verified; full suite **1378 passed**.
+
+### Fixed
+
+- **A cover that vanishes from disk no longer churns the render loop for the rest
+  of the album (#325 — MEDIUM, `R7-12`).** When the mtime-LRU pruned a cover still
+  marked ready in `_cover_on_disk` (a warm-start cover's mtime is never refreshed,
+  so it's the prune's first victim), the off-loop decode early-returned WITHOUT
+  dropping the marker — so `_load_cover` respawned a blocking-`exists()`, no-op
+  decode task every frame and the R6-18 retry driver stayed gated off. The decode
+  now drops the stale marker and refetches (recovering the cover within the
+  track); a cover that was never on disk still defers to the state-change prefetch.
+- **A cover pruned mid-decode is no longer misfiled as corrupt (#326 — LOW,
+  `R7-13`).** A file removed between the `exists()` check and the executor's
+  `pygame.image.load` raised `FileNotFoundError`, which the corrupt-bytes handler
+  treated as bad data — unlinking an already-gone file and burning an attempt
+  toward a spurious blacklist a same-album track change could never lift. That
+  race is now recognised as a vanished file (drop the marker + refetch, no decode
+  tally).
+
+### Testing
+
+- **The R6-18 cover self-heal driver is now pinned (#327 — MEDIUM, `R7-14`).**
+  Deleting the render loop's one `_maybe_retry_cover_download()` call previously
+  left the whole suite green. A new integration test drives real render-loop
+  iterations with an elapsed download backoff and asserts the retry fires — so
+  removing the driver now fails fast.
+
+### Documented
+
+- **The `_prefetch_cover` blacklist comment covers both routes (#328 — NIT,
+  `R7-15`).** It claimed a blacklisted URL "keeps its corrupt bytes on disk so
+  `exists()` is true" — true for the decode-blacklist route, but the
+  download-blacklist route leaves no bytes on disk. Corrected to describe both.
+
 ## [1.5.22] — 2026-08-12
 
 **Round-7 audit — Wave 3: display fidelity (milestone "R7 Wave 3", #320–#324).**

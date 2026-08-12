@@ -9,6 +9,7 @@ B-18 — a corrupt cached cover is re-fetched within the track (not left as a
 """
 import asyncio
 import os
+import time
 
 import pytest
 
@@ -405,6 +406,116 @@ async def test_stab1_transient_decode_failure_still_recovers(tmp_path):
         assert url not in r._cover_decode_failures        # tally cleared on a clean load
     finally:
         pygame.display.quit()
+
+
+@pytest.mark.asyncio
+async def test_vanished_cover_drops_marker_and_refetches(tmp_path):
+    """R7-12: a cover MARKED on disk whose file has since been pruned (mtime-LRU
+    victim) must drop its _cover_on_disk marker and refetch — not leave the marker
+    set, which made _load_cover respawn a blocking-stat, no-op decode every frame
+    for the rest of the album while the R6-18 retry driver stayed gated off."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/warmstart.jpg"
+    r._cover_on_disk.add(url)                              # marked ready…
+    assert not r._cover_store.path_for(url).exists()      # …but the file is gone
+
+    refetched = []
+
+    async def rec_prefetch(u):
+        refetched.append(u)
+
+    r._prefetch_cover = rec_prefetch
+    await r._decode_cover_async(url, 100, 100)
+    await asyncio.gather(*list(r._bg_tasks), return_exceptions=True)
+
+    assert url not in r._cover_on_disk        # marker dropped → churn stops
+    assert refetched == [url]                 # …and a refetch was scheduled
+
+
+@pytest.mark.asyncio
+async def test_cover_pruned_during_load_is_not_misclassified_corrupt(tmp_path, monkeypatch):
+    """R7-13: a file pruned BETWEEN the exists() check and the executor load
+    (pygame raises FileNotFoundError) is treated as not-on-disk — drop the marker
+    + refetch, NO decode tally — not as corrupt bytes, which would unlink an
+    already-gone file and burn a load-failure attempt toward a spurious blacklist."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._cover_cache = _BoundedCache(8)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/racy.jpg"
+    r._cover_on_disk.add(url)
+    cache_path = r._cover_store.path_for(url)
+    cache_path.write_bytes(b"present at the exists() check")   # exists when decode starts
+
+    refetched = []
+
+    async def rec_prefetch(u):
+        refetched.append(u)
+
+    r._prefetch_cover = rec_prefetch
+
+    def load_then_vanished(p):
+        try:
+            os.remove(p)                                  # pruned mid-load
+        except OSError:
+            pass
+        raise FileNotFoundError(p)
+
+    monkeypatch.setattr("pygame.image.load", load_then_vanished)
+    await r._decode_cover_async(url, 100, 100)
+    await asyncio.gather(*list(r._bg_tasks), return_exceptions=True)
+
+    assert url not in r._cover_on_disk
+    assert refetched == [url]
+    assert r._cover_decode_failures == {}     # NOT counted as a corrupt-decode attempt
+    assert url not in r._cover_bad_urls        # …so no spurious blacklist
+
+
+@pytest.mark.asyncio
+async def test_render_loop_drives_the_r618_cover_retry(monkeypatch):
+    """R7-14: the render loop must DRIVE _maybe_retry_cover_download — a backed-off
+    cover download whose window has elapsed is re-spawned by the loop itself.
+    Previously nothing pinned the wiring: deleting the one render-loop call left
+    the whole suite green (a surviving mutant). This runs a real loop iteration
+    (render step skipped: not dirty, not transitioning) and asserts the retry
+    actually fires from the loop."""
+    r = make_renderer()
+    r._bg_tasks = set()
+    r._running = True
+    r._dirty = False
+    r._transition_start = time.monotonic() - 10          # not transitioning → no render
+    url = "https://i.discogs.com/backoff.jpg"
+    r._wanted_cover_url = url
+    r._cover_download_retry_after[url] = time.monotonic() - 1   # backoff already elapsed
+
+    retried = []
+
+    async def rec_prefetch(u):
+        retried.append(u)
+        r._running = False                               # stop the loop once it fires
+
+    r._prefetch_cover = rec_prefetch
+    monkeypatch.setattr("pygame.event.get", lambda: [])
+
+    # Bound the loop so a BROKEN wiring (retry never fires) still exits fast and
+    # fails on the assertion below, not on a wait_for timeout: cap the per-frame
+    # sleep to a couple of iterations and yield so the spawned retry can run.
+    real_sleep = asyncio.sleep
+    frames = {"n": 0}
+
+    async def capped_sleep(_delay):
+        frames["n"] += 1
+        if frames["n"] >= 3:
+            r._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr("asyncio.sleep", capped_sleep)
+
+    await asyncio.wait_for(r.run(), timeout=2)
+    assert retried == [url], "the render loop did not drive the R6-18 retry (R7-14)"
 
 
 @pytest.mark.asyncio
