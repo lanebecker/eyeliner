@@ -12,6 +12,7 @@ the module stays importable on machines without the image stack.
 """
 import colorsys
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -56,6 +57,42 @@ FALLBACK_PALETTE = DisplayPalette(
 # territory on a 512 MB–1 GB Pi. cover_cache validates at cache-WRITE, so an
 # oversized image is now rejected before it is ever stored, decoded, or rendered.
 MAX_IMAGE_PIXELS = 3200 * 3200
+
+# #305: two-tier policy for an OVERSIZED-but-legitimate cover (a high-res Cover Art
+# Archive scan whose full-size original exceeds MAX_IMAGE_PIXELS). Rather than
+# reject it (which blanked the cover AND made R6-18 re-download the same huge file
+# 5x), a JPEG in (MAX_IMAGE_PIXELS, MAX_DECODE_PIXELS] is DOWNSCALED to the display
+# cap at cache-write via a REDUCED decode (see downscale_oversized_image). Anything
+# ABOVE MAX_DECODE_PIXELS is a genuine decompression bomb and is rejected at the
+# HEADER, never decoded (preserving the S-2 guarantee). ~36 MP (6000x6000) is well
+# above any real album-art scan; it is the header sanity ceiling, NOT a claim that a
+# full 36 MP decode is affordable — it is not (~400 MB RSS on a Pi, the R6-20 OOM),
+# which is exactly why the decode is done reduced (draft) and the reduced size is
+# re-checked against MAX_IMAGE_PIXELS before any pixels are materialized.
+MAX_DECODE_PIXELS = 6000 * 6000
+
+# #305 (R8, corrected): the box passed to JPEG draft() when reducing an oversized
+# cover. draft() decodes to the smallest 1/2^n scale whose result is still >= this
+# box, so a decoded axis lands in [side, 2*side) — meaning the reduced decode is
+# <= 4*side^2 pixels REGARDLESS of the source's size. side = floor(sqrt(cap)/2) makes
+# that bound == MAX_IMAGE_PIXELS, i.e. the reduced decode never exceeds the memory
+# the app already tolerates for a normal in-cap cover. Drafting straight to the cap
+# (side ~3200) would NOT reduce a source below 2x the cap: a 6000x6000 JPEG would
+# decode at its full 36 MP (~400 MB) — the R8 cold-audit regression this constant
+# fixes. draft() also only halves while BOTH axes stay >= the box, so a cover whose
+# MINOR axis is below ~2x the box (i.e. wider than roughly square, not just extreme
+# ratios) may resist reduction; the post-draft size is therefore re-checked against
+# the cap before the decode, and anything still over is rejected (blanked). Album
+# art is square, so this rejects only unusual wide covers.
+_DRAFT_TARGET_SIDE = int(math.isqrt(MAX_IMAGE_PIXELS) // 2)
+
+
+class PermanentCoverError(ValueError):
+    """A cover that is DEFINITIVELY unusable for THESE bytes - a decompression
+    bomb beyond the decode ceiling, a corrupt/truncated payload, or a disallowed
+    format. A ``ValueError`` subclass (so existing ``except ValueError`` catches
+    still fire), but distinct so the download leg can BLACKLIST it immediately
+    instead of re-downloading the same bad bytes up to 5x (#305)."""
 
 
 # ---------------------------------------------------------------------------
@@ -107,12 +144,12 @@ def validate_image_file(path: str, *, return_image=False):
                 fmt = probe.format
                 width, height = probe.size
         except Exception as e:
-            raise ValueError(f"not a decodable image: {e}")
+            raise PermanentCoverError(f"not a decodable image: {e}")
 
         if fmt not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
-            raise ValueError(f"unexpected image format: {fmt!r}")
+            raise PermanentCoverError(f"unexpected image format: {fmt!r}")
         if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
-            raise ValueError(f"image dimensions out of bounds: {width}x{height}")
+            raise PermanentCoverError(f"image dimensions out of bounds: {width}x{height}")
 
         # 2. Force a real decode.  This is the only structural check that
         #    actually bites for JPEG (verify() does not), and it is the last
@@ -127,7 +164,7 @@ def validate_image_file(path: str, *, return_image=False):
         except Exception as e:
             if decoded is not None:
                 decoded.close()
-            raise ValueError(f"not a decodable image: {e}")
+            raise PermanentCoverError(f"not a decodable image: {e}")
 
         if return_image:
             return decoded          # caller owns it and must close it
@@ -135,6 +172,89 @@ def validate_image_file(path: str, *, return_image=False):
         return None
     finally:
         Image.MAX_IMAGE_PIXELS = _prev_max
+
+
+def downscale_oversized_image(path: str) -> bool:
+    """#305: if the image at *path* exceeds ``MAX_IMAGE_PIXELS`` but is within the
+    ``MAX_DECODE_PIXELS`` bomb ceiling, reduce-decode it and overwrite it with a copy
+    scaled to fit within ``MAX_IMAGE_PIXELS``. Returns True if it downscaled, False if
+    the image was already within the display cap (header read only — no decode).
+
+    Memory safety (R8 cold-audit fix). An oversized image can only be decoded
+    affordably on a Pi if the decode itself is REDUCED — a full 36 MP decode is the
+    ~400 MB RSS spike R6-20 exists to prevent. Pillow offers a reduced decode only
+    for JPEG (``draft()`` → DCT-domain scaled decode), so:
+
+    * A JPEG is drafted to the small ``_DRAFT_TARGET_SIDE`` box (NOT the display cap),
+      which bounds the reduced decode to ``<= MAX_IMAGE_PIXELS`` regardless of the
+      source's size. ``draft()`` merely SETS the decode scale — no pixels yet — so the
+      post-draft size is re-checked against the cap and rejected if still over (a
+      cover wider than roughly square can resist ``draft()``'s both-axes halving)
+      BEFORE any decode. This closes the hole where drafting to the cap left a
+      6000×6000 JPEG decoding at full resolution.
+    * A non-JPEG (PNG/WEBP/GIF/BMP) that is oversized cannot be reduce-decoded, so it
+      is rejected with :class:`PermanentCoverError` rather than risk the full-decode
+      OOM. Such covers are rare (CAA/Discogs serve JPEG); the backstop blanks it.
+
+    Raises :class:`PermanentCoverError` WITHOUT decoding for a genuine decompression
+    bomb (dimensions above ``MAX_DECODE_PIXELS``) — the S-2 header guard is preserved
+    — and for the oversized-non-JPEG and resist-reduction cases above. A decode/encode
+    error on a within-ceiling JPEG also raises ``PermanentCoverError`` (corrupt bytes).
+    Call this BEFORE :func:`validate_image_file` at cache-write: it either leaves a
+    within-cap file for validate to check, or rejects up front.
+    """
+    from PIL import Image
+
+    try:
+        with Image.open(path) as probe:
+            fmt = probe.format
+            w, h = probe.size
+    except Exception as e:
+        raise PermanentCoverError(f"not a decodable image: {e}")
+
+    if w <= 0 or h <= 0:
+        raise PermanentCoverError(f"image dimensions out of bounds: {w}x{h}")
+    if w * h <= MAX_IMAGE_PIXELS:
+        return False                        # within the display cap — nothing to do
+    if w * h > MAX_DECODE_PIXELS:
+        # Genuine decompression bomb — reject at the HEADER, never decode (S-2).
+        raise PermanentCoverError(f"image dimensions out of bounds: {w}x{h}")
+    if fmt != "JPEG":
+        # No reduced decode available for this format — a full-resolution decode of
+        # an oversized image is the R6-20 OOM. Reject rather than risk it.
+        raise PermanentCoverError(
+            f"oversized non-JPEG cover cannot be safely downscaled: {fmt!r} {w}x{h}"
+        )
+
+    box = (_DRAFT_TARGET_SIDE, _DRAFT_TARGET_SIDE)
+    _prev_max = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS
+    try:
+        with Image.open(path) as src:
+            # draft() only ADJUSTS the decoder scale + src.size; no pixels are
+            # materialized until convert()/load(). Re-check the post-draft size so a
+            # source draft() could not reduce below the cap (a cover wider than
+            # roughly square, whose minor axis is already below ~2x the draft box) is
+            # rejected BEFORE the full-resolution decode it would otherwise trigger.
+            src.draft("RGB", box)
+            dw, dh = src.size
+            if dw * dh > MAX_IMAGE_PIXELS:
+                raise PermanentCoverError(
+                    f"oversized cover could not be reduced below the cap: {dw}x{dh}"
+                )
+            img = src.convert("RGB")        # independent copy; triggers the reduced load
+        try:
+            img.thumbnail(box, Image.LANCZOS)   # only shrinks; result <= cap
+            img.save(path, format="JPEG", quality=90)
+        finally:
+            img.close()
+    except PermanentCoverError:
+        raise
+    except Exception as e:
+        raise PermanentCoverError(f"could not downscale oversized cover: {e}")
+    finally:
+        Image.MAX_IMAGE_PIXELS = _prev_max
+    return True
 
 
 # ---------------------------------------------------------------------------

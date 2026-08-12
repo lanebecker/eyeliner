@@ -56,7 +56,7 @@ from urllib.parse import urljoin, urlsplit
 import certifi
 import urllib3
 
-from src.display.palette import validate_image_file
+from src.display.palette import validate_image_file, downscale_oversized_image
 
 log = logging.getLogger(__name__)
 
@@ -548,7 +548,11 @@ class CoverArtCache:
                                 f"cover art exceeds {_MAX_COVER_BYTES} byte cap"
                             )
                         f.write(chunk)
-                # Validate the decoded image before exposing it to the cache (S-2).
+                # #305: downscale a legitimate-but-oversized cover (a high-res CAA
+                # scan) to the display cap in-place — a true bomb (> the decode
+                # ceiling) is still rejected at the header, never decoded. Then
+                # validate the (now within-cap) image before exposing it (S-2).
+                downscale_oversized_image(tmp.name)
                 validate_image_file(tmp.name)
                 os.replace(tmp.name, str(cache_path))  # atomic on POSIX
             except Exception:

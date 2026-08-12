@@ -1,15 +1,17 @@
-# R6-30 (corrected R7-24): automated dependency-update PRs, weekly.
+# R6-30 (R7-24 re-corrected in #343): automated dependency-update PRs, weekly.
 #
-# What this actually catches — and what it does NOT: Dependabot version-updates
-# raise a PR only when the manifest does not already permit the newest release.
-# requirements.txt is `>=`-FLOOR-pinned with no lockfile (the Option-A decision),
-# so a new upstream release already SATISFIES the floor → Dependabot opens NO pip
-# PR for it. Floor drift is instead caught by the weekly `tests.yml` cron, which
-# reinstalls the tree and fails if a new release breaks the suite. Dependabot's
-# real jobs here are: the SHA-pinned GitHub Actions (EXACT pins → it bumps the SHA
-# + the version comment) and security advisories (a vulnerable dependency still
-# gets a PR regardless of the floor). The floors in requirements.txt stay the
-# abstract spec.
+# What this catches: Dependabot's default pip versioning-strategy is `increase`, so
+# for a `>=` floor it opens a PR RAISING the floor to the newest release (verified
+# live — e.g. the pylast/shazamio/urllib3/sounddevice/pytest floor-bump PRs). It
+# also bumps the SHA-pinned GitHub Actions (EXACT pins → new SHA + version comment)
+# and raises security-advisory PRs. So Dependabot IS the pip floor-drift surfacer.
+# (An earlier R7-24 note wrongly claimed it opens no pip PR for a satisfied `>=`
+# floor — the open pip PRs disprove that; #343.) The weekly `tests.yml` cron is a
+# COMPLEMENTARY guard: it reinstalls the tree and fails the suite if a new release
+# actually breaks something (a PR alone can't tell you that) — but GitHub disables
+# a schedule after 60 days of repo inactivity, so a finished appliance repo must
+# keep it alive via a push or workflow_dispatch. The floors in requirements.txt
+# stay the abstract spec.
 version: 2
 updates:
   - package-ecosystem: "pip"

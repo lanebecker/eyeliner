@@ -100,6 +100,7 @@ from src.display.palette import DisplayPalette
 from src.display.palette import (
     extract_palette,
     GRADIENT_TEXT_PEAK,
+    PermanentCoverError,
 )
 # ensure_contrast / ensure_contrast_hue_preserving / text_background were used
 # only by _quantize_palette, which moved to palette_transition.py (ARCH-3); they
@@ -532,6 +533,18 @@ class DisplayRenderer:
                 # so the gate is only consulted on a cache miss; keeping the marker
                 # would grow the set by one per distinct cover over 24/7 uptime.
                 self._cover_on_disk.discard(self._wanted_cover_url)
+                # #306 (R7 scope-extension): also sweep the OUTGOING cover's failure
+                # bookkeeping. Its download/decode tally + retry deadline otherwise
+                # linger forever for a URL that failed 1–4× then was never revisited,
+                # growing unbounded over 24/7 uptime keyed by distinct cover URL.
+                # `_cover_bad_urls` is deliberately NOT swept — a permanently-bad
+                # cover stays blacklisted so a return to it isn't re-attempted (the
+                # accepted STAB-1 residual).
+                outgoing = self._wanted_cover_url
+                if outgoing is not None and outgoing != url:
+                    self._cover_download_failures.pop(outgoing, None)
+                    self._cover_download_retry_after.pop(outgoing, None)
+                    self._cover_decode_failures.pop(outgoing, None)
             self._wanted_cover_url = url
             self._queue_palette(url)
             if url:
@@ -957,7 +970,12 @@ class DisplayRenderer:
             chip = pygame.Surface((chip_w, chip_h), pygame.SRCALPHA)
             pygame.draw.rect(chip, border, chip.get_rect(), 1)
             chip.blit(label, (px, py))
-            target.blit(chip, (x, y))
+            # #344: clip the blit to the column's right edge so a chip wider than
+            # the whole column (a genre string longer than the metadata column can
+            # hold — unreachable with realistic names, but R7-08 bounded only the
+            # vertical axis) is clipped instead of bleeding past the right edge.
+            avail_w = (rect.x + rect.w) - x
+            target.blit(chip, (x, y), area=(0, 0, min(chip_w, avail_w), chip_h))
             x += chip_w + gap
             return True
 
@@ -1477,6 +1495,22 @@ class DisplayRenderer:
                     # tally is cleared only on a successful DECODE (_decode_cover_async).
                     self._cover_download_failures.pop(url, None)
                     self._cover_download_retry_after.pop(url, None)
+                except PermanentCoverError as e:
+                    # #305: a validation reject (decompression bomb beyond the decode
+                    # ceiling, corrupt/truncated bytes, or a disallowed format) is
+                    # PERMANENT for these bytes — re-downloading re-lands the same
+                    # reject. Blacklist immediately instead of R6-18's up-to-5×
+                    # re-download of the same (often large) file. Drop any pending
+                    # download bookkeeping for it too (#306).
+                    self._cover_bad_urls.add(url)
+                    self._cover_download_failures.pop(url, None)
+                    self._cover_download_retry_after.pop(url, None)
+                    log.error(
+                        f"Cover art at {url} is permanently unusable ({e}) — "
+                        f"blacklisting immediately, no re-download (a same-album track "
+                        f"change reuses this URL and won't lift it)."
+                    )
+                    return
                 except Exception as e:
                     # R6-18: a failed download backs off (time-based) rather than
                     # blacklisting within the album; only a persistently-dead URL
@@ -1487,6 +1521,12 @@ class DisplayRenderer:
                     self._cover_download_failures[url] = failures
                     if failures >= _COVER_MAX_DOWNLOAD_FAILURES:
                         self._cover_bad_urls.add(url)
+                        # #306: once blacklisted, the download tally + retry deadline
+                        # are dead weight — drop them (the URL is now gated by
+                        # _cover_bad_urls). Bounds the dicts to actively-retrying
+                        # covers.
+                        self._cover_download_failures.pop(url, None)
+                        self._cover_download_retry_after.pop(url, None)
                         log.error(
                             f"Cover art download for {url} failed {failures} times "
                             f"— giving up until a different cover is requested "

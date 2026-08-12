@@ -9,6 +9,58 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.26] — 2026-08-12
+
+**Round-8 cleanup wave — the backlog opened during Rounds 6–7 (#304, #305, #306,
+#343, #344).** Five carried-over issues: an oversized-cover downscaler (so a large
+CAA scan shows instead of blanking), two cover-state memory-hygiene fixes, a genre-
+chip clip, a capture-throttle key coarsening, and a doc re-correction. RED-first and
+mutation-verified for the code fixes; an independent break-this cold review found a
+**critical memory regression in the first cut of #305** (see below) — reworked,
+re-measured, and a narrow second pass converged clean before ship. Full suite
+**1403 passed**.
+
+### Fixed
+
+- **An oversized-but-legitimate cover is downscaled instead of blanked (#305 —
+  MEDIUM).** A high-res Cover Art Archive scan above the ~10 MP display cap but under
+  the 36 MP bomb ceiling used to be rejected outright — blanking the cover and making
+  the R6-18 self-heal re-download the same large file up to 5×. It is now reduced-
+  decoded and downscaled at cache-write. **Memory safety:** the reduced decode is
+  bounded by drafting the JPEG to a small box (`_DRAFT_TARGET_SIDE`), so the decode
+  never exceeds the cap regardless of the source's true size; the post-draft size is
+  re-checked before any pixels are materialized, and a cover that resists reduction
+  (wider than roughly square) or an oversized non-JPEG (no `draft()` path) is rejected
+  rather than risk the full-resolution decode. ⚠️ The first implementation drafted to
+  the *display cap*, where `draft()` never engages for a 6000×6000 source — it decoded
+  the full 36 MP (~400 MB RSS, the R6-20 OOM). Caught by the cold audit and corrected;
+  peak RSS on that exact input is now ~116 MB (in line with a normal cover). A new
+  `PermanentCoverError` (a `ValueError`) lets the download leg blacklist a definitively
+  bad cover immediately instead of retrying the same bytes 5×.
+- **The cover download-failure bookkeeping no longer grows unbounded (#306 — LOW).**
+  On a track change the outgoing cover's transient failure/back-off/decode-failure
+  entries are swept, and the download-failure blacklist branch pops the two download
+  dicts it supersedes. (`_cover_bad_urls`, the permanent blacklist, is deliberately
+  retained.)
+- **An over-wide genre chip is clipped to its column (#344 — LOW).** `_draw_genre_chips`
+  now blits each chip with a horizontal `area` clip to the column's right edge, so a
+  chip wider than the remaining space is trimmed rather than overflowing the card.
+- **The capture-error log throttle keys on the error *class*, not the full message
+  (#304 — LOW).** A same-type error whose message varies every occurrence (an
+  embedded errno, address, or timestamp) used to mint a fresh throttle key each time,
+  defeating the anti-flood suppression and unbounding the key map. It now keys on
+  `type(error).__name__`; the full message still prints on the surfaced line.
+
+### Documented
+
+- **The Dependabot / CI-drift docs are re-corrected (#343 — the R7-24 regression).**
+  The v1.5.25 note wrongly claimed Dependabot opens no pip PR for a satisfied `>=`
+  floor. It does — its `increase` strategy raises the floor to the newest release
+  (the repo's own open pip PRs prove it). `dependabot.yml`, `tests.yml`, and the
+  v1.5.19/v1.5.25 CHANGELOG entries now state that Dependabot is the floor-drift
+  surfacer and the weekly cron is the complementary "does the new release break the
+  suite" guard.
+
 ## [1.5.25] — 2026-08-12
 
 **Round-7 audit — Wave 6: CI, docs & matching residue (milestone "R7 Wave 6",
@@ -49,12 +101,12 @@ QUALITY pass); full suite **1391 passed**.
 
 ### Documented
 
-- **CI/dependency-drift docs corrected (#337 — MEDIUM, `R7-24`).** The dependabot
-  comment and a CHANGELOG entry overclaimed that Dependabot surfaces `>=` floor
-  drift (it raises no pip PR when the floor already admits the newest release — no
-  lockfile) and that the weekly cron catches drift "within a week" (GitHub disables
-  a schedule after 60 days of repo inactivity). Both corrected; `workflow_dispatch`
-  and a 60-day maintenance note added.
+- **CI/dependency-drift docs corrected (#337 — MEDIUM, `R7-24`).** ⚠️ **Partly
+  WRONG — see #343 / v1.5.26.** This entry claimed Dependabot "raises no pip PR
+  when the floor already admits the newest release"; that is false (Dependabot's
+  `increase` strategy opens pip floor-bump PRs, as the repo's own open PRs show),
+  and #343 re-corrects it. The accurate parts stand: the weekly cron auto-disables
+  after 60 days of repo inactivity, and `workflow_dispatch` was added.
 - **The CHANGELOG version-heading check is stricter (#342 — NIT, `R7-29`).** The
   grep interpolated the version into a regex where `.` is a wildcard; the dots are
   now escaped while keeping the start-of-line anchor.
@@ -310,14 +362,14 @@ grep-verified against the code, workflow logic executed).
   scrollback, or `ps`.
 - **Supply-chain drift is caught in CI, not at bring-up (#295 — MEDIUM, security,
   `R6-30`).** `requirements.txt` is floor-pinned (`>=`), so a breaking/compromised
-  release lands on the Pi silently. The `tests.yml` **weekly cron** is the actual
-  floor-drift catcher — it reinstalls the tree and fails if a new release breaks
-  the suite. A new `dependabot.yml` handles the SHA-pinned GitHub Actions (exact
-  pins it can bump) and security advisories. _(Correction, R7-24: Dependabot
-  raises NO pip PR for a `>=` floor that already admits the newest release — there
-  is no lockfile — so it is not the pip-drift mechanism; and GitHub disables the
-  weekly cron after 60 days of repo inactivity, so on a finished appliance repo
-  the drift check must be kept alive via a push or `workflow_dispatch`.)_
+  release lands on the Pi silently. A new `dependabot.yml` opens weekly PRs
+  bumping the pip `>=` floors (Dependabot's `increase` strategy) and the SHA-pinned
+  GitHub Actions, plus security advisories; the `tests.yml` weekly cron
+  complements it by reinstalling the tree and failing the suite if a new release
+  actually breaks something. _(An R7-24/v1.5.25 note wrongly claimed Dependabot
+  opens no pip PR for a satisfied `>=` floor — corrected in #343/v1.5.26; the open
+  pip floor-bump PRs disprove it. GitHub disables a schedule after 60 days of repo
+  inactivity, so keep the cron alive via a push or `workflow_dispatch`.)_
 - **`config.yaml`'s two write-scope secrets get file permissions (#301 — LOW,
   security, `R6-36`).** `chmod 600 config.yaml` added to the setup guide §7 and the
   README quick start — `cp` leaves it world-readable under the default umask.

@@ -108,25 +108,23 @@ class AudioCapture:
         # health signal per _DROP_WARN_INTERVAL_SECONDS.
         self._drop_throttle = LogThrottle(interval=_DROP_WARN_INTERVAL_SECONDS)
 
-        # #178: capture-loop error log — per_message summarizer keyed on the error
-        # MESSAGE, so a CHANGED error surfaces immediately instead of waiting out
-        # the window, while identical repeats are counted and summarized. R6-02:
-        # per_message (not single-key) so a device flapping between TWO failure
-        # shapes (~1 rebuild/s) can't defeat the throttle — in single-key mode
-        # every message change, including changing back, emits, so alternating
-        # errors flood the journal/SD card (the class R5-13 fixed for the
-        # recognizer sites). Each distinct message is now rate-limited on its own
-        # interval and carries its own tally. (Depends on R6-01: per_message
-        # reset() must not corrupt the key map — this site never calls reset(),
-        # but the mode's correctness rests on that fix.)
-        # Accepted tradeoff (R6-02 cold-review F1/F2, follow-up filed): because
-        # this raw throttle has no recovery point (capture never calls reset()
-        # or evicted_suppressed(), unlike ThrottledLogger), a stale message's
-        # repeat-COUNT can go unsurfaced — buried in the per-key map or dropped
-        # by the LRU cap. Every distinct error's FIRST occurrence still logs at
-        # once, so no error is silenced; only the tally of a since-stopped repeat
-        # is under-reported. Strictly less harm than the alternating-message
-        # flood this replaces.
+        # #178: capture-loop error log — per_message summarizer. R6-02: per_message
+        # (not single-key) so a device flapping between TWO failure shapes
+        # (~1 rebuild/s) can't defeat the throttle — in single-key mode every
+        # message change, including changing back, emits, so alternating errors
+        # flood the journal/SD card (the class R5-13 fixed for the recognizer
+        # sites). Each key is rate-limited on its own interval and carries its own
+        # tally. (Depends on R6-01: per_message reset() must not corrupt the key
+        # map — this site never calls reset(), but the mode's correctness rests on
+        # that fix.)
+        # #304 (R6-02 cold-review F1/F2 follow-up, FIXED): _log_capture_error keys
+        # this on the error CLASS (type name), NOT the full message. A message-keyed
+        # throttle grew an unbounded per-key map as a varying detail minted a new
+        # key per variant, and — this raw throttle having no recovery point — a
+        # since-stopped variant's suppressed count was buried or LRU-evicted
+        # unsurfaced. The exception type is a bounded key set, so nothing is ever
+        # evicted/buried; anti-flood is preserved (a few throttled keys, not one
+        # emit per message change).
         self._capture_error_throttle = LogThrottle(
             interval=_CAPTURE_ERROR_WARN_INTERVAL_SECONDS, per_message=True
         )
@@ -321,16 +319,23 @@ class AudioCapture:
         """Log a capture-loop error, throttled so a PERMANENT failure can't flood
         the journal (#178).
 
-        The first error, and any error whose message CHANGED since the last one
-        logged, report immediately (a changed message is a new condition worth
-        surfacing at once). Identical repeats are counted and summarized at most
-        once per _CAPTURE_ERROR_WARN_INTERVAL_SECONDS, so a device that is
-        misconfigured or absent forever — raising the same error every retry —
-        leaves a periodic health line, not one record per backoff.
+        The first error of each TYPE reports immediately; further errors of that
+        type (identical repeats or same-type variants) are counted and summarized
+        at most once per _CAPTURE_ERROR_WARN_INTERVAL_SECONDS, so a device that is
+        misconfigured or absent forever leaves a periodic health line, not one
+        record per backoff.  The full message is always shown on the emitted line.
         """
         msg = str(error)
+        # #304: throttle on the error CLASS, not the full message. Keying on the
+        # message let a varying detail (a changing device index / errno) mint a new
+        # key per variant, so a stopped repeat's tally lingered in — or was evicted
+        # from — the 64-key LRU with its suppressed count never surfaced (capture
+        # has no reset point). The exception TYPE is a bounded key set (a handful),
+        # so nothing is ever evicted/buried, and R6-02's anti-flood still holds — a
+        # device flapping between failure shapes shares (or splits into a few)
+        # throttled keys rather than emitting on every message change.
         emit, suppressed = self._capture_error_throttle.should_log(
-            time.monotonic(), key=msg
+            time.monotonic(), key=type(error).__name__
         )
         if not emit:
             return
