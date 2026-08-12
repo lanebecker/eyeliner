@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 # natural exits are an empty page or ``page >= pagination.pages``; a malformed or
 # hostile pagination response (a huge ``pages`` value with never-empty pages) or a
 # logic bug would otherwise page WITHOUT BOUND.  Under the documented systemd crash
-# loop (Restart=on-failure / RestartSec=10, and StartLimitBurst added by this same
+# loop (Restart=on-failure / RestartSec=15, and StartLimitBurst added by this same
 # fix) each restart re-pages from zero, so an unbounded build pins the appliance at
 # the authenticated 60-request/minute rate limit.  At 100 releases/page this cap is
 # 100,000 records — several times the most extreme personal vinyl collection, so it
