@@ -5,6 +5,7 @@ defaults) and load_config (file handling), plus the frozen-ness of the section
 dataclasses.  No filesystem is touched except the explicit load_config tests,
 which use tmp_path.
 """
+import os
 import textwrap
 
 import pytest
@@ -259,6 +260,78 @@ def test_load_config_empty_file_raises_config_error(tmp_path):
     assert "empty" in str(exc.value)
 
 
+# ---------------------------------------------------------------------------
+# R7-16 — load_config must raise ConfigError (never a bare OSError /
+# UnicodeDecodeError) so systemd parks at exit 78 instead of crash-looping.
+# ---------------------------------------------------------------------------
+
+def test_load_config_directory_raises_config_error(tmp_path):
+    """A directory at the config path (open → IsADirectoryError, an OSError) must
+    become a ConfigError, not a bare traceback that exits 1 and crash-loops."""
+    d = tmp_path / "config.yaml"
+    d.mkdir()
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(d))
+    assert "could not be read" in str(exc.value)
+
+
+def test_load_config_invalid_utf8_raises_config_error(tmp_path):
+    """A non-UTF-8 config.yaml (read → UnicodeDecodeError, NOT a yaml.YAMLError)
+    must become a ConfigError."""
+    p = tmp_path / "config.yaml"
+    p.write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(p))
+    assert "UTF-8" in str(exc.value)
+
+
+@pytest.mark.skipif(getattr(os, "getuid", lambda: 1)() == 0,
+                    reason="root bypasses file-permission checks")
+def test_load_config_unreadable_file_raises_config_error(tmp_path):
+    """An unreadable config.yaml (PermissionError — the likeliest first-boot slip:
+    a root-owned 600 file after a `sudo` edit) must become a ConfigError."""
+    p = tmp_path / "config.yaml"
+    p.write_text("audio: {}")
+    os.chmod(p, 0o000)
+    try:
+        with pytest.raises(ConfigError) as exc:
+            load_config(str(p))
+        assert "could not be read" in str(exc.value)
+    finally:
+        os.chmod(p, 0o644)   # restore so tmp_path teardown can remove it
+
+
+# ---------------------------------------------------------------------------
+# R7-17 — the shipped Discogs credential placeholders must fail validation
+# (exit 78 at startup), not validate clean and 401 at runtime.
+# ---------------------------------------------------------------------------
+
+def test_placeholder_discogs_token_is_rejected():
+    raw = _valid_raw()
+    raw["discogs"]["user_token"] = "YOUR_DISCOGS_TOKEN_HERE"
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    msg = str(exc.value)
+    assert "user_token" in msg and "placeholder" in msg
+    assert "YOUR_DISCOGS_TOKEN_HERE" not in msg     # SEC-3: value never echoed
+
+
+def test_placeholder_discogs_username_is_rejected():
+    raw = _valid_raw()
+    raw["discogs"]["username"] = "your_discogs_username"
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert "username" in str(exc.value) and "placeholder" in str(exc.value)
+
+
+def test_real_discogs_credentials_still_validate():
+    """Control: genuine (non-placeholder) creds pass unchanged."""
+    raw = _valid_raw()
+    raw["discogs"]["user_token"] = "a-real-looking-token-123"
+    raw["discogs"]["username"] = "lanebecker"
+    AppConfig.from_dict(raw)   # must not raise
+
+
 def test_load_config_reads_and_validates(tmp_path):
     p = tmp_path / "config.yaml"
     p.write_text(textwrap.dedent("""
@@ -291,10 +364,24 @@ def test_load_config_invalid_yaml_raises_config_error(tmp_path):
         load_config(str(p))
 
 
-def test_example_config_is_valid():
-    """The shipped config.example.yaml must always parse — it's the template
-    users copy."""
-    cfg = load_config("config.example.yaml")
+def test_example_config_is_structurally_valid_once_placeholders_filled():
+    """The shipped config.example.yaml is the template users copy: it must be
+    structurally sound — every section present, all types correct — EXCEPT for the
+    credential placeholders, which R7-17 deliberately rejects so a user who forgets
+    to edit them gets a friendly exit-78 rather than a runtime 401."""
+    import yaml
+    with open("config.example.yaml", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    # As shipped, the Discogs placeholders are rejected (R7-17).
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert "placeholder" in str(exc.value)
+
+    # Fill them in → the rest of the template validates cleanly.
+    raw["discogs"]["user_token"] = "a-real-token"
+    raw["discogs"]["username"] = "a-real-user"
+    cfg = AppConfig.from_dict(raw)
     assert cfg.audio.device_name
     assert cfg.recognition.backend == "shazamio"
 

@@ -17,10 +17,12 @@ from types import SimpleNamespace
 import pytest
 
 from src.config import ConfigError
+import main as main_mod
 from main import (
     verify_recognition_backend_importable,
     install_secret_redaction,
     _SecretRedactingFilter,
+    _run_scrubbed,
 )
 
 
@@ -43,6 +45,21 @@ def test_probe_raises_configerror_when_shazamio_import_fails():
     assert "audioop" in msg                 # names the actual cause
     assert "requirements.txt" in msg        # names the fix
     assert "Legacy" in msg                  # names the alternative image
+
+
+def test_probe_raises_configerror_on_non_import_error():
+    """R7-18: the probe catches ANY import-time failure, not just ImportError — a
+    broken native dependency raises OSError ("libFLAC.so: cannot open shared object
+    file") at import, which must also become an actionable ConfigError, not a bare
+    traceback that crash-loops past the exit-78 park."""
+    cfg = SimpleNamespace(recognition=SimpleNamespace(backend="shazamio"))
+
+    def boom(name):
+        raise OSError("libFLAC.so.8: cannot open shared object file")
+
+    with pytest.raises(ConfigError) as ei:
+        verify_recognition_backend_importable(cfg, _import=boom)
+    assert "shazamio" in str(ei.value)
 
 
 def test_probe_passes_when_backend_importable():
@@ -154,3 +171,46 @@ def test_install_attaches_to_root_handler_and_scrubs_propagated_record():
             if installed is not None:
                 h.removeFilter(installed)
         root.removeHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# R7-20 — _run_scrubbed must not leak a secret-bearing exception chain when
+# Ctrl+C lands mid-error (the KeyboardInterrupt __context__ leak).
+# ---------------------------------------------------------------------------
+
+def test_run_scrubbed_ki_with_secret_context_is_scrubbed_and_severed(monkeypatch, capsys):
+    """R7-20: if Ctrl+C interrupts a token-bearing exception, a BARE KI re-raise
+    lets Python's default excepthook render the whole __context__ chain raw to
+    stderr → journald. _run_scrubbed must scrub-and-print the chain here, then
+    re-raise a CONTEXT-SEVERED KeyboardInterrupt so nothing secret is left to
+    print — SIGINT exit behaviour preserved."""
+    secret = "TOKEN_ABC_SECRET_XYZ"
+
+    async def boom_main():
+        try:
+            raise ValueError(f"discogs request failed: /x?token={secret}")
+        except ValueError:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(main_mod, "main", boom_main)
+    monkeypatch.setattr(main_mod, "_REDACTOR", _SecretRedactingFilter([secret]))
+
+    with pytest.raises(KeyboardInterrupt) as ei:
+        _run_scrubbed()
+
+    assert ei.value.__suppress_context__ is True    # chain severed for the excepthook
+    err = capsys.readouterr().err
+    assert secret not in err                         # our scrubbed print does not leak it
+    assert "redacted" in err                         # …and something WAS scrubbed
+
+
+def test_run_scrubbed_plain_ki_reraises_untouched(monkeypatch, capsys):
+    """Control: a plain Ctrl+C with no in-flight error (no __context__) re-raises
+    untouched, printing nothing."""
+    async def clean_ki():
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(main_mod, "main", clean_ki)
+    with pytest.raises(KeyboardInterrupt):
+        _run_scrubbed()
+    assert capsys.readouterr().err == ""

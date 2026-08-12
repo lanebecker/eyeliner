@@ -9,6 +9,53 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.24] — 2026-08-12
+
+**Round-7 audit — Wave 5: ops & first-boot (milestone "R7 Wave 5", #329–#334).**
+Closes the first-boot failure modes that crash-loop instead of parking cleanly,
+adds startup detection for the shipped credential placeholders, plugs a
+Ctrl+C secret-leak, and bounds the clock gate above as well as below. **Land
+before Pi bring-up.** RED-first with executed repros; independent break-this cold
+review (SPEC + QUALITY pass); the behavioural fixes mutation-verified; full suite
+**1389 passed**.
+
+### Fixed
+
+- **An unreadable or mistyped `config.yaml` now parks at exit 78 instead of
+  crash-looping (#329 — HIGH, `R7-16`).** `load_config` caught only
+  `yaml.YAMLError`, so a `PermissionError` (a root-owned 600 file after a `sudo`
+  edit — the likeliest slip now that setup guides say `chmod 600`), an
+  `IsADirectoryError`, or a non-UTF-8 file escaped as a raw traceback → exit 1 →
+  systemd churning `Restart=on-failure` into `start-limit-hit`. All are now caught
+  and re-raised as a friendly `ConfigError`, which mains parks at EX_CONFIG (78).
+- **The shipped Discogs credential placeholders are rejected at startup, not at
+  runtime (#330 — MEDIUM, `R7-17`).** A config left with
+  `YOUR_DISCOGS_TOKEN_HERE` / `your_discogs_username` validated clean and then
+  401'd on every Discogs call — a systemd-healthy service that never worked. They
+  now fail config validation (aggregated `ConfigError` → exit 78) so the operator
+  gets one friendly message; the value is never echoed. (Last.fm placeholders keep
+  their runtime graceful-degrade — scrobbling is optional.)
+- **A broken recognition-backend install fails loud regardless of exception type
+  (#331 — LOW, `R7-18`).** The import probe caught only `ImportError`; a broken
+  native dependency raising `OSError` at import escaped. It now catches any
+  import-time failure (still letting `KeyboardInterrupt` / `SystemExit` through).
+- **The wall-clock trust gate now has a far-future ceiling (#332 — LOW,
+  `R7-19`).** It was a lower bound only, so a glitched RTC reading years ahead
+  passed and would stamp a future, unrecoverable Last Played / scrobble date. A
+  century-high ceiling (never clips a real clock) now rejects garbage far-future
+  readings too.
+- **Ctrl+C no longer leaks a secret through the exception chain (#333 — LOW,
+  security, `R7-20`).** A bare `KeyboardInterrupt` re-raise let Python's default
+  excepthook render the whole `__context__` chain raw to stderr → journald; if the
+  interrupt landed while a token-bearing Discogs error was in flight, the token
+  leaked. The interrupt handler now scrubs-and-prints the chain, then re-raises a
+  context-severed `KeyboardInterrupt` (SIGINT exit 130 preserved).
+
+### Documented
+
+- **A stale `RestartSec` comment is corrected (#334 — NIT, `R7-21`).** A
+  `reader.py` comment said `RestartSec=10`; the shipped systemd unit is `15`.
+
 ## [1.5.23] — 2026-08-12
 
 **Round-7 audit — Wave 4: cover state machine (milestone "R7 Wave 4",

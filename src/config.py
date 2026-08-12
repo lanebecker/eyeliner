@@ -243,6 +243,20 @@ class AudioConfig:
         )
 
 
+# R7-17: the literal credential placeholders shipped in config.example.yaml.
+# Discogs is the REQUIRED core the product hangs off — unlike the optional Last.fm
+# scrobbler, whose placeholders degrade gracefully to "scrobbling disabled" at
+# runtime (R6-25). A partially-filled Discogs config left at these placeholders
+# validates CLEAN and then 401s on every collection call, surfacing only via #189
+# as a systemd-healthy service that never actually works. Reject them at config
+# time so the one aggregated startup ConfigError names them and the unit parks at
+# exit 78 (R6-27) instead of a silent runtime failure.
+_DISCOGS_PLACEHOLDERS = frozenset({
+    "YOUR_DISCOGS_TOKEN_HERE",
+    "your_discogs_username",
+})
+
+
 @dataclass(frozen=True)
 class DiscogsConfig:
     """``[discogs]`` — collection lookups + play-count field names."""
@@ -273,6 +287,16 @@ class DiscogsConfig:
                f"  • {s}.username: must not be empty", errors)
         _check(play_count_field_name is None or play_count_field_name.strip() != "",
                f"  • {s}.play_count_field_name: must not be empty", errors)
+
+        # R7-17: reject the config.example.yaml placeholders (never echo the value —
+        # SEC-3; name only the field). Discogs is required, so an unedited placeholder
+        # is a hard config error, not a runtime 401.
+        _check(user_token is None or user_token not in _DISCOGS_PLACEHOLDERS,
+               f"  • {s}.user_token: still the config.example.yaml placeholder — get "
+               f"your token at https://www.discogs.com/settings/developers", errors)
+        _check(username is None or username not in _DISCOGS_PLACEHOLDERS,
+               f"  • {s}.username: still the config.example.yaml placeholder — set it "
+               f"to your Discogs username", errors)
 
         return cls(
             user_token=user_token,
@@ -473,9 +497,11 @@ class AppConfig:
 def load_config(path: str = "config.yaml") -> AppConfig:
     """Read *path*, parse + validate it, and return a typed :class:`AppConfig`.
 
-    Raises :class:`ConfigError` (never a bare ``KeyError`` / ``OSError``) for a
-    missing file, malformed YAML, an empty file, or any schema violation, so the
-    caller can present one friendly startup failure.
+    Raises :class:`ConfigError` (never a bare ``KeyError`` / ``OSError`` /
+    ``UnicodeDecodeError``) for a missing, unreadable, mis-typed, non-UTF-8,
+    malformed, or empty file, or any schema violation, so the caller can present
+    one friendly startup failure and systemd parks the unit at exit 78 rather than
+    crash-looping on a raw traceback.
     """
     p = Path(path)
     if not p.exists():
@@ -484,10 +510,28 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             "your values."
         )
     try:
-        with open(p) as f:
+        with open(p, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
     except yaml.YAMLError as e:
         raise ConfigError(f"{path} is not valid YAML: {e}")
+    except UnicodeDecodeError as e:
+        # R7-16: a non-UTF-8 config.yaml (a Latin-1 smart-quote pasted from a doc,
+        # a wrong file entirely) raises UnicodeDecodeError from the read, NOT a
+        # yaml.YAMLError. Surface it as a ConfigError so the caller parks at exit 78
+        # instead of crash-looping on a bare traceback.
+        raise ConfigError(f"{path} is not valid UTF-8 text: {e}")
+    except OSError as e:
+        # R7-16: an unreadable / mis-typed config.yaml — a root-owned 600 file after
+        # a `sudo` edit (PermissionError — the likeliest first-boot slip now that the
+        # setup guide tells operators to `chmod 600` it), a directory at the path
+        # (IsADirectoryError), or a TOCTOU delete of the file after the exists()
+        # check (FileNotFoundError — a broken symlink instead fails the earlier
+        # exists() and hits the "not found" branch above). All are OSError; without
+        # this the process exits
+        # 1 on a raw traceback and systemd churns through its restart budget into
+        # start-limit-hit, never reaching the R6-27 "parked at 78" state the docs
+        # promise.
+        raise ConfigError(f"{path} could not be read: {e}")
 
     if raw is None:
         raise ConfigError(f"{path} is empty")

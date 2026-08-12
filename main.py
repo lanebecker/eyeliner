@@ -106,7 +106,14 @@ def verify_recognition_backend_importable(config, _import=None) -> None:
     _import = _import or importlib.import_module
     try:
         _import("shazamio")
-    except ImportError as e:
+    except Exception as e:
+        # R7-18: catch ANY import-time failure, not just ImportError. A broken
+        # native dependency raises OSError ("libFLAC.so: cannot open shared object
+        # file"), a mis-built wheel can raise RuntimeError/ValueError at import — all
+        # the same reinstall-to-fix class this probe exists to surface. Without the
+        # broadened catch they escape as a bare traceback → exit 1 → systemd
+        # crash-loop, never the friendly exit-78 park. (Exception, not BaseException,
+        # so KeyboardInterrupt / SystemExit still propagate.)
         raise ConfigError(
             f"The 'shazamio' recognition backend failed to import: {e}.\n"
             "  This is almost always Python 3.13+ (the current default Raspberry "
@@ -545,7 +552,27 @@ def _run_scrubbed() -> None:
     import traceback
     try:
         asyncio.run(main())
-    except (SystemExit, KeyboardInterrupt):
+    except SystemExit:
+        # Clean exit codes preserved (the ConfigError path's EX_CONFIG 78, etc.);
+        # its __context__ is a friendly ConfigError already logged, not a secret.
+        raise
+    except KeyboardInterrupt:
+        # R7-20 (sec): a BARE re-raise lets Python's default excepthook render the
+        # whole __context__ chain raw to stderr → journald. If Ctrl+C lands WHILE a
+        # token-bearing exception is in flight (a discogs-client request error
+        # carries the token in its URL), that chained context leaks the secret to
+        # exactly the sink R6-26 exists to protect. Scrub-and-print the full chain
+        # here, then re-raise a CONTEXT-SEVERED KeyboardInterrupt (`from None`) so
+        # the default excepthook has nothing secret left to print — SIGINT exit 130
+        # preserved. A plain Ctrl+C with no in-flight error (no __context__) just
+        # re-raises untouched.
+        exc = sys.exc_info()[1]
+        if exc is not None and exc.__context__ is not None:
+            rendered = traceback.format_exc()
+            if _REDACTOR is not None:
+                rendered = _REDACTOR.scrub(rendered)
+            sys.stderr.write(rendered)
+            raise KeyboardInterrupt() from None
         raise
     except BaseException:
         rendered = traceback.format_exc()
