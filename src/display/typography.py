@@ -17,9 +17,77 @@ importable on machines without SDL.
 """
 
 import logging
+import unicodedata
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# DISP-5 / R7-07: per-glyph letter-spacing (see TextRenderer.render_tracked) is
+# visually correct for any script whose glyphs are INDEPENDENT and laid out
+# left-to-right — Latin (incl. precomposed diacritics), Greek, Cyrillic, CJK,
+# digits, punctuation, symbols, arrows.  It is WRONG only for text that needs
+# complex shaping: contextual joining (Arabic), reordering / stacked conjuncts
+# (Indic, Thai, …), floating combining marks, right-to-left runs, or
+# ZWJ / variation-selector sequences (emoji).  The original DISP-5 gate used
+# ``not text.isascii()``, which ALSO caught the renderer's own label glyphs — the
+# mid-dot U+00B7 in "SIDE A · 04 OF 06", the ellipsis U+2026 in "STILL
+# LISTENING…", the arrows U+2190/2192 in "← PREV" / "NEXT →" — and silently
+# dropped their DESIGNED tracking on every frame (R7-07).  ``_needs_shaping``
+# shapes ONLY genuinely complex text, so those labels keep their letter-spacing.
+
+# Codepoint ranges of complex-shaping scripts, for the case of a character that
+# is not itself combining/RTL yet belongs to a script that shapes (e.g. a base
+# Indic consonant that forms a conjunct with a following virama).
+_COMPLEX_SHAPING_RANGES = (
+    (0x0590, 0x05FF),    # Hebrew
+    (0x0600, 0x06FF),    # Arabic
+    (0x0700, 0x074F),    # Syriac
+    (0x0750, 0x077F),    # Arabic Supplement
+    (0x0780, 0x07BF),    # Thaana
+    (0x07C0, 0x07FF),    # NKo
+    (0x0900, 0x0DFF),    # Indic block span: Devanagari … Sinhala
+    (0x0E00, 0x0E7F),    # Thai
+    (0x0E80, 0x0EFF),    # Lao
+    (0x0F00, 0x0FFF),    # Tibetan
+    (0x1000, 0x109F),    # Myanmar
+    (0x1780, 0x17FF),    # Khmer
+    (0xFB1D, 0xFDFF),    # Hebrew + Arabic presentation forms-A
+    (0xFE70, 0xFEFF),    # Arabic presentation forms-B
+    (0x1F000, 0x1FAFF),  # emoji & pictographs (ZWJ sequences, VS16 bases)
+)
+
+
+def _needs_shaping(text: str) -> bool:
+    """True when *text* must be rendered as ONE shaped run rather than per-glyph
+    with manual tracking (DISP-5 / R7-07 — see the note above).
+
+    The complex-script coverage is a curated allow-list, NOT exhaustive: a few
+    shaping scripts that carry combining-class 0 and bidi class "L" and are absent
+    from ``_COMPLEX_SHAPING_RANGES`` — decomposed (NFD) conjoining Hangul jamo,
+    Mongolian, and some Brahmic scripts beyond the Indic span — fall through to
+    the tracked path and would render per-glyph.  Accepted: Discogs metadata is
+    effectively always NFC (precomposed Hangul U+AC00, which correctly needs no
+    shaping), and these scripts are near-absent from vinyl catalog data; add a
+    range if one ever shows up mis-spaced on the display.
+    """
+    for ch in text:
+        o = ord(ch)
+        if o < 0x0300:
+            # Basic Latin + Latin-1 Supplement: all spacing glyphs, no shaping —
+            # includes the label mid-dot U+00B7 and precomposed diacritics (é, ñ).
+            continue
+        if o in (0x200C, 0x200D):                      # ZWNJ / ZWJ (joiners)
+            return True
+        if 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF:  # variation selectors
+            return True
+        if unicodedata.combining(ch):                  # floating marks / viramas
+            return True
+        if unicodedata.bidirectional(ch) in ("R", "AL", "AN"):  # RTL runs
+            return True
+        for lo, hi in _COMPLEX_SHAPING_RANGES:
+            if lo <= o <= hi:
+                return True
+    return False
 
 _FONT_DIR = Path(__file__).parent / "assets" / "fonts"
 _FONT_FILES = {
@@ -95,14 +163,16 @@ class TextRenderer:
 
         font = self.font("mono", size)
 
-        # DISP-5: per-glyph tracking assumes every codepoint is an independent
-        # glyph — true for the ASCII metadata/labels this is designed for, but it
-        # destroys shaping for complex scripts (Arabic joining, Devanagari
-        # conjuncts, floating combining marks, emoji ZWJ) that arrive in
-        # free-text Discogs fields.  For any non-ASCII string, render it as ONE
-        # shaped run and skip the manual tracking, rather than reverse/mis-space
-        # it a glyph at a time.  ASCII keeps its designed letter-spacing below.
-        if not text.isascii():
+        # DISP-5 / R7-07: per-glyph tracking assumes every codepoint is an
+        # independent glyph — true for Latin/CJK/punctuation/arrows (including the
+        # app's own ·, …, ←, → labels), but it destroys shaping for complex
+        # scripts (Arabic joining, Devanagari conjuncts, floating combining marks,
+        # emoji ZWJ) that arrive in free-text Discogs fields.  Only such text is
+        # rendered as ONE shaped run (skipping the manual tracking) rather than
+        # reversed/mis-spaced a glyph at a time; everything else — the designed
+        # labels included — keeps its letter-spacing below.  (The pre-R7-07 gate
+        # was ``not text.isascii()``, which wrongly shaped the app's own labels.)
+        if _needs_shaping(text):
             surf = font.render(text, True, color)
             self._label_cache.put(key, surf)
             return surf
@@ -120,6 +190,41 @@ class TextRenderer:
             x += g.get_width() + extra
         self._label_cache.put(key, surf)
         return surf
+
+    def render_tracked_ellipsized(
+        self, text: str, size: int, color: tuple, tracking: float, max_width: int
+    ):
+        """R7-09: render a tracked mono label, trimming it with a trailing … so the
+        LETTER-SPACED width fits *max_width* — instead of hard-clipping mid-glyph.
+
+        The catalog footer (`year · label · catalog`) is drawn tracked and can
+        exceed its column; the old code blitted it with a width clip, cutting the
+        last glyph in half.  Ellipsizing must measure the REAL tracked width (each
+        glyph carries ~``tracking·size`` of extra advance), not the plain font
+        width, or the trimmed string would still overflow — so this binary-searches
+        on ``render_tracked`` output (cached) rather than ``font.size``.
+
+        Degenerate case: if *max_width* is narrower than the ellipsis itself,
+        nothing sensible fits, so the bare "…" surface is returned even though it
+        exceeds *max_width* (the caller's area clip is the backstop; unreachable at
+        the 1024×600 footer column).
+        """
+        surf = self.render_tracked(text, size, color, tracking)
+        if surf.get_width() <= max_width:
+            return surf
+        ell = "…"
+        ell_surf = self.render_tracked(ell, size, color, tracking)
+        if ell_surf.get_width() > max_width:
+            return ell_surf  # degenerate column — nothing sensible fits
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            cand = self.render_tracked(text[:mid].rstrip() + ell, size, color, tracking)
+            if cand.get_width() <= max_width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return self.render_tracked(text[:lo].rstrip() + ell, size, color, tracking)
 
     @staticmethod
     def break_long_token(token: str, font, max_width: int) -> list:

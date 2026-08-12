@@ -4,7 +4,8 @@ This was scattered through the pygame renderer, which is the wrong home for
 colour maths and the DisplayPalette invariant.  It now lives in one module the
 renderer *consumes*: `extract_palette()` is the factory that turns a cover image
 into a DisplayPalette and **guarantees** the Full-Opacity Rule (muted ≥4.5:1 vs
-bg) by construction, so the renderer never builds an invalid palette by hand.
+solid `surface`, #206) by construction, so the renderer never builds an invalid
+palette by hand.
 
 Pillow / numpy imports are kept lazy (inside the functions that need them) so
 the module stays importable on machines without the image stack.
@@ -233,9 +234,11 @@ def extract_palette(image_path: Path) -> Optional[DisplayPalette]:
     """Extract a 5-color DisplayPalette from a cached cover image.
 
     Quantizes the cover, derives (bg, surface, accent, text, muted), and
-    GUARANTEES both text roles pass the Full-Opacity Rule (≥4.5:1) against the
-    gradient's brightest pixel: `muted` (secondary text) and `accent` (the album
-    title, DISP-1).
+    GUARANTEES both text roles pass the Full-Opacity Rule (≥4.5:1), each against
+    the brightest thing it lands on: `accent` (the album title on the gradient
+    card) against the gradient's brightest pixel (`text_background`, DISP-1), and
+    `muted` (secondary text on the solid status strip) against solid `surface`
+    (#206 — surface ≥ the gradient peak, so this subsumes the DISP-2 guarantee).
 
     R6-17: returns None on ANY failure (a malformed/undecodable image, or a
     quantize that yields no colors) rather than FALLBACK_PALETTE. Its sole caller,

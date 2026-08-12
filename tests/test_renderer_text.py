@@ -109,20 +109,45 @@ def test_render_tracked_ascii_keeps_letter_spacing():
     assert surf.get_width() > plain_w
 
 
-def test_render_tracked_non_ascii_is_single_shaped_run():
-    # DISP-5: a non-ASCII label renders as ONE shaped run (no manual tracking),
-    # so its width matches a plain font.render — not the wider, per-character,
-    # shaping-destroying layout the old code produced.
+def test_render_tracked_complex_script_is_single_shaped_run():
+    # DISP-5: text that genuinely needs shaping (here Arabic — contextual joining
+    # + RTL) renders as ONE shaped run (no manual tracking), so its width matches
+    # a plain font.render — not the wider, per-character, shaping-destroying
+    # layout that would reverse/disjoin it.
     r = make_renderer()
-    text = "café-noir"                                    # é → not ASCII
-    assert not text.isascii()
+    text = "مرحبا"                                        # Arabic → must shape
     surf = r._render_tracked(text, 13, (255, 255, 255), 0.16)
     plain = r._font("mono", 13).render(text, True, (255, 255, 255))
     assert surf.get_width() == plain.get_width()
 
 
+def test_render_tracked_app_labels_keep_letter_spacing():
+    # R7-07 regression: the renderer's OWN labels contain non-ASCII glyphs by
+    # construction (mid-dot ·, ellipsis …, arrows ← →). The old `not isascii()`
+    # gate shaped them, silently dropping the DESIGNED tracking on every frame.
+    # Each must now render WIDER than a plain single-run layout (tracking applied).
+    r = make_renderer()
+    font = r._font("mono", 13)
+    for label in ("SIDE A · 04 OF 06", "1987 · SST Records · SST-134",
+                  "← PREV", "NEXT →", "STILL LISTENING…"):
+        surf = r._render_tracked(label, 13, (255, 255, 255), 0.16)
+        assert surf.get_width() > font.size(label)[0], (
+            f"{label!r} lost its letter-spacing (R7-07)"
+        )
+
+
+def test_render_tracked_latin1_diacritic_now_keeps_tracking():
+    # R7-07: a precomposed Latin-1 diacritic (é) is an independent spacing glyph —
+    # it renders correctly per-glyph, so it now keeps its tracking rather than
+    # being shaped away.
+    r = make_renderer()
+    surf = r._render_tracked("café-noir", 13, (255, 255, 255), 0.16)
+    assert surf.get_width() > r._font("mono", 13).size("café-noir")[0]
+
+
 def test_render_tracked_empty_string_is_safe():
-    # Empty label must not raise (isascii() is True for "" → ASCII path).
+    # Empty label must not raise (_needs_shaping("") is False → per-glyph path,
+    # which produces a 1px placeholder surface rather than crashing).
     r = make_renderer()
     surf = r._render_tracked("", 13, (255, 255, 255), 0.16)
     assert surf.get_width() >= 1

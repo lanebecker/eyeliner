@@ -88,14 +88,68 @@ def test_genre_overflow_counts_what_actually_fit():
     r._render_tracked = fake_render
     target = pygame.Surface((1024, 600), pygame.SRCALPHA)
 
-    # A box only tall/wide enough for a single chip → only 1 genre fits.
-    chips_rect = Rect(0, 0, 130, 26)
+    # A box wide enough for a single chip per row (200px chip > 130px column) and
+    # tall enough for exactly ONE row → only 1 genre fits. (Height 45 clears one
+    # chip (~28px) but not two rows; the old 26px was actually SHORTER than a
+    # chip, so it only "fit" one via the R7-08 overflow bug this now avoids.)
+    chips_rect = Rect(0, 0, 130, 45)
     r._draw_genre_chips(target, ["G1", "G2", "G3", "G4", "G5"], layout, FALLBACK_PALETTE,
                         chips_rect=chips_rect)
 
     # 1 genre fit → overflow must be "+4" (5 − 1), never the fixed-cap "+2".
     assert "+4" in rendered
     assert "+2" not in rendered
+
+
+class _RecordingTarget:
+    """Stand-in blit target (a pygame Surface's blit is read-only, so it can't be
+    monkeypatched). Records (x, y, w, h) of every chip blitted onto it."""
+    def __init__(self):
+        self.blits = []
+
+    def blit(self, surf, pos, *a, **k):
+        self.blits.append((pos[0], pos[1], surf.get_width(), surf.get_height()))
+
+
+def test_genre_chips_never_blit_outside_the_box():
+    """R7-08: no chip (including the "+N") may blit past its bounding box. A box
+    shorter than a chip is the extreme push-down case where the old code — whose
+    vertical check lived only inside the wrap branch — blitted chips below the
+    box. The fix suppresses them instead; every blit that DOES happen stays
+    inside the box on all four edges."""
+    r = make_renderer()
+    layout = get_now_playing_layout(1024, 600)
+    label = pygame.Surface((60, 18), pygame.SRCALPHA)   # fixed chip label
+    r._render_tracked = lambda *a: label
+    target = _RecordingTarget()
+
+    # Box SHORTER than a chip (chip height ≈ 18 + 2·py) → old code drew below it.
+    chips_rect = Rect(10, 400, 400, 12)
+    r._draw_genre_chips(target, ["A", "B", "C", "D", "E"], layout, FALLBACK_PALETTE,
+                        chips_rect=chips_rect)
+
+    for bx, by, bw, bh in target.blits:
+        assert by + bh <= chips_rect.y + chips_rect.h, "chip blitted BELOW the box (R7-08)"
+        assert bx + bw <= chips_rect.x + chips_rect.w, "chip blitted past the right edge"
+        assert bx >= chips_rect.x and by >= chips_rect.y
+
+
+def test_genre_chips_within_box_are_all_inside_it():
+    """Control: with a normal box, chips DO draw and every blit is within it."""
+    r = make_renderer()
+    layout = get_now_playing_layout(1024, 600)
+    label = pygame.Surface((60, 18), pygame.SRCALPHA)
+    r._render_tracked = lambda *a: label
+    target = _RecordingTarget()
+
+    chips_rect = Rect(10, 400, 400, 120)   # room for several rows
+    r._draw_genre_chips(target, ["A", "B", "C", "D", "E"], layout, FALLBACK_PALETTE,
+                        chips_rect=chips_rect)
+
+    assert target.blits, "expected some chips to draw in a roomy box"
+    for bx, by, bw, bh in target.blits:
+        assert chips_rect.x <= bx and bx + bw <= chips_rect.x + chips_rect.w
+        assert chips_rect.y <= by and by + bh <= chips_rect.y + chips_rect.h
 
 
 def test_genre_no_overflow_chip_when_all_fit():

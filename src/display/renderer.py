@@ -48,17 +48,19 @@ Implements the full DESIGN.md type/visual spec from design/DirectionA.jsx:
     Falls back to DejaVu SysFonts if the files are missing.
   - Letter-spacing for mono labels via per-character rendering
     (_render_tracked), cached in a _BoundedCache.
-  - Shrink-to-fit typography everywhere: the hero keeps its step-down
-    behavior, and artist (single line) and album (two wrapped lines) now
-    shrink rather than clip.  Ellipsis appears only in the PREV/NEXT panel
-    (per design + product decision).
+  - Shrink-to-fit typography for the hero (step-down), artist (single line),
+    and album (two wrapped lines) — they shrink rather than clip.  Ellipsis is
+    used for fixed-size DATA labels that can't shrink: the PREV/NEXT adjacent
+    track names and (R7-09) the catalog footer, which is trimmed to its column
+    with a trailing … rather than hard-clipped mid-glyph.
   - Cover Lift shadow (Pillow gaussian blur, cached) + hairline ring.
   - Status strip with solid `surface` background; status dot with spec
     pulse (opacity/scale, 1.6s ease-in-out) and accent glow.
   - Genre chips: transparent background, accent @ ~33% alpha border,
     capped at 3 with a "+N" overflow chip.
-  - Muted palette role is contrast-clamped to ≥4.5:1 against bg at
-    extraction time (DESIGN.md Full-Opacity Rule).
+  - Muted palette role is contrast-clamped to ≥4.5:1 against solid `surface`
+    (the status-strip fill it lands on, brighter than the gradient peak — #206)
+    at extraction time (DESIGN.md Full-Opacity Rule).
   - display.reduced_motion config flag freezes all animation
     (translation of the design's prefers-reduced-motion requirement).
 
@@ -618,9 +620,14 @@ class DisplayRenderer:
         palette) onto an offscreen Surface (_compose_now_playing).  Steady-
         state frames — the overwhelming majority — are one full-screen blit
         plus a few alpha circles for the dot, instead of re-rendering every
-        text element at 10 fps (v1.4.0).  During the 1s palette lerp the key
-        changes each frame, so the frame recomposes — same cost profile as
-        the pre-cache code, and only for one second per track change.
+        text element at 10 fps (v1.4.0).  During the 1s palette lerp the
+        composite key changes only when the QUANTIZED palette does (P-4 /
+        `_PALETTE_LERP_QUANTIZE`) — a dozen-plus times over the second rather than
+        every frame.  The exact count is data-dependent (bounded by the frame
+        count, driven by how far each channel travels — roughly 12–25 for typical
+        vs high-contrast transitions), not a fixed function of the step constant;
+        either way it is far below the pre-cache "re-render everything each frame"
+        cost this cache replaced.
         """
         track = self.state.current_track
         layout = self._layout
@@ -768,11 +775,16 @@ class DisplayRenderer:
         if track.genres:
             self._draw_genre_chips(surf, track.genres, layout, p, chips_rect)
 
-        # Bottom-anchored: catalog footer (tracked mono) + adjacent panel
+        # Bottom-anchored: catalog footer (tracked mono) + adjacent panel.
+        # R7-09: ellipsize the joined string to the column width rather than
+        # hard-clipping it mid-glyph (a third overflow policy the design didn't
+        # sanction). The area clip stays as a vertical backstop only — the
+        # ellipsize already guarantees the width fits.
         meta_parts = [str(x) for x in [track.year, track.label, track.catalog_number] if x]
         if meta_parts:
-            label = self._render_tracked(
-                " · ".join(meta_parts), layout.font_size_meta, p.muted, layout.tracking_catalog
+            label = self._render_tracked_ellipsized(
+                " · ".join(meta_parts), layout.font_size_meta, p.muted,
+                layout.tracking_catalog, layout.meta_text.w,
             )
             surf.blit(label, (layout.meta_text.x, layout.meta_text.y),
                       area=(0, 0, layout.meta_text.w, layout.meta_text.h))
@@ -910,19 +922,37 @@ class DisplayRenderer:
 
         def draw_chip(text) -> bool:
             """Draw one chip at the running (x, y), wrapping rows as needed.
-            Returns False if it didn't fit (out of vertical room)."""
+
+            R7-08: the target position is computed on LOCALS and the cursor is
+            committed (and the chip blitted) ONLY when the chip fits the bounding
+            box both horizontally (after any wrap) AND vertically.  Returns False
+            WITHOUT mutating the cursor or drawing otherwise.  The old code
+            checked the vertical bound only INSIDE the wrap branch and moved
+            ``x``/``y`` before its early return, so a chip that fit horizontally on
+            an over-low row — or ANY chip when the box was shorter than a chip
+            (the extreme push-down case) — blitted BELOW the box, the "+N" grazing
+            the catalog footer's row.  A chip that cannot fit is now suppressed
+            rather than drawn out of bounds (the fail-safe direction: a missing
+            overflow chip beats one bleeding into the footer).
+            """
             nonlocal x, y
             label = self._render_tracked(text, layout.font_size_chips, p.muted, layout.tracking_chip)
             chip_w = label.get_width() + px * 2
             chip_h = label.get_height() + py * 2
 
-            # Wrap to next row if we'd overflow the bounding box width
-            if x + chip_w > rect.x + rect.w and x > rect.x:
-                x = rect.x
-                y += chip_h + gap
-                if y + chip_h > rect.y + rect.h:
-                    return False  # Out of room
+            nx, ny = x, y
+            # Wrap to the next row if the chip would run past the column's right
+            # edge — but not when already at the row start (a chip wider than the
+            # whole column can't wrap away).
+            if nx + chip_w > rect.x + rect.w and nx > rect.x:
+                nx = rect.x
+                ny = y + chip_h + gap
+            # Must fit the box VERTICALLY at its final row — checked on EVERY path,
+            # not just after a wrap (the R7-08 fix).
+            if ny + chip_h > rect.y + rect.h:
+                return False
 
+            x, y = nx, ny
             # Per-chip SRCALPHA surface so the border alpha actually blends
             chip = pygame.Surface((chip_w, chip_h), pygame.SRCALPHA)
             pygame.draw.rect(chip, border, chip.get_rect(), 1)
@@ -1212,6 +1242,10 @@ class DisplayRenderer:
     def _render_tracked(self, text: str, size: int, color: tuple, tracking: float):
         return self._text.render_tracked(text, size, color, tracking)
 
+    def _render_tracked_ellipsized(self, text: str, size: int, color: tuple,
+                                   tracking: float, max_width: int):
+        return self._text.render_tracked_ellipsized(text, size, color, tracking, max_width)
+
     @staticmethod
     def _break_long_token(token: str, font, max_width: int) -> list:
         return TextRenderer.break_long_token(token, font, max_width)
@@ -1449,7 +1483,9 @@ class DisplayRenderer:
                         self._cover_bad_urls.add(url)
                         log.error(
                             f"Cover art download for {url} failed {failures} times "
-                            f"— giving up until the track changes: {e}"
+                            f"— giving up until a different cover is requested "
+                            f"(a same-album track change reuses this URL and won't "
+                            f"lift the blacklist): {e}"
                         )
                     else:
                         self._cover_download_retry_after[url] = (
@@ -1664,7 +1700,9 @@ class DisplayRenderer:
             self._cover_bad_urls.add(url)
             log.error(
                 f"Cover art at {url} still undecodable after {failures} "
-                f"attempts — giving up until the track changes: {error}"
+                f"attempts — giving up until a different cover is requested "
+                f"(a same-album track change reuses this URL and won't lift the "
+                f"blacklist): {error}"
             )
             return None
         log.warning(f"Failed to load cached cover art (attempt {failures}): {error}")
