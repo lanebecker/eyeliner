@@ -48,6 +48,7 @@ def make_renderer():
     r._cover_decode_inflight = set()
     r._cover_on_disk = set()          # R5-21 cover-readiness gate
     r._cover_decode_deferred = False
+    r._cover_decode_retry_at = 0.0    # R8-06: the deferred latch's retry deadline
     r._cover_version = 0
     r._wanted_cover_url = None        # R6-22: prefetch marks readiness only if wanted
     return r
@@ -400,6 +401,7 @@ async def test_stab1_display_fault_does_not_delete_a_good_cover(tmp_path):
     r._cover_cache = _BoundedCache(8)
     r._bg_tasks = set()
     url = "https://i.discogs.com/good.jpg"
+    r._wanted_cover_url = url   # F3P-1: only the WANTED cover latches the episode
     cache_path = r._cover_store.path_for(url)
     Image.new("RGB", (120, 120), (60, 110, 190)).save(cache_path)  # a VALID cover
 
@@ -635,6 +637,7 @@ async def test_stab1_deferred_flag_clears_when_display_returns(tmp_path):
     r._cover_cache = _BoundedCache(8)
     r._bg_tasks = set()
     url = "https://i.discogs.com/good.jpg"
+    r._wanted_cover_url = url   # F3P-1: only the WANTED cover latches the episode
     cache_path = r._cover_store.path_for(url)
     Image.new("RGB", (100, 100), (10, 20, 30)).save(cache_path)   # a VALID cover
 
@@ -707,6 +710,7 @@ async def test_stab1_persistent_scale_error_is_log_bounded(tmp_path, monkeypatch
     r._cover_cache = _BoundedCache(8)
     r._bg_tasks = set()
     url = "https://i.discogs.com/good.jpg"
+    r._wanted_cover_url = url   # F3P-1: only the WANTED cover latches the episode
     cache_path = r._cover_store.path_for(url)
     Image.new("RGB", (100, 100), (5, 5, 5)).save(cache_path)   # a VALID cover
 
