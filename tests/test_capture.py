@@ -498,10 +498,11 @@ def test_capture_error_two_alternating_messages_do_not_defeat_the_throttle(
     monkeypatch, caplog
 ):
     """R6-02: a device flapping between two failure shapes (~1 rebuild/s)
-    alternates the error message; in single-key mode every change — including
-    changing BACK — emits, so the 30s interval never engages and the journal/SD
-    card floods (the exact class R5-13 fixed for the recognizer sites). Keyed
-    per-message, the two conditions collapse to one emit each within the window.
+    alternates the error; in single-key mode every change — including changing
+    BACK — emits, so the 30s interval never engages and the journal/SD card floods
+    (the exact class R5-13 fixed for the recognizer sites). Keyed per error CLASS
+    (#304), the two distinct-type conditions collapse to one emit each within the
+    window.
     """
     import logging
     cap = make_capture()
@@ -512,9 +513,27 @@ def test_capture_error_two_alternating_messages_do_not_defeat_the_throttle(
         for i in range(120):
             cap._log_capture_error(err_a if i % 2 == 0 else err_b)
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    # 2 immediate (one per distinct message); every repeat within the frozen
+    # 2 immediate (one per distinct error CLASS); every repeat within the frozen
     # window is suppressed. Single-key mode would emit all 120.
     assert len(errors) == 2, f"expected 2 throttled errors, got {len(errors)}"
+
+
+def test_304_same_type_varying_messages_share_one_throttle_key(monkeypatch, caplog):
+    """#304: throttling keys on the error CLASS, so many same-type errors with a
+    VARYING detail (a changing index/errno) collapse to ONE throttled key — bounding
+    the throttle's key map so a stopped variant's suppressed tally can't be buried
+    or LRU-evicted unsurfaced (capture has no reset point). Message-keyed, each of
+    the 50 distinct messages would mint its own key and emit immediately."""
+    import logging
+    cap = make_capture()
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: 1000.0)  # frozen < interval
+    with caplog.at_level(logging.ERROR, logger="src.audio.capture"):
+        for i in range(50):
+            cap._log_capture_error(OSError(f"PortAudio error -{9000 + i} on device {i}"))
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, (
+        f"same-type varying-message errors must share ONE key; got {len(errors)}"
+    )
 
 
 # ---------------------------------------------------------------------------

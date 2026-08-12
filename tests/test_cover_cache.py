@@ -567,6 +567,85 @@ def test_r6_20_pixel_cap_lowered_blocks_the_oom_bomb(tmp_path):
     palette.validate_image_file(str(ok))   # must not raise
 
 
+def test_305_downscales_legit_oversized_cover_to_cap(tmp_path):
+    """#305: a legitimate large CAA cover (>10 MP, within the decode ceiling) is
+    DOWNSCALED to the display cap at cache-write instead of rejected — so the cover
+    SHOWS rather than blanking, and validate then passes on the downscaled file."""
+    p = tmp_path / "big.jpg"
+    Image.new("RGB", (3500, 3500), (80, 40, 20)).save(p, "JPEG")   # 12.25 MP > 10.24 cap
+    assert palette.downscale_oversized_image(str(p)) is True
+    w, h = Image.open(p).size
+    assert w * h <= palette.MAX_IMAGE_PIXELS                       # now within the cap
+    # R8 memory-safety pin: the output is drafted to the SMALL box, not the cap.
+    # The pre-fix "draft to the cap" code left each axis ~3200 (and, worse, did not
+    # reduce the DECODE at all for a 6000² source); a <= _DRAFT_TARGET_SIDE result is
+    # what proves the reduced-decode path ran.
+    assert max(w, h) <= palette._DRAFT_TARGET_SIDE
+    palette.validate_image_file(str(p))                            # passes
+
+
+def test_305_oversized_but_huge_jpeg_reduced_decode_stays_bounded(tmp_path):
+    """#305 (R8): a 36 MP JPEG (the R6-20 attack shape) downscales successfully AND
+    the stored result is bounded to the small draft box — i.e. the decode was reduced,
+    never the full 36 MP bitmap that OOM'd the Pi."""
+    p = tmp_path / "huge.jpg"
+    Image.new("RGB", (6000, 6000), (30, 90, 150)).save(p, "JPEG", quality=90)  # 36 MP
+    assert palette.downscale_oversized_image(str(p)) is True
+    w, h = Image.open(p).size
+    assert max(w, h) <= palette._DRAFT_TARGET_SIDE
+    assert w * h <= palette.MAX_IMAGE_PIXELS
+    palette.validate_image_file(str(p))
+
+
+def test_305_oversized_non_jpeg_rejected_not_full_decoded(tmp_path):
+    """#305 (R8): an oversized PNG/WEBP/GIF has no reduced-decode path (draft() is
+    JPEG-only), so downscaling it would require the full-resolution decode R6-20
+    forbids. It is rejected as PermanentCoverError rather than risk the OOM."""
+    p = tmp_path / "big.png"
+    Image.new("RGB", (3600, 3600), (120, 30, 200)).save(p, "PNG")   # 12.96 MP > cap
+    with pytest.raises(palette.PermanentCoverError, match="non-JPEG"):
+        palette.downscale_oversized_image(str(p))
+
+
+def test_305_extreme_aspect_jpeg_that_resists_draft_is_rejected(tmp_path):
+    """#305 (R8): draft() halves only while BOTH axes stay >= the box, so a very wide
+    JPEG whose short axis is already <= the box cannot be reduced below the cap. The
+    post-draft size is re-checked and the cover rejected BEFORE any full decode."""
+    p = tmp_path / "wide.jpg"
+    Image.new("RGB", (12000, 2000), (7, 7, 7)).save(p, "JPEG", quality=85)  # 24 MP, short axis 2000
+    with pytest.raises(palette.PermanentCoverError, match="could not be reduced"):
+        palette.downscale_oversized_image(str(p))
+
+
+def test_305_within_cap_cover_is_untouched(tmp_path):
+    """#305: a normal-sized cover is a no-op (header read only, no re-encode)."""
+    p = tmp_path / "ok.jpg"
+    Image.new("RGB", (600, 600), (10, 20, 30)).save(p, "JPEG")
+    before = p.read_bytes()
+    assert palette.downscale_oversized_image(str(p)) is False
+    assert p.read_bytes() == before                                # bytes untouched
+
+
+def test_305_true_bomb_above_ceiling_rejected_without_decode(tmp_path, monkeypatch):
+    """#305: an image above the DECODE ceiling is a genuine decompression bomb —
+    rejected at the header (never decoded) as PermanentCoverError. The two caps are
+    lowered so the test needn't build a 36 MP file."""
+    monkeypatch.setattr(palette, "MAX_IMAGE_PIXELS", 100)     # tiny display cap
+    monkeypatch.setattr(palette, "MAX_DECODE_PIXELS", 400)    # tiny bomb ceiling
+    p = tmp_path / "bomb.png"
+    Image.new("RGB", (64, 64), (0, 0, 0)).save(p)             # 4096 px > 400 ceiling
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        with pytest.raises(palette.PermanentCoverError, match="dimensions out of bounds"):
+            palette.downscale_oversized_image(str(p))
+
+
+def test_305_permanent_cover_error_is_a_valueerror():
+    """PermanentCoverError subclasses ValueError so existing `except ValueError`
+    catches (and the R6-20 tests) keep firing."""
+    assert issubclass(palette.PermanentCoverError, ValueError)
+
+
 def test_image_validation_rejects_dimension_bomb_below_pillow_backstop(tmp_path, monkeypatch):
     # The 1x-2x "bomb" band MUT-2 flags: an image whose pixel count exceeds our
     # MAX_IMAGE_PIXELS but stays under Pillow's own 2x DecompressionBomb *error*

@@ -109,7 +109,14 @@ class _RecordingTarget:
         self.blits = []
 
     def blit(self, surf, pos, *a, **k):
-        self.blits.append((pos[0], pos[1], surf.get_width(), surf.get_height()))
+        # Record the DRAWN width/height: an `area` (positional or kw) clips the
+        # source region, so the effective drawn size is the area's, not the surface's.
+        area = k.get("area", a[0] if a else None)
+        if area is not None:
+            w, h = area[2], area[3]
+        else:
+            w, h = surf.get_width(), surf.get_height()
+        self.blits.append((pos[0], pos[1], w, h))
 
 
 def test_genre_chips_never_blit_outside_the_box():
@@ -151,6 +158,23 @@ def test_genre_chips_within_box_are_all_inside_it():
     for bx, by, bw, bh in target.blits:
         assert chips_rect.x <= bx and bx + bw <= chips_rect.x + chips_rect.w
         assert chips_rect.y <= by and by + bh <= chips_rect.y + chips_rect.h
+
+
+def test_344_over_wide_chip_is_clipped_to_the_column():
+    """R7-08 addressed only the vertical bound; #344: a chip WIDER than the whole
+    column is now clipped to the column's right edge (horizontal area clip) instead
+    of bleeding past it."""
+    r = make_renderer()
+    layout = get_now_playing_layout(1024, 600)
+    wide_label = pygame.Surface((500, 18), pygame.SRCALPHA)   # far wider than the column
+    r._render_tracked = lambda *a: wide_label
+    target = _RecordingTarget()
+    chips_rect = Rect(10, 400, 120, 60)                       # 120px column < 500px chip
+    r._draw_genre_chips(target, ["OneVeryLongGenreName"], layout, FALLBACK_PALETTE,
+                        chips_rect=chips_rect)
+    assert target.blits, "the over-wide chip should still draw (clipped)"
+    for bx, by, bw, bh in target.blits:
+        assert bx + bw <= chips_rect.x + chips_rect.w        # clipped to the column edge
 
 
 def test_genre_no_overflow_chip_when_all_fit():
@@ -241,6 +265,89 @@ async def test_missing_cover_does_not_refetch(tmp_path):
     await asyncio.sleep(0)
 
     assert refetched == []
+
+
+@pytest.mark.asyncio
+async def test_305_permanent_cover_error_blacklists_immediately(tmp_path, monkeypatch):
+    """#305 backstop: a PermanentCoverError from download (a true bomb above the
+    decode ceiling, corrupt bytes, or a disallowed format) is permanent for these
+    bytes — blacklist IMMEDIATELY, never entering R6-18's up-to-5× re-download
+    backoff of the same (often large) file."""
+    from src.display.palette import PermanentCoverError
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/bomb.jpg"
+
+    def boom(u):
+        raise PermanentCoverError("image dimensions out of bounds: 9000x9000")
+
+    monkeypatch.setattr(r._cover_store, "exists", lambda u: False)
+    monkeypatch.setattr(r._cover_store, "download", boom)
+    r._wanted_cover_url = url
+
+    await r._prefetch_cover(url)
+
+    assert url in r._cover_bad_urls                      # blacklisted immediately
+    assert url not in r._cover_download_retry_after      # NOT scheduled for retry
+    assert r._cover_download_failures.get(url) is None   # no failure tally accrued
+
+
+def test_306_outgoing_cover_failure_dicts_swept_on_track_change(tmp_path):
+    """#306: on a track change the OUTGOING cover's download/decode tally + retry
+    deadline are swept, so they don't grow unbounded over 24/7 uptime keyed by
+    distinct cover URL. `_cover_bad_urls` is deliberately left (STAB-1 residual)."""
+    from src.state.player_state import PlayerState, PlayerStatus
+    from src.metadata.models import TrackMetadata, MetadataSource
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._bg_tasks = set()
+    r._queue_palette = lambda u: None
+    r._prefetch_cover = lambda u: None
+    r._spawn = lambda coro: None
+
+    outgoing = "https://i.discogs.com/old.jpg"
+    r._wanted_cover_url = outgoing
+    r._cover_download_failures[outgoing] = 3
+    r._cover_download_retry_after[outgoing] = 12345.0
+    r._cover_decode_failures[outgoing] = 2
+    r._cover_bad_urls.add(outgoing)
+
+    st = PlayerState()
+    st.current_track = TrackMetadata(
+        title="t", artist="a", album="al", source=MetadataSource.FALLBACK,
+        cover_art_url="https://i.discogs.com/new.jpg", tracklist=[],
+    )
+    st.status = PlayerStatus.PLAYING
+    r._on_state_change(st)
+
+    assert outgoing not in r._cover_download_failures       # swept
+    assert outgoing not in r._cover_download_retry_after     # swept
+    assert outgoing not in r._cover_decode_failures          # swept
+    assert outgoing in r._cover_bad_urls                     # deliberately NOT swept
+
+
+@pytest.mark.asyncio
+async def test_306_download_blacklist_pops_the_download_dicts(tmp_path, monkeypatch):
+    """#306: reaching the download-failure blacklist drops the URL's now-dead
+    download tally + retry deadline (bounds the dicts to actively-retrying covers)."""
+    r = make_renderer()
+    r._cover_store = CoverArtCache(tmp_path)
+    r._bg_tasks = set()
+    url = "https://i.discogs.com/dead.jpg"
+    r._wanted_cover_url = url
+    r._cover_download_failures[url] = 10          # already past the blacklist threshold
+    monkeypatch.setattr(r._cover_store, "exists", lambda u: False)
+
+    def neterr(u):
+        raise ConnectionError("network down")
+
+    monkeypatch.setattr(r._cover_store, "download", neterr)
+    await r._prefetch_cover(url)                   # one more failure → blacklist
+
+    assert url in r._cover_bad_urls
+    assert url not in r._cover_download_failures    # popped on blacklist
+    assert url not in r._cover_download_retry_after  # popped on blacklist
 
 
 # ---------------------------------------------------------------------------
