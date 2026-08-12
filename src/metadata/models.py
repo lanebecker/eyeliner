@@ -449,11 +449,20 @@ class TrackMetadata:
 @dataclass
 class PlaySession:
     """Tracks the state of a single play session (needle drop to lift)."""
-    # Monotonic session-start time.  R7-05: formerly dead state; now read by
-    # ListenTracker._apply_flip_resume as the recency anchor for R7-03 flip-resume
-    # (a prior unarmed session is inheritable only if it started within the
-    # flip-resume window).
+    # Monotonic session-start time.  R7-05: formerly dead state; R8-01 (#345):
+    # the flip-resume window is now measured as `new_session.started_at -
+    # prev.ended_at` (the GAP between the sessions), so this is the near edge of
+    # that gap.  NOTE (test trap, R8-04): `default_factory=time.monotonic` binds
+    # the REAL function at class-definition time — a test that patches
+    # time.monotonic must stamp `started_at` explicitly.
     started_at: float = field(default_factory=time.monotonic)
+    # R8-01 (#345): monotonic time this session was DETACHED (stamped in
+    # ListenTracker._detach_session_locked — the SESSION_ENDED / split moment).
+    # The far edge of the flip-resume gap: the R7-03 window used to be anchored
+    # at the prior session's STARTED_AT, which (fragment play + gap + tail play
+    # + trailing silence) always exceeded 300s for real music — the feature
+    # could never fire.  None until detached.
+    ended_at: Optional[float] = None
     identified_tracks: list[TrackMetadata] = field(default_factory=list)
     potential_last_track: bool = False
     album_release_id: Optional[int] = None

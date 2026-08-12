@@ -262,7 +262,12 @@ def test_max_session_forces_end_on_continuous_music(monkeypatch):
     clock.advance(silence_mod._MAX_MUSIC_SECONDS)
     det.process(_chunk(0.5), cfg.sample_rate)              # still music (locked groove)
 
-    assert AudioEvent.SESSION_ENDED in events              # forced end → side credits
+    # R8-16 (#350): the forced end is its OWN event — the tracker credits on it
+    # but must not treat it as a physical spin boundary (a genuine-silence
+    # SESSION_ENDED here would clear the per-spin credit memory and let a
+    # still-identified groove re-credit hourly).
+    assert AudioEvent.SESSION_ENDED_FORCED in events       # forced end → side credits
+    assert AudioEvent.SESSION_ENDED not in events          # …but NOT a spin boundary
 
 
 def test_max_session_also_fires_from_tick(monkeypatch):
@@ -281,7 +286,7 @@ def test_max_session_also_fires_from_tick(monkeypatch):
     clock.advance(silence_mod._MAX_MUSIC_SECONDS + 1)
     det.tick()
 
-    assert AudioEvent.SESSION_ENDED in events
+    assert AudioEvent.SESSION_ENDED_FORCED in events       # R8-16: forced variant
 
 
 def test_normal_music_under_max_is_not_force_ended(monkeypatch, caplog):

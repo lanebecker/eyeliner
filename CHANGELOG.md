@@ -7,10 +7,107 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
-## [Unreleased]
+## [1.5.27] — 2026-08-12
+
+**R8 Wave 1 — credit timing at real cadence (milestone `R8 Wave 1`; #345, #346,
+#347, #348, #349, #350, #351).** The Round-8 audit's two HIGH findings, plus their
+whole defect class: both flagship R7 Wave-1 credit fixes passed their own
+compressed-time tests and failed at the pipeline's real cadence (15s chunks /
+10s hop / 2-confirmation / 45s silence) — R8-01 flip-resume could never fire,
+and R8-02's 45s window expired between two confirmation cycles, letting one
+physical spin double-credit the real Discogs collection. Design locked by Lane
+2026-08-12: silence-boundary credit memory, gap-anchored flip-resume,
+finalize-at-drain. Every wall-clock-guarded behavior now carries a
+realistic-cadence test on a fake tracker-scoped monotonic clock (the R8-04 exit
+criterion — the tests that would have caught both HIGHs). RED-first end-to-end:
+six executed reproductions on the pre-fix code (2 credits / 0 credits / 2
+credits / stale chain / 0 at drain / 2 scrobbles), all flipped by the fixes.
+⚠ The independent break-this cold review then caught a **HIGH I introduced in
+the first cut (F1)**: switching the #195 forced end to `SESSION_ENDED_FORCED`
+updated only ONE of the event's two consumers — `apply_state_silence_effect`
+still switched on `SESSION_ENDED` alone, so a forced end no longer cleared the
+card or bumped the B-1 session epoch (stranded display, stale in-flight commits
+passing every staleness check). Fixed + pinned by a wiring test. Two more
+review catches reworked: (F2) the forced end used to latch the silence detector
+closed, so an input that decayed without re-crossing the music threshold never
+produced another event and the surviving spin memory ate the NEXT genuine
+spin's credit — the detector now re-arms its silence timer (a genuine boundary
+one window later; the dead-band residual is documented in-code); (F3) the
+boundary clear ran when the terminal finalize *completed* (legally minutes late
+on the honoured-Retry-After path), wiping keys the next spin had recorded — the
+spin-memory swap is now synchronous at the boundary, with the outgoing memory
+threaded to the boundary finalize. A narrow second pass over the rework
+converged (one LOW comment correction). 13/13 targeted mutations killed. Full
+suite **1424 passed** (was 1403).
+
+### Fixed
+
+- **One physical spin can no longer double-credit at ANY confirmation cadence
+  (#346 / R8-02 — HIGH, data integrity).** The R7-02 credited-memory was a 45s
+  wall-clock window — but the gap it actually measured (credit #1 landing → the
+  next split's finalize) spans two ping-pong confirmation cycles, routinely
+  50–70s, so the guard expired and the double-credit returned (boundary: 22s
+  cycles → 1 credit, 23s → 2). The memory is now a per-spin set
+  (`_credited_this_spin`), cleared ONLY when a terminal genuine-silence finalize
+  completes — "one physical spin" is delimited by what delimits it, real
+  silence, so the guard is timing-independent by construction. The #185
+  replay-boundary exemption (a genuine re-drop credits again) is unchanged.
+- **Flip-resume actually fires now (#345 / R8-01 — HIGH).** The R7-03 window was
+  anchored at the prior session's `started_at` and measured at the armed
+  session's finalize — fragment play + gap + tail play + trailing silence always
+  exceeded 300s for real music, so the exact credit the feature shipped to save
+  (a full play split by a sleeve-cleaning pause) was still lost every time, and
+  the R7-03 log line had never once been reachable. The window now bounds the
+  GAP — `new_session.started_at - prev.ended_at` (a new `PlaySession.ended_at`
+  stamped at detach) — per #316's original text and what testing-guide.md
+  always described. Verified at the realistic timeline (200s fragment / 60s gap
+  / 240s closer), with both wrong anchors mutation-killed.
+- **The attribution ping-pong no longer duplicates Last.fm scrobbles (#348 /
+  R8-09).** A swing-back re-commits the same physical play (the foreign
+  confirmation broke the consecutive dedup) and Last.fm's server-side dedup
+  doesn't collapse the two scrobbles (distinct timestamps). The scrobble sink
+  now shares the same per-spin memory (`should_scrobble`/`record_scrobble`,
+  consulted by TrackCommitService — wiring pinned by its own test), cleared at
+  the same silence boundary, with a #185 re-dropped release's keys dropped so a
+  genuine replay scrobbles again.
+- **A locked groove can no longer mint one phantom credit per hour (#350 /
+  R8-16).** The #195 safety net now emits `SESSION_ENDED_FORCED` (a new
+  AudioEvent): the tracker ends and credits the session identically, but a
+  forced end is NOT a physical spin boundary (music never stopped), so the
+  per-spin memory survives and the groove's re-armed closer is suppressed until
+  the needle actually lifts.
+- **An armed session is no longer silently discarded at shutdown (#351 /
+  R8-17).** `drain()` now detaches a live ARMED session (closer played, coverage
+  complete, waiting out the silence window) and finalizes it behind the same
+  gates as any end — a `systemctl stop` right after a record finishes keeps the
+  credit; the completion gate still suppresses a phantom, and a session already
+  ended is not re-credited. An unarmed live session is still discarded
+  (debug-logged).
+- **The `_prev_unarmed` chain invariant is true again (#349 / R8-15).** An
+  unarmed split-detached session bypassed `_finalize_session` via the #166
+  short-circuit and left a STALE prior-unarmed session inheritable. The chain
+  now ends at an unarmed split-detach (a split is attribution noise inside
+  continuous music, not a flip — conservative, missed-over-phantom), and the
+  documented invariant matches the code.
+
+### Added
+
+- **`tests/test_credit_cadence_r8.py` (#347 / R8-04)** — the realistic-cadence
+  harness: 17 scenario tests at the real 15s/10s/2-confirm/45s timeline on a
+  tracker-scoped fake monotonic clock. Two harness rules are documented in the
+  file and testing-guide.md, both learned by hitting them: patching
+  `time.monotonic` globally freezes asyncio's own loop clock (hangs every
+  await), so the clock is patched as `src.tracking.listen_tracker.time`; and
+  `PlaySession.started_at`'s default_factory bound the real function at class
+  definition, so tests stamp it explicitly.
 
 ### Changed
 
+- `ListenTracker` no longer takes `session_end_silence_seconds` — the credited
+  memory is silence-boundary keyed, not wall-clock windowed, so the injection
+  (main.py) is gone with it.
+- `AudioEvent` gains `SESSION_ENDED_FORCED`; the two #195 forced-end tests now
+  pin that the forced end is NOT reported as a genuine-silence SESSION_ENDED.
 - **Dependency floors raised to the currently-tested releases (Dependabot
   #309–#313).** `requirements.txt` `>=` floors bumped to match what a fresh install
   already resolves and what the suite validates: `sounddevice>=0.5.5`,

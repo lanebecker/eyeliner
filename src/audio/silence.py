@@ -55,6 +55,12 @@ class AudioEvent(Enum):
     MUSIC_STARTED = auto()
     MUSIC_STOPPED = auto()   # Whole window went quiet → end-of-session timer armed (SIL-3)
     SESSION_ENDED = auto()   # Long silence — side/album finished
+    # R8-16 (#350): the #195 forced end, distinguished from a genuine-silence
+    # SESSION_ENDED.  The tracker treats it as a session end for crediting, but
+    # it is NOT a physical spin boundary — music never actually stopped — so the
+    # tracker must NOT clear its per-spin credit/scrobble memory on it (a locked
+    # groove the recognizer still identifies would otherwise re-credit hourly).
+    SESSION_ENDED_FORCED = auto()
 
 
 class SilenceDetector:
@@ -70,6 +76,17 @@ class SilenceDetector:
                          trip it (SIL-3).  Has no external consumer today — it is
                          the internal music→silence transition marker.
         SESSION_ENDED  — silence persists beyond session_end_silence_seconds
+        SESSION_ENDED_FORCED — the #195 safety net force-ended a session after
+                         _MAX_MUSIC_SECONDS of CONTINUOUS music (locked groove /
+                         stuck input).  Both consumers treat it as a session
+                         end — the player-state half clears the card and bumps
+                         the epoch identically (main.apply_state_silence_effect),
+                         and the tracker ends and credits the session — but it
+                         is NOT a physical spin boundary, so the tracker's
+                         per-spin credit/scrobble memory survives it (R8-16).
+                         The detector re-arms its silence timer afterwards, so
+                         continued non-music still yields a genuine
+                         SESSION_ENDED one window later (cold-review F2).
     """
 
     def __init__(self, config: "AudioConfig"):
@@ -202,11 +219,17 @@ class SilenceDetector:
 
         The normal end is a music→silence transition, but a locked groove or a
         stuck input can hold the RMS above the exit threshold forever, so that
-        transition never fires and the side never credits. Emitting SESSION_ENDED
+        transition never fires and the side never credits. Emitting a session end
         directly (rather than arming the silence timer) is deliberate: for a
         locked groove the RMS never actually falls, so an armed silence timer
         would be cancelled by the next music chunk and never fire. Evaluated from
         both process() and tick() so it holds whether or not chunks keep flowing.
+
+        R8-16 (#350): emits SESSION_ENDED_FORCED, not SESSION_ENDED — music never
+        actually stopped, so this is NOT a physical spin boundary.  The tracker
+        credits the side (unchanged) but keeps its per-spin credit memory, so a
+        groove the recognizer still identifies as the closer cannot mint one
+        phantom credit per hour until the needle lifts.
         """
         if (
             self._is_music
@@ -221,10 +244,30 @@ class SilenceDetector:
             )
             self._is_music = False
             self._music_since = None
-            self._silence_since = None
-            self._session_ended = True
+            # R8-16 cold-review F2: RE-ARM the silence timer instead of latching
+            # the session closed (`_silence_since=None; _session_ended=True`, the
+            # pre-R8 shape).  If the input never re-crosses the music ENTER
+            # threshold after the forced end (a stuck input decaying into the
+            # hysteresis dead band — the very miscalibration class #195 exists
+            # for), the old latch meant NO event could ever fire again, so the
+            # tracker's per-spin credit memory survived indefinitely and ate the
+            # next genuine spin's credit.  Re-armed: a locked groove whose RMS
+            # sits at or above the ENTER threshold trips MUSIC_STARTED on the
+            # next chunk (timer cancelled, nothing spurious), while continued
+            # non-music produces a GENUINE SESSION_ENDED one silence window
+            # later — the spin boundary the tracker needs.  Documented residual
+            # (2nd-pass finding): a groove whose RMS sits INSIDE the hysteresis
+            # dead band [exit, enter) trips neither — the re-armed timer fires a
+            # genuine SESSION_ENDED while audio continues, clearing the spin
+            # memory; if the RMS later wanders above enter, the R8-16 hourly
+            # re-credit can resume for that pathological band.  Accepted: the
+            # discriminating fix (require an RMS < exit sample before honouring
+            # the re-armed timer) is new design, and the alternative latch
+            # (F2) silently ate GENUINE credits — worse in the common case.
+            self._silence_since = now
+            self._session_ended = False
             self._emit(AudioEvent.MUSIC_STOPPED)
-            self._emit(AudioEvent.SESSION_ENDED)
+            self._emit(AudioEvent.SESSION_ENDED_FORCED)   # R8-16: not a spin boundary
 
     def _check_session_end(self, now: float):
         """Fire SESSION_ENDED if sustained silence has elapsed.  Idempotent.

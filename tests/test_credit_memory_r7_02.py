@@ -9,12 +9,16 @@ window, no SESSION_ENDED between the swings, so the PCONC-1 epoch guard cannot
 see it either: the armed release is detached and credited once per swing (+N
 Play Count for ONE play).
 
-The fix (Lane, 2026-08-11, LOCKED): the tracker remembers
-``(release_id -> monotonic credited_at)`` and suppresses a SPLIT-path credit for
-a release credited within the last ``session_end_silence_seconds`` UNLESS the
-split is a genuine #185 replay boundary (a real re-drop of the same record,
-which earns its own credit).  A real back-to-back replay still credits once the
-silence gap passes; two different records never interfere.
+The fix — originally R7-02's 45s wall-clock window, SUPERSEDED by R8-02/#346
+(Lane, 2026-08-12, LOCKED): the window expired between two real confirmation
+cycles of the ping-pong, so the memory is now SILENCE-BOUNDARY keyed — a
+per-spin set cleared only at a terminal genuine-silence finalize — and a credit
+for a release already credited THIS SPIN is suppressed UNLESS the session was
+opened by a genuine #185 replay boundary (a real re-drop, which earns its own
+credit).  A real back-to-back replay still credits (the exemption); a genuine
+later spin credits after the silence boundary; two different records never
+interfere.  These tests pin the MECHANISM in compressed time; the
+realistic-cadence scenarios live in test_credit_cadence_r8.py (R8-04).
 """
 import pytest
 
@@ -120,7 +124,7 @@ async def test_pingpong_suppression_is_logged(caplog):
     await tracker.on_track_identified(make_track("Master-Dik"))
     with caplog.at_level("INFO"):
         await tracker.on_track_identified(_r2("X2"))
-    assert any("R7-02" in r.message for r in caplog.records), (
+    assert any("R8-02" in r.message for r in caplog.records), (
         "a suppressed duplicate split credit must be logged"
     )
 

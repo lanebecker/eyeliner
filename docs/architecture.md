@@ -396,8 +396,11 @@ Key properties (all delegating to `side_index`):
 
 **`PlaySession`**: Tracks one needle-drop-to-lift session.
 
-Key fields: `started_at` (R7-05 — the flip-resume recency anchor),
-`identified_tracks`, `potential_last_track`, `closing_track` (#181 — the track
+Key fields: `started_at` / `ended_at` (R8-01 — the two edges of the flip-resume
+GAP: `ended_at` is stamped at detach, and the window bounds
+`new.started_at - prev.ended_at`; the pre-R8 started_at-only anchor made
+flip-resume inert at real track lengths), `identified_tracks`,
+`potential_last_track`, `closing_track` (#181 — the track
 that armed the flag; the Last.fm love target), `album_release_id`,
 `album_instance_id`, `last_release_id` (v1.3.5 — most recent release ID seen
 from any source; drives the auto-split, unlike the latched pair which only
@@ -744,21 +747,29 @@ AND completion_supported == False          (#182 / R7-01 SIDE-COVERAGE gate: not
 potential_last_track == True
 AND album_release_id is not None
 AND completion_supported == True
-AND _is_duplicate_credit == True           (R7-02: this release was already
-                                            credited within session_end_silence_
-                                            seconds during THIS physical spin — an
-                                            attribution ping-pong re-arming it —
-                                            and the session was NOT opened by a
-                                            genuine #185 replay boundary)
-    → suppress the credit AND the love, log loudly ("R7-02" in the message):
-      one physical play must not be double-counted (guards both the split and
-      the terminal SESSION_ENDED credit paths)
+AND _is_duplicate_credit == True           (R8-02: this release was already
+                                            credited during THIS physical spin —
+                                            an attribution ping-pong or a forced-
+                                            end locked groove re-arming it — and
+                                            the session was NOT opened by a
+                                            genuine #185 replay boundary.  The
+                                            memory is a per-spin SET, cleared
+                                            only when a terminal genuine-silence
+                                            finalize completes; the R7-02 45s
+                                            wall-clock window expired between two
+                                            ~25s confirmation cycles and let the
+                                            double-credit back in)
+    → suppress the credit AND the love, log loudly ("R8-02" in the message):
+      one physical play must not be double-counted (guards the split, terminal
+      SESSION_ENDED, forced-end, and R8-17 drain credit paths)
 
 potential_last_track == True
 AND album_release_id is not None
 AND completion_supported == True
 AND _is_duplicate_credit == False
-    → writer.increment_play_count(release_id, instance_id)   [records credited_at]
+    → writer.increment_play_count(release_id, instance_id)   [records the release
+                                                              in the per-spin
+                                                              credited memory]
     → writer.update_last_played(release_id, instance_id)   [if configured]
     → lastfm.love(closing_track)                           [if love_on_completion=true;
                                                             #181: the closer that ARMED

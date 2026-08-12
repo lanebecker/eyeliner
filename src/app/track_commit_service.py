@@ -178,8 +178,28 @@ class TrackCommitService:
         # write, and a SESSION_ENDED there means the needle lifted) and skips the
         # step for a session that has already ended, neither re-committing nor
         # scrobbling.
+        #
+        # R8-09 (#348): gate on the tracker's per-spin scrobble memory first.
+        # An attribution ping-pong's swing-back re-commits the same physical
+        # play (the foreign confirmation broke the consecutive dedup), and
+        # Last.fm's server-side dedup does not collapse the two scrobbles
+        # (distinct timestamps).  The memory clears at each real silence
+        # boundary and for a #185 re-dropped release, so genuine replays still
+        # scrobble.  Recorded at dispatch (in-flight-latch pattern, see
+        # record_scrobble); if guard.run then skips for an ended session, the
+        # recorded key is cleared moments later by that end's boundary finalize
+        # — a benign, self-healing overhang.
         if self.lastfm:
-            await guard.run(lambda: self._scrobble(metadata, timestamp))
+            if self.tracker.should_scrobble(metadata):
+                self.tracker.record_scrobble(metadata)
+                await guard.run(lambda: self._scrobble(metadata, timestamp))
+            else:
+                log.info(
+                    "R8-09: suppressing duplicate Last.fm scrobble for '%s' — "
+                    "already scrobbled during this physical spin (attribution "
+                    "swing-back re-commit).",
+                    metadata.title,
+                )
 
         return True
 
