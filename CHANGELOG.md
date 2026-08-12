@@ -9,6 +9,41 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.21] — 2026-08-12
+
+**Round-7 audit — Wave 2: commit-pipeline availability (milestone "R7 Wave 2",
+#319).** Stops a throttled album-split credit from stalling the whole recognition
+pipeline, and corrects the comments (and a historical CHANGELOG line) that
+overclaimed it never did. RED-first with an executed stall repro; independent
+break-this cold review (which caught the uncorrected historical-CHANGELOG
+overclaim and a comment imprecision, both fixed); fix mutation-verified; full
+suite **1368 passed**.
+
+### Fixed
+
+- **A split credit honouring a long Discogs `Retry-After` no longer stalls the
+  recognition pipeline for up to ~180s (#319 — MEDIUM, `R7-06`).**
+  `on_track_identified` (the leg that processes audio chunks) awaited the
+  creditable album-split finalize inline via an UNBOUNDED `await
+  asyncio.shield(task)`. When that finalize honoured a Retry-After (#229, up to
+  90s, up to twice), the leg blocked for the whole wait: no chunks processed, the
+  maxsize-5 queue draining ~50s of audio and losing the next record's early
+  tracks (lost scrobbles and #182 supporting rows — and raw material for the
+  R7-02 cross-record swings). The inline wait is now bounded to
+  `_SPLIT_CREDIT_INLINE_WAIT_SECONDS` (5s); a slow credit finishes in the
+  background (already tracked in `_bg_tasks`, failure-logged, drained at
+  shutdown). A normal credit still completes inline, so common-case timing is
+  unchanged; the #187 shutdown-safety and #186 idempotency guarantees are
+  preserved.
+
+### Documented
+
+- **The comments (and the historical 1.5.9/#229 CHANGELOG entry) that claimed the
+  honoured wait "never stalls the next record's session" are corrected
+  (`R7-06`).** They conflated the session START (never stalled — it runs outside
+  the lifecycle lock, CONC-2) with the recognition LEG (which the inline await
+  did block). The distinction is now explicit at each site.
+
 ## [1.5.20] — 2026-08-11
 
 **Round-7 audit — Wave 1: the credit-evidence model (milestone "R7 Wave 1",
@@ -684,8 +719,12 @@ of regressing #185's genuine re-drop crediting, so it remains documented (in
   server-requested backoff out **in the event loop** (`asyncio.sleep`, capped at
   90s) before retrying — cancellable at shutdown (parks no worker thread) and,
   since CONC-2/#96, outside the lifecycle lock (so it never stalls the next
-  record's session). #186's idempotent absolute-set means the honoured re-POST
-  writes the same value, so honouring the wait cannot double-credit.
+  record's session START). #186's idempotent absolute-set means the honoured
+  re-POST writes the same value, so honouring the wait cannot double-credit.
+  _(Correction, R7-06 / [1.5.21]: this does NOT mean the honoured wait never
+  stalled anything — an album-SPLIT credit was awaited inline by the recognition
+  leg, so a honoured wait blocked chunk processing for its full duration until
+  the inline wait was bounded in 1.5.21.)_
 
 ### Fixed
 
