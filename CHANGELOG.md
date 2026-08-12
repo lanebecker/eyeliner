@@ -9,6 +9,63 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.20] — 2026-08-11
+
+**Round-7 audit — Wave 1: the credit-evidence model (milestone "R7 Wave 1",
+#314–#318).** Strengthens the album-completion gate so a compilation can no
+longer mint a phantom credit for an owned album, stops one physical spin being
+double-counted, and recovers a full play split by a mid-side pause. Design gate
+approved by Lane (side-coverage / silence-window / flip-resume, 2026-08-11).
+RED-first with the audit's executed repros; independent break-this cold review
+(which caught the SESSION_ENDED double-credit gap, now fixed and pinned); each
+fix mutation-verified; full suite **1366 passed**.
+
+### Fixed
+
+- **A compilation no longer mints a full album credit for the owned studio LP
+  still in its sleeve (#314 — HIGH, `R7-01`).** The completion gate required ≥2
+  distinct tracklist rows of the latched release, which a Best-Of defeats from
+  the mirror direction: two of its tracks (the album's closer among them) resolve
+  to the owned pressing (Shazam reports the original album), arming a phantom
+  full-album Play Count + Last Played + love. The gate is now **side-coverage** —
+  every vinyl row sharing the closer's side letter must be identified this
+  session. Carve-outs: a one-row closing side is covered by the closer alone; a
+  sideless (numbered / CD-only) tracklist falls back to the prior ≥2-rows rule.
+  R5-05 preserved (the closer must belong to the latched release). Strictly
+  stronger, accepting the missed-credit cost of weak closing-side recognition
+  (missed-over-phantom).
+- **One physical spin is no longer double-credited when Shazam's attribution
+  ping-pongs between two records (#315 — HIGH, `R7-02`).** A foreign
+  mis-identification mid-spin splits the session and credits the armed release;
+  when the attribution swings back and re-arms, the next swing (or the spin's own
+  end) credited it AGAIN — +2 Play Count for one play, which the #185 and #186
+  guards (within-session / within-finalize) could not see across the fresh
+  sessions a split mints. The tracker now keeps a `(release_id → credited_at)`
+  memory and suppresses a duplicate credit within `session_end_silence_seconds`
+  unless the session was opened by a genuine #185 re-drop — guarding **both** the
+  split and the terminal SESSION_ENDED credit paths (and the matching love).
+- **A full album played through a mid-side pause now credits instead of being
+  silently dropped (#316 — MEDIUM, `R7-03`).** A multi-row closing side split by
+  a silence gap longer than `session_end_silence_seconds` (a sleeve-cleaning
+  pause) left the armed session holding only the tail of the side — the
+  mis-attributed-single signature — so the whole play was suppressed. The armed
+  session now **inherits** the immediately-prior unarmed session's closing-side
+  rows, bounded to a 5-minute window (same closing side, same release). A
+  side-long closer (one-row closing side, e.g. *Meddle*'s "Echoes") is already
+  handled by the side-coverage carve-out.
+- **`PlaySession.started_at` is no longer dead state (#318 — NIT, `R7-05`).** It
+  is now the recency anchor for the R7-03 flip-resume window.
+
+### Documented
+
+- **The `_same_track` dedup's cross-record cost is acknowledged (#317 — LOW,
+  `R7-04`).** Recognition dedup compares title + artist only (never the unstable
+  album field, by design): a genuine record change whose boundary track shares
+  the previous track's title AND artist is swallowed until the next
+  differently-named track. Reproduced and kept as-is — re-including album would
+  trade a rare, self-healing miss for frequent per-chunk re-resolve churn — with
+  the tradeoff now documented in the method.
+
 ## [1.5.19] — 2026-08-11
 
 **Round-6 audit — Wave 6: docs, CI & supply chain (milestone #36) — completes

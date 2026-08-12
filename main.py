@@ -251,7 +251,10 @@ def build_components(config, state: PlayerState) -> "Components":
         resolver = MetadataResolver(DiscogsReader(discogs_http, config.discogs))
         lastfm = LastFmClient(config.lastfm)
         tracker = ListenTracker(
-            DiscogsCollectionWriter(discogs_http, config.discogs), lastfm
+            DiscogsCollectionWriter(discogs_http, config.discogs), lastfm,
+            # R7-02: the credited-memory suppression window is the audio silence
+            # timeout — a genuine second spin cannot complete inside it.
+            session_end_silence_seconds=config.audio.session_end_silence_seconds,
         )
         # A-9: the application-layer commit service owns resolve → state → track →
         # scrobble; the recognition loop just confirms a result and hands it off.

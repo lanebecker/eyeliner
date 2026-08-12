@@ -449,6 +449,10 @@ class TrackMetadata:
 @dataclass
 class PlaySession:
     """Tracks the state of a single play session (needle drop to lift)."""
+    # Monotonic session-start time.  R7-05: formerly dead state; now read by
+    # ListenTracker._apply_flip_resume as the recency anchor for R7-03 flip-resume
+    # (a prior unarmed session is inheritable only if it started within the
+    # flip-resume window).
     started_at: float = field(default_factory=time.monotonic)
     identified_tracks: list[TrackMetadata] = field(default_factory=list)
     potential_last_track: bool = False
@@ -496,70 +500,163 @@ class PlaySession:
     # silence window; a FALLBACK-resolved record swap that can't trigger the
     # album split), and the love must not land on those.
     closing_track: Optional["TrackMetadata"] = None
+    # R7-03 (flip-resume): closing-side global indices inherited from an
+    # immediately-prior unarmed session of the SAME release and closing side —
+    # populated by ListenTracker when a full play of a MULTI-row closing side is
+    # split across sessions by a mid-side silence gap (or a long flip), so the
+    # armed session that holds only the tail of the side still credits.  Empty
+    # in the normal case; the tracker restricts what it adds to genuine
+    # closing-side rows, so a union can never manufacture coverage.  Affects the
+    # completion gate only (not the love target, which stays :attr:`closing_track`).
+    inherited_side_rows: set[int] = field(default_factory=set)
+    # R7-02: True when this session was opened by a genuine #185 replay boundary
+    # (the record was physically re-dropped).  Such a session is a real second
+    # spin, so its Play Count credit is EXEMPT from the credited-memory guard
+    # even if the release was credited moments ago; a session opened by an
+    # attribution-swing split (or MUSIC_STARTED) leaves this False and is subject
+    # to the guard on BOTH the split and the terminal SESSION_ENDED credit paths.
+    opened_by_replay_boundary: bool = False
 
     @property
     def completion_supported(self) -> bool:
-        """#182: is this session's armed completion SUPPORTED by its history?
+        """#182 / R7-01: is this session's armed completion SUPPORTED by its
+        history?
 
         A Shazam attribution swing can mint a split-off session whose sole
         track latches an owned compilation AND arms ``potential_last_track``
         (compilations routinely close with the hit) — phantom-crediting a
-        record that never left its sleeve.  The gate (Lane, 2026-08-08):
-        a latched-release completion counts only when the session identified
-        at least TWO DISTINCT TRACKLIST ROWS of that release (the closer's
-        row plus one supporting row), with a carve-out for genuine
-        single-track releases, whose full play IS one row.
+        record that never left its sleeve.  The original #182 gate (Lane,
+        2026-08-08) demanded ≥2 distinct tracklist rows of the latched
+        release.  R7-01 showed that gate defeated from the mirror direction:
+        a compilation sequencing TWO tracks of one owned album with that
+        album's closer among them (canonically "Brain Damage" → "Eclipse" on
+        *Echoes: The Best of Pink Floyd*, both resolving to *Dark Side of the
+        Moon* via the collection tier) satisfies "two rows" while the album
+        never left its sleeve.
 
-        Distinctness is judged on the resolved row identity
-        (``side_index.global_index``, #182 second-pass review): a decorated
-        re-identification of the closer ("The Hit - 2011 Remaster" after
-        "The Hit" — same release via the album cache, invisible to both the
-        recognizer's and log_track's dedups) resolves to the SAME row via
-        the #180 tiered matcher and counts once, while genuinely different
-        sibling variants ("Golden Hour" and "Golden Hour (Acoustic)" as two
-        rows; a variants-only 12" EP) resolve to different rows and count
-        separately — a decoration-base rule got both of those wrong.  A track
-        whose title resolves to NO row contributes nothing: an identification
-        that cannot be placed on the tracklist cannot vouch for a completed
-        side.  Missed count preferred over phantom count (the META-4
-        posture); callers log the suppression loudly with
-        :attr:`supporting_row_count` for diagnosis.
+        The gate is therefore strengthened to SIDE-COVERAGE (Lane,
+        2026-08-11, R7-01 — LOCKED): a latched-release completion counts only
+        when EVERY vinyl row of the CLOSING SIDE (all rows sharing the
+        closer's side letter) was identified this session.  The comp shape
+        fails because it covers only 2 of the closing side's rows (side 2 of
+        *Dark Side* has five); a genuine straight-through play of the closing
+        side covers them all.  This is strictly stronger than the old
+        two-rows rule and deliberately accepts the missed-credit cost when
+        recognition is weak on the closing side (the codebase's standing
+        missed-over-phantom / META-4 posture).
+
+        Two carve-outs preserve prior correct behaviour:
+
+        * **One-row closing side** (a side-long closer such as "Echoes", or a
+          genuine single) is fully covered by the closer alone — the R6-07
+          single-(vinyl-)row carve-out, now expressed as full coverage of a
+          1-row side.  This is also what fixes R7-03 for the *Meddle* shape
+          (side B is one row) without needing flip-resume.
+
+        * **Sideless tracklist** (numbered / CD-only — no row parses to a
+          vinyl side, so ``side_letter`` is None): "closing side" is
+          undefined, so fall back to the pre-R7 evidence rule (≥2 distinct
+          rows, or a single playable row).  Lane 2026-08-11: sideless
+          releases are not the vinyl attribution-swing vector R7-01 targets,
+          so the least-surprise choice is to leave their behaviour unchanged.
+
+        R5-05 is preserved throughout: the closer must be a row OF the latched
+        release.  A Shazam swing to a FOREIGN single arms
+        ``potential_last_track`` on its own one-row tracklist; without this
+        guard that lone row would "cover" a side and phantom-credit the
+        multi-track album it was latched to.
+
+        Row identity is the resolved ``side_index.global_index`` (#182
+        second-pass): a decorated re-identification of a row ("The Hit - 2011
+        Remaster" after "The Hit") resolves to the SAME index and is counted
+        once, while genuine sibling variants resolve to different indices.  A
+        track whose title resolves to NO row contributes nothing.
 
         Sessions without a latched release are not this gate's concern
-        (returns True; the fallback-metadata branch handles them).
-
-        Documented residual (#182 third pass, accepted): one physical spin
-        whose chunks resolve to two DIFFERENT rows (chunk 1 misattributed to
-        the plain row, chunk 2 to the variant closer, both rows on the
-        tracklist) counts as two rows and passes the gate — as it did under
-        every prior rule except the rejected decoration-base one, whose cure
-        was worse (it falsely refused legitimate sibling rows).
+        (returns True; the fallback-metadata branch handles them).  Callers
+        log a suppression loudly with :attr:`supporting_row_count` /
+        :attr:`closing_side_coverage` for diagnosis.
         """
         if self.album_release_id is None:
             return True
-        if self.supporting_row_count >= 2:
-            return True
-        # Single-track carve-out: a genuine one-row release IS complete on its
-        # sole row.  R5-05: the closer must be a track OF THE LATCHED RELEASE —
-        # a Shazam swing to a FOREIGN one-track single (its own tracklist is one
-        # row, so that row is is_last_track and it becomes closing_track) would
-        # otherwise pass this carve-out and phantom-credit the multi-track album
-        # it was latched to.  Require the closer's release id to equal the
-        # latched release before trusting its length.
-        #
-        # R6-07: count PLAYABLE (vinyl) rows, not len(tracklist).  A hybrid LP+CD
-        # edition whose only vinyl side is a single side-long piece has ONE
-        # playable row but len(tracklist) > 1 (the bonus-CD rows), so the old
-        # len==1 test suppressed its full vinyl play forever — while
-        # supporting_row_count maxes at 1 because only that one vinyl row can ever
-        # be identified.  Counting vinyl rows mirrors the R5-16(a) anchor, so a
-        # one-vinyl-row release is treated as the single-track release it plays as.
+        # R5-05 (preserved): the closer must be a row OF the latched release —
+        # a foreign single would otherwise cover its own one-row side and
+        # phantom-credit the multi-track album it was latched to.
         closer = self.closing_track
-        return (
-            closer is not None
-            and closer.discogs_release_id == self.album_release_id
-            and _playable_row_count(closer.tracklist) == 1
-        )
+        if closer is None or closer.discogs_release_id != self.album_release_id:
+            return False
+        side_rows = self._closing_side_row_indices(closer)
+        if not side_rows:
+            # Sideless (numbered / CD-only) tracklist — no vinyl-side concept
+            # exists.  Fall back to the pre-R7 evidence rule (Lane 2026-08-11).
+            # R6-07: count PLAYABLE (vinyl) rows, not len(tracklist), so a
+            # hybrid LP+CD whose only vinyl side is one side-long piece still
+            # reads as the single-row release it plays as.  (Reached only when
+            # the closer's tracklist has no side letters at all, so the vinyl
+            # count falls through to len().)
+            return (
+                self.supporting_row_count >= 2
+                or _playable_row_count(closer.tracklist) == 1
+            )
+        # SIDE-COVERAGE: every vinyl row of the closing side must have been
+        # identified this session (or inherited from a flip-resumed prior
+        # session, R7-03).  A one-row closing side is covered by the closer alone
+        # (the single-vinyl-row carve-out, as full coverage).
+        covered = self._identified_side_rows(side_rows) | (self.inherited_side_rows & side_rows)
+        return side_rows <= covered
+
+    def _closing_side_row_indices(self, closer: "TrackMetadata") -> set[int]:
+        """R7-01: the global indices of every VINYL row sharing *closer*'s side
+        letter — the full row-set of the closing side.
+
+        Empty set for a numbered / CD-only (sideless) tracklist, whose closer
+        has no side letter; the caller reads that as "no side concept, fall
+        back to the legacy evidence rule".  Side membership uses the same
+        :func:`_match_side` predicate as the completion anchor and
+        :func:`_playable_row_count`, so bonus CD/DVD/file rows (which are not
+        real vinyl sides) never join a side.
+        """
+        letter = closer.side_letter
+        if letter is None:
+            return set()
+        return {
+            i
+            for i, e in enumerate(closer.tracklist)
+            if (m := _match_side(e.position)) is not None
+            and m.group(1).upper() == letter
+        }
+
+    def _identified_side_rows(self, side_rows: set[int]) -> set[int]:
+        """R7-01: the subset of *side_rows* actually identified this session for
+        the latched release — distinct resolved global indices, restricted to
+        the closing side.  An identification that resolves to no row
+        (``global_index`` None) or to a row off the closing side contributes
+        nothing; a decorated re-identification of a closing-side row collapses
+        onto its single index, exactly as :attr:`supporting_row_count` does.
+        """
+        return {
+            t.side_index.global_index
+            for t in self.identified_tracks
+            if t.discogs_release_id == self.album_release_id
+            and t.side_index.global_index in side_rows
+        }
+
+    @property
+    def closing_side_coverage(self) -> "Optional[tuple[int, int]]":
+        """R7-01 diagnostic for the suppression log line: ``(identified, total)``
+        vinyl rows of the closing side, or None when the gate does not use
+        side-coverage (no latched release, no/foreign closer, or a sideless
+        tracklist that falls back to the legacy rule)."""
+        if self.album_release_id is None:
+            return None
+        closer = self.closing_track
+        if closer is None or closer.discogs_release_id != self.album_release_id:
+            return None
+        side_rows = self._closing_side_row_indices(closer)
+        if not side_rows:
+            return None
+        covered = self._identified_side_rows(side_rows) | (self.inherited_side_rows & side_rows)
+        return (len(covered), len(side_rows))
 
     def _distinct_row_count(self, release_id: Optional[int]) -> int:
         """Distinct resolved tracklist rows of *release_id* identified this

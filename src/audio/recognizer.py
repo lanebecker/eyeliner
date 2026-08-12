@@ -442,6 +442,21 @@ class RecognitionLoop:
         track between chunks (trailing whitespace, capitalization tweaks).
         Without normalization those count as a new track and trigger an
         unnecessary re-resolve / re-scrobble.
+
+        R7-04 (accepted cost, deliberate): the comparison uses title + artist
+        ONLY, never the album.  Shazam's album field is unstable between chunks
+        for one track (it reports a track's ORIGINAL album, a comp, a reissue —
+        the R5-07 note), so comparing album would flip a still-playing track to
+        "new" every time the field wobbled, forcing per-chunk re-resolve /
+        re-scrobble churn (the worse failure).  The cost of excluding it: a
+        genuine RECORD CHANGE whose boundary track shares the previous track's
+        title AND artist (a live vs. studio "Untitled", a self-titled track, a
+        common cover across two owned records) compares equal here, so the new
+        record's opener is swallowed — no commit, no scrobble, one supporting
+        row lost, and the card stays on the old track until the NEXT,
+        differently-named track arrives.  Reproduced 2026-08-11; kept as-is
+        because re-including the unstable album field trades a rare, self-healing
+        miss for frequent churn on every album-tier resolve.
         """
         if a is None or b is None:
             return False

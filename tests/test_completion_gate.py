@@ -1,4 +1,4 @@
-"""Regression tests for #182 (R4:gap1-3) — the ≥2-track completion gate.
+"""Regression tests for #182 (R4:gap1-3) and R7-01 — the completion gate.
 
 The album-change auto-split treats ANY confirmed release-id change as a
 physical record swap, and ``potential_last_track`` arms from any track's
@@ -10,19 +10,35 @@ compilations routinely end with the major hit), and the next Album-X track's
 split finalized it: a phantom full-album Play Count + Last Played for a record
 that never left its sleeve.
 
-The gate (approved by Lane, 2026-08-08): a session with a latched release is
-credit- and love-eligible only when it identified at least TWO tracks of that
-release (the closer plus one supporting track) — with a carve-out for genuine
-single-track releases, whose full play IS one track.  Suppression is logged
-loudly so a deliberate closer-only needle drop is diagnosable.  Missed count
-preferred over phantom count (the META-4 posture).
+The original #182 gate (approved by Lane, 2026-08-08) demanded ≥2 distinct
+tracklist rows of the latched release.  R7-01 (2026-08-11) showed that gate
+defeated from the mirror direction: a compilation that sequences TWO tracks of
+one owned album with that album's closer among them (canonically "Brain
+Damage" → "Eclipse", both resolving to *Dark Side of the Moon*) satisfies "two
+rows" while the record never left its sleeve.
+
+The gate is therefore strengthened to SIDE-COVERAGE (Lane, 2026-08-11, LOCKED):
+a latched-release completion counts only when EVERY vinyl row of the CLOSING
+SIDE (all rows sharing the closer's side letter) was identified this session.
+Two carve-outs preserve prior correct behaviour: a ONE-ROW closing side (a
+side-long closer, or a genuine single) is covered by the closer alone; and a
+SIDELESS (numbered / CD-only) tracklist falls back to the pre-R7 ≥2-rows rule.
+R5-05 is preserved: the closer must be a row OF the latched release.
+Suppression is logged loudly so a deliberate closer-only needle drop is
+diagnosable.  Missed count preferred over phantom count (the META-4 posture).
+
+Note on fixtures: ``make_tracklist`` (imported via ``make_track``) has a
+SINGLE-ROW closing side, so its full-play fixtures credit on the closer alone —
+those tests are not about closing-side shape.  The multi-row side-coverage
+contract is exercised here with the dedicated ``_SIDE_COVERAGE_TL`` /
+``_DSOTM_TL`` fixtures below.
 """
 from unittest.mock import MagicMock
 
 import pytest
 
 from src.audio.silence import AudioEvent
-from src.metadata.models import MetadataSource, TrackMetadata, TracklistEntry
+from src.metadata.models import MetadataSource, PlaySession, TrackMetadata, TracklistEntry
 from src.tracking.listen_tracker import ListenTracker
 from tests.test_listen_tracker import make_track, make_writer_mock
 
@@ -59,6 +75,131 @@ def _tracker(with_lastfm=False):
         lastfm.love = MagicMock(return_value=True)
     tracker = ListenTracker(writer, lastfm)
     return tracker, writer, lastfm
+
+
+# ---------------------------------------------------------------------------
+# R7-01 side-coverage fixtures.  make_tracklist's closing side is a single row
+# (covered by the closer alone), so the MULTI-row closing-side contract needs
+# its own fixtures.  _SIDE_COVERAGE_TL: side B has THREE rows, so a closer-only
+# or partial-side identification genuinely fails coverage.  _DSOTM_TL: the
+# canonical R7-01 shape — a five-row closing side, two of whose rows a
+# compilation sequences ("Brain Damage" → "Eclipse").
+# ---------------------------------------------------------------------------
+
+_SIDE_COVERAGE_TL = [
+    TracklistEntry("A1", "Opener"),
+    TracklistEntry("B1", "B-First"),
+    TracklistEntry("B2", "B-Second"),
+    TracklistEntry("B3", "B-Closer"),      # side B has three rows; B3 is the closer
+]
+
+
+def _sc(title):
+    return TrackMetadata(
+        title=title, artist="Coverage Band", album="Coverage LP",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        discogs_release_id=800, discogs_instance_id=801,
+        tracklist=_SIDE_COVERAGE_TL,
+    )
+
+
+_DSOTM_TL = [
+    TracklistEntry("A1", "Speak to Me"), TracklistEntry("A2", "Breathe"),
+    TracklistEntry("A3", "On the Run"), TracklistEntry("A4", "Time"),
+    TracklistEntry("A5", "The Great Gig in the Sky"),
+    TracklistEntry("B1", "Money"), TracklistEntry("B2", "Us and Them"),
+    TracklistEntry("B3", "Any Colour You Like"),
+    TracklistEntry("B4", "Brain Damage"), TracklistEntry("B5", "Eclipse"),
+]
+
+
+def _dsotm(title):
+    """A track resolving to the owned *Dark Side of the Moon* pressing — as
+    Shazam attributes a comp track to the original album (R5-07 note)."""
+    return TrackMetadata(
+        title=title, artist="Pink Floyd", album="The Dark Side of the Moon",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        discogs_release_id=900, discogs_instance_id=901, tracklist=_DSOTM_TL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# R7-01 (side-coverage): the headline compilation phantom, executed in the
+# audit — playing two tracks of an owned album (its closer among them) off a
+# COMPILATION must NOT credit the studio album, because the closing side is not
+# covered.  Under the old ≥2-rows gate this returned a full phantom credit.
+# ---------------------------------------------------------------------------
+
+def test_compilation_two_rows_of_owned_album_side_is_not_covered():
+    """R7-01 RED-before-fix: "Brain Damage" (B4) + "Eclipse" (B5, closer) off a
+    Best-Of both resolve to *Dark Side* — two rows of side B, but side B has
+    five rows.  ≥2-rows said credit; side-coverage says suppress."""
+    s = PlaySession()
+    bd, ec = _dsotm("Brain Damage"), _dsotm("Eclipse")
+    s.album_release_id = ec.discogs_release_id
+    s.log_track(bd)
+    s.log_track(ec)
+    s.potential_last_track = True
+    s.closing_track = ec
+    assert ec.is_last_track is True                 # Eclipse arms the session
+    assert s.supporting_row_count == 2              # the old gate would have passed
+    assert s.closing_side_coverage == (2, 5)        # only 2 of side B's 5 rows
+    assert s.completion_supported is False           # side-coverage suppresses
+
+
+def test_full_closing_side_credits():
+    """A genuine straight-through play of the closing side (all five side-B
+    rows of *Dark Side*) is covered and credits."""
+    s = PlaySession()
+    rows = [_dsotm(t) for t in
+            ("Money", "Us and Them", "Any Colour You Like", "Brain Damage", "Eclipse")]
+    s.album_release_id = rows[-1].discogs_release_id
+    for t in rows:
+        s.log_track(t)
+    s.potential_last_track = True
+    s.closing_track = rows[-1]
+    assert s.closing_side_coverage == (5, 5)
+    assert s.completion_supported is True
+
+
+def test_partial_closing_side_is_suppressed():
+    """One row short of the closing side (four of five) is still suppressed —
+    the accepted missed-credit cost of weak closing-side recognition."""
+    s = PlaySession()
+    rows = [_dsotm(t) for t in
+            ("Us and Them", "Any Colour You Like", "Brain Damage", "Eclipse")]
+    s.album_release_id = rows[-1].discogs_release_id
+    for t in rows:
+        s.log_track(t)
+    s.potential_last_track = True
+    s.closing_track = rows[-1]
+    assert s.closing_side_coverage == (4, 5)
+    assert s.completion_supported is False
+
+
+def test_one_row_closing_side_credits_on_closer_alone():
+    """R7-01 / R7-03 carve-out (Lane 2026-08-11): a side-long closer whose side
+    is a single row (a *Meddle* "Echoes" shape) is covered by the closer alone —
+    this is what fixes R7-03's full-play-suppressed bug without flip-resume."""
+    meddle_tl = [
+        TracklistEntry("A1", "One of These Days"), TracklistEntry("A2", "A Pillow of Winds"),
+        TracklistEntry("A3", "Fearless"), TracklistEntry("A4", "San Tropez"),
+        TracklistEntry("A5", "Seamus"),
+        TracklistEntry("B1", "Echoes"),        # side B is one 23-minute row
+    ]
+    echoes = TrackMetadata(
+        title="Echoes", artist="Pink Floyd", album="Meddle",
+        source=MetadataSource.DISCOGS_COLLECTION,
+        discogs_release_id=910, discogs_instance_id=911, tracklist=meddle_tl,
+    )
+    assert echoes.is_last_track is True
+    s = PlaySession()
+    s.album_release_id = echoes.discogs_release_id
+    s.log_track(echoes)
+    s.potential_last_track = True
+    s.closing_track = echoes
+    assert s.closing_side_coverage == (1, 1)
+    assert s.completion_supported is True
 
 
 # ---------------------------------------------------------------------------
@@ -108,11 +249,13 @@ async def test_phantom_session_love_is_also_suppressed(caplog):
 @pytest.mark.asyncio
 async def test_closer_only_needle_drop_is_suppressed_and_logged(caplog):
     # last_played_field_name configured so the update_last_played assertion
-    # is load-bearing, not vacuous (#182 cold-review note).
+    # is load-bearing, not vacuous (#182 cold-review note).  Uses a MULTI-row
+    # closing side (_SIDE_COVERAGE_TL, side B = 3 rows) so a closer-only drop
+    # genuinely fails coverage — make_tracklist's single-row side would credit.
     writer = make_writer_mock(last_played_field_name="Last Played")
     tracker = ListenTracker(writer)
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
-    await tracker.on_track_identified(make_track("Master-Dik"))       # closer only
+    await tracker.on_track_identified(_sc("B-Closer"))               # closer only, side B 1/3
     with caplog.at_level("INFO"):
         await tracker._end_session()
 
@@ -322,7 +465,7 @@ async def test_release_less_tracks_do_not_count_as_support():
     release's closer."""
     tracker, writer, _ = _tracker()
     tracker.on_silence_event(AudioEvent.MUSIC_STARTED)
-    await tracker.on_track_identified(make_track("Master-Dik"))       # closer only
+    await tracker.on_track_identified(_sc("B-Closer"))               # closer only, side B 1/3
     filler = TrackMetadata(
         title="Static Between Records", artist="Nobody", album="Nothing",
         source=MetadataSource.FALLBACK,
@@ -525,27 +668,46 @@ async def test_single_vinyl_row_hybrid_full_play_credits():
     writer.increment_play_count.assert_called_once_with(700, 701)
 
 
-def test_multi_vinyl_row_hybrid_still_needs_two_rows():
-    """Control: a hybrid with TWO vinyl rows is NOT a single-track release — a
-    closer-only needle drop stays suppressed (the carve-out must not fire just
-    because CD rows were dropped from the count)."""
+def test_multi_row_closing_side_hybrid_needs_full_side_and_ignores_cd_rows():
+    """R7-01 + R6-07: a hybrid whose CLOSING SIDE has two vinyl rows (B1, B2)
+    plus a bonus CD row.  The CD row must not join side B, and a closer-only
+    drop (coverage 1/2) stays suppressed; identifying both side-B rows credits.
+    (Under the old ≥2-rows gate this fixture's closer-only case was the control;
+    side-coverage reframes it around the closing SIDE, not a raw row count.)"""
     tl = [
-        TracklistEntry("A1", "Movement I"), TracklistEntry("B1", "Movement II"),
-        TracklistEntry("CD1", "Bonus"),
+        TracklistEntry("A1", "Overture"),
+        TracklistEntry("B1", "Movement I"), TracklistEntry("B2", "Movement II"),
+        TracklistEntry("CD1", "Bonus"),             # never joins a vinyl side
     ]
-    closer = TrackMetadata(
-        title="Movement II", artist="Band", album="Two Movements (+CD)",
-        source=MetadataSource.DISCOGS_COLLECTION,
-        discogs_release_id=710, discogs_instance_id=711, tracklist=tl,
-    )
-    assert closer.is_last_track is True             # B1 is the last vinyl row
+
+    def hy(title):
+        return TrackMetadata(
+            title=title, artist="Band", album="Two Movements (+CD)",
+            source=MetadataSource.DISCOGS_COLLECTION,
+            discogs_release_id=710, discogs_instance_id=711, tracklist=tl,
+        )
+
+    closer = hy("Movement II")
+    assert closer.is_last_track is True             # B2 is the last vinyl row
+
+    # Closer-only: side B is 1/2 covered (the CD row is not part of side B).
     s = PlaySession()
     s.album_release_id = closer.discogs_release_id
     s.log_track(closer)
     s.potential_last_track = True
     s.closing_track = closer
-    assert s.supporting_row_count == 1
-    assert s.completion_supported is False          # two vinyl rows → needs the supporting one
+    assert s.closing_side_coverage == (1, 2)        # CD1 did NOT inflate the side to 3
+    assert s.completion_supported is False
+
+    # Both side-B rows identified → full closing-side coverage → credit.
+    s2 = PlaySession()
+    s2.album_release_id = closer.discogs_release_id
+    s2.log_track(hy("Movement I"))
+    s2.log_track(closer)
+    s2.potential_last_track = True
+    s2.closing_track = closer
+    assert s2.closing_side_coverage == (2, 2)
+    assert s2.completion_supported is True
 
 
 # ---------------------------------------------------------------------------
