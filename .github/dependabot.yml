@@ -1,8 +1,15 @@
-# R6-30: automated dependency-update PRs so a floor-pinned (`>=`) dependency's new
-# release is surfaced and reviewed HERE, not discovered on the Pi at bring-up
-# between pushes. Weekly, for both the pip requirements and the SHA-pinned GitHub
-# Actions (Dependabot keeps the pin a full commit SHA and updates the version
-# comment). The floors in requirements.txt stay the abstract spec.
+# R6-30 (corrected R7-24): automated dependency-update PRs, weekly.
+#
+# What this actually catches — and what it does NOT: Dependabot version-updates
+# raise a PR only when the manifest does not already permit the newest release.
+# requirements.txt is `>=`-FLOOR-pinned with no lockfile (the Option-A decision),
+# so a new upstream release already SATISFIES the floor → Dependabot opens NO pip
+# PR for it. Floor drift is instead caught by the weekly `tests.yml` cron, which
+# reinstalls the tree and fails if a new release breaks the suite. Dependabot's
+# real jobs here are: the SHA-pinned GitHub Actions (EXACT pins → it bumps the SHA
+# + the version comment) and security advisories (a vulnerable dependency still
+# gets a PR regardless of the floor). The floors in requirements.txt stay the
+# abstract spec.
 version: 2
 updates:
   - package-ecosystem: "pip"

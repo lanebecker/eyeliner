@@ -79,10 +79,23 @@ _ALBUM_DECORATION_WORD_RE = re.compile(f"(?:{_DECORATION_LEXICAL}|{_ALBUM_EXTRA}
 
 # Anchored, single, innermost-last: interior parentheticals are part of the
 # title ("(What's the Story) Morning Glory?" is untouched), and only the LAST
-# dash segment is a candidate suffix ("Money - It's a Gas - Live" strips
+# " - " dash segment is a candidate suffix ("Money - It's a Gas - Live" strips
 # " - Live", keeping the interior dash).
 _TRAILING_PAREN_RE = re.compile(r"\s*\(([^()]*)\)\s*$")
-_TRAILING_DASH_RE = re.compile(r"\s-\s([^-]*)$")
+# R7-25: anchor to the LAST " - " via a negative lookahead, and capture the whole
+# tail with `(.+)` — NOT `([^-]*)`. The old `[^-]*` forbade any hyphen inside the
+# captured segment, so a hyphenated decoration ("- Re-Recorded", "- Hi-Res
+# Version", "- Live/Semi-Acoustic") never matched and its record's decoration
+# never stripped (a permanent missed credit). The decoration-keyword gate
+# (_DECORATION_WORD_RE) below is unchanged, so widening the capture can only let a
+# genuinely keyword-gated suffix strip — never over-strip an ordinary interior
+# dash. The lookahead keeps `m.start()` on the last " - " (the code slices there),
+# which a greedy `.*\s-\s` could not. Matches the old pattern on realistic titles;
+# it differs only cosmetically on pathological empty-dash-runs ("x - - - live"),
+# all keyword-gate-rejected. Note the lookahead makes matching O(n²) in the worst
+# case vs the old linear pattern — irrelevant here (folded titles are bounded to a
+# few hundred chars → microseconds), never fed adversarial input.
+_TRAILING_DASH_RE = re.compile(r"\s-\s(?!.*\s-\s)(.+)$")
 
 
 def fold_text(s: str) -> str:

@@ -147,7 +147,12 @@ def _entry_credit_key(entry: dict) -> str:
     if k is not None:
         return k
     credit = entry.get("artist_credit")
-    if credit is None:
+    if not credit:
+        # R7-28: reconstruct for an EMPTY-STRING artist_credit too, not just None.
+        # R6-16 tested `is None`, so an entry carrying artist_credit="" (a
+        # community-edited blank) returned "" here while its precompute key and the
+        # old pre-R6-16 fallback both reconstructed "john and jane" from `artists`
+        # — a silent key mismatch. `not credit` restores parity for both empties.
         # R6-16: mirror the precompute / _reconstruct_artist_credit path — strip
         # the Discogs "(n)" disambiguator PER NAME before joining, not once on the
         # joined string. _ARTIST_DISAMBIG_RE is $-anchored, so a single outer strip
@@ -638,9 +643,19 @@ class DiscogsReader:
         if (self._db_search_key != key
                 or now - self._db_search_stamp >= _DB_SEARCH_MEMO_TTL_SECONDS):
             results = self._client.search(album, artist=artist, type="release")
+            # R7-26: publish the DATA (page + stamp) BEFORE the key, which acts as
+            # the "memo is ready" flag the check above reads. A reader that observes
+            # the new key is then guaranteed to also see the matching new page —
+            # never this query's page returned for a different query's key. The
+            # reader path is single-caller today (the resolver serializes reader
+            # calls, so this races with nothing), making key-last defence-in-depth
+            # on the 2-worker Discogs pool rather than a lock: a reader that catches
+            # the stale key mid-fetch merely re-fetches (fail-safe redundant GET),
+            # it never mismatches. NOT a general thread-safety guarantee — the
+            # check-then-return is only safe because callers are serialized.
             self._db_search_page = list(results.page(1))
-            self._db_search_key = key
             self._db_search_stamp = now
+            self._db_search_key = key            # published LAST
         return self._db_search_page[:limit]
 
     def _get_collection_index(self) -> dict:

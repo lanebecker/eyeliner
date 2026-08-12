@@ -12,7 +12,10 @@ name: Release consistency
 # ${{ }} — so a crafted tag or VERSION cannot inject shell.
 on:
   push:
-    tags: ['v*']
+    # R7-22: match only version-shaped tags. The old 'v*' also fired on non-release
+    # tags like 'v2-experiments' / 'vfoo', producing a noisy false consistency
+    # failure for something that was never a release.
+    tags: ['v[0-9]*']
 
 permissions:
   contents: read
@@ -28,8 +31,14 @@ jobs:
         run: |
           set -euo pipefail
           file_ver="$(cat VERSION)"
-          if ! printf '%s' "$file_ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::VERSION '$file_ver' is not a valid MAJOR.MINOR.PATCH semver"
+          # R7-22: accept the OPTIONAL `-<suffix>` pre-release form, single-sourcing
+          # the exact pattern sync-version-badge.yml validates against (keep the two
+          # in sync). The old strict MAJOR.MINOR.PATCH regex hard-failed a
+          # `1.6.0-rc1` tag that the badge workflow explicitly supports, so a
+          # pre-release could never satisfy both jobs at once. Still excludes every
+          # shell/sed metacharacter, preserving the TQ-5 injection-safety.
+          if ! printf '%s' "$file_ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::VERSION '$file_ver' is not a valid semantic version (e.g. 1.5.4 or 1.5.4-rc1)"
             exit 1
           fi
           tag_ver="${TAG#v}"
@@ -37,7 +46,15 @@ jobs:
             echo "::error::tag '$TAG' (=$tag_ver) does not match the VERSION file ($file_ver)"
             exit 1
           fi
-          if ! grep -q "^## \[$file_ver\]" CHANGELOG.md; then
+          # R7-29: the old `grep -q "^## \[$file_ver\]"` interpolated the version
+          # into a BRE where `.` is a wildcard, so `## [1x5x24]` would have
+          # satisfied the 1.5.24 check. Escape the dots (the version is validated
+          # above to hold only [0-9A-Za-z.-], so backslash-escaping `.` is
+          # sufficient and safe) and keep the `^## \[…\]` ANCHOR — `grep -F` would
+          # fix the dots but drop the start-of-line anchor, letting a mid-line or
+          # mis-levelled `## [x.y.z]` false-pass.
+          esc_ver="${file_ver//./\\.}"
+          if ! grep -qE "^## \[${esc_ver}\]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no '## [$file_ver]' heading for this release"
             exit 1
           fi
