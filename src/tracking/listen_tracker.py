@@ -79,6 +79,7 @@ never trigger a split.
 
 import asyncio
 import logging
+import time
 from typing import Callable, Optional, TYPE_CHECKING
 
 from src.metadata.models import MetadataSource, PlaySession, TrackMetadata
@@ -137,6 +138,14 @@ _FINALIZE_RETRY_BACKOFF_SECONDS = 1.0
 # drain() abandons after _SHUTDOWN_DRAIN_SECONDS.
 _HONORED_RETRY_AFTER_CAP_SECONDS = 90.0
 
+# R7-03 (flip-resume): how far back a newly-armed session may reach to inherit an
+# immediately-prior UNARMED session's closing-side rows (Lane, 2026-08-11: fixed
+# 5-minute wall-clock, same closing side only, measured off the prior session's
+# started_at).  A full play of a multi-row closing side split by a mid-side
+# silence gap resumes within this window; a genuinely separate later listening
+# does not.
+_FLIP_RESUME_WINDOW_SECONDS = 300.0
+
 
 class ListenTracker:
     """Manages play sessions and triggers Discogs field updates on album completion."""
@@ -145,6 +154,7 @@ class ListenTracker:
         self,
         writer: "DiscogsCollectionWriter",
         lastfm: Optional["LastFmClient"] = None,
+        session_end_silence_seconds: float = 45.0,
     ):
         # A-4: depend only on the Discogs WRITE half (Play Count / Last Played),
         # injected at the composition root (main.py).  A-3 had already moved this
@@ -165,6 +175,28 @@ class ListenTracker:
                 "will actually be loved."
             )
         self._session: Optional[PlaySession] = None
+        # R7-02: silence-window credited-memory.  Maps release_id → the
+        # monotonic time its Play Count was last credited.  One physical spin
+        # whose Shazam attribution ping-pongs between two releases splits
+        # repeatedly, and each split detaches the SAME armed release — without
+        # this memory each split credits it AGAIN (+N Play Count for ONE play;
+        # the #185 replay boundary and #186 idempotency guard only protect
+        # WITHIN one session / one finalize, not across the fresh sessions a
+        # split mints).  A split-path credit for a release credited within
+        # `session_end_silence_seconds` is suppressed unless the split was a
+        # genuine #185 replay boundary (a real re-drop of the same record, which
+        # earns its own credit).  The window is the silence timeout because a
+        # genuine second spin cannot complete inside it (a side is minutes long).
+        self._session_end_silence_seconds = float(session_end_silence_seconds)
+        self._credited_at: dict[int, float] = {}
+        # R7-03 (flip-resume): the immediately-prior session that ended WITHOUT
+        # arming a completion (a played side that never reached its closer, or
+        # the first part of a closing side interrupted by a mid-side silence
+        # gap).  The next armed session may inherit its closing-side rows if it
+        # cannot cover the side alone — see :meth:`_apply_flip_resume`.  Holds at
+        # most one session; overwritten each unarmed end, cleared on any armed
+        # end (a completion, suppression, or unlatched close ends the chain).
+        self._prev_unarmed: Optional[PlaySession] = None
         # Strong references to in-flight _end_session tasks.  asyncio only
         # keeps weak references to tasks, so a fire-and-forget create_task()
         # could in principle be garbage-collected mid-flight — and this is the
@@ -357,6 +389,80 @@ class ListenTracker:
         self._session = None
         return session
 
+    def _is_duplicate_credit(self, session: PlaySession) -> bool:
+        """R7-02: True when *session*'s Play Count credit must be suppressed as a
+        duplicate of one already made, for the SAME release, within the silence
+        window during the SAME physical spin.
+
+        Checked in :meth:`_finalize_session`, so it guards BOTH the split-path
+        credit (an attribution ping-pong re-arming an already-credited release)
+        AND the terminal SESSION_ENDED credit (the spin ends on the re-armed
+        release) — the R7-02 double-credit reproduces via either.  A session
+        opened by a genuine #185 replay boundary is a real second spin and is
+        NEVER suppressed (``opened_by_replay_boundary``).  A release absent from
+        the credited-memory, or last credited at least
+        ``session_end_silence_seconds`` ago, is likewise creditable: a genuine
+        later play, since a real second spin cannot COMPLETE inside that window
+        (a side runs minutes).  Read-only — the memory is written only when a
+        credit actually lands, in :meth:`_credit_completed_album`.
+        """
+        if session.opened_by_replay_boundary:
+            return False
+        rid = session.album_release_id
+        if rid is None:
+            return False
+        last = self._credited_at.get(rid)
+        if last is None:
+            return False
+        return (time.monotonic() - last) < self._session_end_silence_seconds
+
+    def _apply_flip_resume(self, session: PlaySession) -> None:
+        """R7-03: when *session* armed a completion its OWN identifications cannot
+        cover, inherit the immediately-prior unarmed session's rows of the SAME
+        release on the SAME closing side — so a full play of a MULTI-row closing
+        side split across sessions by a mid-side silence gap (or a long flip)
+        still credits, instead of being suppressed as a mis-attributed single.
+
+        Bounded (Lane, 2026-08-11): only the immediately-prior unarmed session,
+        only if it started within ``_FLIP_RESUME_WINDOW_SECONDS``, only rows on
+        the closing side.  Cannot manufacture a phantom: it adds only rows the
+        prior session GENUINELY identified for THIS release AND that lie on the
+        closing side, so a compilation's foreign/off-side rows never join the
+        set.  A one-row closing side never reaches here (the closer covers it,
+        so ``completion_supported`` is already True).  Mutates only
+        ``session.inherited_side_rows`` (the completion gate re-reads it below);
+        the love target is untouched.
+        """
+        prev = self._prev_unarmed
+        if prev is None:
+            return
+        if not (session.potential_last_track and session.album_release_id):
+            return
+        if session.completion_supported:
+            return  # already covered on its own — nothing to inherit
+        if time.monotonic() - prev.started_at > _FLIP_RESUME_WINDOW_SECONDS:
+            return  # the prior unarmed session is too old to be one flip away
+        closer = session.closing_track
+        if closer is None or closer.discogs_release_id != session.album_release_id:
+            return
+        side_rows = session._closing_side_row_indices(closer)
+        if not side_rows:
+            return  # sideless closer — no closing side to resume
+        inherited = {
+            t.side_index.global_index
+            for t in prev.identified_tracks
+            if t.discogs_release_id == session.album_release_id
+            and t.side_index.global_index in side_rows
+        }
+        if inherited:
+            session.inherited_side_rows |= inherited
+            log.info(
+                "R7-03 flip-resume: inherited %d closing-side row(s) %s from the "
+                "prior unarmed session for release %s — a full play split by a "
+                "mid-side silence gap still credits.",
+                len(inherited), sorted(inherited), session.album_release_id,
+            )
+
     async def _finalize_detached(self, session: PlaySession):
         """Credit an already-detached session, serialized against every other
         finalize (CONC-2).
@@ -388,12 +494,30 @@ class ListenTracker:
             log.debug("Session already credited — skipping to stay idempotent (B-8).")
             return
 
+        # R7-03: before the completion gate, let an armed session that cannot
+        # cover its closing side alone inherit a recent prior unarmed session's
+        # closing-side rows (a full play split by a mid-side silence gap).
+        self._apply_flip_resume(session)
+
         track_count = len(session.identified_tracks)
         log.info(
             f"Play session ended. "
             f"Identified {track_count} track(s). "
             f"Last track reached: {session.potential_last_track}"
         )
+
+        # R7-03: this session's outcome decides whether it can seed a later
+        # flip-resume.  Default to clearing the chain; the not-armed branch below
+        # re-arms it.  A completion, a suppression, or an unlatched close all end
+        # the chain (nothing downstream should inherit from them).
+        self._prev_unarmed = None
+
+        # R7-02: is this a duplicate credit of the same release within the silence
+        # window (an attribution ping-pong, not a genuine #185 re-drop)?  Computed
+        # once and applied to BOTH the Play Count credit and the Last.fm love, so
+        # neither double-fires for one physical spin regardless of whether that
+        # spin ends via a split or a terminal SESSION_ENDED.
+        duplicate_credit = self._is_duplicate_credit(session)
 
         if (
             session.potential_last_track
@@ -420,6 +544,24 @@ class ListenTracker:
                 ", ".join(repr(t.title) for t in session.identified_tracks[:6])
                 + ("…" if len(session.identified_tracks) > 6 else ""),
                 session.supporting_row_count,
+            )
+        elif session.potential_last_track and session.album_release_id and duplicate_credit:
+            # R7-02: this release was credited within the silence window during
+            # the SAME physical spin (an attribution ping-pong re-armed an
+            # already-credited release), and this session was NOT opened by a
+            # genuine #185 re-drop — suppress the duplicate Play Count credit AND
+            # the love (the love gate below also honours `duplicate_credit`).
+            # Loud on purpose so a real edge case is diagnosable.  Reaches here on
+            # EITHER path: a split-detached re-arm, or the terminal SESSION_ENDED
+            # credit of a spin that ends on the re-armed release.
+            rid = session.album_release_id
+            log.info(
+                "R7-02: suppressing a duplicate credit for release %s — it was "
+                "credited %.1fs ago (< %.0fs silence window) and this session was "
+                "not opened by a #185 replay boundary; one physical play must not "
+                "be double-credited.",
+                rid, time.monotonic() - self._credited_at[rid],
+                self._session_end_silence_seconds,
             )
         elif session.potential_last_track and session.album_release_id:
             if session.crediting:
@@ -467,6 +609,12 @@ class ListenTracker:
                 "Last track not reached — not incrementing Play Count "
                 "or updating Last Played (likely only one side played)."
             )
+            # R7-03: a played stretch that never reached its closer — the flip
+            # source.  If the next armed session is the remainder of this same
+            # closing side (a mid-side gap split the play), it can inherit these
+            # rows.  Held whether or not a release is latched; _apply_flip_resume
+            # filters by release + closing side, so an irrelevant one is ignored.
+            self._prev_unarmed = session
 
         # Last.fm: love the album's CLOSER if the full side completed and love
         # is enabled.  #181: the target is session.closing_track — the track
@@ -484,6 +632,8 @@ class ListenTracker:
             and session.love_supported   # #182 gate + R6-06: unlatched DB-tier
                                          # closers need ≥2 rows too (the credit
                                          # path skips them; the love must as well)
+            and not duplicate_credit     # R7-02: a duplicate credit must not
+                                         # double-love the closer either
             and not session.loved
             and not session.loving
             and self.lastfm
@@ -621,6 +771,21 @@ class ListenTracker:
         )
         if success:
             session.credited = True  # committed ONLY after the write landed (#163)
+            # R7-02: remember WHEN this release was credited so a subsequent
+            # split-path credit for the same release inside the silence window
+            # (an attribution ping-pong, not a genuine re-drop) is suppressed.
+            # Recorded only on a landed credit, keyed by release.  Prune entries
+            # older than the window opportunistically so the map stays bounded on
+            # a long-running appliance (an entry older than the window can never
+            # suppress again).
+            now = time.monotonic()
+            if session.album_release_id is not None:
+                self._credited_at[session.album_release_id] = now
+            self._credited_at = {
+                rid: t
+                for rid, t in self._credited_at.items()
+                if now - t < self._session_end_silence_seconds
+            }
             log.info("✅ Discogs Play Count incremented successfully.")
         else:
             log.error(
@@ -759,6 +924,12 @@ class ListenTracker:
                 self._start_session()
 
             split_reason = None
+            # R7-02: True only when the split below is a genuine #185 replay
+            # boundary (the same record was re-dropped).  A replay-boundary split
+            # detaches a genuinely-completed playthrough that earns its credit
+            # even if the release was credited moments ago; an attribution-swing
+            # split (album change) does not, so the credited-memory guard applies.
+            replay_boundary_split = False
             if (
                 self._session.last_release_id is not None
                 and track.discogs_release_id is not None
@@ -840,6 +1011,7 @@ class ListenTracker:
                     f"{track.discogs_release_id} identified after the closer "
                     f"armed the session — the record was re-dropped"
                 )
+                replay_boundary_split = True   # R7-02: a genuine re-drop, not a swing
 
             if split_reason is not None:
                 log.info(f"{split_reason} — splitting session.")
@@ -851,6 +1023,12 @@ class ListenTracker:
                 # next one — needs.
                 detached = self._detach_session_locked()
                 self._start_session()
+                # R7-02: mark a session opened by a genuine #185 re-drop so its
+                # eventual credit (via EITHER the split path below or a terminal
+                # SESSION_ENDED) is exempt from the credited-memory guard — a real
+                # second spin earns its own credit.  An attribution-swing (album
+                # change) split leaves this False, so its credit is guarded.
+                self._session.opened_by_replay_boundary = replay_boundary_split
 
             self._session.log_track(track)
             if track.is_last_track:

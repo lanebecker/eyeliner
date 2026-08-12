@@ -68,14 +68,23 @@ def make_writer_mock(
 
 
 def make_tracklist():
+    # R7-01 (side-coverage gate): the completion gate now requires EVERY vinyl
+    # row of the closing side to be identified.  These tracking / split /
+    # concurrency / love / drain fixtures are not about closing-side *shape* —
+    # they only need "a play that credits" — so the closing side (B) is a single
+    # row (the closer), which the R6-07 single-vinyl-row carve-out covers on the
+    # closer alone.  The multi-row side-coverage contract itself is exercised
+    # explicitly, with its own multi-row fixtures, in test_completion_gate.py.
+    # (Titles/order are the real *Sister* sequence; only the side split moved so
+    # "Master-Dik" is the sole side-B row.)
     return [
         TracklistEntry("A1", "Catholic Block"),
         TracklistEntry("A2", "Pipeline/Kill Time"),
         TracklistEntry("A3", "Stereo Sanctity"),
-        TracklistEntry("B1", "Tuff Gnarl"),
-        TracklistEntry("B2", "Cotton Crown"),
-        TracklistEntry("B3", "White Cross"),
-        TracklistEntry("B4", "Master-Dik"),
+        TracklistEntry("A4", "Tuff Gnarl"),
+        TracklistEntry("A5", "Cotton Crown"),
+        TracklistEntry("A6", "White Cross"),
+        TracklistEntry("B1", "Master-Dik"),
     ]
 
 

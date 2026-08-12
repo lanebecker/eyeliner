@@ -308,13 +308,24 @@ the public `on_silence_event(SESSION_ENDED)` → `create_task` path, T-5). Tests
 every edge case from the architecture doc.
 
 Key cases — Play Count:
-- **Happy path:** a supporting track AND the last track identified + session
-  ends → `increment_play_count` called with correct `release_id` and
-  `instance_id` (#182: a closer alone no longer credits — the session needs
-  ≥2 distinct resolved tracklist rows of the latched release, single-track
-  releases excepted)
-- **Closer only:** just the last track identified → NOT called, suppression
-  logged with `#182` in the message
+- **Happy path:** the whole closing side identified + session ends →
+  `increment_play_count` called with correct `release_id` and `instance_id`
+  (#182 / R7-01 SIDE-COVERAGE: a closer alone no longer credits a multi-row
+  closing side — every vinyl row sharing the closer's side letter must be
+  identified; one-row closing sides and sideless tracklists excepted, see
+  `test_completion_gate.py`)
+- **Closer only (multi-row side):** just the last track identified → NOT called,
+  suppression logged with `#182` in the message
+- **Compilation two-rows-of-owned-album (R7-01):** a Best-Of playing two rows of
+  an owned album with its closer among them → NOT credited (closing side not
+  covered)
+- **Attribution ping-pong (R7-02):** one physical spin swinging between two
+  releases → the armed release credited exactly once, duplicate suppressed with
+  `R7-02` in the message (both split and terminal SESSION_ENDED paths); a genuine
+  #185 re-drop still credits each spin — see `test_credit_memory_r7_02.py`
+- **Mid-side gap flip-resume (R7-03):** a multi-row closing side split by a
+  silence gap credits once via inherited rows; a >5-min gap or a different-side/
+  different-release prior session does not — see `test_flip_resume_r7_03.py`
 - **Only Side A:** session ends before last track → NOT called
 - **Missed recognition:** all tracks except the last identified → NOT called
 - **Fallback metadata:** last track reached but `discogs_release_id = None` → NOT called

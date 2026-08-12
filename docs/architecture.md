@@ -396,14 +396,24 @@ Key properties (all delegating to `side_index`):
 
 **`PlaySession`**: Tracks one needle-drop-to-lift session.
 
-Key fields: `started_at`, `identified_tracks`, `potential_last_track`,
-`closing_track` (#181 — the track that armed the flag; the Last.fm love
-target), `album_release_id`, `album_instance_id`, `last_release_id`
-(v1.3.5 — most recent release ID seen from any source; drives the
-auto-split, unlike the latched pair which only collection-owned tracks
-set), `last_release_source` / `last_release_resolve_key` (#184 — recorded
-beside `last_release_id` so the split detector can recognise a B-4 tier
-upgrade)
+Key fields: `started_at` (R7-05 — the flip-resume recency anchor),
+`identified_tracks`, `potential_last_track`, `closing_track` (#181 — the track
+that armed the flag; the Last.fm love target), `album_release_id`,
+`album_instance_id`, `last_release_id` (v1.3.5 — most recent release ID seen
+from any source; drives the auto-split, unlike the latched pair which only
+collection-owned tracks set), `last_release_source` / `last_release_resolve_key`
+(#184 — recorded beside `last_release_id` so the split detector can recognise a
+B-4 tier upgrade), `inherited_side_rows` (R7-03 — closing-side rows inherited
+from a prior unarmed session so a full play split by a mid-side gap still
+credits), `opened_by_replay_boundary` (R7-02 — True when a genuine #185 re-drop
+opened the session, exempting its credit from the credited-memory guard)
+
+The completion gate itself is `completion_supported` (R7-01 SIDE-COVERAGE):
+every vinyl row sharing the closer's side letter must be identified this session
+(or inherited via R7-03). Carve-outs: a one-row closing side is covered by the
+closer alone; a sideless (numbered / CD-only) tracklist falls back to the
+pre-R7 ≥2-distinct-rows rule. R5-05 preserved: the closer must belong to the
+latched release.
 
 `log_track(track)` behaviour:
 - Deduplicates consecutive identical tracks
@@ -719,18 +729,36 @@ the writes use the injected `DiscogsCollectionWriter`):
 ```
 potential_last_track == True
 AND album_release_id is not None
-AND completion_supported == False          (#182 gate: fewer than 2 DISTINCT
-                                            resolved tracklist ROWS of the
-                                            latched release identified —
-                                            unless the release has 1 track)
-    → suppress everything, log loudly ("#182" in the message): the classic
-      shape of a mis-attributed single minting a phantom session, or a
+AND completion_supported == False          (#182 / R7-01 SIDE-COVERAGE gate: not
+                                            every vinyl row of the CLOSING SIDE
+                                            was identified this session — unless
+                                            the closing side is a single row, or
+                                            a sideless tracklist falls back to
+                                            the ≥2-rows rule; R7-03 flip-resume
+                                            may inherit a prior unarmed session's
+                                            closing-side rows first)
+    → suppress everything, log loudly ("#182" in the message): a compilation
+      playing two rows of an owned album, a mis-attributed single, or a
       closer-only needle drop (missed count preferred over phantom count)
 
 potential_last_track == True
 AND album_release_id is not None
 AND completion_supported == True
-    → writer.increment_play_count(release_id, instance_id)
+AND _is_duplicate_credit == True           (R7-02: this release was already
+                                            credited within session_end_silence_
+                                            seconds during THIS physical spin — an
+                                            attribution ping-pong re-arming it —
+                                            and the session was NOT opened by a
+                                            genuine #185 replay boundary)
+    → suppress the credit AND the love, log loudly ("R7-02" in the message):
+      one physical play must not be double-counted (guards both the split and
+      the terminal SESSION_ENDED credit paths)
+
+potential_last_track == True
+AND album_release_id is not None
+AND completion_supported == True
+AND _is_duplicate_credit == False
+    → writer.increment_play_count(release_id, instance_id)   [records credited_at]
     → writer.update_last_played(release_id, instance_id)   [if configured]
     → lastfm.love(closing_track)                           [if love_on_completion=true;
                                                             #181: the closer that ARMED
