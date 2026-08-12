@@ -112,12 +112,16 @@ _SHUTDOWN_DRAIN_SECONDS = 10.0
 # Bounded and SHORT for two reasons. First, the attempts must fit within the
 # _SHUTDOWN_DRAIN_SECONDS window on shutdown (1s + 2s = 3s of backoff across 3
 # attempts) and never spin. Second, on the album-split path the split-off
-# session's finalize is awaited inline by on_track_identified (and so by the
-# recognition pipeline). Since CONC-2 (#96) that finalize runs OUTSIDE the
-# lifecycle lock, so it no longer stalls the next record's session start; a short
-# bound still keeps that inline credit from lengthening the splitting commit.
-# CONC-6's is_stale predicate prevents any phantom credit and the event loop is
-# never blocked (sleep + writer.run yield).
+# session's finalize runs OUTSIDE the lifecycle lock (CONC-2/#96), so it never
+# stalls the next record's session START. R7-06 correction: it does NOT follow
+# that the finalize is free — on_track_identified used to `await` the split
+# credit inline, so the recognition LEG (the chunk-processing pipeline) blocked
+# for the whole finalize, honoured Retry-After included (up to ~180s). That inline
+# wait is now BOUNDED (see _SPLIT_CREDIT_INLINE_WAIT_SECONDS); the short retry
+# bound here still keeps an ordinary (non-throttled) credit from lengthening the
+# splitting commit noticeably. The event loop itself is never blocked within an
+# attempt (sleep + writer.run yield); CONC-6's is_stale predicate prevents any
+# phantom credit.
 _FINALIZE_WRITE_ATTEMPTS = 3
 _FINALIZE_RETRY_BACKOFF_SECONDS = 1.0
 
@@ -132,11 +136,30 @@ _FINALIZE_RETRY_BACKOFF_SECONDS = 1.0
 # wait and the credit lands on the next attempt. The bound is per-wait, not total:
 # the retry loop can honour a wait after attempts 1 and 2 (never after the last),
 # so the worst case is (_FINALIZE_WRITE_ATTEMPTS - 1) waits ≈ 180s for one
-# finalize. That is acceptable because it runs OUTSIDE the lifecycle lock
-# (CONC-2/#96) — it never stalls the next record's session, only serialises behind
-# _finalize_lock — and every wait is a cancellable event-loop sleep that shutdown
-# drain() abandons after _SHUTDOWN_DRAIN_SECONDS.
+# finalize. This runs OUTSIDE the lifecycle lock (CONC-2/#96) and every wait is a
+# cancellable event-loop sleep that shutdown drain() abandons after
+# _SHUTDOWN_DRAIN_SECONDS. R7-06 correction: this ~180s does NOT "never stall the
+# next record's session" — a SESSION_ENDED credit runs as a background task and
+# never touched the leg, but an album-SPLIT credit used to be awaited inline by
+# on_track_identified, so a honoured wait stalled the recognition pipeline for its
+# full duration. That inline wait is now bounded (see the split-finalize site and
+# _SPLIT_CREDIT_INLINE_WAIT_SECONDS): the honoured tail completes in the
+# background while the leg goes back to processing chunks.
 _HONORED_RETRY_AFTER_CAP_SECONDS = 90.0
+
+# R7-06: how long on_track_identified (the recognition leg) will wait INLINE for a
+# creditable album-split finalize before letting it finish in the background. The
+# task is already tracked in _bg_tasks (drained at shutdown) with a failure-logging
+# done-callback, so the leg need not block on it. The cap sits between the short
+# linear-retry total (~3s) and the honoured-Retry-After floor: a 429 is only
+# HONOURED (event-loop sleep, up to 90s) when its Retry-After exceeds the transport's
+# _RATE_LIMIT_MAX_WAIT (10s), so a honoured wait ALWAYS exceeds this 5s cap and is
+# backgrounded — capping the R7-06 pipeline stall at ~5s instead of ~180s. At 5s a
+# normal credit and an ordinary linear-backoff retry (~3s) still complete inline, so
+# common-case timing is unchanged. (A 429 whose Retry-After is in (5s, 10s] is retried
+# IN-THREAD by the transport rather than honoured; such a credit also exceeds the cap
+# and is backgrounded too — harmless, the credit still lands via _bg_tasks.)
+_SPLIT_CREDIT_INLINE_WAIT_SECONDS = 5.0
 
 # R7-03 (flip-resume): how far back a newly-armed session may reach to inherit an
 # immediately-prior UNARMED session's closing-side rows (Lane, 2026-08-11: fixed
@@ -685,7 +708,10 @@ class ListenTracker:
         short (1s + 2s = 3s total) so the attempts fit the shutdown drain window
         (_SHUTDOWN_DRAIN_SECONDS) and never spin. This whole helper runs OUTSIDE
         the lifecycle lock (CONC-2/#96) — it holds only the finalize lock — so its
-        backoff never stalls the next record's session start.
+        backoff never stalls the next record's session START. (R7-06: on the
+        album-split path the recognition LEG no longer blocks on this either — the
+        split credit's inline wait is bounded by _SPLIT_CREDIT_INLINE_WAIT_SECONDS
+        and a honoured Retry-After finishes in the background.)
 
         #229: when an attempt raises :class:`DiscogsRateLimited` (a Play Count 429
         whose Retry-After exceeds the transport's in-thread cap), the backoff for
@@ -1035,12 +1061,12 @@ class ListenTracker:
                 log.info(f"Last track of album identified: '{track.title}' — watching for session end.")
 
         # CONC-2: credit the split-off session OUTSIDE the lifecycle lock, so the
-        # NEXT record's session start (under the lock above) is never blocked by a
-        # slow write.  This is still awaited inline by the recognition pipeline and
-        # `_finalize_detached` takes `_finalize_lock`, so a creditable split can
-        # briefly wait here behind an unrelated in-flight credit — bounded by the
-        # retry window, far smaller and rarer than the pre-CONC-2 whole-pipeline
-        # stall.
+        # NEXT record's session START (under the lock above) is never blocked by a
+        # slow write.  R7-06: the recognition LEG, however, DID block — this credit
+        # was awaited inline below, so a finalize honouring a Retry-After stalled
+        # chunk processing for up to ~180s.  The leg now waits only a bounded
+        # _SPLIT_CREDIT_INLINE_WAIT_SECONDS and lets a slow credit finish in the
+        # background (it is in _bg_tasks and drained at shutdown).
         #
         # #166: but the COMMON mid-album swap detaches a session that never reached
         # its last track — nothing to credit or love — and finalizing it would
@@ -1050,33 +1076,47 @@ class ListenTracker:
         # non-creditable case here and never touch the lock. A creditable split
         # (its closer played right before the swap — rare) still finalizes below.
         if detached is not None and detached.potential_last_track:
-            # #187: run the creditable split finalize as a TRACKED task and await it
-            # through asyncio.shield.  This method is awaited by the recognition
-            # pipeline leg, which run_pipeline CANCELS at shutdown BEFORE it calls
-            # drain(); the pre-#187 bare inline await meant a split credit mid-write
-            # (including one honouring a long Retry-After, #229) was torn up by that
-            # cancellation, and drain() — which waits only on _bg_tasks — never saw
-            # it, losing the completed play's credit.  Registering the task in
-            # _bg_tasks (with the same done-callback as a SESSION_ENDED credit) puts
-            # it under drain()'s bounded wait; `shield` lets the leg still await the
-            # credit inline in NORMAL operation (unchanged timing — the credit is
-            # complete when this returns, and _finalize_lock still serializes it,
-            # CONC-2) while DETACHING it from the leg's shutdown cancellation, so the
-            # task survives into drain() instead of dying with the leg.  A bare
-            # `await task` would NOT do this — cancelling the awaiter cancels the
-            # awaited task too; shield is what breaks that chain.  drain() keeps its
-            # short bound (Lane, 2026-08-11): the honoured-Retry-After sleep is a
-            # cancellable await, so at shutdown drain cancels a still-in-flight
-            # credit after _SHUTDOWN_DRAIN_SECONDS and the rare
-            # long-throttle-at-shutdown play is abandoned + logged LOST (the safe
-            # under-count direction) rather than stalling the Pi's power-cycle.
+            # #187 + R7-06: run the creditable split finalize as a TRACKED task.
+            # It is registered in _bg_tasks with the same done-callback as a
+            # SESSION_ENDED credit (which logs any failure) and is drained at
+            # shutdown, so it is complete-and-safe WITHOUT the recognition leg
+            # blocking on it.  Because it is an independent task (not a child of
+            # this coroutine), the leg's shutdown cancellation does NOT cancel it —
+            # drain() awaits it via _bg_tasks.
+            #
+            # #187 was right that a bare inline `await task` loses the credit at
+            # shutdown (cancelling the awaiter cancels the awaited), but its cure —
+            # `await asyncio.shield(task)` UNBOUNDED — meant the leg still blocked
+            # for the WHOLE finalize, honoured Retry-After included, stalling chunk
+            # processing up to ~180s (R7-06).  Fix: wait_for a BOUNDED
+            # _SPLIT_CREDIT_INLINE_WAIT_SECONDS; on timeout the shielded task keeps
+            # running in the background and the leg returns to processing audio.
+            # shield is still required so wait_for's timeout-cancel hits only the
+            # wrapper, never the credit.  In NORMAL operation (no throttle) the
+            # credit completes well inside the bound, so common-case timing is
+            # unchanged; only a honoured-Retry-After tail is deferred to the
+            # background.
             task = asyncio.create_task(self._finalize_detached(detached))
             self._bg_tasks.add(task)
             task.add_done_callback(self._on_end_session_done)
             try:
-                await asyncio.shield(task)
+                await asyncio.wait_for(
+                    asyncio.shield(task), _SPLIT_CREDIT_INLINE_WAIT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # R7-06: the credit is taking longer than the inline bound (almost
+                # always a honoured Discogs Retry-After). Stop blocking the
+                # recognition leg — the shielded task is still running, in
+                # _bg_tasks, and its done-callback will log the outcome.
+                log.info(
+                    "R7-06: split credit for release %s still in flight after %.1fs "
+                    "(likely honouring a Discogs Retry-After) — continuing to "
+                    "process audio; it completes in the background and is drained "
+                    "at shutdown.",
+                    detached.album_release_id, _SPLIT_CREDIT_INLINE_WAIT_SECONDS,
+                )
             except asyncio.CancelledError:
-                # Shutdown cancelled the recognition leg mid-credit — propagate so
+                # Shutdown cancelled the recognition leg mid-wait — propagate so
                 # the leg tears down cleanly. drain() still awaits the shielded
                 # task through _bg_tasks (that's what #187 registered it for).
                 raise
