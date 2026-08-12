@@ -9,6 +9,56 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.22] — 2026-08-12
+
+**Round-7 audit — Wave 3: display fidelity (milestone "R7 Wave 3", #320–#324).**
+Restores the designed letter-spacing the renderer was silently dropping from its
+own labels, stops the catalog footer and the "+N" chip drawing outside their
+bounds, and corrects stale colour-clamp docs and two render-loop comments.
+RED-first with executed repros; independent break-this cold review (SPEC + QUALITY
+pass); the two code fixes mutation-verified; full suite **1375 passed**.
+
+### Fixed
+
+- **The app's own labels get their designed letter-spacing back (#320 — HIGH,
+  `R7-07`).** The DISP-5 shaping gate was `not text.isascii()`, but the renderer's
+  labels are non-ASCII by construction — the mid-dot in `SIDE A · 04 OF 06`, the
+  ellipsis in `STILL LISTENING…`, the arrows in `← PREV` / `NEXT →` — so every one
+  was rendered as a single shaped run with NO tracking, on every frame since
+  v1.5.5. A new `_needs_shaping` predicate shapes ONLY genuinely complex text
+  (Arabic/Hebrew joining, Indic conjuncts, combining marks, emoji ZWJ/variation
+  selectors); Latin (incl. precomposed diacritics), CJK, punctuation, and arrows —
+  the labels included — keep their letter-spacing.
+- **The catalog footer is ellipsized instead of hard-clipped mid-glyph (#322 —
+  LOW, `R7-09`).** A `year · label · catalog` string wider than its column was
+  blitted with a width clip that sliced the last glyph in half. It is now trimmed
+  with a trailing … measured on the real letter-spaced width (`year · label · …`).
+  Interacts with R7-07: restoring tracking widens footers, so this is fixed in the
+  same wave.
+- **The "+N" genre overflow chip can no longer draw below its box (#321 — LOW,
+  `R7-08`).** `draw_chip` checked the vertical bound only inside its row-wrap
+  branch and moved the cursor before the early return, so a chip that fit
+  horizontally on an over-low row (or any chip at extreme push-down) blitted into
+  the catalog footer's row. It now verifies the fit on every path and commits the
+  cursor only when it draws; a chip that can't fit is suppressed rather than drawn
+  out of bounds.
+
+### Documented
+
+- **The `muted` contrast-clamp docs match the code again (#323 — LOW, `R7-10`).**
+  DESIGN.md, the renderer, and the palette module still said `muted` is clamped
+  against the gradient's brightest pixel (or flat `bg`); since #206 it is clamped
+  against solid `surface` — the status-strip fill it lands on, brighter than the
+  gradient peak — while `accent` (the album title) is the role clamped against the
+  gradient peak. Corrected at five sites.
+- **Two render-loop comments corrected (#324 — NIT, `R7-11`).** The static-frame
+  cache comment claimed the composite recomposes "each frame" during the palette
+  lerp (it recomposes only when the quantized palette changes, P-4 — roughly a
+  dozen-plus times per second, data-dependent); and the two cover-blacklist log
+  lines said "giving up until the track changes" when a same-album track change
+  reuses the URL and won't lift the blacklist — now "until a different cover is
+  requested."
+
 ## [1.5.21] — 2026-08-12
 
 **Round-7 audit — Wave 2: commit-pipeline availability (milestone "R7 Wave 2",

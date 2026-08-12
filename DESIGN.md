@@ -95,7 +95,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 
 ### Neutral
 - **Near-White Text** (`#ebe6dc`): Primary text. Warm off-white; slight warmth prevents harshness. Each album replaces this with a tinted near-white matching the cover's dominant hue.
-- **Muted Secondary** (`#8a857c`): Secondary text. Status labels, catalog text, PREV/NEXT labels, genre chip text. Must pass 4.5:1 contrast against the gradient's brightest pixel — the centre of the bg→surface radial, **not flat bg** (DISP-2) — at full opacity — never stack with additional opacity reductions. When extracting a muted value for a new album, verify the ratio; cool-dark backgrounds (e.g., Cavetown `#0e1a2a`) pull contrast down faster than neutral darks.
+- **Muted Secondary** (`#8a857c`): Secondary text. Status labels, catalog text, PREV/NEXT labels, genre chip text. Must pass 4.5:1 contrast against **solid `surface`** — the fill of the status strip these labels sit on, which is brighter than the gradient's peak (#206) — at full opacity — never stack with additional opacity reductions. When extracting a muted value for a new album, verify the ratio; cool-dark backgrounds (e.g., Cavetown `#0e1a2a`) pull contrast down faster than neutral darks.
 
 **Canvas Chrome** (`#f0eee9`): The design-tool background. Never part of the now-playing display.
 
@@ -103,7 +103,7 @@ The color system is semantic, not fixed. Five roles; each album fills them from 
 
 **Palette transitions** are smooth: all five roles lerp simultaneously over ~1 second when a track change triggers a new palette. This is a production feature, not a design enhancement — design work should treat the transition as a given and not work around it.
 
-**The Full-Opacity Rule.** Secondary text (`muted`) already conveys its subdued role through hue. Never compound with opacity. `p.muted` at `opacity: 0.65` over a dark bg fails contrast. Use the color as-is; reduce saturation or lightness in the palette if it reads too heavy. Both text roles — `muted` and, in production, `accent` (the album title) — are contrast-clamped to ≥4.5:1 against the **gradient's brightest pixel** (the bg→surface radial centre), not flat `bg`, since that is the brightest surface text can land on (DISP-1 / DISP-2). The clamp is re-asserted per-frame during the 1s palette lerp so readability holds mid-transition too.
+**The Full-Opacity Rule.** Secondary text (`muted`) already conveys its subdued role through hue. Never compound with opacity. `p.muted` at `opacity: 0.65` over a dark bg fails contrast. Use the color as-is; reduce saturation or lightness in the palette if it reads too heavy. Both text roles are contrast-clamped to ≥4.5:1, but against **different** targets (each the brightest thing that role actually lands on): `accent` (the album title, drawn on the gradient card) against the **gradient's brightest pixel** (the bg→surface radial centre, DISP-1 / DISP-2); `muted` (secondary text, drawn on the solid status strip) against **solid `surface`** (#206). Since `surface` ≥ the gradient peak ≥ `bg`, the `muted`-vs-`surface` clamp subsumes the gradient-card guarantee. The clamp is re-asserted per-frame during the 1s palette lerp so readability holds mid-transition too.
 
 **The Per-Album Rule.** The five palette roles (`bg`, `surface`, `accent`, `text`, `muted`) are architecture, not values. Treat the fallback palette as the null state; treat each album's extraction as the real design. New album additions require a new palette entry in `design/src/data.js`, not a design change.
 

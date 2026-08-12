@@ -117,12 +117,49 @@ def test_render_tracked_returns_a_surface_and_caches():
     assert s1.get_width() > 0
 
 
-def test_render_tracked_non_ascii_is_a_single_shaped_run():
-    """DISP-5: a non-ASCII string is rendered as one shaped run (no per-glyph
-    tracking that would mangle complex scripts)."""
+def test_render_tracked_complex_script_is_a_single_shaped_run():
+    """DISP-5 / R7-07: text that genuinely needs shaping (Arabic joining + RTL)
+    renders as one shaped run — width matches a plain font.render, no per-glyph
+    tracking that would mangle it."""
     t = make_text()
-    s = t.render_tracked("café ☕ 日本語", 16, (255, 255, 255), 0.2)
-    assert s.get_width() > 0
+    text = "مرحبا"
+    s = t.render_tracked(text, 16, (255, 255, 255), 0.2)
+    plain = t.font("mono", 16).render(text, True, (255, 255, 255))
+    assert s.get_width() == plain.get_width()
+
+
+def test_render_tracked_app_labels_keep_letter_spacing():
+    """R7-07: the app's own non-ASCII labels (·, …, ←, →) keep their designed
+    tracking — rendered wider than a plain single-run layout."""
+    t = make_text()
+    font = t.font("mono", 13)
+    for label in ("SIDE A · 04 OF 06", "← PREV", "NEXT →", "STILL LISTENING…"):
+        assert t.render_tracked(label, 13, (255, 255, 255), 0.16).get_width() \
+            > font.size(label)[0], f"{label!r} lost its letter-spacing (R7-07)"
+
+
+def test_render_tracked_ellipsized_trims_overflow_to_fit():
+    """R7-09: a catalog footer wider than its column is trimmed with a trailing …
+    so its LETTER-SPACED width fits, instead of hard-clipping mid-glyph."""
+    t = make_text()
+    footer = "1998 · Deutsche Grammophon Gesellschaft mbH · 289 459 610-2"
+    col = 440
+    full = t.render_tracked(footer, 13, (255, 255, 255), 0.08).get_width()
+    assert full > col                                    # genuinely overflows
+    trimmed = t.render_tracked_ellipsized(footer, 13, (255, 255, 255), 0.08, col)
+    assert trimmed.get_width() <= col                    # now fits the column
+    assert trimmed.get_width() < full                    # something was trimmed
+
+
+def test_render_tracked_ellipsized_leaves_fitting_label_alone():
+    """R7-09: a footer that already fits is returned untouched (same width as a
+    plain tracked render — no spurious ellipsis)."""
+    t = make_text()
+    footer = "1987 · SST · SST-134"
+    col = 440
+    plain = t.render_tracked(footer, 13, (255, 255, 255), 0.08).get_width()
+    assert plain <= col
+    assert t.render_tracked_ellipsized(footer, 13, (255, 255, 255), 0.08, col).get_width() == plain
 
 
 # ---------------------------------------------------------------------------
