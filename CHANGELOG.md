@@ -7,6 +7,80 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [1.5.28] — 2026-08-12
+
+**R8 Wave 2 — display i18n & render survival (milestone `R8 Wave 2`; #352,
+#353, #354, #355).** The audit's third HIGH plus the display's two
+video-fault resilience gaps. Design gate cleared with rendered mockups (Lane,
+2026-08-12): Noto Sans JP fallback in role-matched weights, upright fallback
+runs. RED-first: three executed reproductions on the pre-fix code (4/4 album
+chars tofu; 30 full decodes over a 30-frame convert-fault episode; `run()`
+dying on the first `pygame.error`), all flipped.
+⚠ The independent break-this cold review + two narrow follow-up passes caught
+and fixed five issues in the first cuts before commit: (F1) the R8-06 gate
+traded the decode storm for a **permanent placeholder under reduced_motion**
+(the storm had accidentally been the recovery mechanism) — the probe is now
+clock-driven from the render loop, re-armed after the probe frame (the first
+re-arm attempt deadlocked its own probe — caught by the third pass' scope);
+(F3) `pygame.event.get()` can also raise `pygame.error` on a dead video
+subsystem and sat outside the survival try — pump faults now join the episode
+and route into the reinit/recovery path; (F5) a combining mark after a
+fallback run detached into its own primary run — marks now stay attached to
+their base's run when covered; (F4) multi-run renders honour a `background`
+argument; (F3P-1) a stale decode task (track changed mid-decode) can no longer
+latch the global episode flag against the new cover. A vacuous test assertion
+(F2) was also fixed and its mutant re-killed. 14/14 targeted mutations killed.
+Full suite **1447 passed** (+2 skips that activate when the Noto files land).
+
+### Fixed
+
+- **Non-Latin metadata renders real glyphs instead of tofu boxes (#352 /
+  R8-03 — HIGH).** `pygame.font.Font` renders one file with no fallback chain,
+  and no bundled face covered CJK — a Japanese pressing (坂本龍一) rendered
+  every role as .notdef boxes, and Newsreader-Italic's missing Cyrillic/Greek
+  meant a Кино record rendered the artist fine and the album title as boxes on
+  the same screen. `TextRenderer.font()` now returns a `_CompositeFont`: runs
+  the primary face doesn't cover (per its cmap, read once via the new
+  `fonttools` dependency) render with the role's Noto Sans JP fallback face
+  (hero→SemiBold, artist→Medium, album+mono→Regular — see
+  `src/display/assets/fonts/fallback/README.md`), upright, baseline-aligned,
+  through every text path (wrap/fit/tracked/ellipsize/chips) with zero call-site
+  changes. ASCII takes a byte-identical fast path; layout metrics stay the
+  primary face's (no line-height jumps); text neither face covers (Arabic —
+  deliberately unbundled) renders exactly as before. Missing fallback files or
+  fontTools degrade to pre-R8-03 single-face rendering with one WARNING.
+- **A video-loss episode no longer costs a full JPEG decode + SD read at
+  ~10 Hz (#353 / R8-06 — MEDIUM).** The `_cover_decode_deferred` latch
+  suppressed only the LOG; each failed `convert()` cleared the inflight guard
+  and left the URL marked on-disk, so `_load_cover` re-spawned the decode every
+  frame for the whole HDMI fault (executed: 30 frames → 30 decodes; now 1).
+  The latch now gates the WORK: one probe per `_COVER_DECODE_RETRY_SECONDS`
+  (5s), the deadline re-arms on every failed attempt, and a clean decode or a
+  new cover clears it.
+- **A `pygame.error` escaping the per-frame render no longer kills the whole
+  pipeline (#354 / R8-07 — MEDIUM).** One flaky HDMI cable used to mean
+  display-leg fault → FIRST_COMPLETED → process exit → systemd restart loop.
+  `run()` now logs once per episode, slows to ~1 attempt/s, re-tries
+  `pygame.display.set_mode` every `_RENDER_FAULT_REINIT_SECONDS` (5s, with a
+  forced static-frame recompose on recovery), and logs the episode duration
+  when the display returns. Non-pygame exceptions remain fatal — fail-fast on
+  genuine bugs is unchanged.
+
+### Added
+
+- `tests/test_font_fallback_r8.py` (run-splitting with a bundled-font stand-in
+  fallback + real-Noto tests that activate when the files land) and
+  `tests/test_display_survival_r8.py` (decode-storm gate, deadline re-arm,
+  fault survival, re-init, non-pygame fatality).
+- `fonttools>=4.38.0` (pure-Python, startup-only cmap reads).
+
+### Documented
+
+- R8-23 (#355): `render_tracked_ellipsized`'s shaped/RTL limitations (logical-
+  end ellipsis, joining-form changes at the cut, binary-search monotonicity
+  assumption) — data-field-only, backstopped by the caller's area clip, moot
+  until shaped scripts get a covered face.
+
 ## [1.5.27] — 2026-08-12
 
 **R8 Wave 1 — credit timing at real cadence (milestone `R8 Wave 1`; #345, #346,

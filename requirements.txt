@@ -29,6 +29,12 @@ musicbrainzngs>=0.7.1
 # Display
 pygame>=2.5.0
 Pillow>=10.0.0
+# R8-03 (#352): reads each bundled font's cmap once at FIRST USE (cached per
+# file) so the display can split text into primary/fallback runs (Noto Sans JP
+# for CJK + the Cyrillic/Greek gaps in Newsreader-Italic). Pure Python, no
+# per-frame work; if absent the display degrades to single-face rendering with
+# one WARNING.
+fonttools>=4.38.0
 # Cover-art fetch pins the connection to a vetted IP (S-7); these are imported
 # directly by src/display/cover_cache.py, not just transitively via requests.
 # urllib3>=2.0 is required: the IP-pinned HTTPSConnectionPool relies on the

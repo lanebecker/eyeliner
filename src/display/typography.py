@@ -104,6 +104,192 @@ _SYSFONT_FALLBACKS = {
     "mono": ("dejavu sans mono", False, False),
 }
 
+# ---------------------------------------------------------------------------
+# R8-03 (#352): per-run script fallback.
+#
+# The bundled faces cover Latin (+ precomposed diacritics); Inter Tight and
+# JetBrains Mono also cover Cyrillic/Greek, but Newsreader-Italic does NOT —
+# and none of the four covers CJK, Arabic, Hebrew or emoji.  pygame.font.Font
+# renders ONE file with no fallback chain, so a Japanese pressing (坂本龍一)
+# used to render every role as .notdef tofu boxes, and a Кино record rendered
+# the artist fine but the album title as boxes (R8-03).
+#
+# Fix (Lane, 2026-08-12, mockup-approved): bundle Noto Sans JP — whose coverage
+# includes CJK AND Cyrillic/Greek/extended Latin — in the three role weights,
+# and render any run the primary face doesn't cover with the role's fallback
+# face, upright (CJK convention; no faux-oblique for the album role).
+# Coverage is read from each face's cmap ONCE via fontTools (pure-Python,
+# startup-only); if fontTools or the fallback files are absent the composite
+# degrades to exactly the old single-face behavior, with one WARNING.
+#
+# Arabic/Hebrew remain uncovered by choice (rare in vinyl metadata; the
+# _needs_shaping gate above already routes them to a single shaped run, which
+# would need a shaping engine AND a face — revisit if a pressing shows up).
+_FALLBACK_DIR = _FONT_DIR / "fallback"
+_FALLBACK_FONT_FILES = {
+    "display": "NotoSansJP-SemiBold.ttf",   # hero — matches Inter Tight SemiBold
+    "text": "NotoSansJP-Medium.ttf",        # artist — matches Inter Tight Medium
+    "title": "NotoSansJP-Regular.ttf",      # album — UPRIGHT (no CJK italic)
+    "mono": "NotoSansJP-Regular.ttf",       # catalog/labels — Regular
+}
+
+# Per-file codepoint coverage sets, loaded lazily via fontTools.  None is the
+# "unknown" sentinel (fontTools missing / file unreadable): the composite then
+# treats everything as primary-covered — the pre-R8-03 behavior.
+_COVERAGE_CACHE: dict = {}
+_coverage_warned = False
+
+
+def _font_coverage(path) -> "set | None":
+    """Codepoints covered by the font file at *path*, or None if unknowable.
+
+    Cached per path.  Uses fontTools' best cmap (startup-only, pure Python);
+    a missing file, a parse failure, or an absent fontTools all degrade to
+    None so rendering falls back to the old single-face path rather than
+    failing the display.
+    """
+    global _coverage_warned
+    key = str(path)
+    if key in _COVERAGE_CACHE:
+        return _COVERAGE_CACHE[key]
+    coverage = None
+    try:
+        from fontTools.ttLib import TTFont
+        with TTFont(key, lazy=True) as tt:
+            coverage = set(tt.getBestCmap().keys())
+    except Exception as e:
+        if not _coverage_warned:
+            log.warning(
+                "R8-03 font-fallback coverage unavailable (%s: %s) — non-Latin "
+                "metadata may render as boxes (single-face rendering).",
+                Path(key).name, e,
+            )
+            _coverage_warned = True
+    _COVERAGE_CACHE[key] = coverage
+    return coverage
+
+
+class _CompositeFont:
+    """A pygame-Font-compatible facade that renders per-run script fallback.
+
+    Wraps a *primary* pygame Font and an optional *fallback* Font.  Exposes the
+    exact surface of the pygame.font.Font API this codebase uses — ``render``,
+    ``size``, ``get_height``, ``get_ascent``, ``get_descent`` — so every call
+    site (wrap/fit/tracked/ellipsize/chips) gains fallback without changes.
+
+    Run rule: a character renders with the FALLBACK only when the primary's
+    cmap lacks it AND the fallback's cmap has it; everything else stays primary
+    (so text neither face covers renders primary .notdef exactly as before, and
+    an unknown coverage set — fontTools missing — degrades to all-primary).
+
+    Metrics: ``get_height``/``get_ascent``/``get_descent`` report the PRIMARY's
+    metrics — they are layout constants (line advance, baseline) and must not
+    jump when a CJK run appears.  Mixed-run surfaces are baseline-aligned (each
+    run blitted at ``max_ascent - run_ascent``) and may exceed get_height by a
+    few pixels; callers already tolerate that (glyph surfaces are blitted, not
+    packed).  ``size``/``render`` agree exactly by construction (same run
+    arithmetic).
+    """
+
+    def __init__(self, primary, fallback, primary_coverage, fallback_coverage):
+        self._primary = primary
+        self._fallback = fallback
+        self._pcov = primary_coverage
+        self._fcov = fallback_coverage
+
+    # -- run splitting ------------------------------------------------------
+
+    def _use_fallback(self, ch: str) -> bool:
+        if self._fallback is None or self._pcov is None or self._fcov is None:
+            return False
+        o = ord(ch)
+        return o not in self._pcov and o in self._fcov
+
+    def _runs(self, text: str):
+        """Yield (font, chunk) runs.  Fast path: all-primary → one run."""
+        if self._fallback is None or not text:
+            yield (self._primary, text)
+            return
+        if text.isascii():
+            yield (self._primary, text)
+            return
+        import unicodedata
+        out = []
+        for ch in text:
+            fb = self._use_fallback(ch)
+            # Cold-review F5: a COMBINING mark must stay attached to its base's
+            # run when that run's face covers it — otherwise "Кино́"-style text
+            # splits the mark into its own run and it renders detached as a
+            # spacing glyph.  (U+0301 is in most Latin faces' cmaps, so the
+            # plain "primary has it" rule pulled it out of the fallback run.)
+            if out and unicodedata.combining(ch):
+                prev_fb = out[-1][0]
+                prev_cov = self._fcov if prev_fb else self._pcov
+                if prev_cov is not None and ord(ch) in prev_cov:
+                    out[-1][1] += ch
+                    continue
+            if out and out[-1][0] == fb:
+                out[-1][1] += ch
+            else:
+                out.append([fb, ch])
+        for fb, chunk in out:
+            yield (self._fallback if fb else self._primary, chunk)
+
+    def _char_font(self, ch: str):
+        """The concrete pygame Font this composite would render *ch* with —
+        for callers doing their own per-glyph layout (render_tracked's
+        baseline alignment)."""
+        return self._fallback if self._use_fallback(ch) else self._primary
+
+    # -- pygame.font.Font API ----------------------------------------------
+
+    def render(self, text: str, antialias: bool, color, background=None):
+        import pygame
+
+        runs = list(self._runs(text))
+        if len(runs) == 1:
+            font, chunk = runs[0]
+            if background is not None:
+                return font.render(chunk, antialias, color, background)
+            return font.render(chunk, antialias, color)
+        surfs = [(font, font.render(chunk, antialias, color)) for font, chunk in runs]
+        max_ascent = max(font.get_ascent() for font, _ in surfs)
+        height = max(
+            max_ascent - font.get_ascent() + s.get_height() for font, s in surfs
+        )
+        width = sum(s.get_width() for _, s in surfs)
+        out = pygame.Surface((max(1, width), max(1, height)), pygame.SRCALPHA)
+        if background is not None:
+            # Cold-review F4: honour the facade contract — a caller passing a
+            # background color must get it on the multi-run path too (no
+            # current caller does; latent-consistency fix).
+            out.fill(background)
+        x = 0
+        for font, s in surfs:
+            out.blit(s, (x, max_ascent - font.get_ascent()))
+            x += s.get_width()
+        return out
+
+    def size(self, text: str):
+        runs = list(self._runs(text))
+        if len(runs) == 1:
+            return runs[0][0].size(runs[0][1])
+        width = sum(font.size(chunk)[0] for font, chunk in runs)
+        height = max(font.size(chunk)[1] for font, chunk in runs)
+        return (width, height)
+
+    def get_height(self):
+        return self._primary.get_height()
+
+    def get_ascent(self):
+        return self._primary.get_ascent()
+
+    def get_descent(self):
+        return self._primary.get_descent()
+
+    def get_linesize(self):
+        return self._primary.get_linesize()
+
 
 class TextRenderer:
     """Font loading + text layout over two bounded LRU caches.
@@ -119,6 +305,9 @@ class TextRenderer:
         self._font_cache = font_cache
         self._label_cache = label_cache
 
+    # R8-03: warn once (not per role×size) when the fallback faces are absent.
+    _fallback_missing_warned = False
+
     def font(self, role: str, size: int):
         """Return the bundled font for a role at a pixel size, cached.
 
@@ -128,6 +317,14 @@ class TextRenderer:
         fixed handful of sizes).  Falls back to the DejaVu SysFont family if the
         bundled file is missing, so dev machines and CI without the assets still
         render.
+
+        R8-03 (#352): the returned object is a :class:`_CompositeFont` wrapping
+        the primary face plus the role's script-fallback face (Noto Sans JP in
+        the matching weight), so every text path — wrap, fit, tracked,
+        ellipsize, chips — renders non-Latin runs with real glyphs instead of
+        .notdef boxes.  If the fallback file (or fontTools) is unavailable the
+        composite degrades to single-face behavior identical to pre-R8-03,
+        with one WARNING for the whole process.
         """
         import pygame
 
@@ -138,11 +335,32 @@ class TextRenderer:
 
         path = _FONT_DIR / _FONT_FILES[role]
         try:
-            font = pygame.font.Font(str(path), size)
+            primary = pygame.font.Font(str(path), size)
+            primary_cov = _font_coverage(path)
         except (FileNotFoundError, OSError, pygame.error):
             name, bold, italic = _SYSFONT_FALLBACKS[role]
-            font = pygame.font.SysFont(name, size, bold=bold, italic=italic)
+            primary = pygame.font.SysFont(name, size, bold=bold, italic=italic)
+            primary_cov = None   # SysFont path unknown — degrade to single-face
             log.warning(f"Bundled font missing ({path.name}); using SysFont fallback")
+
+        fallback = None
+        fallback_cov = None
+        fb_path = _FALLBACK_DIR / _FALLBACK_FONT_FILES[role]
+        try:
+            fallback = pygame.font.Font(str(fb_path), size)
+            fallback_cov = _font_coverage(fb_path)
+        except (FileNotFoundError, OSError, pygame.error):
+            if not TextRenderer._fallback_missing_warned:
+                log.warning(
+                    "R8-03 script-fallback font missing (%s) — CJK/Cyrillic/Greek "
+                    "metadata the primary faces don't cover will render as boxes. "
+                    "See src/display/assets/fonts/fallback/README.md.",
+                    fb_path.name,
+                )
+                TextRenderer._fallback_missing_warned = True
+            fallback = None
+
+        font = _CompositeFont(primary, fallback, primary_cov, fallback_cov)
         self._font_cache.put(key, font)
         return font
 
@@ -178,15 +396,32 @@ class TextRenderer:
             return surf
 
         extra = tracking * size
-        glyphs = [font.render(ch, True, color) for ch in text]
+        # R8-03: per-glyph baseline alignment.  With script fallback a label can
+        # mix faces (e.g. an ASCII catalog number + a CJK label name); each
+        # glyph is blitted at (max_ascent − its face's ascent) so baselines
+        # meet.  For an all-primary label this reduces exactly to the old
+        # y=0 / font-height layout (uniform ascent).  `_char_font` is the
+        # composite's per-char face; a plain injected Font (tests) has no
+        # such method and gets the uniform path.
+        char_font = getattr(font, "_char_font", None)
+        glyphs = []
+        for ch in text:
+            g = font.render(ch, True, color)
+            asc = char_font(ch).get_ascent() if char_font else font.get_ascent()
+            glyphs.append((g, asc))
+        max_ascent = max((asc for _, asc in glyphs), default=font.get_ascent())
+        height = max(
+            [max_ascent - asc + g.get_height() for g, asc in glyphs]
+            + [font.get_height()]
+        )
         # Total width: glyph advances + tracking between characters (CSS adds
         # tracking after every glyph including the last; trim it for cleaner
         # right-alignment).
-        width = int(sum(g.get_width() for g in glyphs) + extra * max(0, len(glyphs) - 1))
-        surf = pygame.Surface((max(1, width), font.get_height()), pygame.SRCALPHA)
+        width = int(sum(g.get_width() for g, _ in glyphs) + extra * max(0, len(glyphs) - 1))
+        surf = pygame.Surface((max(1, width), height), pygame.SRCALPHA)
         x = 0.0
-        for g in glyphs:
-            surf.blit(g, (int(x), 0))
+        for g, asc in glyphs:
+            surf.blit(g, (int(x), max_ascent - asc))
             x += g.get_width() + extra
         self._label_cache.put(key, surf)
         return surf
@@ -208,6 +443,20 @@ class TextRenderer:
         nothing sensible fits, so the bare "…" surface is returned even though it
         exceeds *max_width* (the caller's area clip is the backstop; unreachable at
         the 1024×600 footer column).
+
+        R8-23 (#355) — documented limitations for shaped/RTL text (data-field
+        content only; all backstopped by the caller's area clip):
+          * the appended "…" lands at the LOGICAL end of the string, which for
+            an RTL run is the visual LEFT — unconventional but unambiguous;
+          * truncating Arabic mid-word changes joining forms at the cut point
+            (the last kept letter re-shapes to final/isolated form);
+          * the binary search assumes rendered width is monotonic in prefix
+            length — true for the tracked per-glyph path, not guaranteed for a
+            shaped run (contextual forms can shrink as text grows), so a shaped
+            candidate may land a few px under the optimum (never over: the
+            final candidate's width was measured, not predicted).
+        Moot in practice until shaped scripts get a fallback face with real
+        coverage (deferred with Arabic/Hebrew under R8-03).
         """
         surf = self.render_tracked(text, size, color, tracking)
         if surf.get_width() <= max_width:

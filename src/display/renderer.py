@@ -170,6 +170,19 @@ _COVER_MAX_LOAD_FAILURES = 1
 _COVER_DOWNLOAD_RETRY_BACKOFF_SECONDS = 30.0
 _COVER_MAX_DOWNLOAD_FAILURES = 5
 
+# R8-06 (#353): while a convert() fault is latched (_cover_decode_deferred),
+# re-attempt the decode at most once per this many seconds instead of every
+# frame — a video-loss episode used to cost a full JPEG decode + SD read at
+# ~10 Hz for its whole duration.
+_COVER_DECODE_RETRY_SECONDS = 5.0
+
+# R8-07 (#354): a pygame.error escaping the per-frame render/flip no longer
+# kills the pipeline (one flaky HDMI cable used to mean a process restart
+# loop).  During a fault episode the loop slows to one attempt per second and
+# re-tries pygame.display.set_mode() every this many seconds; non-pygame
+# exceptions remain fatal (FIRST_COMPLETED tears the pipeline down as before).
+_RENDER_FAULT_REINIT_SECONDS = 5.0
+
 # Cap on the tracked-label Surface cache (letter-spaced mono labels).
 # Labels are tiny surfaces and mostly static per track; 128 is plenty.
 _LABEL_CACHE_MAX = 128
@@ -381,9 +394,17 @@ class DisplayRenderer:
         # so the gated decode then spawns); _on_state_change drops it for a NEW
         # cover so a stale entry can't mislead the next track.
         self._cover_on_disk: set = set()
-        # True while the display surface is unavailable (video-mode loss);
-        # suppresses per-frame "decode deferred" logging until a cover decodes.
+        # True while the display surface is unavailable (video-mode loss).
+        # R8-06 (#353): the latch now gates the WORK, not just the log —
+        # pre-R8-06 each failed convert() cleared the inflight guard and left
+        # the URL in _cover_on_disk, so _load_cover respawned a full JPEG
+        # decode + SD read EVERY frame (~10 Hz) for the whole fault episode.
+        # While latched, _load_cover skips the decode spawn until
+        # _cover_decode_retry_at elapses (~one attempt per
+        # _COVER_DECODE_RETRY_SECONDS); cleared on a clean decode and on a
+        # state change to a new cover.
         self._cover_decode_deferred: bool = False
+        self._cover_decode_retry_at: float = 0.0
         self._gradient_key: Optional[tuple] = None           # (bg, surface, w, h)
         self._gradient_surface: Optional["pygame.Surface"] = None
 
@@ -545,6 +566,13 @@ class DisplayRenderer:
                     self._cover_download_failures.pop(outgoing, None)
                     self._cover_download_retry_after.pop(outgoing, None)
                     self._cover_decode_failures.pop(outgoing, None)
+                # R8-06 (#353): a NEW cover gets an immediate decode attempt —
+                # clear the episode latch AND the deadline (the latch re-sets on
+                # the next failure if the display is still gone).  2nd-pass fix:
+                # the latch clear was missing, leaving the F1 probe armed with
+                # no decode path to resolve it while the new download pended.
+                self._cover_decode_deferred = False
+                self._cover_decode_retry_at = 0.0
             self._wanted_cover_url = url
             self._queue_palette(url)
             if url:
@@ -561,11 +589,46 @@ class DisplayRenderer:
     # -----------------------------------------------------------------------
 
     async def run(self):
-        """Async display loop — re-renders when dirty or transitioning."""
+        """Async display loop — re-renders when dirty or transitioning.
+
+        R8-07 (#354): a ``pygame.error`` escaping the per-frame render/flip —
+        an SDL surface lost to a video fault (HDMI hotplug/blanking, the same
+        episode class the cover convert() branch already treats as transient) —
+        no longer faults the display leg and thereby the whole pipeline
+        (FIRST_COMPLETED → cancel all → systemd restart loop on one flaky
+        cable).  During a fault episode the loop logs once, slows to ~1 attempt
+        per second, and re-tries ``pygame.display.set_mode`` every
+        ``_RENDER_FAULT_REINIT_SECONDS``; recovery is logged with the episode
+        duration.  Non-pygame exceptions stay FATAL — fail-fast on genuine
+        bugs is unchanged.
+        """
         import pygame
         prev_transitioning = False
+        fault_since: Optional[float] = None
+        fault_last_reinit = 0.0
         while self._running:
-            for event in pygame.event.get():
+            # R8-07 (cold-review F3): the event pump can ALSO raise pygame.error
+            # once the video subsystem is gone ("video system not initialized") —
+            # keep it inside the same survival policy as the render below.  A
+            # pump fault starts/continues the episode; events are retried next
+            # iteration.
+            try:
+                events = pygame.event.get()
+            except pygame.error as e:
+                events = []
+                if fault_since is None:
+                    fault_since = time.monotonic()
+                    fault_last_reinit = fault_since
+                    log.warning(
+                        "Event pump failed (%s) — video fault? Keeping the "
+                        "pipeline alive (R8-07).", e,
+                    )
+                # 2nd-pass fix: route the episode into the render try below
+                # (where retry, set_mode reinit and recovery-logging live) —
+                # without this a pump-only fault on a static frame never
+                # reached the reinit and never ended the episode.
+                self._dirty = True
+            for event in events:
                 if event.type == pygame.QUIT:
                     self.stop()
                     return
@@ -577,6 +640,24 @@ class DisplayRenderer:
             # Cheap O(1) check per loop iteration (~10 fps even when idle), so a
             # transient download failure self-heals within ~the backoff — no timer.
             self._maybe_retry_cover_download()
+
+            # R8-06 (cold-review F1): the decode probe must be CLOCK-driven, not
+            # render-driven.  Under reduced_motion the now-playing frame doesn't
+            # self-dirty, so once a convert-fault episode's last frame passed,
+            # nothing would ever call _load_cover again and the cover stayed a
+            # placeholder for the rest of the track (the pre-R8-06 storm was,
+            # accidentally, also the recovery mechanism).  O(1) per iteration.
+            # 2nd-pass fix, take two: the probe frame is BOUNDED — one per
+            # window — by re-arming the deadline AFTER the probe frame renders
+            # (see below).  Re-arming HERE (take one) deadlocked the probe:
+            # _load_cover's gate saw the freshly-future deadline and skipped
+            # the very decode this frame existed to spawn.
+            probe_frame = (
+                self._cover_decode_deferred
+                and time.monotonic() >= self._cover_decode_retry_at
+            )
+            if probe_frame:
+                self._dirty = True
 
             # Keep re-rendering during a palette transition even if not dirty
             transitioning = (time.monotonic() - self._transition_start) < _TRANSITION_SECS
@@ -598,12 +679,58 @@ class DisplayRenderer:
                 # _render_empty can set self._dirty = True to request
                 # another frame for animations (pulsing dot, spinner).
                 self._dirty = False
-                self._render()
-                pygame.display.flip()
+                try:
+                    self._render()
+                    pygame.display.flip()
+                    if fault_since is not None:
+                        log.info(
+                            "Display recovered after a %.0fs video-fault "
+                            "episode (R8-07).", time.monotonic() - fault_since,
+                        )
+                        fault_since = None
+                except pygame.error as e:
+                    now = time.monotonic()
+                    if fault_since is None:
+                        fault_since = now
+                        fault_last_reinit = now
+                        log.warning(
+                            "Per-frame render failed (%s) — video fault? "
+                            "Keeping the pipeline alive; retrying ~1/s and "
+                            "re-initializing the display every %.0fs (R8-07).",
+                            e, _RENDER_FAULT_REINIT_SECONDS,
+                        )
+                    self._dirty = True   # keep attempting frames
+                    if now - fault_last_reinit >= _RENDER_FAULT_REINIT_SECONDS:
+                        fault_last_reinit = now
+                        try:
+                            flags = pygame.FULLSCREEN if self.fullscreen else 0
+                            self._screen = pygame.display.set_mode(
+                                (self.width, self.height), flags
+                            )
+                            # Composed surfaces may hold the old pixel format;
+                            # force a recompose on the next successful frame.
+                            self._static_key = None
+                        except pygame.error:
+                            pass   # display still gone; next window retries
+                if probe_frame:
+                    # R8-06 2nd-pass: re-arm AFTER the probe frame ran, whether
+                    # or not it managed to spawn a decode — bounds the
+                    # no-decode-path case (cover not on disk, blacklisted,
+                    # IDLE screen) to ONE frame per window instead of a
+                    # permanent ~10fps dirty loop.  A spawned probe's own
+                    # failure/success re-arms/clears independently.
+                    self._cover_decode_retry_at = (
+                        time.monotonic() + _COVER_DECODE_RETRY_SECONDS
+                    )
 
             # Sleep cadence: 30 fps while transitioning (smooth lerp), otherwise
             # ~10 fps — fast enough for the 1.6s pulsing dot, but easy on the Pi.
-            await asyncio.sleep(1 / 30 if transitioning else 1 / 10)
+            # R8-07: ~1 fps during a video-fault episode (each attempt raises;
+            # don't burn CPU rendering into a dead surface at full cadence).
+            if fault_since is not None:
+                await asyncio.sleep(1.0)
+            else:
+                await asyncio.sleep(1 / 30 if transitioning else 1 / 10)
 
     # -----------------------------------------------------------------------
     # Render dispatch
@@ -1661,6 +1788,14 @@ class DisplayRenderer:
         # task every frame for the whole track. _prefetch_cover marks readiness
         # and bumps _cover_version, so a landed download triggers a repaint that
         # reaches here with url in _cover_on_disk and the decode spawns once.
+        # R8-06 (#353): while a convert() fault is latched, the WORK is gated —
+        # not just the log.  Without this, every failed decode task cleared the
+        # inflight guard and this cache-miss respawned a full JPEG decode + SD
+        # read per frame (~10 Hz) for the entire video-loss episode.  One
+        # retry per _COVER_DECODE_RETRY_SECONDS probes for the display coming
+        # back; a clean decode or a new cover clears the latch.
+        if self._cover_decode_deferred and time.monotonic() < self._cover_decode_retry_at:
+            return None
         if url in self._cover_on_disk and (url, w, h) not in self._cover_decode_inflight:
             self._spawn(self._decode_cover_async(url, w, h))
         return None
@@ -1749,13 +1884,26 @@ class DisplayRenderer:
                 # episode; the latch clears on the next clean decode.  Catch
                 # Exception (not just pygame.error) so a stray non-pygame error
                 # fails safe to the placeholder instead of escaping the task.
+                # 3rd-pass F3P-1: a STALE task (its cover no longer wanted —
+                # the track changed mid-decode) must not latch the GLOBAL
+                # episode flag: a cover-specific failure would otherwise gate
+                # the NEW cover's first decode ~5s on a healthy display.  A
+                # real video fault re-latches via the new cover's own decode.
+                if url != self._wanted_cover_url:
+                    return
                 if not self._cover_decode_deferred:
                     if isinstance(e, pygame.error):
                         log.warning(f"Cover decode deferred — display not ready: {e}")
                     else:
                         log.error(f"Unexpected error scaling cover art for {url}: {e}")
                     self._cover_decode_deferred = True
-                self._dirty = True
+                    self._dirty = True   # paint the placeholder once
+                # R8-06: (re)arm the retry deadline on EVERY failed attempt —
+                # first or repeat — so _load_cover's gate holds between probes
+                # instead of re-opening once the first deadline passes.
+                self._cover_decode_retry_at = (
+                    time.monotonic() + _COVER_DECODE_RETRY_SECONDS
+                )
                 return
 
             self._cover_cache.put(key, scaled)
