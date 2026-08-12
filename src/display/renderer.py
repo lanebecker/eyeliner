@@ -1434,13 +1434,19 @@ class DisplayRenderer:
         state-change prefetch and a load-failure refetch must not both hit the
         network for one cover.
         """
-        # #165: a URL already given up on (blacklisted) keeps its corrupt bytes on
-        # disk (see _handle_corrupt_cover), so exists() is true and the palette step
-        # below would re-decode them and log one "Palette extraction failed" WARNING
-        # on every track-change prefetch. Skip a blacklisted URL entirely. A
-        # genuinely NEW cover has already been discard()'d from _cover_bad_urls by
-        # _on_state_change before this task is spawned, so it still gets a fresh
-        # attempt; only a still-blacklisted URL is short-circuited here.
+        # #165 / R7-15: skip a URL already given up on (blacklisted), whichever of
+        # the two routes blacklisted it. The DECODE route (_handle_corrupt_cover
+        # past _COVER_MAX_LOAD_FAILURES) LEAVES its corrupt bytes on disk, so
+        # exists() is true and — without this guard — the palette step below would
+        # re-decode them and log one "Palette extraction failed" WARNING on every
+        # track-change prefetch; skipping avoids that flood. The DOWNLOAD route
+        # (past _COVER_MAX_DOWNLOAD_FAILURES) leaves NO bytes on disk, so exists()
+        # is false and the palette step wouldn't fire anyway — but skipping is
+        # still correct (a dead URL must not be re-attempted, and the download
+        # branch below would just re-fail). Either way, a genuinely NEW cover was
+        # already discard()'d from _cover_bad_urls by _on_state_change before this
+        # task is spawned, so it still gets a fresh attempt; only a
+        # still-blacklisted URL is short-circuited here.
         if url in self._cover_bad_urls:
             return
         if url in self._cover_prefetch_inflight:
@@ -1645,7 +1651,26 @@ class DisplayRenderer:
             return                              # a decode for this cover is already running
         cache_path = self._cover_store.path_for(url)
         if not cache_path.exists():
-            return                              # not downloaded yet — prefetch lands it + repaints
+            if url in self._cover_on_disk:
+                # R7-12: the URL was MARKED on disk but the file has VANISHED — the
+                # mtime-LRU pruned it. A warm-start cover's mtime is never refreshed
+                # after the download short-circuits, so it is the prune's first
+                # victim once any later download crosses the cache bound. The old
+                # code returned WITHOUT dropping the marker, so `url in
+                # _cover_on_disk` stayed true and _load_cover respawned this
+                # (blocking-stat, no-op) decode EVERY frame for the rest of the
+                # album, while the R6-18 retry driver stayed gated off (it too skips
+                # a URL still in _cover_on_disk). Drop the readiness marker and
+                # refetch — exactly as the corrupt-bytes path does (R6-19) — so the
+                # churn stops and the cover recovers within the track.
+                self._cover_on_disk.discard(url)
+                if url not in self._cover_prefetch_inflight:
+                    self._spawn(self._prefetch_cover(url))
+                self._dirty = True   # repaint to the placeholder now the cover is gone
+            # else: the decode raced ahead of a still-PENDING download (the file was
+            # never on disk). The state-change prefetch owns landing it; do NOT
+            # refetch here (that download path is not this method's job).
+            return
 
         self._cover_decode_inflight.add(key)
         try:
@@ -1653,6 +1678,22 @@ class DisplayRenderer:
                 loop = asyncio.get_running_loop()
                 raw = await loop.run_in_executor(None, pygame.image.load, str(cache_path))
             except Exception as e:
+                # R7-13: distinguish a file PRUNED between the exists() check above
+                # and the executor load (a race) from genuinely CORRUPT bytes.
+                # pygame raises FileNotFoundError for a missing file; re-checking
+                # existence also covers any load error on a now-absent file
+                # whatever its exception type. A vanished file is treated as
+                # not-on-disk (drop the marker + refetch, NO decode tally), never as
+                # a corrupt-decode failure — which would unlink an already-gone file
+                # and burn a _COVER_MAX_LOAD_FAILURES attempt toward a spurious
+                # blacklist that a same-album track change could never lift.
+                if isinstance(e, FileNotFoundError) or not cache_path.exists():
+                    if url in self._cover_on_disk:
+                        self._cover_on_disk.discard(url)
+                        if url not in self._cover_prefetch_inflight:
+                            self._spawn(self._prefetch_cover(url))
+                    self._dirty = True
+                    return
                 # Corrupt/partial bytes (the SD read is off-loop, so its failure
                 # surfaces here): STAB-1 bounded unlink + refetch, then blacklist.
                 self._handle_corrupt_cover(url, cache_path, e)
