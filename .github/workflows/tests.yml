@@ -17,7 +17,15 @@ on:
     branches: [main]
   pull_request:
   schedule:
+    # R7-24: the weekly cron is the ACTUAL floor-drift catcher (Dependabot raises
+    # no PR for a `>=` floor that already admits the newest release — there is no
+    # lockfile, the Option-A decision). ⚠ GitHub DISABLES a scheduled workflow
+    # after 60 days without repository activity, which a finished appliance repo
+    # will hit — re-enable it (or push any commit) if the weekly run stops.
     - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  # R7-24: manual trigger so the drift check can be run on demand (and to keep the
+  # schedule reachable) without waiting for Monday.
+  workflow_dispatch:
 
 # R5-35 (TQ-5 parity with sync-version-badge.yml): scope the token to read-only.
 # This job installs the full pip dependency tree on every push/PR, so it must not
@@ -27,8 +35,15 @@ permissions:
 
 # R6-37: keep only the newest run per ref alive — a fresh push / PR-sync cancels
 # the superseded matrix instead of running two full matrices to completion.
+# R7-23: include github.event_name in the group. A `schedule` run executes with
+# github.ref = refs/heads/main, the SAME ref as a main-branch push, so without the
+# event_name they shared one cancel-in-progress group: the Monday cron would
+# cancel an in-flight push run (regression signal ends "cancelled"), and a push
+# would silently cancel the weekly run (voiding the R6-30 drift-catch guarantee
+# with nothing red). Separating by event keeps push-cancels-push while never
+# letting the schedule and a push cancel each other.
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

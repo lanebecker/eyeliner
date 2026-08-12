@@ -431,10 +431,11 @@ timeout), far below the point where a power-cut owner assumes the Pi has wedged.
 > bounded to ~10s. If a SIGTERM arrives while an end-of-session Play Count credit is
 > waiting out a *server-requested* Retry-After longer than 10s (a Discogs 429 asking
 > for a longer wait), that credit can't fit inside the drain window — it is logged as
-> abandoned and retries only when the record next plays. This is the accepted
-> shutdown behaviour (a prompt power-cycle beats holding the process open for an
-> unbounded server backoff), not a bug: the credit is idempotent and lands on the
-> next spin.
+> abandoned and that spin's credit is LOST — the drain does not persist a pending
+> credit across restarts (the #187 decision). This is the accepted shutdown
+> behaviour (a prompt power-cycle beats holding the process open for an unbounded
+> server backoff), not a bug: the abandoned play is simply uncounted, and the NEXT
+> spin credits normally on its own (a fresh play, not a replay of the lost one).
 
 `RestartPreventExitStatus=78` (R6-27) makes a **configuration** error terminal: on
 a bad `config.yaml` (missing/typo'd required key, out-of-range value, an

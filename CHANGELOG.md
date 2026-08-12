@@ -9,6 +9,60 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.25] — 2026-08-12
+
+**Round-7 audit — Wave 6: CI, docs & matching residue (milestone "R7 Wave 6",
+#335–#342) — completes Round 7.** A CI-workflow correctness pass, a matching-regex
+fix, a resolver-memo hardening, and doc/comment corrections. RED-first for the two
+code fixes (both mutation-verified); independent break-this cold review (SPEC +
+QUALITY pass); full suite **1391 passed**.
+
+### Fixed
+
+- **The release-consistency workflow no longer contradicts the badge workflow
+  (#335 — MEDIUM, `R7-22`).** It validated `VERSION` with a strict
+  `MAJOR.MINOR.PATCH` regex while `sync-version-badge.yml` accepts a `-rc1`
+  pre-release suffix, so a pre-release tag could never satisfy both. It now uses
+  the same pattern, and its tag trigger is tightened from `v*` (which fired on
+  non-release tags like `v2-experiments`) to `v[0-9]*`.
+- **The test-suite workflow's schedule and pushes no longer cancel each other
+  (#336 — MEDIUM, `R7-23`).** A `schedule` run executes with
+  `github.ref = refs/heads/main`, so it shared one cancel-in-progress concurrency
+  group with main-branch pushes — the Monday cron could kill an in-flight push run,
+  and a push could silently void the weekly drift check. The group now includes
+  `github.event_name`.
+- **A hyphenated trailing decoration is now stripped for matching (#338 — LOW,
+  `R7-25`).** `_TRAILING_DASH_RE` forbade any hyphen inside the dash segment, so
+  `"… - Re-Recorded Version"` / `"… - Hi-Res Version"` never stripped — a permanent
+  missed collection match for that record class. It now anchors to the last `" - "`
+  and captures the whole tail; the decoration-keyword gate is unchanged, so no
+  ordinary interior dash is over-stripped.
+- **The database-search memo publishes its data before its key (#339 — LOW,
+  `R7-26`).** Defence-in-depth on the 2-worker Discogs pool: page + stamp are set
+  before the key that flags the memo ready, so a reader can never get one query's
+  page under another query's key. (The reader path is single-caller / resolver-
+  serialized today, so this is not a lock — documented as such.)
+- **The full-credit key handles an empty-string artist credit (#341 — NIT,
+  `R7-28`).** R6-16 tested `is None`, so an `artist_credit: ""` returned an empty
+  key while its precompute counterpart reconstructed the names — a silent
+  mismatch. Now reconstructs for both empties.
+
+### Documented
+
+- **CI/dependency-drift docs corrected (#337 — MEDIUM, `R7-24`).** The dependabot
+  comment and a CHANGELOG entry overclaimed that Dependabot surfaces `>=` floor
+  drift (it raises no pip PR when the floor already admits the newest release — no
+  lockfile) and that the weekly cron catches drift "within a week" (GitHub disables
+  a schedule after 60 days of repo inactivity). Both corrected; `workflow_dispatch`
+  and a 60-day maintenance note added.
+- **The CHANGELOG version-heading check is stricter (#342 — NIT, `R7-29`).** The
+  grep interpolated the version into a regex where `.` is a wildcard; the dots are
+  now escaped while keeping the start-of-line anchor.
+- **The shutdown-drain note no longer overstates recovery (#340 — LOW, `R7-27`).**
+  It claimed an abandoned-at-shutdown credit "is idempotent and lands on the next
+  spin"; the abandoned play is permanently uncounted, and the next spin credits as
+  a fresh play. Corrected to match the #187 drain decision.
+
 ## [1.5.24] — 2026-08-12
 
 **Round-7 audit — Wave 5: ops & first-boot (milestone "R7 Wave 5", #329–#334).**
@@ -256,9 +310,14 @@ grep-verified against the code, workflow logic executed).
   scrollback, or `ps`.
 - **Supply-chain drift is caught in CI, not at bring-up (#295 — MEDIUM, security,
   `R6-30`).** `requirements.txt` is floor-pinned (`>=`), so a breaking/compromised
-  release lands on the Pi silently. `tests.yml` now runs on a weekly schedule, and
-  a new `dependabot.yml` opens weekly update PRs for both pip and the SHA-pinned
-  GitHub Actions.
+  release lands on the Pi silently. The `tests.yml` **weekly cron** is the actual
+  floor-drift catcher — it reinstalls the tree and fails if a new release breaks
+  the suite. A new `dependabot.yml` handles the SHA-pinned GitHub Actions (exact
+  pins it can bump) and security advisories. _(Correction, R7-24: Dependabot
+  raises NO pip PR for a `>=` floor that already admits the newest release — there
+  is no lockfile — so it is not the pip-drift mechanism; and GitHub disables the
+  weekly cron after 60 days of repo inactivity, so on a finished appliance repo
+  the drift check must be kept alive via a push or `workflow_dispatch`.)_
 - **`config.yaml`'s two write-scope secrets get file permissions (#301 — LOW,
   security, `R6-36`).** `chmod 600 config.yaml` added to the setup guide §7 and the
   README quick start — `cp` leaves it world-readable under the default umask.

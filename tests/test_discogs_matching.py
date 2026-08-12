@@ -783,6 +783,23 @@ def test_r6_14_album_dash_form_strips_only_when_keyword_gated():
         == "getting into knives - ep"
 
 
+def test_r7_25_hyphenated_dash_decoration_strips():
+    """R7-25: `_TRAILING_DASH_RE`'s `[^-]*` forbade ANY hyphen inside the dash
+    segment, so a hyphenated decoration ("- Re-Recorded Version", "- Hi-Res
+    Version") never stripped — a permanent missed credit for that record class.
+    Anchoring to the LAST " - " and capturing the whole tail fixes it while the
+    keyword gate keeps every non-decoration dash intact."""
+    from src.metadata.normalize import strip_title_decoration, fold_text
+    assert strip_title_decoration(fold_text("Song - Re-Recorded Version")) == "song"
+    assert strip_title_decoration(fold_text("Track - Hi-Res Version")) == "track"
+    # Behaviour-identical controls: only the LAST " - " is a candidate; an interior
+    # dash with no keyword suffix stays, and a plain suffix strips as before.
+    assert strip_title_decoration(fold_text("Money - It's a Gas - Live")) == "money - it's a gas"
+    assert strip_title_decoration(fold_text("Song - Live")) == "song"
+    # No keyword in the (now hyphen-tolerant) segment → not stripped.
+    assert strip_title_decoration(fold_text("Wilco - Sky Blue-Green")) == "wilco - sky blue-green"
+
+
 def test_r6_14_dash_single_query_credits_the_owned_45():
     """R6-14 end-to-end: an owned 7" titled "Blinding Lights" is matched when the
     Shazam/Apple query arrives as "Blinding Lights - Single" — previously a
@@ -806,6 +823,20 @@ def test_r6_16_names_only_credit_key_strips_disambiguator_per_name():
     per name to "john and jane". The paths are documented as mirrors; align them."""
     from src.metadata.discogs.reader import _entry_credit_key
     assert _entry_credit_key({"artists": ["John (2)", "Jane"]}) == "john and jane"
+
+
+def test_r7_28_empty_string_artist_credit_reconstructs_from_names():
+    """R7-28: R6-16's rewrite tested `credit is None`, so an entry carrying
+    artist_credit="" (a community-edited blank) returned "" here — while its
+    precompute key and the pre-R6-16 fallback both reconstructed the names. `not
+    credit` restores parity for BOTH empties."""
+    from src.metadata.discogs.reader import _entry_credit_key
+    # Empty string now reconstructs from `artists` (was "" pre-fix).
+    assert _entry_credit_key({"artist_credit": "", "artists": ["John (2)", "Jane"]}) == "john and jane"
+    # None still reconstructs (unchanged).
+    assert _entry_credit_key({"artist_credit": None, "artists": ["John (2)", "Jane"]}) == "john and jane"
+    # A real (non-empty) credit is still normalized and used, not reconstructed.
+    assert _entry_credit_key({"artist_credit": "Radiohead"}) == "radiohead"
 
 
 def test_r6_16_names_only_fallback_bridges_a_mid_string_disambiguator():
