@@ -151,6 +151,24 @@ renderer's **runtime title push-down** (long track titles shrinking/wrapping in
 
 ---
 
+## 7. R8 bring-up probes (one-time checks from the Round-8 audit; R8-19/#362)
+
+- **Pre-flight the recognition import on the Pi's own Python** before first run:
+  `python3 -c "import shazamio"`. CI now hard-imports it per matrix leg
+  (R8-08/#361), but the Pi's interpreter is the one that matters — a broken
+  import surfaces only as NO MATCH FOUND under a healthy-looking service.
+- **Credit a record filed in a NON-default Discogs folder (R8-10/#366).** The
+  field write POSTs to virtual folder `0`; Discogs may 404 field edits for
+  instances filed in a custom folder. Watch the write succeed — if it 404s,
+  #366 jumps from hypothesis to fix (store the instance's real `folder_id` in
+  the index).
+- **One Discogs token = one rate budget** for reader AND writer: during a long
+  honoured Retry-After on a credit, recognition resolves may 429 and the
+  display may briefly show NO MATCH FOUND. Self-heals — don't misdiagnose it
+  as two independent failures.
+- **Expect a transient dip to ~20fps during the 1s palette lerp** on track
+  change (measured; cosmetic, no action).
+
 ## Watch-fors / known deferrals (revisit only if observed)
 
 - **Executor contention (issue #61, shipped — R6-32).** Blocking work is split

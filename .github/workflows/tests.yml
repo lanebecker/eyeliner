@@ -1,11 +1,16 @@
 name: tests
 
 # TQ-9: run the test suite on every push / PR so a regression is caught before it
-# reaches the appliance. R5-33: matrix over BOTH supported Pythons — 3.11 (the
-# Raspberry Pi OS bookworm/Legacy system Python and the version the app targets)
-# AND 3.13 (the current default Pi OS "trixie" image, via the audioop-lts backport
-# in requirements.txt). The 3.13 leg is what would have caught #198 — audioop
-# removal breaking `import shazamio` at runtime — before it reached the appliance.
+# reaches the appliance. R5-33/R6-33: three-leg matrix — 3.11 (the Raspberry Pi
+# OS bookworm/Legacy system Python and the version the app targets), 3.12
+# (claimed supported by the setup guide), and 3.13 (the current default Pi OS
+# "trixie" image, via the audioop-lts backport
+# in requirements.txt). R8-08 (#361): the 3.13 leg catches the #198 class —
+# audioop removal breaking `import shazamio` at runtime — ONLY because
+# tests/test_ci_integrity_r8.py HARD-imports shazamio on the running interpreter.
+# (The suite's only other touch of the real module is pytest.importorskip, which
+# SKIPS — reports green — on failure, so before that test this comment's claim
+# was aspirational: a broken 3.13 import left the whole matrix green.)
 on:
   # R6-37: run on main pushes + every PR (not every branch push), so a push to a
   # PR branch triggers ONE run via pull_request instead of both push and
@@ -21,12 +26,13 @@ on:
     # floor-bump PRs (its `increase` strategy raises a `>=` floor to the newest
     # release), but only the cron reinstalls the tree and FAILS the suite if a new
     # release actually breaks something, which a PR alone can't tell you. ⚠ GitHub
-    # DISABLES a scheduled workflow after 60 days without repository activity, which
-    # a finished appliance repo will hit — re-enable it (or push any commit) if the
-    # weekly run stops.
+    # documents DISABLING a scheduled workflow after 60 days without repository
+    # activity on PUBLIC repos (treat it as possible on a private one, R8-19) —
+    # re-enable it (or push any commit) if the weekly run stops.
     - cron: '0 6 * * 1'   # Mondays 06:00 UTC
-  # R7-24: manual trigger so the drift check can be run on demand (and to keep the
-  # schedule reachable) without waiting for Monday.
+  # R7-24: manual trigger so the drift check can be run on demand without waiting
+  # for Monday. (R8-19: a dispatch re-runs the CHECK; it is not documented to
+  # reset any schedule-disable window.)
   workflow_dispatch:
 
 # R5-35 (TQ-5 parity with sync-version-badge.yml): scope the token to read-only.
