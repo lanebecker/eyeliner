@@ -56,7 +56,10 @@ from urllib.parse import urljoin, urlsplit
 import certifi
 import urllib3
 
-from src.display.palette import validate_image_file, downscale_oversized_image
+from src.display.palette import (
+    validate_image_file, downscale_oversized_image, normalize_cover_image,
+    PermanentCoverError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -347,6 +350,72 @@ class CoverArtCache:
         """Deterministic on-disk path for a cover URL (md5 of the URL)."""
         return self.cache_dir / (hashlib.md5(url.encode()).hexdigest() + ".jpg")
 
+    def sweep_legacy_oversized(self) -> int:
+        """R8-18 (#359): one-shot normalization of PRE-v1.5.29 cache files.
+
+        Covers written before the cache-write normalization keep their original
+        size for the life of the cache — a 3000×3000 legacy scan pays the
+        Pi-scaled ~0.4–0.7s on-loop convert()+smoothscale stall on every decode
+        forever.  Walk the cache once, apply the same downscale+normalize
+        pipeline the write path uses (both rewrite ATOMICALLY via tmp +
+        os.replace, so a concurrent decode reads old-or-new, never partial),
+        and DELETE a legacy file the pipeline rejects (corrupt/bomb — it could
+        never render anyway; the URL re-downloads through the modern path if it
+        ever recurs).  Returns the number of files touched.  Blocking — run in
+        an executor (the renderer spawns it once at loop start).
+        """
+        from src.display.palette import MAX_IMAGE_PIXELS, _probe_image_header
+
+        touched = 0
+        for f in sorted(self.cache_dir.glob("*.jpg")):
+            try:
+                # W3 cold-review F5: a legacy OVERSIZED NON-JPEG (legal under
+                # the pre-v1.5.26 36MP cap) still RENDERS today — pygame loads
+                # it fine, just slowly.  Deleting it would blank a working
+                # cover (its URL re-downloads and is then rejected by the
+                # modern policy).  SKIP it instead: it keeps rendering at its
+                # old cost, and the modern write path governs new downloads.
+                # 2nd-pass fix: the probe is LOCKED (Pillow's bomb check fires
+                # at open time — an unlocked probe raced a concurrent validate
+                # and condemned legitimate 25MP legacy files).
+                try:
+                    legacy_fmt, _mode, (pw, ph) = _probe_image_header(str(f))
+                    if pw * ph > MAX_IMAGE_PIXELS and legacy_fmt != "JPEG":
+                        log.debug(
+                            "R8-18 sweep: leaving legacy oversized non-JPEG "
+                            "%s in place (renders today; not deletable "
+                            "without blanking a working cover).", f.name,
+                        )
+                        continue
+                except Exception as probe_err:
+                    if isinstance(probe_err, OSError) and probe_err.errno is not None:
+                        continue           # transient I/O — next boot retries
+                    # errno-less (undecodable content, or a genuine bomb's
+                    # DecompressionBombError — NOT an OSError): fall through
+                    # and let the pipeline below classify + drop it; a probe
+                    # failure must never abort the whole sweep.
+
+                changed = downscale_oversized_image(str(f))
+                changed = normalize_cover_image(str(f)) or changed
+                if changed:
+                    touched += 1
+            except PermanentCoverError as e:
+                # Genuinely condemned BYTES (errno-less content failure — see
+                # palette._classify_cover_error): undecodable in pygame too,
+                # so dropping loses nothing.
+                log.warning(
+                    "R8-18 sweep: dropping undecodable legacy cover %s (%s)",
+                    f.name, e,
+                )
+                f.unlink(missing_ok=True)
+                touched += 1
+            except OSError:
+                # W3 F1/F6: a REAL disk error (ENOSPC/EIO/racing prune —
+                # errno-carrying, now propagated as OSError by the helpers) is
+                # TRANSIENT: skip, keep the file, next boot's sweep retries.
+                continue
+        return touched
+
     def exists(self, url: str) -> bool:
         """True if this cover is already cached on disk."""
         return self.path_for(url).exists()
@@ -371,9 +440,17 @@ class CoverArtCache:
         download's in-flight tempfile and fail it; a legitimately in-flight
         partial can only be as old as _DOWNLOAD_DEADLINE_SECONDS, so the age gate
         spares it while still clearing true orphans (#230).
+
+        W3 cold-review F4: also sweeps ``*.norm-part`` — the R8-18 atomic-rewrite
+        tempfiles.  The helpers unlink their own tmp on failure, but a hard kill
+        mid-save strands one, and nothing else matched it (not this glob, not the
+        ``*.jpg`` disk bound, not the legacy sweep) — so they accumulated forever.
+        The same age gate applies (a normalize is even shorter-lived than a
+        download).
         """
         try:
             partials = list(self.cache_dir.glob(".cover-*.part"))
+            partials += list(self.cache_dir.glob("*.norm-part"))
         except OSError:
             return
         now = time.time()
@@ -554,6 +631,14 @@ class CoverArtCache:
                 # validate the (now within-cap) image before exposing it (S-2).
                 downscale_oversized_image(tmp.name)
                 validate_image_file(tmp.name)
+                # R8-18 (#359, E1): normalize EVERY cover to the display-scale
+                # bound (<= NORMALIZED_COVER_SIDE, RGB JPEG) at write — a
+                # typical 3000x3000 CAA scan otherwise pays a Pi-scaled
+                # ~0.4-0.7s on-loop convert()+smoothscale stall on every
+                # decode for the life of the cache (plus a ~100MB palette
+                # executor decode).  The common Discogs-thumbnail case is a
+                # header read (already within bounds).
+                normalize_cover_image(tmp.name)
                 os.replace(tmp.name, str(cache_path))  # atomic on POSIX
             except Exception:
                 # Clean up partial / rejected file before re-raising

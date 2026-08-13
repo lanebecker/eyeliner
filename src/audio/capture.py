@@ -315,27 +315,59 @@ class AudioCapture:
 
         return callback
 
+    @staticmethod
+    def _capture_error_key(error: Exception) -> str:
+        """R8-12 (#358): the throttle key — exception type + the first WORD of
+        the message (with a leading "[Errno N]" bracket stripped first).
+
+        The #304 type-only key over-coarsened: two DIFFERENT failure conditions
+        of the same class ("Device unavailable" then "Invalid sample rate", both
+        OSError) shared one key, so a genuinely NEW condition stayed invisible
+        for up to a full 30s window and the eventual summary attributed a MIXED
+        tally to whichever message was current.  The condition word distinguishes
+        them while staying a small bounded set — unlike full-message keying (the
+        #304 bug), a varying detail (device index, errno, PaErrorCode) cannot
+        mint per-variant keys.
+
+        Shape handling (W3 cold-review F3 — verified against the installed
+        sounddevice 0.5.5 `_check`): sounddevice's ``PortAudioError`` formats as
+        ``"Error opening InputStream: Device unavailable [PaErrorCode -9985]"``
+        — a CONSTANT first word ("Error"), the condition in the LAST colon
+        segment, and a trailing bracket.  A plain ``OSError`` formats as
+        ``"[Errno -9997] Invalid sample rate"`` — a leading bracket.  So: strip
+        a leading "[…]", strip a trailing "[…]", then key on the first word of
+        the LAST ": "-separated segment.  Without the shape handling the
+        dominant capture error class degenerated back to type-only keying.
+        """
+        msg = str(error)
+        if msg.startswith("[") and "]" in msg:
+            msg = msg.split("]", 1)[1].strip()   # "[Errno -9997] Invalid…" → "Invalid…"
+        # The last-colon-segment rule applies ONLY to the trailing-bracket
+        # (sounddevice) shape: there the segment before the bracket is the
+        # CONDITION.  Applying it unconditionally would key an OSError like
+        # "Device unavailable: hw:5" on its varying DETAIL ("hw:5") — minting
+        # per-variant keys, the exact #304 bug.
+        if msg.endswith("]") and "[" in msg:
+            msg = msg[: msg.rfind("[")].strip()  # "…unavailable [PaErrorCode -9985]" →
+            if ": " in msg:                      # "Error opening InputStream: Device…"
+                msg = msg.rsplit(": ", 1)[1].strip()   # → "Device unavailable"
+        first = msg.split(maxsplit=1)[0] if msg else ""
+        return f"{type(error).__name__}:{first}"
+
     def _log_capture_error(self, error: Exception) -> None:
         """Log a capture-loop error, throttled so a PERMANENT failure can't flood
         the journal (#178).
 
-        The first error of each TYPE reports immediately; further errors of that
-        type (identical repeats or same-type variants) are counted and summarized
-        at most once per _CAPTURE_ERROR_WARN_INTERVAL_SECONDS, so a device that is
+        The first error of each CONDITION reports immediately (R8-12: keyed on
+        exception type + first message word, see ``_capture_error_key``);
+        further errors of that condition are counted and summarized at most
+        once per _CAPTURE_ERROR_WARN_INTERVAL_SECONDS, so a device that is
         misconfigured or absent forever leaves a periodic health line, not one
         record per backoff.  The full message is always shown on the emitted line.
         """
         msg = str(error)
-        # #304: throttle on the error CLASS, not the full message. Keying on the
-        # message let a varying detail (a changing device index / errno) mint a new
-        # key per variant, so a stopped repeat's tally lingered in — or was evicted
-        # from — the 64-key LRU with its suppressed count never surfaced (capture
-        # has no reset point). The exception TYPE is a bounded key set (a handful),
-        # so nothing is ever evicted/buried, and R6-02's anti-flood still holds — a
-        # device flapping between failure shapes shares (or splits into a few)
-        # throttled keys rather than emitting on every message change.
         emit, suppressed = self._capture_error_throttle.should_log(
-            time.monotonic(), key=type(error).__name__
+            time.monotonic(), key=self._capture_error_key(error)
         )
         if not emit:
             return

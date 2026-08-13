@@ -181,7 +181,13 @@ def _loop_renderer(monkeypatch):
     r._transition_start = 0.0
     r.width, r.height, r.fullscreen = 64, 64, False
     r._static_key = None
+    r._bg_tasks = set()          # R8-18: run() spawns the legacy-cover sweep
     monkeypatch.setattr(r, "_maybe_retry_cover_download", lambda: None, raising=False)
+
+    async def _no_sweep():       # keep loop tests isolated from the sweep task
+        return None
+
+    monkeypatch.setattr(r, "_sweep_legacy_covers", _no_sweep, raising=False)
     monkeypatch.setattr("pygame.event.get", lambda: [])
     return r
 
