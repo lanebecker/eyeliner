@@ -27,7 +27,7 @@ requests>=2.34.2  # Used directly in the Discogs transport (also transitive dep 
 musicbrainzngs>=0.7.1
 
 # Display
-pygame>=2.5.0
+pygame>=2.6.1
 Pillow>=12.3.0
 # R8-03 (#352): reads each bundled font's cmap once at FIRST USE (cached per
 # file) so the display can split text into primary/fallback runs (Noto Sans JP
