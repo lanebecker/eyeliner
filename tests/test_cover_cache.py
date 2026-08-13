@@ -608,13 +608,41 @@ def test_305_oversized_non_jpeg_rejected_not_full_decoded(tmp_path):
 
 
 def test_305_extreme_aspect_jpeg_that_resists_draft_is_rejected(tmp_path):
-    """#305 (R8): draft() halves only while BOTH axes stay >= the box, so a very wide
-    JPEG whose short axis is already <= the box cannot be reduced below the cap. The
-    post-draft size is re-checked and the cover rejected BEFORE any full decode."""
+    """#305 (R8) / R8-11 (#357): draft() halves only while BOTH axes stay >= the
+    box, so a JPEG whose short axis is below 2× the box cannot be reduced below
+    the cap. With the R8-11 box (800), the resist set shrank to minor axis
+    < 1600 — the post-draft re-check still rejects those BEFORE any full
+    decode."""
     p = tmp_path / "wide.jpg"
-    Image.new("RGB", (12000, 2000), (7, 7, 7)).save(p, "JPEG", quality=85)  # 24 MP, short axis 2000
+    # 11 MP, short axis 1000 (< 2×800): /2 would leave 500 < 800, so draft
+    # cannot reduce at all and the post-draft size stays over the cap.
+    Image.new("RGB", (11000, 1000), (7, 7, 7)).save(p, "JPEG", quality=85)
     with pytest.raises(palette.PermanentCoverError, match="could not be reduced"):
         palette.downscale_oversized_image(str(p))
+
+
+def test_r8_11_wide_but_reducible_jpeg_now_downscales(tmp_path):
+    """R8-11 (#357): the pre-fix box (1600) rejected this 24 MP / short-axis-2000
+    cover; the 800 box reduces it (/2 → 6000×1000 = 6 MP ≤ cap) — the rejected
+    set shrank to genuine extreme ratios."""
+    p = tmp_path / "wide-ok.jpg"
+    Image.new("RGB", (12000, 2000), (7, 7, 7)).save(p, "JPEG", quality=85)
+    assert palette.downscale_oversized_image(str(p)) is True
+    with Image.open(p) as im:
+        assert im.size[0] * im.size[1] <= palette.MAX_IMAGE_PIXELS
+
+
+def test_r8_11_near_square_oversized_scans_downscale_not_blacklist(tmp_path):
+    """R8-11 (#357): the headline case — near-square oversized scans (3400×3100
+    ratio 1.10; 4000×3000) were REJECTED (permanent blacklist, blank cover) by
+    the 1600 draft box while the comment claimed only 'unusual wide covers'
+    were affected. They now reduce."""
+    for w, h in [(3400, 3100), (4000, 3000)]:
+        p = tmp_path / f"scan{w}.jpg"
+        Image.new("RGB", (w, h), (120, 60, 40)).save(p, "JPEG", quality=85)
+        assert palette.downscale_oversized_image(str(p)) is True, f"{w}x{h} rejected"
+        with Image.open(p) as im:
+            assert im.size[0] * im.size[1] <= palette.MAX_IMAGE_PIXELS
 
 
 def test_305_within_cap_cover_is_untouched(tmp_path):
@@ -629,14 +657,22 @@ def test_305_within_cap_cover_is_untouched(tmp_path):
 def test_305_true_bomb_above_ceiling_rejected_without_decode(tmp_path, monkeypatch):
     """#305: an image above the DECODE ceiling is a genuine decompression bomb —
     rejected at the header (never decoded) as PermanentCoverError. The two caps are
-    lowered so the test needn't build a 36 MP file."""
+    lowered so the test needn't build a 36 MP file.
+
+    W3 2nd-pass: the header probe is now itself bomb-limit-bounded (locked, at
+    the decode ceiling), so a >2×ceiling bomb trips Pillow's own
+    DecompressionBombError inside the probe — classified errno-less →
+    PermanentCoverError with the bomb message — rather than reaching the
+    explicit dimensions check.  Either message is the same guarantee:
+    header-level rejection, zero pixels decoded."""
     monkeypatch.setattr(palette, "MAX_IMAGE_PIXELS", 100)     # tiny display cap
     monkeypatch.setattr(palette, "MAX_DECODE_PIXELS", 400)    # tiny bomb ceiling
     p = tmp_path / "bomb.png"
     Image.new("RGB", (64, 64), (0, 0, 0)).save(p)             # 4096 px > 400 ceiling
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-        with pytest.raises(palette.PermanentCoverError, match="dimensions out of bounds"):
+        with pytest.raises(palette.PermanentCoverError,
+                           match="dimensions out of bounds|decompression bomb"):
             palette.downscale_oversized_image(str(p))
 
 

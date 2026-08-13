@@ -7,6 +7,85 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [1.5.29] — 2026-08-13
+
+**R8 Wave 3 — cover pipeline residue (milestone `R8 Wave 3`; #356, #357, #358,
+#359, #360).** No design gate. RED-first (four executed repros: A→IDLE→B left
+all three bookkeeping entries; 3400×3100 and 4000×3000 scans rejected; a
+3000×3000 scan stored full-size; the type-only throttle key hiding a new error
+condition), all flipped.
+⚠ The independent break-this cold review + two narrow follow-up passes caught
+and fixed six issues in the first cuts before commit: (F1) the legacy sweep
+wrapped EVERY failure into a permanent condemnation, so a transient disk error
+(ENOSPC/EIO — the exact flaky-SD hardware this wave hardens against) DELETED a
+good cover; failures are now classified by errno (disk errors propagate, the
+sweep skips and retries next boot; only errno-less content failures condemn
+bytes). (F2) `Image.MAX_IMAGE_PIXELS` is a process global mutated to DIFFERENT
+bounds by validate (10.24MP) and downscale (36MP) — concurrent executor
+threads raced and a legitimate 25MP legacy file bombed out under the wrong
+bound and was deleted; all bomb-limit critical sections now serialize on a
+lock, INCLUDING the header probes (the second pass proved Pillow's bomb check
+fires at open time, re-entering the race one call earlier — probes now go
+through a locked `_probe_image_header`; the third pass verified no deadlock,
+no restore-chain leak, and the 2× margin on normalize's unlocked body).
+(F3) sounddevice's `PortAudioError` formats with a CONSTANT first word
+("Error opening InputStream: <condition> [PaErrorCode N]"), so the first-cut
+key degenerated to type-only for the dominant capture error class — the key
+now takes the last colon segment when the trailing bracket is present.
+(F4) `.norm-part` tempfiles stranded by a hard kill were invisible to every
+cleanup mechanism — `_sweep_partials` now globs them, and the atomic-save
+helper unlinks its tmp on any failure. (F5) the sweep deleted legacy oversized
+non-JPEGs that RENDER fine today — it now skips them (the modern write path
+governs new downloads). (F6/F7) the sweep's dead `except OSError` is now live,
+and the run()-start sweep spawn is re-entry-guarded. 16/16 targeted mutations
+killed. Full suite **1468 passed** (was 1449).
+
+### Fixed
+
+- **The #306 sweep now runs on the COMMON album boundary (#356 / R8-05 —
+  MEDIUM).** It lived only in the direct-track-change branch, but between
+  records there is ≥45s of silence → IDLE, which nulled `_wanted_cover_url`
+  first — so the previous album's `_cover_download_failures` /
+  `_cover_download_retry_after` / `_cover_decode_failures` entries survived
+  forever and v1.5.26's "no longer grows unbounded" claim did not hold on the
+  path records actually take (a correction note now sits under [1.5.26]).
+  The IDLE/ERROR/LISTENING branch sweeps the outgoing URL's three dicts;
+  `_cover_bad_urls` deliberately persists (the accepted STAB-1 residual).
+- **Near-square oversized scans downscale instead of blacklisting (#357 /
+  R8-11 — LOW).** The #305 draft box (1600) only engaged when the minor axis
+  was ≥3200, so a 3400×3100 (ratio 1.10!) or 4000×3000 scan raised
+  `PermanentCoverError` → immediate blacklist → blank cover, while the
+  accompanying comment claimed only "unusual wide covers" were affected. Box
+  is now 800: reduction engages at minor ≥1600, the reduced decode is bounded
+  at 2.56 MP (FOUR times stronger than before), and the rejected set shrinks
+  to genuine extreme ratios (still blanked via the post-draft re-check, e.g.
+  11000×1000; a 12000×2000 that used to be rejected now reduces).
+- **A genuinely NEW capture-error condition surfaces immediately again (#358 /
+  R8-12 — LOW).** The #304 type-only throttle key made "Invalid sample rate"
+  invisible for up to 30s behind an earlier "Device unavailable" (both
+  OSError) and attributed mixed tallies to whichever message was current. The
+  key is now (exception type, first message word) with the "[Errno N]" bracket
+  stripped first — every OSError begins "[Errno", so without the strip the
+  first-word key would collapse back to type-only. The #304 anti-flood
+  property is preserved: a varying device index / errno deeper in the message
+  cannot mint per-variant keys.
+- **Every cover is normalized to display scale at cache-write, and legacy
+  files get a one-shot startup sweep (#359 / R8-18 + E1 — LOW/performance).**
+  A typical 3000×3000 CAA scan was stored full-size forever, paying a
+  Pi-scaled ~0.4–0.7s on-loop `convert()+smoothscale` stall (~118MB episode
+  peak) on every decode plus ~100MB palette executor decodes.
+  `normalize_cover_image` (≤880px longer side — 2× the 440px display slot —
+  RGB JPEG, CMYK converted defensively, atomic tmp+`os.replace` rewrite) runs
+  in the download pipeline after downscale+validate, and
+  `CoverArtCache.sweep_legacy_oversized()` — spawned once by the render loop
+  at start, in the executor — normalizes pre-v1.5.29 files in place (dropping
+  undecodable legacy files; the already-normalized common case is a header
+  read). Disk cache shrinks several-fold as a side effect.
+- **The two event-loop `exists()` stats moved behind the executor (#360 /
+  R8-26 — NIT).** `_prefetch_cover` and `_extract_palette_async` each ran one
+  blocking stat on the loop per track change; on a dying SD card a stat can
+  block for seconds. Both now `run_in_executor`.
+
 ## [1.5.28] — 2026-08-12
 
 **R8 Wave 2 — display i18n & render survival (milestone `R8 Wave 2`; #352,
@@ -225,7 +304,10 @@ re-measured, and a narrow second pass converged clean before ship. Full suite
   On a track change the outgoing cover's transient failure/back-off/decode-failure
   entries are swept, and the download-failure blacklist branch pops the two download
   dicts it supersedes. (`_cover_bad_urls`, the permanent blacklist, is deliberately
-  retained.)
+  retained.) *Correction (R8-05/#356, v1.5.29): as shipped here the sweep ran only
+  on a DIRECT track change; the common PLAYING→IDLE→PLAYING album boundary never
+  swept, so the headline claim did not hold in practice until v1.5.29 added the
+  IDLE-path sweep.*
 - **An over-wide genre chip is clipped to its column (#344 — LOW).** `_draw_genre_chips`
   now blits each chip with a horizontal `area` clip to the column's right edge, so a
   chip wider than the remaining space is trimmed rather than overflowing the card.

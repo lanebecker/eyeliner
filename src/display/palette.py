@@ -13,6 +13,8 @@ the module stays importable on machines without the image stack.
 import colorsys
 import logging
 import math
+import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -71,20 +73,24 @@ MAX_IMAGE_PIXELS = 3200 * 3200
 # re-checked against MAX_IMAGE_PIXELS before any pixels are materialized.
 MAX_DECODE_PIXELS = 6000 * 6000
 
-# #305 (R8, corrected): the box passed to JPEG draft() when reducing an oversized
-# cover. draft() decodes to the smallest 1/2^n scale whose result is still >= this
-# box, so a decoded axis lands in [side, 2*side) — meaning the reduced decode is
-# <= 4*side^2 pixels REGARDLESS of the source's size. side = floor(sqrt(cap)/2) makes
-# that bound == MAX_IMAGE_PIXELS, i.e. the reduced decode never exceeds the memory
-# the app already tolerates for a normal in-cap cover. Drafting straight to the cap
-# (side ~3200) would NOT reduce a source below 2x the cap: a 6000x6000 JPEG would
-# decode at its full 36 MP (~400 MB) — the R8 cold-audit regression this constant
-# fixes. draft() also only halves while BOTH axes stay >= the box, so a cover whose
-# MINOR axis is below ~2x the box (i.e. wider than roughly square, not just extreme
-# ratios) may resist reduction; the post-draft size is therefore re-checked against
-# the cap before the decode, and anything still over is rejected (blanked). Album
-# art is square, so this rejects only unusual wide covers.
-_DRAFT_TARGET_SIDE = int(math.isqrt(MAX_IMAGE_PIXELS) // 2)
+# #305 (R8, corrected; R8-11/#357 re-corrected): the box passed to JPEG draft()
+# when reducing an oversized cover. draft() decodes to the smallest 1/2^n scale
+# whose result is still >= this box, so a decoded axis lands in [side, 2*side) —
+# meaning the reduced decode is <= 4*side^2 pixels REGARDLESS of the source's
+# size. draft() also only halves while BOTH axes stay >= the box, so reduction
+# engages only when the MINOR axis is >= 2*side.
+#
+# R8-11: side = floor(sqrt(cap)/2) (1600) required a minor axis >= 3200 to
+# engage — which rejected NEAR-SQUARE oversized scans (3400x3100, ratio 1.10;
+# 4000x3000) and permanently blacklisted their covers, while the accompanying
+# comment claimed "album art is square, so this rejects only unusual wide
+# covers". side = floor(sqrt(cap)/4) (800) engages for any minor axis >= 1600,
+# bounds the reduced decode at 4*side^2 = 2.56 MP — FOUR TIMES stronger than
+# the previous bound (== cap) — and still exceeds the 1024px display need.
+# The rejected set shrinks to genuine extreme ratios (minor axis < 1600 with
+# total pixels > the cap, i.e. roughly > 6.4:1 at the cap boundary); the
+# post-draft re-check remains the backstop for those, which are blanked.
+_DRAFT_TARGET_SIDE = int(math.isqrt(MAX_IMAGE_PIXELS) // 4)
 
 
 class PermanentCoverError(ValueError):
@@ -128,12 +134,20 @@ def validate_image_file(path: str, *, return_image=False):
     # Belt-and-suspenders: bound Pillow's own decompression-bomb threshold for
     # the duration of this call, then restore the prior value.  This fixes the
     # test-isolation leak (#172): a test that lowered MAX_IMAGE_PIXELS no longer
-    # sees that small cap persist into a later test.  The restore is NOT
-    # thread-isolated — concurrent validations on the shared executor can race
-    # and leave the global at MAX_IMAGE_PIXELS — but that is harmless: every
-    # caller writes the identical bound, the value seen *during* any call is
-    # always that intended bound, and MAX_IMAGE_PIXELS only ever *lowers*
-    # Pillow's default, so the worst possible residual is the safe cap we want.
+    # sees that small cap persist into a later test.
+    #
+    # W3 cold-review F2: `Image.MAX_IMAGE_PIXELS` is a process GLOBAL, and this
+    # function and `downscale_oversized_image` set DIFFERENT bounds (the 10.24MP
+    # display cap here; the 36MP decode ceiling there).  Concurrent executor
+    # threads — the R8-18 legacy sweep decoding a legal pre-v1.5.26 25MP file
+    # while a download validates — raced: the sweep's decode ran under THIS
+    # function's 10.24MP bound, tripped Pillow's DecompressionBombError, and the
+    # sweep deleted a legitimate file.  (The old comment's "every caller writes
+    # the identical bound" premise has been false since #305 introduced the
+    # 36MP bump.)  All bomb-limit critical sections now serialize on
+    # `_BOMB_LIMIT_LOCK`; these are blocking executor-side functions, so the
+    # lock adds no event-loop stall.
+    _BOMB_LIMIT_LOCK.acquire()
     _prev_max = Image.MAX_IMAGE_PIXELS
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
     try:
@@ -172,6 +186,75 @@ def validate_image_file(path: str, *, return_image=False):
         return None
     finally:
         Image.MAX_IMAGE_PIXELS = _prev_max
+        _BOMB_LIMIT_LOCK.release()
+
+
+# W3 cold-review F2: serializes every mutation of Pillow's global
+# Image.MAX_IMAGE_PIXELS (validate_image_file at the 10.24MP display cap;
+# downscale_oversized_image at the 36MP decode ceiling).  Without it, two
+# executor threads interleaving DIFFERENT bounds let a legitimate 10.24–36MP
+# legacy file decode under the wrong (lower) bound and bomb out.
+_BOMB_LIMIT_LOCK = threading.Lock()
+
+
+def _classify_cover_error(e: Exception, stage: str) -> Exception:
+    """W3 cold-review F1/F6: map a failure to the right exception class.
+
+    A REAL disk/filesystem error carries an ``errno`` (ENOSPC, EIO, ENOENT from
+    a racing prune, EACCES…) and is TRANSIENT — it must propagate as the
+    OSError it is, so the legacy sweep SKIPS the file (retried next boot) and
+    the download path backs off, instead of both treating it as
+    permanently-bad bytes (the first cut deleted a GOOD cover on a full disk).
+    Pillow's content failures (undecodable/truncated bytes, encode rejects)
+    surface as errno-less OSErrors/ValueErrors — those genuinely condemn the
+    BYTES and become :class:`PermanentCoverError`.
+    """
+    if isinstance(e, OSError) and e.errno is not None:
+        return e
+    return PermanentCoverError(f"{stage}: {e}")
+
+
+def _probe_image_header(path: str) -> tuple:
+    """Header-only probe → (format, mode, (w, h)), under the bomb-limit lock.
+
+    W3 2nd-pass finding: Pillow's decompression-bomb check fires AT OPEN TIME
+    from the header dimensions, so an UNLOCKED probe of a legitimate 25MP
+    legacy file while a concurrent validate held the global at the 10.24MP
+    display cap raised DecompressionBombError (errno-less → condemned → the
+    sweep deleted the file) — the F2 race re-entering one call earlier.  The
+    probe therefore takes the same lock, bound to the DECODE ceiling: a genuine
+    >2×36MP bomb still errors here (errno-less → PermanentCoverError at the
+    caller), a 36–72MP file opens with a warning and is rejected by the
+    caller's explicit header check, and everything legitimate probes clean.
+    No pixels are decoded (header read only).
+    """
+    from PIL import Image
+
+    with _BOMB_LIMIT_LOCK:
+        _prev = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS
+        try:
+            with Image.open(path) as probe:
+                return probe.format, probe.mode, probe.size
+        finally:
+            Image.MAX_IMAGE_PIXELS = _prev
+
+
+def _atomic_jpeg_save(img, path: str) -> None:
+    """Atomic RGB-JPEG rewrite (tmp + os.replace) with tmp cleanup on ANY
+    failure (W3 cold-review F4: an orphaned ``.norm-part`` was invisible to
+    every cleanup mechanism — unmatched by ``_sweep_partials``'s glob, uncounted
+    by the disk bound, unswept — and accumulated forever)."""
+    tmp = f"{path}.norm-part"
+    try:
+        img.save(tmp, format="JPEG", quality=90)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def downscale_oversized_image(path: str) -> bool:
@@ -206,11 +289,11 @@ def downscale_oversized_image(path: str) -> bool:
     from PIL import Image
 
     try:
-        with Image.open(path) as probe:
-            fmt = probe.format
-            w, h = probe.size
+        fmt, _mode, (w, h) = _probe_image_header(path)   # locked (2nd-pass fix)
     except Exception as e:
-        raise PermanentCoverError(f"not a decodable image: {e}")
+        # W3 F1/F6: a racing-prune FileNotFoundError (errno) propagates as the
+        # transient OSError it is; only errno-less content failures condemn the bytes.
+        raise _classify_cover_error(e, "not a decodable image")
 
     if w <= 0 or h <= 0:
         raise PermanentCoverError(f"image dimensions out of bounds: {w}x{h}")
@@ -227,6 +310,7 @@ def downscale_oversized_image(path: str) -> bool:
         )
 
     box = (_DRAFT_TARGET_SIDE, _DRAFT_TARGET_SIDE)
+    _BOMB_LIMIT_LOCK.acquire()              # W3 F2: serialize the global mutation
     _prev_max = Image.MAX_IMAGE_PIXELS
     Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS
     try:
@@ -245,15 +329,79 @@ def downscale_oversized_image(path: str) -> bool:
             img = src.convert("RGB")        # independent copy; triggers the reduced load
         try:
             img.thumbnail(box, Image.LANCZOS)   # only shrinks; result <= cap
-            img.save(path, format="JPEG", quality=90)
+            # R8-18: ATOMIC rewrite — the legacy sweep runs this against LIVE
+            # cache files a concurrent decode may be reading.
+            _atomic_jpeg_save(img, path)
         finally:
             img.close()
     except PermanentCoverError:
         raise
     except Exception as e:
-        raise PermanentCoverError(f"could not downscale oversized cover: {e}")
+        # W3 F1: real disk errors (errno) propagate as transient OSError —
+        # the sweep skips (retries next boot) and the download path backs off;
+        # only errno-less content failures condemn the bytes.
+        raise _classify_cover_error(e, "could not downscale oversized cover")
     finally:
         Image.MAX_IMAGE_PIXELS = _prev_max
+        _BOMB_LIMIT_LOCK.release()
+    return True
+
+
+# R8-18 (#359, E1): every cover is normalized to at most this side at
+# cache-write. 2x the 440px display slot, so smoothscale keeps full quality
+# headroom at 1024x600 while: the per-decode on-loop convert()+smoothscale
+# stall shrinks from ~0.4-0.7s (Pi-scaled, 3000x3000 scan, ~118MB episode
+# peak) to milliseconds; the palette executor decode shrinks the same way
+# (~99MB -> small); the disk cache shrinks several-fold; and CMYK is converted
+# to RGB defensively at write (SDL_image renders CMYK JPEGs unreliably).
+NORMALIZED_COVER_SIDE = 880
+
+
+def normalize_cover_image(path: str, max_side: int = NORMALIZED_COVER_SIDE) -> bool:
+    """R8-18 (#359): normalize the (already within-cap, validated-decodable)
+    cover at *path* to <= *max_side* on its longer axis, re-encoded as RGB JPEG.
+
+    Returns True if the file was rewritten, False if it was already within
+    bounds AND already an RGB JPEG (nothing to do — the overwhelmingly common
+    Discogs-thumbnail case pays only a header read).  Call AFTER
+    :func:`downscale_oversized_image` (which bounds the decode for >cap
+    sources; anything reaching here decodes at <= MAX_IMAGE_PIXELS, a one-time
+    <= ~40MB transient at write) and after :func:`validate_image_file`.
+
+    Raises :class:`PermanentCoverError` on a decode/encode failure — by this
+    point the bytes validated clean, so a failure here is corrupt-in-a-new-way
+    and the caller's blacklist semantics apply.
+    """
+    from PIL import Image
+
+    try:
+        fmt, mode, (w, h) = _probe_image_header(path)    # locked (2nd-pass fix)
+    except Exception as e:
+        raise _classify_cover_error(e, "not a decodable image")
+
+    if max(w, h) <= max_side and fmt == "JPEG" and mode == "RGB":
+        return False                    # already normalized — header read only
+
+    try:
+        with Image.open(path) as src:
+            if fmt == "JPEG":
+                # Cheap reduced decode toward the target where available.
+                src.draft("RGB", (max_side, max_side))
+            img = src.convert("RGB")
+        try:
+            img.thumbnail((max_side, max_side), Image.LANCZOS)  # only shrinks
+            # Atomic rewrite with tmp cleanup — the legacy sweep normalizes
+            # LIVE cache files (W3 F4).
+            _atomic_jpeg_save(img, path)
+        finally:
+            img.close()
+    except PermanentCoverError:
+        raise
+    except Exception as e:
+        # W3 F1: errno-carrying disk errors stay transient OSError (sweep
+        # skips; download backs off); errno-less content failures condemn the
+        # bytes as PermanentCoverError.
+        raise _classify_cover_error(e, "could not normalize cover")
     return True
 
 

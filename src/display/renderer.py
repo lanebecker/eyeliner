@@ -581,6 +581,18 @@ class DisplayRenderer:
             # Empty states always use the fallback palette (DESIGN.md §2);
             # lerp back smoothly rather than jump-cutting.
             self._cover_on_disk.discard(self._wanted_cover_url)   # R5-21: bound the set
+            # R8-05 (#356): sweep the outgoing cover's failure bookkeeping HERE
+            # too.  The #306 sweep lived only in the PLAYING url-change branch —
+            # but the COMMON album boundary is PLAYING→IDLE→PLAYING (>=45s of
+            # silence between records), where `_wanted_cover_url` was nulled
+            # first, so the next record's sweep saw outgoing=None and the
+            # previous album's three entries survived forever.  Same policy as
+            # the PLAYING branch: `_cover_bad_urls` deliberately NOT swept.
+            outgoing = self._wanted_cover_url
+            if outgoing is not None:
+                self._cover_download_failures.pop(outgoing, None)
+                self._cover_download_retry_after.pop(outgoing, None)
+                self._cover_decode_failures.pop(outgoing, None)
             self._wanted_cover_url = None
             self._queue_palette(None)
 
@@ -606,6 +618,14 @@ class DisplayRenderer:
         prev_transitioning = False
         fault_since: Optional[float] = None
         fault_last_reinit = 0.0
+        # R8-18 (#359): one-shot legacy-cover normalization, off the loop.
+        # Pre-v1.5.29 cache files keep their original (up to ~10MP) size
+        # forever otherwise; the sweep rewrites them atomically in the
+        # executor while the loop runs.  Guarded (W3 F7): run() is called once
+        # in production, but a re-entry must not re-walk the cache.
+        if not getattr(self, "_legacy_sweep_started", False):
+            self._legacy_sweep_started = True
+            self._spawn(self._sweep_legacy_covers())
         while self._running:
             # R8-07 (cold-review F3): the event pump can ALSO raise pygame.error
             # once the video subsystem is gone ("video system not initialized") —
@@ -1598,7 +1618,12 @@ class DisplayRenderer:
             return
         self._cover_prefetch_inflight.add(url)
         try:
-            if not self._cover_store.exists(url):
+            # R8-26 (#360): the existence stat runs off the loop — on a dying SD
+            # card a stat can block for seconds, and this coroutine runs on the
+            # event loop (once per track change).
+            loop = asyncio.get_running_loop()
+            on_disk = await loop.run_in_executor(None, self._cover_store.exists, url)
+            if not on_disk:
                 # R6-18: honour the download backoff window — a recently-failed URL
                 # is not re-attempted until its retry_after deadline, so a transient
                 # network blip neither hammers the CDN nor blanks the cover for the
@@ -1608,7 +1633,6 @@ class DisplayRenderer:
                 if deadline is not None and time.monotonic() < deadline:
                     return
                 try:
-                    loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, self._cover_store.download, url)
                     log.debug(f"Cover art cached: {self._cover_store.path_for(url).name}")
                     # A clean download clears only the DOWNLOAD-failure state. It
@@ -1713,10 +1737,12 @@ class DisplayRenderer:
                 self._queue_palette(url)  # cache hit → real palette, no decode
             return
         cache_path = self._cover_store.path_for(url)
-        if not cache_path.exists():
-            return
         try:
             loop = asyncio.get_running_loop()
+            # R8-26 (#360): stat off the loop (a dying SD card can block a stat
+            # for seconds; this coroutine runs on the event loop).
+            if not await loop.run_in_executor(None, cache_path.exists):
+                return
             palette = await loop.run_in_executor(None, extract_palette, cache_path)
         except Exception as e:
             log.warning(f"Palette extraction failed for {url}: {e}")
@@ -1755,6 +1781,24 @@ class DisplayRenderer:
         if (now if now is not None else time.monotonic()) < deadline:
             return   # still backing off
         self._spawn(self._prefetch_cover(url))
+
+    async def _sweep_legacy_covers(self):
+        """R8-18 (#359): run the cover store's one-shot legacy normalization in
+        the executor (SD-card I/O + decodes; never on the loop).  Failures are
+        logged and non-fatal — the display works fine with oversized legacy
+        files, just slower per decode."""
+        try:
+            loop = asyncio.get_running_loop()
+            touched = await loop.run_in_executor(
+                None, self._cover_store.sweep_legacy_oversized
+            )
+            if touched:
+                log.info(
+                    "R8-18: normalized %d legacy cached cover(s) to display "
+                    "scale (one-shot sweep).", touched,
+                )
+        except Exception as e:
+            log.warning("R8-18 legacy cover sweep failed (non-fatal): %r", e)
 
     def _load_cover(self, url: Optional[str], w: int, h: int):
         """Return the scaled cover for *url* from the in-memory cache, or None.
