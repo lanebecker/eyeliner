@@ -20,7 +20,7 @@ shazamio>=0.8.1
 audioop-lts>=0.2; python_version >= "3.13"
 
 # Discogs
-python3-discogs-client>=2.6.0
+python3-discogs-client>=2.9
 requests>=2.34.2  # Used directly in the Discogs transport (also transitive dep of discogs-client)
 
 # Cover art fallback
