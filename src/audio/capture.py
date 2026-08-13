@@ -139,6 +139,9 @@ class AudioCapture:
         # warns even when the winning index is unchanged.
         self._device_using_throttle = LogThrottle()
         self._device_match_throttle = LogThrottle()
+        # R8-20 (#369): warn ONCE when the sounddevice private-API device-table
+        # refresh (#194 hotplug recovery) turns out to be unavailable.
+        self._device_refresh_degraded_warned = False
 
         # R6-28: PortAudio input-status warning, marshalled off the realtime
         # callback thread onto the loop and throttled per distinct flag string so a
@@ -252,12 +255,33 @@ class AudioCapture:
         except Exception as e:
             # Degrade to pre-#194 behaviour: the next retry simply sees the table
             # it would have seen anyway. A private-API breakage must not escalate a
-            # recoverable device-down loop into a crash. Debug (not error): the
-            # real failure is already surfaced by _log_capture_error just above.
-            log.debug(
-                "PortAudio device-table refresh unavailable (%r); retrying "
-                "against the existing table.", e
-            )
+            # recoverable device-down loop into a crash.
+            #
+            # R8-20 (#369): the refresh rests on sounddevice PRIVATE APIs
+            # (`sd._terminate`/`sd._initialize`, pinned working at the 0.5.5
+            # floor) — a future `pip install -U sounddevice` on the Pi could
+            # remove them and silently revert the #194 hotplug recovery.  Say
+            # so ONCE at WARNING (with the installed version) so a bring-up
+            # journal shows the degradation; repeats stay debug (the real
+            # failure is already surfaced by _log_capture_error just above).
+            # Known-accepted (2nd review): the warn is once-per-PROCESS on ANY
+            # exception here — a one-off transient during re-init consumes it,
+            # and a later genuine API removal then logs only at debug.  The
+            # exception repr in the message keeps the journal diagnosable
+            # either way; a per-cause latch isn't worth the state.
+            if not self._device_refresh_degraded_warned:
+                self._device_refresh_degraded_warned = True
+                log.warning(
+                    "PortAudio device-table refresh unavailable (%r; "
+                    "sounddevice %s) — the #194 hotplug recovery is degraded: "
+                    "a re-plugged device may need a service restart to be "
+                    "seen (R8-20).", e, getattr(sd, "__version__", "?"),
+                )
+            else:
+                log.debug(
+                    "PortAudio device-table refresh unavailable (%r); retrying "
+                    "against the existing table.", e
+                )
 
     def _enqueue_block(self, blocks: asyncio.Queue, block: np.ndarray):
         """Put an audio block on the queue, dropping the OLDEST first when it's

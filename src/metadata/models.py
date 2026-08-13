@@ -565,9 +565,16 @@ class PlaySession:
         * **Sideless tracklist** (numbered / CD-only — no row parses to a
           vinyl side, so ``side_letter`` is None): "closing side" is
           undefined, so fall back to the pre-R7 evidence rule (≥2 distinct
-          rows, or a single playable row).  Lane 2026-08-11: sideless
-          releases are not the vinyl attribution-swing vector R7-01 targets,
-          so the least-surprise choice is to leave their behaviour unchanged.
+          rows, or a single playable row) — BUT the closer-identity check
+          (R5-05, below) runs FIRST, which is a deliberate behaviour change
+          from pre-v1.5.20 (R8-13/#367, RATIFIED Lane 2026-08-12): a sideless
+          release whose armed closer is FOREIGN is now suppressed even with
+          ≥2 supporting rows, where the old gate credited.  A foreign closer
+          arming is itself the attribution-swing signature, so suppression is
+          the missed-over-phantom-consistent choice.  (An earlier version of
+          this docstring promised sideless behaviour was "unchanged" while
+          the gate order change shipped three lines below it — the R8 audit's
+          R8-13 finding; see CHANGELOG [1.5.20] correction note.)
 
         R5-05 is preserved throughout: the closer must be a row OF the latched
         release.  A Shazam swing to a FOREIGN single arms
