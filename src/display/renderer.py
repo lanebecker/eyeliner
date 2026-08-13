@@ -185,6 +185,12 @@ _RENDER_FAULT_REINIT_SECONDS = 5.0
 
 # Cap on the tracked-label Surface cache (letter-spaced mono labels).
 # Labels are tiny surfaces and mostly static per track; 128 is plenty.
+# R8-28 (#372, ACCEPTED as-is): during the 1s palette lerp the muted color
+# quantizes through ~16 steps, so ~6–10 labels × ~16 colors ≈ 160 inserts can
+# evict-and-rerender steady-state labels within one lerp.  Measured bounded
+# and invisible (steady-state render ~1ms on the Pi; the churn ends with the
+# lerp) — deliberately NOT bumped to 256: the cache exists to bound memory,
+# and a transient re-render is cheaper than doubling the resident surface set.
 _LABEL_CACHE_MAX = 128
 
 # Cap on the font cache.  The shrink-to-fit logic probes many sizes per role,
@@ -1109,6 +1115,16 @@ class DisplayRenderer:
                 ny = y + chip_h + gap
             # Must fit the box VERTICALLY at its final row — checked on EVERY path,
             # not just after a wrap (the R7-08 fix).
+            #
+            # R8-14/#368 (RATIFIED Lane 2026-08-12): the locked #321 fix text
+            # also prescribed RESERVING width for the "+N" overflow chip before
+            # laying out the last genre — that half was deliberately NOT built.
+            # Consequence: in a tight box the last genre can consume the room
+            # and the "+N" is silently suppressed (hidden genres unsignaled) —
+            # a knowing exception to B-17's honesty rule, accepted because
+            # suppress-over-overflow is the fail-safe direction and the
+            # tight-box case is unreachable at 1024×600 with realistic genre
+            # names.  If a future layout shrinks the chips box, revisit.
             if ny + chip_h > rect.y + rect.h:
                 return False
 

@@ -7,6 +7,46 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [1.5.31] — 2026-08-13
+
+**R8 Wave 5 — ratifications & hardening residue (milestone `R8 Wave 5`; #367,
+#368, #369, #370, #371, #372) — the FINAL Round-8 remediation wave.** Mostly
+Lane-locked ratifications turned into truthful documentation; one behavioral
+change (a warn-once). #366 (R8-10, the non-default-folder Discogs write probe)
+deliberately stays OPEN — it is verified at Pi bring-up per first-boot-checklist
+§7. Full suite **1474 passed** (was 1472).
+
+### Fixed
+
+- **The sounddevice private-API degradation is no longer silent (#369 /
+  R8-20 — LOW).** The #194 hotplug recovery calls `sd._terminate()` /
+  `sd._initialize()` (private, pinned working at the 0.5.5 floor); if an
+  upgrade removes them the recovery silently reverted with only a debug line.
+  It now WARNs exactly once, naming the installed version; repeats stay debug.
+  Pinned warn-once by test.
+
+### Documented (ratifications, Lane 2026-08-12)
+
+- **#367 / R8-13:** the v1.5.20 sideless-gate behavior change (foreign-closer
+  suppression before the ≥2-rows fallback) is RATIFIED as an intended
+  missed-over-phantom extension; the `models.py` docstring that promised
+  "unchanged" now describes the real gate order, and a correction note sits
+  under [1.5.20].
+- **#368 / R8-14:** the dropped "+N width reservation" half of #321 is
+  RATIFIED — suppress-over-overflow is the fail-safe, the tight-box case is
+  unreachable at 1024×600; the deviation is now documented at the
+  `draw_chip` vertical check as a knowing B-17 exception.
+- **#370 / R8-21:** #330's un-built "unify the Last.fm placeholder trio into
+  ConfigError" clause is RATIFIED as deliberate (optional feature; graceful
+  degrade beats parking the service) — ratification note under [1.5.24].
+- **#371 / R8-27:** `fit_wrapped`'s absolute-pixel minimums are documented as
+  the same posture as the `layouts.py` legibility floors (unscaled by design;
+  irrelevant at the shipped 1024×600).
+- **#372 / R8-28:** the palette-lerp label-cache churn (~160 inserts vs 128
+  entries for the 1s lerp) is ACCEPTED as-is, documented at
+  `_LABEL_CACHE_MAX` with the reasoning (bounded, invisible, ends with the
+  lerp; not worth doubling the resident surface set).
+
 ## [1.5.30] — 2026-08-13
 
 **R8 Wave 4 — CI & test integrity (milestone `R8 Wave 4`; #361, #362, #363,
@@ -451,7 +491,12 @@ review (SPEC + QUALITY pass); the behavioural fixes mutation-verified; full suit
   401'd on every Discogs call — a systemd-healthy service that never worked. They
   now fail config validation (aggregated `ConfigError` → exit 78) so the operator
   gets one friendly message; the value is never echoed. (Last.fm placeholders keep
-  their runtime graceful-degrade — scrobbling is optional.)
+  their runtime graceful-degrade — scrobbling is optional.) *Ratification note
+  (R8-21/#370, v1.5.31): #330's fix text also proposed unifying the Last.fm trio
+  into the aggregated ConfigError; that clause was deliberately NOT implemented —
+  scrobbling is an optional feature, and a fatal config error for an optional
+  feature's placeholders would park a service whose core function works. The
+  deviation was silent at ship time; ratified by Lane 2026-08-12.*
 - **A broken recognition-backend install fails loud regardless of exception type
   (#331 — LOW, `R7-18`).** The import probe caught only `ImportError`; a broken
   native dependency raising `OSError` at import escaped. It now catches any
@@ -607,6 +652,12 @@ suite **1368 passed**.
 longer mint a phantom credit for an owned album, stops one physical spin being
 double-counted, and recovers a full play split by a mid-side pause. Design gate
 approved by Lane (side-coverage / silence-window / flip-resume, 2026-08-11).
+*Correction note (R8-13/#367, v1.5.31): this release ALSO changed sideless-
+tracklist gating — the closer-identity check now precedes the ≥2-rows fallback,
+so a sideless release with a FOREIGN armed closer is suppressed where it used
+to credit — while the shipped docstring promised sideless behaviour was
+"unchanged". Ratified as an intended missed-over-phantom extension by Lane
+2026-08-12; the docstring now describes the real gate order.*
 RED-first with the audit's executed repros; independent break-this cold review
 (which caught the SESSION_ENDED double-credit gap, now fixed and pinned); each
 fix mutation-verified; full suite **1366 passed**.

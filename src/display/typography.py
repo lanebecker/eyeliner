@@ -541,6 +541,21 @@ class TextRenderer:
         truncate.  If even min_size can't fit the line count, returns the
         min_size wrap (caller clips — practically unreachable for real
         metadata).
+
+        R8-27 (#371, documented — deliberately NOT scaled): ``min_size`` and
+        the callers' floors are ABSOLUTE pixels, unscaled by the layout's
+        ``s`` factor — at sub-reference resolutions a shrink floor can exceed
+        the scaled base size, in which case the while-loop never runs and the
+        function returns the FLOOR: the text renders at ``min_size`` — larger
+        than the scaled base — and wraps/clips there.  (2nd-review fix: an
+        earlier version of this note claimed it "wraps/clips at base size",
+        which is not what the code does.)  This is the same posture as the
+        per-role legibility floors in ``layouts.py`` — fonts stop shrinking
+        (hold at the floor value) while rects keep scaling; the CLAUDE.md
+        floors table's artist/album entries (s≈0.375 / s≈0.44) derive from
+        these very mins.  Below-reference resolutions are unsupported
+        territory, and a floor that binds early beats unreadably small text.
+        Irrelevant at the shipped 1024×600 (s=1.0, no floor binds).
         """
         size = base_size
         while size >= min_size:
