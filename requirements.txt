@@ -50,7 +50,7 @@ urllib3>=2.7.0,<3.0.0
 certifi>=2023.7.22
 
 # Config
-PyYAML>=6.0.1
+PyYAML>=6.0.3
 
 # Last.fm scrobbling
 pylast>=7.1.0
