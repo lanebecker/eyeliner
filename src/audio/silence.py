@@ -128,6 +128,17 @@ class SilenceDetector:
 
     def process(self, audio: np.ndarray, sample_rate: int):
         """Process one audio chunk. Called synchronously from AudioCapture."""
+        # R9-25 (#404) — accept-with-comment (the np.dot optimization was tried
+        # and REJECTED).  `audio ** 2` does allocate a full ~2.6MB temp per chunk,
+        # and `np.dot(x, x) / x.size` computes the same mean-of-squares without it
+        # — BUT np.dot (BLAS) accumulates SEQUENTIALLY while np.mean uses PAIRWISE
+        # summation, which sums a constant array EXACTLY (repeated doublings, no
+        # rounding).  On an input sitting EXACTLY at the threshold, np.mean yields
+        # 0.010000000000000002 (≥ thr → music) but np.dot yields
+        # 0.009999999999999981 (< thr → spurious silence), breaking the documented
+        # ">= threshold is music" boundary (test_signal_just_at_threshold_is_music).
+        # A per-chunk 2.6MB transient is cheap and freed immediately; a boundary
+        # misclassification of the needle-lift signal is not.  Keep np.mean.
         rms = float(np.sqrt(np.mean(audio ** 2)))
 
         # SIL-2: a NaN or inf anywhere in the window makes `rms` non-finite (one

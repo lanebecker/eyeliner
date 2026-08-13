@@ -101,7 +101,8 @@ real CDN**. Verify it once on the Pi.
   download → decode → palette → render over the pinned path.
 - **Targeted (optional), from the repo venv on the Pi:**
 
-  ```python
+  ```bash
+  cd ~/vinyl-now-playing        # repo root — the heredoc imports from src/
   python3 - <<'PY'
   import tempfile
   from src.display.cover_cache import CoverArtCache

@@ -7,6 +7,79 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [1.5.34] — 2026-08-13
+
+**R9 Wave 3 — ops & polish (milestone `R9 Wave 3 — ops & polish`; #395–#404).**
+The Round-9 audit's trailing batch — no MEDIUM+, all LOW/NIT robustness, CI, and
+doc-honesty. Three code fixes (mutation-verified), one optimization tried and
+**rejected** because it wasn't actually free, plus CI/doc corrections. Full suite
+**1485 → 1510** (v1.5.32 baseline; +25 across W2+W3 tests). **#405 (R9-28, the
+mutated-Pillow-global refactor) is deferred open** as tracked architecture,
+alongside #394. Right-sized process for a no-MEDIUM+ batch: RED-first tests +
+mutation on the code fixes, tight self-review in place of the twin-agent cold
+review the earlier waves warranted.
+
+### Fixed
+
+- **The capture-error throttle key no longer FRAGMENTS on the 3-arg
+  PortAudioError shape (#395 / R9-07 — LOW).** The classic ALSA/USB
+  `paUnanticipatedHostError` formats as `"Unanticipated host API error:
+  '<free ALSA text>' [host error N]"`. After the trailing bracket was stripped,
+  the last colon segment was arbitrary quoted ALSA text, so two faults of the
+  *same* condition minted different keys (`'Resource` vs `'No`) — the #304
+  over-fragmentation bug in the opposite direction, and the stable condition
+  never became the key. When the last segment is quoted free text, the key now
+  derives from the condition segment that precedes it (`Unanticipated`).
+- **A missing audio C-extension now parks instead of crash-looping (#396 /
+  R9-13 — LOW).** `main.py` imported `AudioCapture` (→ `sounddevice` →
+  `libportaudio2`) at module level, so a fresh Pi lacking `libportaudio2` (a
+  documented first-boot state) died before `main()`'s try — bypassing the
+  ConfigError→exit-78 park and crash-looping to StartLimitBurst. The import is
+  now lazy, and a startup probe (`verify_audio_backend_importable`) surfaces the
+  failure as the friendly park with an `apt-get install libportaudio2` hint.
+- **A transient EIO during cover validation no longer permanently blacklists the
+  URL (#397 / R9-15 — LOW).** `validate_image_file` condemned every failure as
+  `PermanentCoverError`, so an errno-carrying `OSError` (EIO/ENOSPC — a real disk
+  fault mid-read of the download temp) blacklisted a possibly-good cover forever.
+  Both the header-probe and decode paths now route through `_classify_cover_error`
+  (the same errno taxonomy already applied to downscale/normalize): errno-carrying
+  OSErrors propagate (the download path backs off), errno-less content failures
+  still condemn.
+
+### CI
+
+- **VERSION whitespace normalization unified across the release workflows (#398 /
+  R9-17 — LOW).** `release-consistency.yml` used bare `$(cat VERSION)` while
+  `sync-version-badge.yml` used `tr -d '[:space:]'`; a stray interior space would
+  pass the badge job and hard-fail the tag job. Both now strip identically.
+
+### Documented / accepted
+
+- **#404 / R9-25 — accept-with-comment (optimization REJECTED).** Replacing the
+  RMS `np.sqrt(np.mean(audio**2))` with `np.dot` to avoid the per-chunk ~2.6MB
+  temp array was tried and reverted: `np.dot` (BLAS) accumulates sequentially
+  while `np.mean` uses pairwise summation, which sums a constant array *exactly*.
+  On an input sitting exactly at the threshold, `np.dot` yields
+  `0.009999999999999981` (< threshold → spurious silence) vs `np.mean`'s
+  `0.010000000000000002` (≥ threshold → music), breaking the documented
+  "≥ threshold is music" needle-lift boundary. A cheap, immediately-freed
+  transient is worth more than a misclassification; documented at the site.
+- **#402 / R9-23 — wontfix-with-comment:** the release-consistency job checks
+  tag/VERSION/CHANGELOG agreement, not the test suite; tags are cut on `main`
+  commits `tests.yml` already ran green, so a tag-suite job would only re-test an
+  already-tested tree. Noted in the workflow.
+- **#403 / R9-24 — comment note (HYPOTHESIS/unreachable):** a cancel of
+  `run_pipeline` *itself* during the drain `await` would skip the finally's
+  stop/close statements — but the signal handler cancels only the legs, never
+  `run_pipeline`. Documented with the shield/reorder fix to apply if that wiring
+  ever changes.
+- **Doc corrections:** `#399 / R9-19` — CHANGELOG [1.5.28] ship count corrected
+  `1447 + 2 skips` → the true `1449/0` (the Noto files landed in that commit).
+  `#400 / R9-21` — DESIGN.md's font-floor claim aligned to the CLAUDE.md per-role
+  floors (they bind per-role, only the hero at ≈0.33, not all at one scale).
+  `#401 / R9-22` — two ` ```python ` fences that contain shell relabeled ` ```bash `
+  (+ a `cd` to repo root on the first-boot heredoc).
+
 ## [1.5.33] — 2026-08-13
 
 **R9 Wave 2 — display correctness (milestone `R9 Wave 2 — display correctness`;
@@ -371,7 +444,9 @@ their base's run when covered; (F4) multi-run renders honour a `background`
 argument; (F3P-1) a stale decode task (track changed mid-decode) can no longer
 latch the global episode flag against the new cover. A vacuous test assertion
 (F2) was also fixed and its mutant re-killed. 14/14 targeted mutations killed.
-Full suite **1447 passed** (+2 skips that activate when the Noto files land).
+Full suite **1449 passed** (the two Noto-fallback tests activate — those font
+files landed in THIS commit, so the true ship state was 1449/0, not the
+"1447 + 2 skips" pre-landing count first written here — corrected R9-19/#399).
 
 ### Fixed
 
