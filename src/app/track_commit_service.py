@@ -94,6 +94,13 @@ class TrackCommitService:
         # can't stamp and drop a scrobble. Noted here because META-5 cited only the
         # writer for "bogus scrobble timestamps"; the scrobble timestamp is taken
         # HERE, not there (CRIT-9).
+        #
+        # R9-14 (#383, RATIFIED Lane 2026-08-13): this is CONFIRMATION time, not
+        # track-START time — ~25-40s late at the real cadence (chunk capture +
+        # 2-confirmation × 10s hop + queue lag).  Deliberately NOT corrected:
+        # the skew is self-consistent, preserves inter-track ordering, and sits
+        # within Last.fm's practical tolerance, while a subtracted estimate
+        # would overshoot whenever confirmation took extra chunks.
         timestamp = int(time.time())
         # arch-1/#217: the "re-validate the session epoch after each await" rule
         # (B-1 / PCONC-1 / B-19 / LB-1 / CONC-6) lives in ONE object now. Bind it
@@ -183,12 +190,16 @@ class TrackCommitService:
         # An attribution ping-pong's swing-back re-commits the same physical
         # play (the foreign confirmation broke the consecutive dedup), and
         # Last.fm's server-side dedup does not collapse the two scrobbles
-        # (distinct timestamps).  The memory clears at each real silence
-        # boundary and for a #185 re-dropped release, so genuine replays still
-        # scrobble.  Recorded at dispatch (in-flight-latch pattern, see
-        # record_scrobble); if guard.run then skips for an ended session, the
-        # recorded key is cleared moments later by that end's boundary finalize
-        # — a benign, self-healing overhang.
+        # (distinct timestamps).  The memory is SWAPPED at each real silence
+        # boundary and reset per-release for a #185 re-drop, so genuine replays
+        # still scrobble; R9-03 caps tallies at the tracklist's same-title row
+        # count so a duplicated-title album's second row scrobbles too; R9-01's
+        # drop-on-genuine-credit advances the memory past other releases.
+        # Recorded at dispatch (in-flight-latch pattern, see record_scrobble).
+        # R9-08 corrected the old note here: there is NO await between the
+        # epoch gate above and this record, so the "recorded-then-skipped"
+        # overhang it described cannot occur — and no finalize "clears" the
+        # live memory anyway (the swap replaces it wholesale at boundaries).
         if self.lastfm:
             if self.tracker.should_scrobble(metadata):
                 self.tracker.record_scrobble(metadata)

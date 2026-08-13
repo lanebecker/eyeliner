@@ -21,6 +21,15 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # R9-06 (#381): numpy >=2.5 requires Python >=3.12, which breaks the
+    # supported 3.11 CI leg and the Raspberry Pi OS Bookworm/Legacy install
+    # path (pi-setup §6).  The app's numpy surface is 2.x-clean with no
+    # upgrade urgency, so hold the floor at the 3.11-compatible 2.4.x line;
+    # without this ignore Dependabot re-opens the bump weekly and saturates
+    # its 5-PR limit.  Revisit when 3.11 support is dropped.
+    ignore:
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: "github-actions"

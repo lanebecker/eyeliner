@@ -12,12 +12,16 @@ Play Count for ONE play).
 The fix — originally R7-02's 45s wall-clock window, SUPERSEDED by R8-02/#346
 (Lane, 2026-08-12, LOCKED): the window expired between two real confirmation
 cycles of the ping-pong, so the memory is now SILENCE-BOUNDARY keyed — a
-per-spin set cleared only at a terminal genuine-silence finalize — and a credit
-for a release already credited THIS SPIN is suppressed UNLESS the session was
-opened by a genuine #185 replay boundary (a real re-drop, which earns its own
-credit).  A real back-to-back replay still credits (the exemption); a genuine
-later spin credits after the silence boundary; two different records never
-interfere.  These tests pin the MECHANISM in compressed time; the
+per-spin :class:`SpinMemory` (R9-26) SWAPPED for a fresh one at the boundary
+EVENT itself (R9-08: not "cleared when the finalize completes"; a boundary
+finalize legally completes minutes late and judges against its own outgoing
+spin) — and a credit for a release already credited THIS SPIN is suppressed
+UNLESS the session was opened by a genuine #185 replay boundary (a real
+re-drop, which earns its own credit).  A real back-to-back replay still credits
+(the exemption); a genuine later spin credits after the silence boundary; two
+different records never interfere (R9-01: a genuine credit for a different
+record even advances the spin).  These tests pin the MECHANISM in compressed
+time; the
 realistic-cadence scenarios live in test_credit_cadence_r8.py (R8-04).
 """
 import pytest

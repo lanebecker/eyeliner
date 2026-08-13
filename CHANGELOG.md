@@ -7,6 +7,86 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [1.5.32] — 2026-08-13
+
+**R9 Wave 1 — spin-memory refinement (milestone `R9 Wave 1`; #378, #379, #380,
+#382, #383, #384) + Wave-0 Dependabot triage (#381).** The Round-9 audit's
+three MEDIUM credit/scrobble findings, two of them regressions minted by R8's
+own credit-model redesign. Design locked by Lane 2026-08-13 (drop-on-
+genuine-credit / count-aware scrobble cap / SpinMemory extraction / ratify the
+confirmation-time timestamp). RED-first (three executed repros: A→B→A fast
+swap credited A once not twice with its scrobbles suppressed; a noise blip
+zeroed the flip-resume credit; a duplicated-title track lost its second
+scrobble), all flipped; 8 targeted mutations killed. Full suite **1485 passed**
+(was 1474). Depends on the three merged Dependabot floor bumps (#373/#376/#377)
+landing first.
+
+### Added
+
+- **`src/tracking/spin_memory.py` — a `SpinMemory` object (#384 / R9-26)** that
+  owns the per-physical-spin credit + scrobble memory: swap-at-boundary, the
+  duplicate-credit judgment, credit/scrobble recording, and the two new drop
+  rules. The spin-boundary contract was previously hand-threaded through four
+  `ListenTracker` sites — both R9-01 and the R8-cold-review-F3 class lived in
+  that threading; the object makes the drop rule one method and the threading
+  bug class structurally hard.
+
+### Fixed
+
+- **A fast-swap evening no longer loses a record's second genuine play (#378 /
+  R9-01 — MEDIUM, data integrity).** With every record swap under the 45s
+  silence threshold, no genuine-silence boundary fires, so the whole evening
+  was ONE spin to the R8-02 memory: an A→B→A sequence suppressed A's second
+  full play's Play Count AND every one of its scrobbles (the return swap is an
+  album-change split, not a #185 replay, so it carried no exemption). A credit
+  landing for a DIFFERENT release now drops the other releases' credit entries
+  and scrobble tallies — "the spin moved on to another record". Ping-pong noise
+  cannot trigger the drop: a foreign 1-track swing session never passes the
+  completion gate, so the R8-02 double-credit guard stays closed (pinned).
+  *Accepted tradeoff (disclosed): the scrobble drop is unconditional on the
+  other releases, so a foreign single that was misattributed-and-scrobbled
+  earlier this spin has its tally cleared by an intervening genuine credit and
+  can re-scrobble if re-misattributed — bounded by the number of genuine
+  credits between re-commits (a few per evening), versus a genuine full play
+  losing all its scrobbles forever. R8-09's core swing-back case (no
+  intervening credit) stays fully closed.*
+- **A noise blip during a flip no longer kills the flip-resume credit (#379 /
+  R9-02 — MEDIUM).** The unarmed-terminal-end branch overwrote `_prev_unarmed`
+  unconditionally, so a one-chunk transient (a cueing thump, a door slam) in
+  the very flip gap the feature exists for minted an empty session that
+  clobbered the fragment — the split full play was then suppressed. A
+  zero-track session now touches the chain not at all (neither clearing nor
+  re-seeding); the 300s gap anchor on the kept fragment still bounds the
+  resume.
+- **A duplicated-title track scrobbles up to its tracklist row count (#380 /
+  R9-03 — MEDIUM).** The R8-09 scrobble key (title/artist/release) swallowed
+  the second distinct "Interlude" on an album with repeated interlude titles.
+  The originally-locked row-aware key was inert — `SideIndex` resolves a
+  repeated title to its FIRST occurrence (B-5), so `global_index` was identical
+  for both — so the fix is a per-key COUNT capped at the number of tracklist
+  rows sharing the (tier-1-folded) title: the album's second "Interlude"
+  scrobbles, an N+1th commit is a swing-back and is suppressed. A unique title
+  keeps the plain one-scrobble dedup.
+
+### Documented / ratified
+
+- **#382 / R9-08:** ten shipped sites (comments, two operator docs, a test
+  header, the [1.5.27] CHANGELOG bullet) described the pre-F3 "cleared when the
+  finalize completes" semantics that the shipped swap-at-boundary design
+  replaced — corrected, so a maintainer can't "fix toward" them and reopen the
+  F3 race.
+- **#383 / R9-14 — RATIFIED:** the Last.fm scrobble timestamp is confirmation
+  time (~25–40s late), not track start — self-consistent, ordering-preserving,
+  within tolerance; documented at the site, no code change.
+
+### CI
+
+- **#381 / R9-06:** `dependabot.yml` now ignores numpy `>=2.5.0` (it requires
+  Python ≥3.12, which breaks the supported 3.11 CI leg and the Raspberry Pi OS
+  Bookworm install path). Dependabot #375 was closed for the same reason; the
+  four safe floor bumps (#373 requests, #374 discogs-client, #376 pyyaml,
+  #377 pytest-timeout) merge separately.
+
 ## [1.5.31] — 2026-08-13
 
 **R8 Wave 5 — ratifications & hardening residue (milestone `R8 Wave 5`; #367,
@@ -290,6 +370,12 @@ suite **1424 passed** (was 1403).
   completes — "one physical spin" is delimited by what delimits it, real
   silence, so the guard is timing-independent by construction. The #185
   replay-boundary exemption (a genuine re-drop credits again) is unchanged.
+  *Correction note (R9-08/#382, v1.5.32): "cleared when the finalize completes"
+  described the FIRST cut, which the same release's own cold-review F3 fix
+  replaced — the shipped mechanism swaps the live memory at the boundary EVENT
+  itself, precisely because a boundary finalize legally completes minutes late
+  (honoured Retry-After) and must judge against its own outgoing spin. Since
+  v1.5.32 the memory is owned by `SpinMemory` (R9-26).*
 - **Flip-resume actually fires now (#345 / R8-01 — HIGH).** The R7-03 window was
   anchored at the prior session's `started_at` and measured at the armed
   session's finalize — fragment play + gap + tail play + trailing silence always

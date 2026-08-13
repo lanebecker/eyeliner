@@ -753,12 +753,19 @@ AND _is_duplicate_credit == True           (R8-02: this release was already
                                             end locked groove re-arming it — and
                                             the session was NOT opened by a
                                             genuine #185 replay boundary.  The
-                                            memory is a per-spin SET, cleared
-                                            only when a terminal genuine-silence
-                                            finalize completes; the R7-02 45s
+                                            memory is a per-spin SpinMemory,
+                                            SWAPPED for a fresh one at the
+                                            boundary EVENT itself (R9-08: not
+                                            "when the finalize completes" — a
+                                            boundary finalize legally completes
+                                            minutes late and judges against its
+                                            own outgoing spin); the R7-02 45s
                                             wall-clock window expired between two
                                             ~25s confirmation cycles and let the
-                                            double-credit back in)
+                                            double-credit back in.  R9-01: a
+                                            DIFFERENT release landing a genuine
+                                            credit drops other releases' entries
+                                            — the spin moved on)
     → suppress the credit AND the love, log loudly ("R8-02" in the message):
       one physical play must not be double-counted (guards the split, terminal
       SESSION_ENDED, forced-end, and R8-17 drain credit paths)
