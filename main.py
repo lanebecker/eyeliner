@@ -29,7 +29,12 @@ from pathlib import Path
 from src.config import load_config, ConfigError
 from src.app.track_commit_service import TrackCommitService
 from src.metadata.discogs import DiscogsHttp, DiscogsReader, DiscogsCollectionWriter
-from src.audio.capture import AudioCapture
+# R9-13 (#396): AudioCapture is imported LAZILY where it is constructed, NOT at
+# module level.  It pulls in `sounddevice` → the C library `libportaudio2`, which
+# a fresh Raspberry Pi OS install lacks (a documented first-boot state).  A
+# module-level import dies before main()'s try, so the ConfigError→exit-78 park
+# never applies and systemd crash-loops to StartLimitBurst instead.  The startup
+# probe `verify_audio_backend_importable` surfaces the failure as the friendly park.
 from src.audio.silence import SilenceDetector, AudioEvent
 from src.audio.recognizer import RecognitionLoop
 from src.metadata.resolver import MetadataResolver
@@ -123,6 +128,37 @@ def verify_recognition_backend_importable(config, _import=None) -> None:
             "(it now pulls in the 'audioop-lts' backport on Python 3.13+), or "
             "flash the 'Raspberry Pi OS (Legacy, 64-bit)' image (Python 3.11) — "
             "see docs/pi-setup-guide.md section 1."
+        ) from e
+
+
+def verify_audio_backend_importable(_import=None) -> None:
+    """R9-13 (#396): probe the audio-capture C-extension dependency at startup.
+
+    ``sounddevice`` imports the system library ``libportaudio2`` at import time,
+    and a fresh Raspberry Pi OS install lacks it — a CAN-NEVER-SELF-HEAL config
+    class exactly like the shazamio probe above.  ``AudioCapture`` is imported
+    lazily (not at module level) so this failure surfaces HERE, inside main()'s
+    try, as a ConfigError → the friendly exit-78 park — instead of a bare
+    import-time traceback → exit 1 → systemd crash-loop to StartLimitBurst.
+
+    ``_import`` is an injection seam for tests (defaults to
+    ``importlib.import_module``), independent of the recognition-backend probe's
+    seam so each is exercisable in isolation.
+    """
+    import importlib
+    _import = _import or importlib.import_module
+    try:
+        _import("sounddevice")
+    except Exception as e:
+        # Exception, not BaseException, so KeyboardInterrupt/SystemExit propagate;
+        # a missing libportaudio2 raises OSError, a mis-built wheel RuntimeError —
+        # all the same apt-install-to-fix class this probe exists to surface.
+        raise ConfigError(
+            f"The 'sounddevice' audio-capture backend failed to import: {e}.\n"
+            "  This almost always means the system 'libportaudio2' library is "
+            "missing — a fresh Raspberry Pi OS install does not include it.\n"
+            "  Fix: 'sudo apt-get install -y libportaudio2' — see "
+            "docs/pi-setup-guide.md."
         ) from e
 
 
@@ -271,6 +307,7 @@ def build_components(config, state: PlayerState) -> "Components":
         display = DisplayRenderer(config.display, state)
         silence = SilenceDetector(config.audio)
         recognizer = RecognitionLoop(config.recognition, state, commit_service.commit)
+        from src.audio.capture import AudioCapture   # R9-13: lazy (see import note)
         capture = AudioCapture(config.audio, silence, recognizer)
     except Exception:
         log.error(
@@ -417,6 +454,16 @@ async def run_pipeline(tasks, capture, display, tracker, discogs_http, io_execut
         # tears it down (CONC-1); bounded so a stuck write can't hang shutdown.
         # Runs even when a leg faulted — a crash must not abandon a half-written
         # collection update.
+        #
+        # R9-24 (#403, HYPOTHESIS/unreachable): the first statement here awaits.
+        # If run_pipeline ITSELF were cancelled during this drain, the
+        # CancelledError would propagate out of the await and SKIP the stop/close
+        # statements below (a resource leak). This does not happen under the
+        # shipped wiring: the signal handler (install_signal_handlers) cancels
+        # only the pipeline LEGS, never the run_pipeline coroutine, and main()
+        # awaits run_pipeline directly (no outer cancel). Kept as a note, not a
+        # shield: if a future change ever cancels run_pipeline directly, wrap the
+        # body below in `asyncio.shield` or move the awaited drain last.
         await tracker.drain()
         capture.stop()
         display.stop()
@@ -451,6 +498,9 @@ async def main():
         # (e.g. Python 3.13 missing audioop) — reuses this same friendly exit
         # instead of a silent per-chunk miss at runtime.
         verify_recognition_backend_importable(config)
+        # R9-13 (#396): probe the audio C-extension dep in the SAME startup try,
+        # so a missing libportaudio2 parks (exit 78) instead of crash-looping.
+        verify_audio_backend_importable()
     except ConfigError as e:
         log.error(f"Configuration error:\n{e}")
         # R6-27: exit EX_CONFIG (78), not 1 — a config error can never self-heal on

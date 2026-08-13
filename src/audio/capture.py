@@ -374,7 +374,24 @@ class AudioCapture:
         if msg.endswith("]") and "[" in msg:
             msg = msg[: msg.rfind("[")].strip()  # "…unavailable [PaErrorCode -9985]" →
             if ": " in msg:                      # "Error opening InputStream: Device…"
-                msg = msg.rsplit(": ", 1)[1].strip()   # → "Device unavailable"
+                last = msg.rsplit(": ", 1)[1].strip()   # → "Device unavailable"
+                # R9-07 (#395): the 3-arg PortAudioError shape — the classic
+                # ALSA/USB `paUnanticipatedHostError` — formats as
+                # "Unanticipated host API error: '<free ALSA text>' [host error N]".
+                # After the trailing bracket is stripped, the LAST colon segment
+                # is ARBITRARY quoted ALSA free text, so keying on its first word
+                # FRAGMENTS per-variant (the #304 bug in the other direction) and
+                # the stable condition ("Unanticipated host API error") never
+                # becomes the key. When the last segment is quoted free text, key
+                # on the CONDITION segment that precedes it instead.
+                if last[:1] in ("'", '"') and ": " in msg[: msg.rfind(": ")]:
+                    head = msg[: msg.rfind(": ")].strip()
+                    msg = head.rsplit(": ", 1)[1].strip()
+                elif last[:1] not in ("'", '"'):
+                    msg = last
+                # else: quoted text with no preceding condition segment — leave
+                # `msg` as the whole (bracket-stripped) string; its first word is
+                # a stable-enough key and this shape isn't a real PortAudioError.
         first = msg.split(maxsplit=1)[0] if msg else ""
         return f"{type(error).__name__}:{first}"
 

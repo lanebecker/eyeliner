@@ -321,7 +321,7 @@ actually own. (R8-25/#365)
 
 Confirm sounddevice sees the UCA222 at the Python level:
 
-```python
+```bash
 source venv/bin/activate
 python3 -c "import sounddevice; print(sounddevice.query_devices())"
 ```

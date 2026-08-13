@@ -158,7 +158,13 @@ def validate_image_file(path: str, *, return_image=False):
                 fmt = probe.format
                 width, height = probe.size
         except Exception as e:
-            raise PermanentCoverError(f"not a decodable image: {e}")
+            # R9-15 (#397): route through _classify_cover_error so an
+            # errno-carrying OSError (EIO/ENOSPC — a TRANSIENT disk fault mid-read
+            # of a download's temp file) PROPAGATES and the download path backs
+            # off, instead of condemning the URL to a permanent blacklist. Only
+            # errno-less content failures (undecodable header) stay permanent.
+            # Mirrors the errno taxonomy already applied to downscale/normalize.
+            raise _classify_cover_error(e, "not a decodable image")
 
         if fmt not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
             raise PermanentCoverError(f"unexpected image format: {fmt!r}")
@@ -178,7 +184,10 @@ def validate_image_file(path: str, *, return_image=False):
         except Exception as e:
             if decoded is not None:
                 decoded.close()
-            raise PermanentCoverError(f"not a decodable image: {e}")
+            # R9-15 (#397): same errno taxonomy as the header probe above — an
+            # EIO mid-decode is transient (propagate + back off), not corrupt
+            # bytes to blacklist. errno-less decode failures still condemn.
+            raise _classify_cover_error(e, "not a decodable image")
 
         if return_image:
             return decoded          # caller owns it and must close it

@@ -5,6 +5,14 @@ name: Release consistency
 # only warns on a missing CHANGELOG bump), and the 2026-08-10 badge-rot incident
 # showed that tag / VERSION / CHANGELOG can silently drift apart. Read-only.
 #
+# R9-23 (#402, wontfix-with-comment): this job checks tag/VERSION/CHANGELOG
+# AGREEMENT only — it does NOT re-run the test suite on the tagged commit. That
+# is intentional and mitigated in practice: tags are cut on `main` commits that
+# `tests.yml` already ran green, and the tag points at that exact tree. Adding a
+# suite job here would only re-test an already-tested commit. Revisit only if the
+# release process ever tags a commit that CI has not run (e.g. a hotfix tag off a
+# branch) — then gate the tag on a suite run.
+#
 # Security (mirrors sync-version-badge.yml / TQ-5): the tag and the VERSION bytes
 # are untrusted repo input. VERSION is validated against a strict semver pattern,
 # and both values are passed to the shell via env: (referenced as "$TAG" / built
@@ -30,7 +38,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          file_ver="$(cat VERSION)"
+          # R9-17 (#398): strip ALL whitespace, matching sync-version-badge.yml's
+          # `tr -d '[:space:]'`.  Bare `$(cat VERSION)` only trims the trailing
+          # newline, so a stray INTERIOR space ("1.5. 33") passes the badge job
+          # but hard-fails the semver check here — the two release workflows must
+          # normalize identically or they disagree on the same VERSION bytes.
+          file_ver="$(tr -d '[:space:]' < VERSION)"
           # R7-22: accept the OPTIONAL `-<suffix>` pre-release form, single-sourcing
           # the exact pattern sync-version-badge.yml validates against (keep the two
           # in sync). The old strict MAJOR.MINOR.PATCH regex hard-failed a
