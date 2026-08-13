@@ -530,6 +530,24 @@ class DisplayRenderer:
     def _font(self, role: str, size: int):
         return self._text.font(role, size)
 
+    def _sweep_outgoing_cover(self, outgoing: Optional[str], keep: Optional[str] = None) -> None:
+        """Drop the outgoing cover's readiness marker + transient failure
+        bookkeeping (#306 / R8-05 / R9-05).
+
+        One helper for all three transition branches (PLAYING url-change,
+        PLAYING→no-cover, and IDLE/ERROR/LISTENING) — the three-copy sweep is
+        exactly where #306, R8-05 and R9-05 each found a divergent unswept
+        branch (R9-27 consolidation, at the sweep granularity).  `_cover_bad_urls`
+        is deliberately NOT swept (a permanently-bad cover stays blacklisted).
+        `keep` is the incoming cover, never swept even if it equals `outgoing`.
+        """
+        if outgoing is None or outgoing == keep:
+            return
+        self._cover_on_disk.discard(outgoing)   # R5-21: bound the readiness set
+        self._cover_download_failures.pop(outgoing, None)
+        self._cover_download_retry_after.pop(outgoing, None)
+        self._cover_decode_failures.pop(outgoing, None)
+
     def _on_state_change(self, state: PlayerState):
         """Called by PlayerState whenever anything changes."""
         self._dirty = True
@@ -542,63 +560,55 @@ class DisplayRenderer:
             self._listening_since = None
         # When a new track arrives, queue a palette transition and prefetch cover art
         if state.status == PlayerStatus.PLAYING and state.current_track:
-            url = state.current_track.cover_art_url
-            if url and url != self._wanted_cover_url:
+            # Normalize an absent cover to None so "" and None are one case.
+            url = state.current_track.cover_art_url or None
+            outgoing = self._wanted_cover_url
+            if url and url != outgoing:
                 # STAB-1: a genuinely NEW cover is the "state change" that lifts a
-                # prior blacklist — give it a fresh bounded decode attempt.  (A
-                # repeat state-change for the SAME cover does not, so a permanently
-                # bad cover can't be re-triggered into the loop by state churn.)
+                # prior blacklist and gets a fresh bounded decode attempt.  R9-11
+                # (#389): this DOES re-attempt a previously-blacklisted cover when
+                # the record returns after an IDLE gap (`outgoing` was nulled, so
+                # the returning URL counts as new) — bounded re-attempts with
+                # backoff, NOT the "never re-attempted" the old comment claimed.
                 self._cover_bad_urls.discard(url)
                 self._cover_decode_failures.pop(url, None)
-                # R6-18: also lift any download-failure backoff/blacklist for the
-                # genuinely new cover, so it gets a clean first attempt.
+                # R6-18: also lift any download-failure backoff for the new cover.
                 self._cover_download_failures.pop(url, None)
                 self._cover_download_retry_after.pop(url, None)
-                self._cover_on_disk.discard(url)   # R5-21: re-confirm on this track's prefetch
-                # R5-21: bound _cover_on_disk — drop the OUTGOING cover's readiness
-                # marker. Its scaled surface is already in the (bounded) _cover_cache,
-                # so the gate is only consulted on a cache miss; keeping the marker
-                # would grow the set by one per distinct cover over 24/7 uptime.
-                self._cover_on_disk.discard(self._wanted_cover_url)
-                # #306 (R7 scope-extension): also sweep the OUTGOING cover's failure
-                # bookkeeping. Its download/decode tally + retry deadline otherwise
-                # linger forever for a URL that failed 1–4× then was never revisited,
-                # growing unbounded over 24/7 uptime keyed by distinct cover URL.
-                # `_cover_bad_urls` is deliberately NOT swept — a permanently-bad
-                # cover stays blacklisted so a return to it isn't re-attempted (the
-                # accepted STAB-1 residual).
-                outgoing = self._wanted_cover_url
-                if outgoing is not None and outgoing != url:
-                    self._cover_download_failures.pop(outgoing, None)
-                    self._cover_download_retry_after.pop(outgoing, None)
-                    self._cover_decode_failures.pop(outgoing, None)
+                self._cover_on_disk.discard(url)   # R5-21: re-confirm on this prefetch
                 # R8-06 (#353): a NEW cover gets an immediate decode attempt —
-                # clear the episode latch AND the deadline (the latch re-sets on
-                # the next failure if the display is still gone).  2nd-pass fix:
-                # the latch clear was missing, leaving the F1 probe armed with
-                # no decode path to resolve it while the new download pended.
+                # clear the fault-episode latch AND deadline (it re-sets on the
+                # next failure if the display is still gone).
                 self._cover_decode_deferred = False
                 self._cover_decode_retry_at = 0.0
+            # R9-05 (#386): sweep the OUTGOING cover's readiness marker + failure
+            # bookkeeping on ANY change of the wanted URL — INCLUDING url=None (a
+            # PLAYING track with no artwork, or a cover lost mid-flip).  The
+            # #306/R8-05 sweeps ran only in the url-present PLAYING branch and the
+            # IDLE branch, so a PLAYING→PLAYING(no-cover) boundary was the THIRD
+            # unswept branch of this class, leaking the old cover's three failure
+            # dicts + on_disk marker forever over 24/7 uptime.  `_cover_bad_urls`
+            # deliberately NOT swept (a permanently-bad cover stays blacklisted
+            # until the record itself returns, per the STAB-1/R9-11 rule above).
+            # R9-20 (#393): the #356 secondary residual stands — an in-flight
+            # prefetch of `outgoing` that FAILS after this sweep re-seeds its
+            # entries; bounded (one URL, self-heals on the next boundary).
+            self._sweep_outgoing_cover(outgoing, keep=url)
             self._wanted_cover_url = url
             self._queue_palette(url)
             if url:
                 self._spawn(self._prefetch_cover(url))
         elif state.status in (PlayerStatus.IDLE, PlayerStatus.ERROR, PlayerStatus.LISTENING):
             # Empty states always use the fallback palette (DESIGN.md §2);
-            # lerp back smoothly rather than jump-cutting.
-            self._cover_on_disk.discard(self._wanted_cover_url)   # R5-21: bound the set
-            # R8-05 (#356): sweep the outgoing cover's failure bookkeeping HERE
-            # too.  The #306 sweep lived only in the PLAYING url-change branch —
-            # but the COMMON album boundary is PLAYING→IDLE→PLAYING (>=45s of
-            # silence between records), where `_wanted_cover_url` was nulled
-            # first, so the next record's sweep saw outgoing=None and the
-            # previous album's three entries survived forever.  Same policy as
-            # the PLAYING branch: `_cover_bad_urls` deliberately NOT swept.
-            outgoing = self._wanted_cover_url
-            if outgoing is not None:
-                self._cover_download_failures.pop(outgoing, None)
-                self._cover_download_retry_after.pop(outgoing, None)
-                self._cover_decode_failures.pop(outgoing, None)
+            # lerp back smoothly rather than jump-cutting.  R8-05 (#356): the
+            # common album boundary is PLAYING→IDLE→PLAYING (>=45s silence), so
+            # the outgoing sweep must run here too.
+            self._sweep_outgoing_cover(self._wanted_cover_url)
+            # R9-18 (#392): clear the decode-fault episode latch — a static empty
+            # screen has no cover to decode, so the run loop's clock-driven probe
+            # (R8-06) must not keep re-arming a dirty frame every 5s forever.
+            self._cover_decode_deferred = False
+            self._cover_decode_retry_at = 0.0
             self._wanted_cover_url = None
             self._queue_palette(None)
 
@@ -638,10 +648,12 @@ class DisplayRenderer:
             # keep it inside the same survival policy as the render below.  A
             # pump fault starts/continues the episode; events are retried next
             # iteration.
+            pump_faulted = False
             try:
                 events = pygame.event.get()
             except pygame.error as e:
                 events = []
+                pump_faulted = True
                 if fault_since is None:
                     fault_since = time.monotonic()
                     fault_last_reinit = fault_since
@@ -649,11 +661,6 @@ class DisplayRenderer:
                         "Event pump failed (%s) — video fault? Keeping the "
                         "pipeline alive (R8-07).", e,
                     )
-                # 2nd-pass fix: route the episode into the render try below
-                # (where retry, set_mode reinit and recovery-logging live) —
-                # without this a pump-only fault on a static frame never
-                # reached the reinit and never ended the episode.
-                self._dirty = True
             for event in events:
                 if event.type == pygame.QUIT:
                     self.stop()
@@ -661,6 +668,16 @@ class DisplayRenderer:
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     self.stop()
                     return
+
+            # R8-07 / R9-10: while a video-fault episode is open (pump OR render
+            # faulting), force a render every iteration.  This routes a pump-only
+            # fault into the render try below (where reinit + recovery-logging
+            # live), AND guarantees a render on the iteration the pump recovers
+            # so recovery can be confirmed — a succeeding render otherwise leaves
+            # _dirty False and the episode would hang open at the 1s cadence with
+            # no frame to clear it (2nd-pass fix take two + R9-10).
+            if fault_since is not None:
+                self._dirty = True
 
             # R6-18: re-attempt a backed-off cover download once its window elapses.
             # Cheap O(1) check per loop iteration (~10 fps even when idle), so a
@@ -708,7 +725,15 @@ class DisplayRenderer:
                 try:
                     self._render()
                     pygame.display.flip()
-                    if fault_since is not None:
+                    # R9-10 (#388): only declare recovery when the PUMP also
+                    # succeeded THIS iteration.  A render+flip can succeed while
+                    # the event pump still raises (an asymmetric fault); clearing
+                    # fault_since here reopened the episode next iteration and
+                    # flapped WARNING+"recovered" pairs at full ~10fps cadence
+                    # (the 1s fault sleep never engaging because fault_since was
+                    # None at the sleep).  Requiring a clean pump too holds the
+                    # episode open — 1 line/s — until the display is fully back.
+                    if fault_since is not None and not pump_faulted:
                         log.info(
                             "Display recovered after a %.0fs video-fault "
                             "episode (R8-07).", time.monotonic() - fault_since,
@@ -1884,33 +1909,55 @@ class DisplayRenderer:
             return                              # already decoded (raced with another spawn)
         if key in self._cover_decode_inflight:
             return                              # a decode for this cover is already running
-        cache_path = self._cover_store.path_for(url)
-        if not cache_path.exists():
-            if url in self._cover_on_disk:
-                # R7-12: the URL was MARKED on disk but the file has VANISHED — the
-                # mtime-LRU pruned it. A warm-start cover's mtime is never refreshed
-                # after the download short-circuits, so it is the prune's first
-                # victim once any later download crosses the cache bound. The old
-                # code returned WITHOUT dropping the marker, so `url in
-                # _cover_on_disk` stayed true and _load_cover respawned this
-                # (blocking-stat, no-op) decode EVERY frame for the rest of the
-                # album, while the R6-18 retry driver stayed gated off (it too skips
-                # a URL still in _cover_on_disk). Drop the readiness marker and
-                # refetch — exactly as the corrupt-bytes path does (R6-19) — so the
-                # churn stops and the cover recovers within the track.
-                self._cover_on_disk.discard(url)
-                if url not in self._cover_prefetch_inflight:
-                    self._spawn(self._prefetch_cover(url))
-                self._dirty = True   # repaint to the placeholder now the cover is gone
-            # else: the decode raced ahead of a still-PENDING download (the file was
-            # never on disk). The state-change prefetch owns landing it; do NOT
-            # refetch here (that download path is not this method's job).
-            return
-
+        # R9-W2 narrow-pass (regression INTRODUCED by R9-09's own off-loop move):
+        # claim the inflight guard BEFORE the first await below, then wrap the
+        # ENTIRE remainder in ONE try/finally. With the existence stat moved to
+        # run_in_executor, an await now sits between the inflight CHECK (above)
+        # and this CLAIM — so at 10 fps several frames each pass the still-empty
+        # check and spawn a DUPLICATE decode of the same cover. The window is the
+        # stat's duration: ~0 on a healthy card, but SECONDS on the dying card
+        # R9-09 exists to protect, piling N concurrent blocking stat+load calls
+        # onto the failing card. Claiming here restores the baseline's atomic
+        # check-and-claim (await-free when exists() was synchronous).
+        #
+        # 2nd-pass: a SINGLE finally must span from the claim, because the very
+        # first await (the exists() stat) can RAISE on a failing card — pathlib's
+        # _ignore_error does NOT swallow EIO (errno 5), so .exists() re-raises an
+        # I/O error — and an escape above the try would strand the key and lock
+        # this cover out of every future decode until restart. The vanished
+        # early-return is now inside this try too, so the finally covers it.
         self._cover_decode_inflight.add(key)
         try:
+            cache_path = self._cover_store.path_for(url)
+            loop = asyncio.get_running_loop()
+            # R9-09 (#387): the existence stat runs OFF the loop — this coroutine is
+            # spawned per decode (and repeatedly during recovery episodes, exactly
+            # when the SD card is most suspect), and a stat on a dying card can block
+            # for seconds (the same rationale R8-26 applied to _prefetch_cover /
+            # _extract_palette_async, whose call sites this fix had missed).
+            if not await loop.run_in_executor(None, cache_path.exists):
+                if url in self._cover_on_disk:
+                    # R7-12: the URL was MARKED on disk but the file has VANISHED — the
+                    # mtime-LRU pruned it. A warm-start cover's mtime is never refreshed
+                    # after the download short-circuits, so it is the prune's first
+                    # victim once any later download crosses the cache bound. The old
+                    # code returned WITHOUT dropping the marker, so `url in
+                    # _cover_on_disk` stayed true and _load_cover respawned this
+                    # (blocking-stat, no-op) decode EVERY frame for the rest of the
+                    # album, while the R6-18 retry driver stayed gated off (it too skips
+                    # a URL still in _cover_on_disk). Drop the readiness marker and
+                    # refetch — exactly as the corrupt-bytes path does (R6-19) — so the
+                    # churn stops and the cover recovers within the track.
+                    self._cover_on_disk.discard(url)
+                    if url not in self._cover_prefetch_inflight:
+                        self._spawn(self._prefetch_cover(url))
+                    self._dirty = True   # repaint to the placeholder now the cover is gone
+                # else: the decode raced ahead of a still-PENDING download (the file was
+                # never on disk). The state-change prefetch owns landing it; do NOT
+                # refetch here (that download path is not this method's job).
+                return
+
             try:
-                loop = asyncio.get_running_loop()
                 raw = await loop.run_in_executor(None, pygame.image.load, str(cache_path))
             except Exception as e:
                 # R7-13: distinguish a file PRUNED between the exists() check above
@@ -1922,7 +1969,11 @@ class DisplayRenderer:
                 # a corrupt-decode failure — which would unlink an already-gone file
                 # and burn a _COVER_MAX_LOAD_FAILURES attempt toward a spurious
                 # blacklist that a same-album track change could never lift.
-                if isinstance(e, FileNotFoundError) or not cache_path.exists():
+                # R9-09 (#387): the vanished-file re-check stat also off the loop.
+                vanished = isinstance(e, FileNotFoundError) or not await loop.run_in_executor(
+                    None, cache_path.exists
+                )
+                if vanished:
                     if url in self._cover_on_disk:
                         self._cover_on_disk.discard(url)
                         if url not in self._cover_prefetch_inflight:
@@ -1931,7 +1982,7 @@ class DisplayRenderer:
                     return
                 # Corrupt/partial bytes (the SD read is off-loop, so its failure
                 # surfaces here): STAB-1 bounded unlink + refetch, then blacklist.
-                self._handle_corrupt_cover(url, cache_path, e)
+                await self._handle_corrupt_cover(url, cache_path, e)
                 self._dirty = True
                 return
 
@@ -1974,7 +2025,7 @@ class DisplayRenderer:
         finally:
             self._cover_decode_inflight.discard(key)
 
-    def _handle_corrupt_cover(self, url: str, cache_path, error) -> None:
+    async def _handle_corrupt_cover(self, url: str, cache_path, error) -> None:
         """STAB-1: a cached cover failed to DECODE (corrupt/partial bytes).
 
         Unlink + re-fetch it at most ``_COVER_MAX_LOAD_FAILURES`` times so a
@@ -1982,6 +2033,11 @@ class DisplayRenderer:
         past that the re-download keeps re-landing the same bad bytes, so mark
         the URL bad and stop the per-frame disk/network/log loop.  Always
         returns None (the caller shows the placeholder).
+
+        R9-09 (#387): async so the unlink (a WRITE — the site R8-26 also missed)
+        runs off the event loop.  The unlink is AWAITED before the refetch spawn
+        so ordering holds: the old bytes are gone before the re-download can
+        land, otherwise a fresh download could be deleted by a late unlink.
         """
         failures = self._cover_decode_failures.get(url, 0) + 1
         self._cover_decode_failures[url] = failures
@@ -1995,7 +2051,8 @@ class DisplayRenderer:
             )
             return None
         log.warning(f"Failed to load cached cover art (attempt {failures}): {error}")
-        cache_path.unlink(missing_ok=True)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: cache_path.unlink(missing_ok=True))
         # R6-19: drop the readiness marker along with the file, so _load_cover does
         # NOT keep spawning a (no-op, blocking-stat) decode task every frame during
         # the refetch window — the per-frame churn R5-21 closed. _prefetch_cover

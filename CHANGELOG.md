@@ -7,6 +7,103 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [1.5.33] — 2026-08-13
+
+**R9 Wave 2 — display correctness (milestone `R9 Wave 2 — display correctness`;
+#385–#393).** The Round-9 audit's display batch: two MEDIUM rendering bugs, the
+rest LOW/NIT hygiene and comment-honesty. RED-first where reproducible; every
+code fix mutation-verified. The independent cold "break-this" review of the diff
+found one HIGH regression **introduced by this wave's own R9-09 fix** (a
+duplicate-decode race), and the mandated narrow second pass over that fix found
+a MEDIUM leak in the first repair — both fixed and pinned before release (see
+below). Full suite **1502 passed** (was 1485). **#394 (R9-27, the `CoverPipeline`
+consolidation) is deferred open** as tracked architecture — the R9-05 sweep hoist
+is the shipped point fix; the structural cure is a larger refactor to schedule
+deliberately, not to rush into a bug-fix wave.
+
+### Fixed
+
+- **Mixed-script metadata no longer renders below the layout baseline (#385 /
+  R9-04 — MEDIUM).** A composite line (Latin primary + Noto fallback for
+  Cyrillic/CJK) loaded the fallback face at nominal size, so its taller em box
+  pushed the run below the measured baseline — the accent divider struck hero
+  descenders and a Cyrillic/CJK album title sat ~13px low with ink outside its
+  slot. The fallback face is now loaded at the size whose **ascent matches the
+  primary's** (`size × primary_ascent/fallback_ascent`), so the composite
+  surface shares the Latin baseline and (within a pixel) height. Fixed in
+  `typography.py`, not per call site; also normalizes all-CJK line height.
+  Verified with ink-extent measurements at hero/artist/album sizes.
+- **`_CompositeFont.size()` and `.render()` now compute height with the same
+  baseline arithmetic (#391 / R9-16 — folded into R9-04).** `size()` used a
+  naive max-of-run-heights; `render()` uses `max_ascent + max_descent`. They
+  diverge only when the max-ascent and max-descent come from different runs —
+  latent today (no caller consumes `size()[1]` on mixed runs, and the em-box
+  match equalizes ascents), fixed as a consistency guarantee and pinned by a
+  divergent-ascent stub test plus the real-bundled parity test.
+- **The outgoing-cover sweep now runs on ANY change of the wanted URL (#386 /
+  R9-05 — MEDIUM).** A track with no artwork (`cover_art_url` None) mid-session
+  hit neither the `url != wanted` PLAYING branch nor the IDLE branch — the third
+  unswept branch of the #306 bookkeeping class — so the old URL's on-disk marker
+  and three failure dicts leaked, one entry-set per with-cover→no-cover boundary
+  over a 24/7 run. The sweep is hoisted to fire whenever `outgoing not in (None,
+  url)`, keeping the `_cover_bad_urls` blacklist exception.
+- **`_decode_cover_async` / `_handle_corrupt_cover` no longer do blocking
+  SD-card I/O on the event loop (#387 / R9-09 — LOW).** Both `exists()` stats
+  (the pre-decode check and the vanished-vs-corrupt re-check) and the
+  corrupt-cover `unlink()` now run in the default executor — the R8-26 rationale
+  applied to the call sites it had missed. A stat/unlink on a dying card can
+  block for seconds, exactly during the recovery episodes this coroutine is
+  spawned in.
+  - *Cold-review regression (HIGH, INTRODUCED-then-fixed): moving `exists()`
+    off-loop put an `await` between the inflight-dedup CHECK and its CLAIM, so at
+    10 fps several frames each spawned a duplicate decode — worst on the very
+    slow card the fix targets. The inflight guard is now claimed BEFORE the first
+    await, restoring the baseline's atomic check-and-claim.*
+  - *Second-pass regression (MEDIUM, INTRODUCED-then-fixed): the first repair
+    used two release sites and left the `exists()`-await-raise path uncovered —
+    an `OSError` (pathlib does not swallow EIO) would strand the inflight key and
+    lock the cover out of every future decode until restart. The entire body is
+    now wrapped in ONE `try/finally` from the claim, so every exit — including an
+    await that raises — releases the key. Three RED-first regression tests
+    (duplicate-decode dedup, vanished-branch release, EIO-raise release), all
+    mutation-verified.*
+- **A pump-only video fault no longer flaps WARNING+recovered log pairs (#388 /
+  R9-10 — LOW).** When the SDL event pump raised while rendering still worked,
+  the once-per-episode latch cleared every iteration (~19 lines/second). A
+  per-iteration `pump_faulted` flag now gates recovery on a genuinely clean
+  pump+render iteration; recovery logs once.
+- **The convert-fault deferral latch clears on entering an empty state (#392 /
+  R9-18 — NIT).** `_cover_decode_deferred` / `_cover_decode_retry_at` survived
+  into IDLE/ERROR, so a static screen took a probe frame every 5s forever; now
+  swept alongside the other empty-state bookkeeping.
+
+### Documented / accepted
+
+- **#389 / R9-11:** corrected the false `_cover_bad_urls` comment — a return to a
+  blacklisted cover after IDLE DOES lift the blacklist and re-attempt (bounded,
+  with backoff), which the "never re-attempted" invariant denied. Behavior is
+  defensible; the comment was not.
+- **#390 / R9-12 — accept-with-comment:** the one-shot legacy-sweep × concurrent
+  prune race can resurrect an evicted cover over the file bound with a falsified
+  mtime — bounded to the startup sweep window, self-correcting at the next
+  prune; documented rather than guarded (an exists-check-before-replace is a
+  narrower race, not race-free).
+- **#393 / R9-20:** noted the #356 secondary residual (an in-flight prefetch
+  failing after the IDLE sweep re-seeds swept entries) at the site, closing the
+  [1.5.29] doc gap.
+
+### CI
+
+- **Dependabot Python-3.11 floor-hold widened to a standing policy (Lane,
+  2026-08-13).** The numpy `>=2.5.0` ignore (R9-06/#381, shipped in 1.5.32) is
+  generalized in `dependabot.yml` to a documented, **human-enforced** rule: any
+  bump whose new version raises the package's `Requires-Python` above 3.11 is
+  held until 3.11 support is deliberately dropped, because the Bookworm Pi and
+  the 3.11 CI leg must stay installable. Dependabot's `ignore` cannot gate on
+  Requires-Python, so the rule is enforced per-PR by review (with a version
+  `ignore` added only when a held bump keeps re-opening). Not a security waiver:
+  3.11-compatible advisory bumps still merge.
+
 ## [1.5.32] — 2026-08-13
 
 **R9 Wave 1 — spin-memory refinement (milestone `R9 Wave 1`; #378, #379, #380,

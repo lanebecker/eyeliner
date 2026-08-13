@@ -363,6 +363,16 @@ class CoverArtCache:
         never render anyway; the URL re-downloads through the modern path if it
         ever recurs).  Returns the number of files touched.  Blocking — run in
         an executor (the renderer spawns it once at loop start).
+
+        Accepted residual (R9-12/#390): this one-shot sweep and a concurrent
+        _prune() both mutate the cache dir, so a normalize's os.replace can land
+        a file that a prune just evicted (resurrecting it over the file bound)
+        and give it a fresh mtime (skewing LRU order once).  Bounded to the
+        single sweep window at startup and self-correcting at the next
+        download's prune; not worth an exists-check-before-replace race
+        narrowing that would still be racy.  The atomic rewrite means a
+        concurrent DECODE always reads a whole file, old or new — that part is
+        race-free.
         """
         from src.display.palette import MAX_IMAGE_PIXELS, _probe_image_header
 

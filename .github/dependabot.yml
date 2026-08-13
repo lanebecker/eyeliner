@@ -21,12 +21,26 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    # R9-06 (#381): numpy >=2.5 requires Python >=3.12, which breaks the
-    # supported 3.11 CI leg and the Raspberry Pi OS Bookworm/Legacy install
-    # path (pi-setup §6).  The app's numpy surface is 2.x-clean with no
-    # upgrade urgency, so hold the floor at the 3.11-compatible 2.4.x line;
-    # without this ignore Dependabot re-opens the bump weekly and saturates
-    # its 5-PR limit.  Revisit when 3.11 support is dropped.
+    # ── STANDING POLICY: hold at the Python-3.11 floor (Lane, 2026-08-13) ──
+    # The deployment target is Raspberry Pi OS Bookworm (Python 3.11) and the CI
+    # matrix keeps a 3.11 leg, so the WHOLE dependency tree must stay installable
+    # and importable on 3.11.  Any Dependabot PR whose new version raises the
+    # package's `Requires-Python` above 3.11 must be HELD until 3.11 support is
+    # deliberately dropped — regardless of the package.  Dependabot's `ignore`
+    # cannot gate on Requires-Python (it only matches version ranges), so this is
+    # a HUMAN-ENFORCED review rule on every bump PR, NOT something this file can
+    # express in general.  The check per PR: `pip index versions <pkg>` / the
+    # release's `Requires-Python` on PyPI; if it demands >3.11, close the PR with
+    # a one-line reason and, if it keeps re-opening weekly, add a version `ignore`
+    # entry below (as done for numpy) to stop it saturating the 5-PR limit.
+    # This is a floor-hold, not a security waiver: a 3.11-compatible security
+    # advisory bump still merges normally.
+    #
+    # R9-06 (#381) — the first instance: numpy >=2.5 requires Python >=3.12, which
+    # breaks the 3.11 CI leg and the Bookworm/Legacy install path (pi-setup §6).
+    # numpy's surface is 2.x-clean with no upgrade urgency, so hold the floor at
+    # the 3.11-compatible 2.4.x line; the `ignore` below stops the weekly re-open.
+    # Revisit when 3.11 support is dropped.
     ignore:
       - dependency-name: "numpy"
         versions: [">=2.5.0"]
