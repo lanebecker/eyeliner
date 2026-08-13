@@ -34,7 +34,7 @@ Pillow>=12.3.0
 # for CJK + the Cyrillic/Greek gaps in Newsreader-Italic). Pure Python, no
 # per-frame work; if absent the display degrades to single-face rendering with
 # one WARNING.
-fonttools>=4.38.0
+fonttools>=4.63.0
 # Cover-art fetch pins the connection to a vetted IP (S-7); these are imported
 # directly by src/display/cover_cache.py, not just transitively via requests.
 # urllib3>=2.0 is required: the IP-pinned HTTPSConnectionPool relies on the
