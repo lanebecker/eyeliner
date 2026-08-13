@@ -5,7 +5,7 @@
 # Audio capture
 sounddevice>=0.5.5
 numpy>=1.24.0
-soundfile>=0.12.1
+soundfile>=0.14.0
 
 # Music recognition
 shazamio>=0.8.1
