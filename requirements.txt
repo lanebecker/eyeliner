@@ -4,7 +4,7 @@
 
 # Audio capture
 sounddevice>=0.5.5
-numpy>=1.24.0
+numpy>=2.4.6
 soundfile>=0.14.0
 
 # Music recognition
