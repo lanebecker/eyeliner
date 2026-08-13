@@ -322,8 +322,9 @@ Key cases — Play Count:
 - **Attribution ping-pong (R8-02):** one physical spin swinging between two
   releases → the armed release credited exactly once, duplicate suppressed with
   `R8-02` in the message (split, terminal SESSION_ENDED, forced-end, and drain
-  paths).  The memory is silence-boundary keyed (a per-spin set, cleared only
-  when a terminal genuine-silence finalize completes) — NOT wall-clock windowed,
+  paths).  The memory is silence-boundary keyed (a per-spin SpinMemory, SWAPPED
+  at the boundary EVENT itself — R9-08: not "when the finalize completes"; the
+  boundary finalize judges against its own outgoing spin) — NOT wall-clock windowed,
   so it holds at any confirmation cadence; a genuine #185 re-drop still credits
   each spin — see `test_credit_memory_r7_02.py` (mechanism) and
   `test_credit_cadence_r8.py` (the realistic 15s/10s/2-confirm/45s timelines)

@@ -10,10 +10,12 @@ START, always lost to fragment + gap + tail + silence) and R8-02 (the 45s
 credited-memory window expiring between two ~25s confirmation cycles, letting
 one physical spin double-credit).
 
-The fixes under test (Lane, 2026-08-12, LOCKED):
-  • R8-02/#346  silence-boundary credited-memory: `_credited_this_spin` is a
-    per-spin memory cleared ONLY when a terminal genuine-silence finalize
-    completes — timing-independent by construction.
+The fixes under test (Lane, 2026-08-12, LOCKED; R9-08 wording corrected —
+the memory lives in SpinMemory since R9-26 and is SWAPPED at the boundary
+EVENT itself, not "cleared when the finalize completes"):
+  • R8-02/#346  silence-boundary credited-memory: a per-spin SpinMemory,
+    swapped at each genuine-silence boundary — timing-independent by
+    construction.
   • R8-01/#345  flip-resume window bounds the GAP (`new.started_at -
     prev.ended_at`), with `ended_at` stamped at detach.
   • R8-16/#350  the #195 forced end (SESSION_ENDED_FORCED) credits but is NOT
@@ -143,8 +145,9 @@ async def test_r8_02_slow_pingpong_still_suppressed(clock):
 
 @pytest.mark.asyncio
 async def test_r8_02_genuine_second_spin_credits_after_silence_boundary(clock):
-    """The memory clears when a terminal genuine-silence finalize completes:
-    a real second spin (needle lift, >45s silence, fresh drop) credits again."""
+    """The memory is swapped at the genuine-silence boundary event (R9-08
+    wording): a real second spin (needle lift, >45s silence, fresh drop)
+    credits again."""
     tracker, writer = make_tracker()
     start_session(tracker, clock)
     await tracker.on_track_identified(make_track("Catholic Block")); clock.advance(25)
@@ -339,8 +342,15 @@ async def test_r8_09_forced_end_does_not_clear_scrobble_memory(clock):
 
 @pytest.mark.asyncio
 async def test_r8_09_replay_boundary_clears_the_redropped_releases_keys(clock):
-    """A #185 re-drop REPLAYS the record — its tracks scrobble again; an
-    unrelated release's keys survive the same split."""
+    """A #185 re-drop REPLAYS the record — its tracks scrobble again.
+
+    R9 update: in this scenario the #185 split ALSO lands a genuine credit for
+    the re-dropped release (its side completed), so R9-01's
+    drop-on-genuine-credit additionally frees the unrelated release's tallies
+    (the spin moved on to a completed record).  The pure per-release #185
+    clear — where NO credit intervenes — is pinned directly on SpinMemory in
+    tests/test_spin_refinement_r9.py (test_r9_03_replay_boundary_resets_...
+    and test_r9_01_spinmemory_drop_keeps_own_entries)."""
     tracker, _ = make_tracker()
     r1 = make_track("Catholic Block")                  # release 12345 (opener)
     other = foreign("X1")                              # release 555
@@ -350,14 +360,15 @@ async def test_r8_09_replay_boundary_clears_the_redropped_releases_keys(clock):
     tracker.record_scrobble(r1)
     tracker.record_scrobble(other)
 
-    # The opener arrives after the closer armed → #185 replay split.
+    # The opener arrives after the closer armed → #185 replay split (which here
+    # credits release 12345, whose side is covered).
     await tracker.on_track_identified(make_track("Catholic Block"))
 
     assert tracker.should_scrobble(r1), (
         "a re-dropped release's tracks legitimately scrobble again"
     )
-    assert not tracker.should_scrobble(other), (
-        "an unrelated release's spin memory must survive the replay split"
+    assert tracker.should_scrobble(other), (
+        "R9-01: 12345's genuine credit advances the spin, freeing 555's tally"
     )
     await tracker._end_session()
 
@@ -579,9 +590,9 @@ async def test_f3_late_boundary_finalize_does_not_wipe_next_spins_keys(clock):
     gate = asyncio.Event()
     real_finalize = tracker._finalize_session
 
-    async def slow_finalize(session, credited_memory=None):
+    async def slow_finalize(session, spin=None):   # R9-26: matches _finalize_session
         await gate.wait()                       # park the terminal finalize
-        await real_finalize(session, credited_memory)
+        await real_finalize(session, spin)
 
     tracker._finalize_session = slow_finalize
 

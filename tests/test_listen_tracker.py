@@ -864,7 +864,7 @@ async def test_conc3_raising_end_session_task_logs_the_failure(caplog):
 
     # An unexpected raise anywhere in the fire-and-forget task must still reach
     # the done-callback and be logged.
-    async def _boom(session, credited_memory=None):   # R8-02: matches _finalize_session
+    async def _boom(session, spin=None):   # R8-02/R9-26: matches _finalize_session
         raise RuntimeError("unexpected finalize error")
     tracker._finalize_session = _boom
 

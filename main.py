@@ -257,9 +257,11 @@ def build_components(config, state: PlayerState) -> "Components":
         discogs_http = DiscogsHttp(config.discogs.user_token)
         resolver = MetadataResolver(DiscogsReader(discogs_http, config.discogs))
         lastfm = LastFmClient(config.lastfm)
-        # R8-02: the credited-memory is silence-BOUNDARY keyed (cleared when a
-        # terminal genuine-silence finalize completes), not wall-clock windowed,
-        # so the tracker no longer needs the silence timeout injected.
+        # R8-02/R9-08: the credited-memory is silence-BOUNDARY keyed — the live
+        # SpinMemory is SWAPPED at the boundary EVENT itself (not when that
+        # boundary's finalize completes; a finalize legally completes minutes
+        # late) — not wall-clock windowed, so the tracker no longer needs the
+        # silence timeout injected.
         tracker = ListenTracker(
             DiscogsCollectionWriter(discogs_http, config.discogs), lastfm,
         )
