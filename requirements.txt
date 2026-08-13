@@ -17,7 +17,7 @@ shazamio>=0.8.1
 # so the default image works; the marker keeps it off 3.11 (Bookworm/Legacy),
 # which still has audioop in the stdlib. main.py probes the import at startup and
 # fails loud if this is somehow missing.
-audioop-lts>=0.2; python_version >= "3.13"
+audioop-lts>=0.2.2; python_version >= "3.13"
 
 # Discogs
 python3-discogs-client>=2.9
