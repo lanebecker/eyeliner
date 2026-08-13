@@ -320,8 +320,12 @@ async def test_f3_pump_only_fault_reaches_reinit_and_recovers(monkeypatch, caplo
 
     def render_ok():
         state["renders"] += 1
-        r._running = False               # one successful frame ends the test
-        # (the recovery log still fires later in this same iteration)
+        # R9-10: recovery is only declared on an iteration where the PUMP also
+        # succeeds — so it fires on render #2 (iteration 2, pump healthy), NOT
+        # render #1 (same iteration as the pump fault).  End after render #2 so
+        # the recovery-confirming iteration runs.
+        if state["renders"] >= 2:
+            r._running = False
 
     monkeypatch.setattr(r, "_render", render_ok, raising=False)
     monkeypatch.setattr("pygame.display.flip", lambda: None)

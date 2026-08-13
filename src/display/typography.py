@@ -185,10 +185,13 @@ class _CompositeFont:
     Metrics: ``get_height``/``get_ascent``/``get_descent`` report the PRIMARY's
     metrics — they are layout constants (line advance, baseline) and must not
     jump when a CJK run appears.  Mixed-run surfaces are baseline-aligned (each
-    run blitted at ``max_ascent - run_ascent``) and may exceed get_height by a
-    few pixels; callers already tolerate that (glyph surfaces are blitted, not
-    packed).  ``size``/``render`` agree exactly by construction (same run
-    arithmetic).
+    run blitted at ``max_ascent - run_ascent``).  R9-04: the fallback face is
+    loaded at an ascent-MATCHED size (see :meth:`TextRenderer.font`), so
+    ``max_ascent`` equals the primary ascent and a mixed surface has the same
+    baseline and (within a pixel) the same height as a primary-only render —
+    no push-down, no divider overstrike.  R9-16: ``size`` and ``render`` compute
+    their height with the SAME baseline arithmetic, so they agree (widths always
+    did; the height paths had diverged).
     """
 
     def __init__(self, primary, fallback, primary_coverage, fallback_coverage):
@@ -274,8 +277,16 @@ class _CompositeFont:
         runs = list(self._runs(text))
         if len(runs) == 1:
             return runs[0][0].size(runs[0][1])
+        # R9-16: mirror render()'s baseline arithmetic exactly — height is the
+        # baseline-aligned composed height, not the naive max of run heights
+        # (a shorter-ascent run can be the tallest, making the naive max
+        # disagree with what render() actually produces).
+        max_ascent = max(font.get_ascent() for font, _ in runs)
         width = sum(font.size(chunk)[0] for font, chunk in runs)
-        height = max(font.size(chunk)[1] for font, chunk in runs)
+        height = max(
+            max_ascent - font.get_ascent() + font.size(chunk)[1]
+            for font, chunk in runs
+        )
         return (width, height)
 
     def get_height(self):
@@ -349,6 +360,24 @@ class TextRenderer:
         try:
             fallback = pygame.font.Font(str(fb_path), size)
             fallback_cov = _font_coverage(fb_path)
+            # R9-04 (#385): EM-BOX MATCH.  Noto Sans JP declares a taller ascent
+            # than Inter Tight / Newsreader-Italic at the same pt size (e.g. 84
+            # vs 70 at hero 72px), so a mixed-script line anchored to the tallest
+            # run's ascent pushed the PRIMARY glyphs ~14px DOWN and made the
+            # surface ~17px taller than a Latin-only line — the accent divider
+            # then struck the hero's descenders and a Cyrillic album title sat
+            # low, its ink outside the layout's measured slot.  Re-load the
+            # fallback at the size whose ascent matches the primary's, so the
+            # composite surface has the SAME baseline and height as a
+            # primary-only render and every layout metric (line advance, divider
+            # position, wrap height) that reads the primary metrics stays true.
+            # CJK renders at ~83% of nominal (60px at a 72px hero) — still large
+            # and legible, and the only visible change is correct geometry.
+            pa, fa = primary.get_ascent(), fallback.get_ascent()
+            if fa > pa > 0:
+                matched = max(1, round(size * pa / fa))
+                if matched != size:
+                    fallback = pygame.font.Font(str(fb_path), matched)
         except (FileNotFoundError, OSError, pygame.error):
             if not TextRenderer._fallback_missing_warned:
                 log.warning(
