@@ -8,10 +8,12 @@
 # (An earlier R7-24 note wrongly claimed it opens no pip PR for a satisfied `>=`
 # floor — the open pip PRs disprove that; #343.) The weekly `tests.yml` cron is a
 # COMPLEMENTARY guard: it reinstalls the tree and fails the suite if a new release
-# actually breaks something (a PR alone can't tell you that) — but GitHub disables
-# a schedule after 60 days of repo inactivity, so a finished appliance repo must
-# keep it alive via a push or workflow_dispatch. The floors in requirements.txt
-# stay the abstract spec.
+# actually breaks something (a PR alone can't tell you that). R8-19/#362: GitHub
+# documents a 60-day-inactivity auto-disable for schedules on PUBLIC repos (for a
+# private repo, treat it as possible); a pushed commit resets it, while a manual
+# workflow_dispatch run re-runs the CHECK but is NOT documented to reset the
+# window — see the setup guide's Maintenance section. The floors in
+# requirements.txt stay the abstract spec.
 version: 2
 updates:
   - package-ecosystem: "pip"

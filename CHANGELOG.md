@@ -7,6 +7,51 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [1.5.30] — 2026-08-13
+
+**R8 Wave 4 — CI & test integrity (milestone `R8 Wave 4`; #361, #362, #363,
+#364, #365).** No design gate; no `src/` change (docs, workflows, tests only).
+Both new guards kill-checked (a blocked `import shazamio` fails TWO tests; a
+one-character regex drift trips the wire). Full suite **1472 passed** (was
+1468).
+
+### Fixed
+
+- **The Python-3.13 CI leg can now actually FAIL on the #198 class (#361 /
+  R8-08 — MEDIUM).** The suite's only touch of the real shazamio was
+  `pytest.importorskip` — which SKIPS (reports green) on failure — so a broken
+  3.13 import (audioop removed; the audioop-lts backport path) left the whole
+  matrix green while the tests.yml comment claimed otherwise. New
+  `tests/test_ci_integrity_r8.py` hard-imports shazamio on the running
+  interpreter and runs the startup probe with its REAL importer; the tests.yml
+  comment now tells the truth (and names the three-leg 3.11/3.12/3.13 matrix
+  correctly).
+- **The R7-24 doc deliverable landed, with claims scoped to what GitHub
+  actually documents (#362 / R8-19 — LOW).** The setup guide gains a
+  Maintenance section covering the weekly drift check's possible
+  schedule-auto-disable (documented by GitHub for PUBLIC repos; flagged as
+  unverified for private ones — the cold review caught the first cut stating
+  it, and a "Dependabot keeps arriving regardless" companion claim, as
+  unconditional fact while remediating exactly that failure mode) and
+  Dependabot's own ~90-day PR pause; dependabot.yml and tests.yml now agree
+  with the guide (a `workflow_dispatch` re-runs the check but is not
+  documented to reset any disable window). The four R8 bring-up probes are
+  folded into first-boot-checklist §7 (Pi-side `import shazamio` pre-flight,
+  the #366 non-default-folder credit probe, the shared token-budget note, the
+  palette-lerp fps dip).
+- **The duplicated release-version regex got its tripwire (#363 / R8-22 —
+  NIT).** Per the issue's accept-with-a-stronger-tripwire option: a test
+  extracts the pattern from both workflows and fails the moment they drift,
+  plus a control test pinning the shared pattern's accept/reject behavior
+  (shell `grep -Eq` vs Python `re.search` equivalence verified case by case in
+  review).
+- **`asyncio.get_event_loop()` inside a coroutine removed (#364 / R8-24 —
+  NIT)** — the last regression against the completed `get_running_loop`
+  migration (`tests/test_split_finalize_drain_187.py`).
+- **pi-setup §9 says "up to four" read-only tests (#365 / R8-25 — NIT)** —
+  `get_tracklist` runs only on a collection hit, exactly as
+  `discogs_live_check.py` implements.
+
 ## [1.5.29] — 2026-08-13
 
 **R8 Wave 3 — cover pipeline residue (milestone `R8 Wave 3`; #356, #357, #358,

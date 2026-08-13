@@ -309,9 +309,11 @@ Before dealing with audio and display, confirm the Discogs side works:
 python scripts/discogs_live_check.py
 ```
 
-All four read-only tests should pass. If test 1 (search_collection) misses, see
-`docs/testing-guide.md` — the album strings at the top of the script may need
-adjusting to match a record you actually own.
+Up to four read-only tests run (`get_tracklist` runs only if your test album is
+found in the collection, so a collection miss shows three). All that run should
+pass. If test 1 (search_collection) misses, see `docs/testing-guide.md` — the
+album strings at the top of the script may need adjusting to match a record you
+actually own. (R8-25/#365)
 
 ---
 
@@ -610,6 +612,24 @@ The app runs fullscreen (set in config.yaml: `display.fullscreen: true`) so the
 desktop will be hidden behind it automatically once the service starts.
 
 ---
+
+## Maintenance
+
+- **The weekly CI drift check can auto-disable on a dormant repo
+  (R8-19/#362).** `tests.yml` runs a Monday cron that reinstalls the
+  dependency tree and fails the suite if a new `>=`-floor release breaks
+  something. GitHub documents a 60-days-of-inactivity auto-disable for
+  scheduled workflows on PUBLIC repositories; whether it applies to a private
+  repo is not clearly documented — treat it as possible and check the Actions
+  tab if Monday runs stop. A pushed commit resets the window; a manual
+  `workflow_dispatch` run is NOT documented to reset it (it does re-run the
+  check itself). If the tab shows the schedule disabled, one click re-enables
+  it.
+- **Dependabot is not gated by the Actions schedule rule**, though GitHub
+  pauses Dependabot's scheduled updates after ~90 days without maintainer
+  interaction with its PRs — so on a truly dormant repo the PRs stop too, on a
+  different clock. Merge the pip floor-bumps only after the weekly cron (or a
+  manual dispatch) is green on the new versions.
 
 ## Troubleshooting
 

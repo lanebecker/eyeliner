@@ -103,7 +103,7 @@ async def test_drain_stays_bounded_when_the_split_write_is_stuck():
     with pytest.raises(asyncio.CancelledError):
         await leg
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()   # R8-24 (#364): never get_event_loop in a coroutine
     t0 = loop.time()
     await tracker.drain(timeout=0.2)
     assert loop.time() - t0 < 1.0
