@@ -15,7 +15,7 @@ Work top to bottom; each item says how to verify it and what "good" looks like.
 
 If the first thing you get is a black screen and `journalctl -u vinyl-now-playing`
 shows the app exiting at startup, the log now names the cause on the line just
-above the traceback (ARCH-10). Two failure modes:
+above the traceback (ARCH-10). Three failure modes:
 
 - **"Display initialization failed — the screen will stay black."** `pygame`
   could not open a video device. Check, in order: (1) the HDMI cable is seated and
@@ -37,6 +37,13 @@ above the traceback (ARCH-10). Two failure modes:
   (parents and all), so the failure is a **read-only location** or a **file sitting
   where a directory must go**, not a missing folder. The default is
   `src/display/assets/cache` under the app's working directory.
+- **"The 'sounddevice' audio-capture backend failed to import … `sudo apt-get
+  install -y libportaudio2`."** On a fresh Pi missing `libportaudio2`, the audio
+  backend can't import. As of R9-13/#396 this is caught at startup and parked as a
+  friendly exit-78 `ConfigError` (the message prints the apt hint itself) instead
+  of crash-looping — run `sudo apt install -y libportaudio2` (see `pi-setup-guide.md`
+  §4) and `systemctl reset-failed`. This probe runs before the display and
+  cover-cache checks above, so on such a Pi it is the first thing you'll see.
 
 Because the systemd unit uses `Restart=on-failure` (bounded by
 `StartLimitBurst`, STAB-4), a genuinely broken display config will retry a few

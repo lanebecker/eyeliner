@@ -124,6 +124,7 @@ pytest tests/test_chunking.py
 pytest tests/test_capture.py
 pytest tests/test_player_state.py
 pytest tests/test_listen_tracker.py
+pytest tests/test_clock.py            # STAB-2 wall-clock trust gate on date writes
 pytest tests/test_discogs_client.py
 pytest tests/test_lastfm_client.py
 pytest tests/test_resolver.py

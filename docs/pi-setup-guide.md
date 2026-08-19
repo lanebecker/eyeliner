@@ -441,8 +441,9 @@ timeout), far below the point where a power-cut owner assumes the Pi has wedged.
 
 `RestartPreventExitStatus=78` (R6-27) makes a **configuration** error terminal: on
 a bad `config.yaml` (missing/typo'd required key, out-of-range value, an
-unimplemented `recognition.backend`, or the recognition backend failing to import)
-`main.py` exits `78` (`EX_CONFIG` from `sysexits.h`), and systemd then does **not**
+unimplemented `recognition.backend`, the recognition backend failing to import, or
+the audio-capture backend `sounddevice`/`libportaudio2` failing to import —
+R9-13/#396) `main.py` exits `78` (`EX_CONFIG` from `sysexits.h`), and systemd then does **not**
 restart — the service parks in `failed` so `journalctl` shows the one friendly
 error, instead of crash-looping a fault that can never self-heal. A *transient*
 crash still exits with a different non-zero code and restarts as normal.
@@ -642,8 +643,12 @@ mode is wrong, append `video=HDMI-A-1:1024x600M@60D` to the single line in
 ignored under KMS, and `/boot/config.txt` is a stub on Bookworm/Trixie — the real
 file is `/boot/firmware/config.txt`.
 
-**`OSError: PortAudio library not found`**
-Run `sudo apt install -y libportaudio2` and try again.
+**`sounddevice`/PortAudio fails to import (service parks at exit 78)**
+As of R9-13/#396 the audio backend is imported lazily and probed at startup: a
+missing `libportaudio2` no longer crash-loops with a bare `OSError` traceback —
+`main.py` raises a friendly `ConfigError` (which prints the `apt-get install`
+hint itself) and parks the service in `failed` at exit 78. Fix it with
+`sudo apt install -y libportaudio2` and restart the service.
 
 **`sounddevice` can't find the UCA222**
 Run `python3 -c "import sounddevice; print(sounddevice.query_devices())"` and
