@@ -4,7 +4,7 @@
 
 A Raspberry Pi app that listens to a vinyl record playing through a USB audio interface, identifies the current track via audio fingerprinting, enriches it with metadata from your Discogs collection, and displays the artist, album, track name, and cover art on an HDMI-connected LCD screen.
 
-When the last track of an album finishes, it automatically increments the Play Count and records the Last Played date for that record in your Discogs collection, and scrobbles the session to Last.fm.
+When the last track of an album finishes, it automatically increments the Play Count and records the Last Played date for that record in your Discogs collection. When Last.fm scrobbling is enabled, every identified track is scrobbled to your listening history as it plays.
 
 ## Now Playing Screen
 

@@ -565,16 +565,23 @@ boot animates (arc + dot + ticking label).
   lerping a palette to itself
 - `display.dynamic_theming: false` disables extraction and uses `FALLBACK_PALETTE`
 
-**Font system (v1.4.0 — bundled fonts):** the DESIGN.md type hierarchy ships
-with the app in `src/display/assets/fonts/` (all OFL-licensed): Inter Tight
-SemiBold (hero), Inter Tight Medium (artist + adjacent names), Newsreader
-Italic (album), JetBrains Mono (all labels).  `_font(role, size)` loads
-lazily and caches per `(role, size)`; missing files fall back to the DejaVu
-SysFont family so dev machines and CI without the assets still render.
-Letter-spacing — which SDL_ttf doesn't support — is reproduced for mono
-labels by `_render_tracked()` (per-character blits with a `tracking × size`
-advance, the same arithmetic as CSS em tracking), cached in a
-`_BoundedCache`.
+**Font system (v1.4.0 bundled fonts + v1.5.28 script fallback):** the DESIGN.md
+type hierarchy ships with the app in `src/display/assets/fonts/` (all
+OFL-licensed): Inter Tight SemiBold (hero), Inter Tight Medium (artist + adjacent
+names), Newsreader Italic (album), JetBrains Mono (all labels).  `font(role, size)`
+(on `TextRenderer`, `src/display/typography.py`) loads lazily and caches per
+`(role, size)`; if the bundled files are entirely absent it degrades to the DejaVu
+SysFont family so dev machines and CI without the assets still render.  The object
+`font()` returns is a `_CompositeFont` (R8-03/#352): runs the primary face doesn't
+cover are rendered with a weight-matched bundled **Noto Sans JP** face
+(`assets/fonts/fallback/` — hero→SemiBold, artist→Medium, album+mono→Regular), so
+CJK plus the Cyrillic/Greek gaps in Newsreader-Italic render as real glyphs
+(upright on the album line — there is no CJK italic). Coverage is read from each
+face's cmap via fontTools at first use and cached per file; Arabic/Hebrew are
+deliberately unbundled (they also need a shaping engine — #352).  Letter-spacing —
+which SDL_ttf doesn't support — is reproduced for mono labels by `render_tracked()`
+(per-character blits with a `tracking × size` advance, the same arithmetic as CSS
+em tracking), cached in a `_BoundedCache`.
 
 **Performance (v1.3.3 caches + v1.4.0 static frame):** the now-playing
 screen previously re-rendered every element at ~10 fps just to animate the
@@ -585,8 +592,10 @@ blit plus the dot (`_draw_status_dot`).  During the 1s palette lerp the key
 changes per frame, so composition runs at the transition cadence — same cost
 profile as before, for one second per track change.  The layout is computed
 once at startup (`self._layout`) instead of per frame.  Caches, all on the
-shared `_BoundedCache` helper (insertion-ordered, LRU-refresh-on-get,
-size-capped; unit-tested in `tests/test_renderer_caches.py`):
+shared `_BoundedCache` helper (the `BoundedCache` class now lives in
+`src/util/cache.py` — arch-4/#220 — and is aliased to `_BoundedCache` in the
+renderer for import-compat; insertion-ordered, LRU-refresh-on-get, size-capped;
+unit-tested in `tests/test_renderer_caches.py`):
 
 | Cache | Key | Cap | Saves |
 |-------|-----|-----|-------|
@@ -889,6 +898,10 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
                                  → writer.increment_play_count()
                                  → writer.update_last_played()          [if configured]
                                  → LastFmClient.love(last_track)        [if love_on_completion=true]
+   NOTE: the date-dependent writes (Last Played, scrobble timestamps) are gated on
+   clock_is_trustworthy() (STAB-2, src/util/clock.py). On a pre-NTP / epoch /
+   far-future clock — the Pi has no battery-backed RTC — those writes are SKIPPED
+   with a WARNING rather than stamping an unrecoverable wrong date.
 6. DiscogsCollectionWriter   Play Count: GET current value, increment, POST new value
                              Last Played: POST today's ISO date
                              → HTTP 204 → return True
@@ -941,23 +954,29 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 | `src/audio/chunking.py` | Pure-numpy overlapping-window ChunkAssembler |
 | `src/audio/silence.py` | RMS silence detection, AudioEvent emission (via `Signal`) |
 | `src/audio/recognizer.py` | ShazamIO recognition loop + confirmation gate; emits a confirmed result via `on_confirmed` |
+| `src/audio/log_throttle.py` | `ThrottledLogger` — rate-limits repeated capture/recognition warnings so a stuck device can't flood the journal |
 | `src/app/track_commit_service.py` | `TrackCommitService` — resolve → state → track → scrobble commit (B-1/B-11) |
 | `src/metadata/models.py` | TrackMetadata (+ `SideIndex`), PlaySession, TracklistEntry, MetadataSource, _SIDE_RE |
 | `src/metadata/resolver.py` | 3-step metadata lookup chain (depends on `DiscogsReader`) |
 | `src/metadata/errors.py` | Transient-vs-permanent external-error taxonomy (`is_transient`) |
+| `src/metadata/normalize.py` | `fold_text` / `strip_title_decoration` (#180) — the one shared title/text fold table used by matching, tracking, and display |
 | `src/metadata/discogs/transport.py` | `DiscogsHttp` — shared session + rate-limit-aware `request()`, `_as_id`/`_redact_url` |
 | `src/metadata/discogs/reader.py` | `DiscogsReader` — collection/DB search, tracklist, original-year, result assembly |
 | `src/metadata/discogs/writer.py` | `DiscogsCollectionWriter` — Play Count increment, Last Played update |
 | `src/metadata/coverart.py` | MusicBrainz Cover Art Archive fallback |
 | `src/state/player_state.py` | Central state, status transitions, change listeners (via `Signal`) |
 | `src/util/signal.py` | `Signal[T]` — log-and-continue observer used by PlayerState + SilenceDetector |
+| `src/util/cache.py` | `BoundedCache` (arch-4/#220) — insertion-ordered, size-capped, LRU-refresh-on-get cache; aliased to `_BoundedCache` in the renderer |
+| `src/util/clock.py` | `clock_is_trustworthy` (STAB-2) — bounded wall-clock sanity gate; a pre-NTP / epoch / far-future clock skips Last Played + scrobble writes rather than corrupting the record |
+| `src/util/logthrottle.py` | `LogThrottle` (#221) — generic time-windowed log de-duplication helper |
 | `src/display/layouts.py` | Pixel geometry and font sizes (restyle here) |
 | `src/display/palette.py` | `DisplayPalette` + `FALLBACK_PALETTE` value objects (moved here in ARCH-7), cover-art palette extraction + WCAG colour science (`extract_palette`, `ensure_contrast`, `ensure_contrast_hue_preserving`, `contrast_ratio`, `validate_image_file`) |
 | `src/display/typography.py` | `TextRenderer` (ARCH-3) — font loading + text layout (wrap/fit/ellipsize/tracked-label render) over renderer-owned bounded caches; unit-testable without a pygame renderer |
 | `src/display/palette_transition.py` | `PaletteTransition` (ARCH-3) — the 1s cross-fade state machine + `_lerp_color`/`_lerp_palette`/`_quantize_palette` and `_TRANSITION_SECS`/`_PALETTE_LERP_QUANTIZE` |
 | `src/display/cover_cache.py` | `CoverArtCache` (A-15) — SSRF-hardened IP-pinned cover download (S-1/S-2/S-7), URL→disk cache, `.part` sweep + mtime-LRU prune (R-1/R-2); pygame-free |
 | `src/display/renderer.py` | pygame window, screen rendering, in-memory scaled-cover cache, `EmptyState` table (consumes `CoverArtCache`); composes `TextRenderer` + `PaletteTransition` and delegates to them (ARCH-3) |
-| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs write trigger (via `DiscogsCollectionWriter`), Last.fm love call |
+| `src/tracking/listen_tracker.py` | PlaySession tracking, Discogs write trigger (via `DiscogsCollectionWriter`), Last.fm love call; write path gated on `clock_is_trustworthy` (STAB-2) |
+| `src/tracking/spin_memory.py` | `SpinMemory` (R9-26/#384) — per-physical-spin credit/scrobble dedup, swapped at each silence boundary; owns swap/judge/record/drop with drop-on-genuine-credit (R9-01) |
 | `src/tracking/lastfm_client.py` | Last.fm scrobble and love — wraps pylast; graceful no-op when unconfigured |
 | `get_lastfm_session_key.py` | One-time desktop auth helper — generates a Last.fm session key to paste into config.yaml |
 
@@ -965,7 +984,13 @@ Returns `True` on success, `False` on any exception. Returns `True` immediately
 
 ## What's not yet implemented
 
-All source modules are complete. The only remaining work requires hardware:
+All source modules are complete and shipping. Two structural refactors are
+tracked open as deliberate, scheduled work (not bugs): **#394** (consolidate the
+cover fetch/validate/decode paths into a single `CoverPipeline`) and **#405**
+(eliminate the mutated Pillow module-global). **#366** (a probe for a non-default
+Discogs collection folder) is deferred to be exercised during hardware bring-up.
+
+The only remaining feature/validation work requires hardware:
 
 - **Audio capture testing** — needs the Pi + Behringer UCA222 for the live
   `sd.InputStream` integration only: the overlapping-window logic is

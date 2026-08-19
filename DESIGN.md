@@ -242,7 +242,9 @@ An optional context row that appears below the catalog footer line. Shows the tr
 
 ## 7. Album Data Schema
 
-The production renderer receives an album object per identified track. All production data originates from the three-tier metadata chain: Discogs collection (pressing-specific) → Discogs database → MusicBrainz fallback.
+This is the **design-contract schema** used by the prototype (`design/data.js`) — the field names below (camelCase; `palette`, `prev`/`next` as nested objects) are the prototype's shape, not the production model's. All production data originates from the three-tier metadata chain: Discogs collection (pressing-specific) → Discogs database → MusicBrainz fallback.
+
+> **Production mapping.** The production renderer does not consume this object literally; it reads a snake_case `TrackMetadata` (`src/metadata/models.py`) and computes the palette separately (`src/display/palette.py`). Name map: `track`→`title`, `cover`→`cover_art_url`, `catalog`→`catalog_number`, `side`/`position`/`sideTracks`→`side_letter`/`side_position`/`side_total`, and `prev`/`next` objects→the flat `prev_track_title`/`next_track_title` fields. There is no `palette` field on the model. Treat the table below as the design intent each of those production fields must satisfy.
 
 ### Required fields
 

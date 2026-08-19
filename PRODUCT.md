@@ -41,4 +41,4 @@ Warm, obsessive, physical. Like the handwritten notes on an inner sleeve, or a w
 
 ## Accessibility & Inclusion
 
-WCAG AA minimum. The display is viewed at distance, so text contrast should be generous — target 5:1 or better for primary text. All animations must respect `prefers-reduced-motion`. Album cover alt text should identify artist and album for screen readers.
+WCAG AA minimum — the renderer guarantees ≥4.5:1 contrast on all text roles, clamped at palette-extraction time and re-clamped through the palette transition (see DESIGN.md §2). All animations must respect `prefers-reduced-motion`. Album cover alt text should identify artist and album for screen readers.

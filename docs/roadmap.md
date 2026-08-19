@@ -358,6 +358,7 @@ documented lock-free-session-start invariant (#68–#72); and reconciled two
 doc-vs-code gaps — Hue-Diversity formally deferred and resolution-independence
 backed by a layout matrix (#73–#74). Test suite grew 545 → 632. The one deferred
 follow-up is #61 (dedicated Discogs executor), gated on real rate-limit evidence.
+(#61 has since shipped — see Rounds 5–9 below.)
 
 ### v1.5.2 – v1.5.7 — Code-review hardening, round 3 ✅
 
@@ -384,26 +385,6 @@ test → mutation-check → independent cold-review discipline. By wave:
 
 See `CHANGELOG.md` for the full per-issue breakdown.
 
-### v1.5.9 — Round-4 follow-ups ✅ (current)
-
-**No new user-facing features.** The residuals the round-4 audit filed as
-separate follow-ups (#222–#230), remediated through the same implement → RED test
-→ mutation-check → independent cold-review discipline:
-
-- **Credit-the-right-record correctness** — the collection matcher's reader
-  normalization unified onto one shared fold table (#225); a decorated Shazam
-  album can no longer credit a plain-titled owned family member (#222); strategy 1
-  now defers to refuse-to-guess for distinct identically-titled albums (#226).
-- **Transient-outage & write resilience** — a non-JSON 429/5xx body is classified
-  transient (#228), and a long Discogs `Retry-After` on the Play Count credit is
-  honoured in the event loop instead of losing the credit (#229).
-- **Housekeeping** — in-uptime `.part` orphan sweep (#230) and a `side_position`
-  display fix for duplicated out-of-order titles (#224).
-
-#227 (reprise/bookend phantom double-credit) stays deferred with a trigger: it
-can't be separated from a genuine re-drop without the clock/counter dependency
-#185 rejected. See `CHANGELOG.md` for the full per-issue breakdown.
-
 ### v1.5.8 — Code-review hardening, round 4 ✅
 
 **No new user-facing features** (one visible tweak: brighter status-strip text so
@@ -428,6 +409,65 @@ mutation-check → independent cold-review discipline:
 #218 and #219 (the v1.6 / v1.7 roadmap seams) are intentionally deferred with
 triggers — they land with the features that need them. See `CHANGELOG.md` for the
 full per-issue breakdown.
+
+### v1.5.9 — Round-4 follow-ups ✅
+
+**No new user-facing features.** The residuals the round-4 audit filed as
+separate follow-ups (#222–#230), remediated through the same implement → RED test
+→ mutation-check → independent cold-review discipline:
+
+- **Credit-the-right-record correctness** — the collection matcher's reader
+  normalization unified onto one shared fold table (#225); a decorated Shazam
+  album can no longer credit a plain-titled owned family member (#222); strategy 1
+  now defers to refuse-to-guess for distinct identically-titled albums (#226).
+- **Transient-outage & write resilience** — a non-JSON 429/5xx body is classified
+  transient (#228), and a long Discogs `Retry-After` on the Play Count credit is
+  honoured in the event loop instead of losing the credit (#229).
+- **Housekeeping** — in-uptime `.part` orphan sweep (#230) and a `side_position`
+  display fix for duplicated out-of-order titles (#224).
+
+#227 (reprise/bookend phantom double-credit) stays deferred with a trigger: it
+can't be separated from a genuine re-drop without the clock/counter dependency
+#185 rejected. See `CHANGELOG.md` for the full per-issue breakdown.
+
+### v1.5.10 – v1.5.34 — Code-review hardening, Rounds 5–9 ✅ (current: v1.5.34)
+
+**No new user-facing features.** Five more adversarial cold-audit rounds (Rounds
+5–9), each filed as GitHub milestones and remediated in waves through the same
+implement → RED test → mutation-check → independent cold-review discipline. The
+suite grew from roughly 1,000 (its Round-4 size) to **1510** tests across these
+rounds. By round:
+
+- **Round 5 (v1.5.10–v1.5.13)** — phantom-credit remediation & the credit write
+  path, matching/recognition integrity, availability & input hardening, then a
+  hardening/CI close-out wave.
+- **Round 6 (v1.5.14–v1.5.19)** — log-throttle integrity (stop the crash), credit
+  correctness on the write path & session state, matching reach, cover-pipeline
+  resilience, ops hardening, and a docs/CI/supply-chain wave.
+- **Round 7 (v1.5.20–v1.5.25)** — the credit-evidence model, commit-pipeline
+  availability, display fidelity, the cover state machine, ops & first-boot, and a
+  CI/docs/matching residue wave.
+- **Round-8 cleanup (v1.5.26)** — the backlog opened during Rounds 6–7 (#304–#306
+  et al.).
+- **Round 8 (v1.5.27–v1.5.31)** — credit timing at real cadence, **display i18n &
+  render survival** (the `_CompositeFont` Noto Sans JP script/CJK fallback,
+  R8-03/#352), cover-pipeline residue, CI & test integrity, then ratifications &
+  hardening residue.
+- **Round 9 (v1.5.32–v1.5.34)** — **spin-memory refinement** (the new
+  `src/tracking/spin_memory.py`, which owns per-spin credit/scrobble dedup and
+  drop-on-genuine-credit, R9-26/#384), display correctness (fallback baseline
+  alignment, cover-sweep hoist), and an ops & polish wave (lazy audio-backend
+  import + startup park, capture-throttle key, CI consistency).
+
+**Shipped items previously listed as deferred here:** #61 (the dedicated 2-worker
+Discogs executor) landed during these rounds — `src/metadata/discogs/transport.py`
+now owns a `ThreadPoolExecutor(max_workers=2)`.
+
+**Still-open architecture deferrals (tracked, not bugs):** #394 (CoverPipeline
+consolidation) and #405 (eliminate the mutated Pillow global) are deferred open as
+scheduled refactors; #366 (a non-default Discogs collection-folder probe) is
+deferred to be exercised during hardware bring-up. See `CHANGELOG.md` for the full
+per-issue breakdown of every wave.
 
 ---
 
