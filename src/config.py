@@ -56,6 +56,8 @@ def _config_file_mode(file_obj):
     unsupported/unknown result: callers warn and continue on platforms where
     POSIX mode semantics are unavailable.
     """
+    if os.name != "posix":
+        return None
     try:
         file_stat = os.fstat(file_obj.fileno())
         if not stat.S_ISREG(file_stat.st_mode):
