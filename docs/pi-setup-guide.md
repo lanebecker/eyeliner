@@ -632,11 +632,9 @@ This does not read, print, or copy `config.yaml`.
   cp -a venv "$VNP_KNOWN_GOOD_DIR/venv" || cleanup_known_good $?
   "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" --version || cleanup_known_good $?
   "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -m pip check || cleanup_known_good $?
-  (
-    cd "$VNP_KNOWN_GOOD_DIR"
-    "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I scripts/check_audio_backend.py
-    "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I -c 'import shazamio'
-  ) || cleanup_known_good $?
+  cd "$VNP_KNOWN_GOOD_DIR" || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I scripts/check_audio_backend.py || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I -c 'import shazamio' || cleanup_known_good $?
   sudo cp -p /etc/systemd/system/vinyl-now-playing.service "$VNP_UNIT_BACKUP_TMP" || cleanup_known_good $?
   sudo mv -f -- "$VNP_UNIT_BACKUP_TMP" "$VNP_UNIT_BACKUP" || cleanup_known_good $?
   VNP_UNIT_BACKUP_TMP=
