@@ -608,30 +608,38 @@ This does not read, print, or copy `config.yaml`.
   VNP_KNOWN_GOOD_REF="$(git rev-parse HEAD)"
   VNP_KNOWN_GOOD_DIR=/home/pi/vinyl-now-playing-known-good
   VNP_UNIT_BACKUP=/etc/systemd/system/vinyl-now-playing.service.last-known-good
-  VNP_WORKTREE_ADDED=0
+  VNP_UNIT_BACKUP_TMP=/etc/systemd/system/.vinyl-now-playing.service.last-known-good.$$.tmp
+  VNP_WORKTREE_ATTEMPTED=0
   cleanup_known_good() {
-    local exit_status=$?
-    trap - ERR
-    if [ "$VNP_WORKTREE_ADDED" -eq 1 ]; then
-      git worktree remove --force "$VNP_KNOWN_GOOD_DIR" || true
+    local exit_status="$1"
+    # Work from a directory outside the worktree before removing that worktree.
+    cd /home/pi || exit "$exit_status"
+    if [ "$VNP_WORKTREE_ATTEMPTED" -eq 1 ]; then
+      git -C /home/pi/vinyl-now-playing worktree remove --force "$VNP_KNOWN_GOOD_DIR" || true
+    fi
+    # This is the one exact temporary file used for the atomic unit backup.
+    if [ -e "$VNP_UNIT_BACKUP_TMP" ]; then
+      sudo rm -f -- "$VNP_UNIT_BACKUP_TMP" || true
     fi
     exit "$exit_status"
   }
-  trap cleanup_known_good ERR
-  test ! -e "$VNP_KNOWN_GOOD_DIR"
-  test ! -e "$VNP_UNIT_BACKUP"
-  git worktree add --detach "$VNP_KNOWN_GOOD_DIR" "$VNP_KNOWN_GOOD_REF"
-  VNP_WORKTREE_ADDED=1
-  cp -a venv "$VNP_KNOWN_GOOD_DIR/venv"
-  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" --version
-  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -m pip check
+  test ! -e "$VNP_KNOWN_GOOD_DIR" || exit 1
+  test ! -e "$VNP_UNIT_BACKUP" || exit 1
+  test ! -e "$VNP_UNIT_BACKUP_TMP" || exit 1
+  test -f /etc/systemd/system/vinyl-now-playing.service || exit 1
+  VNP_WORKTREE_ATTEMPTED=1
+  git worktree add --detach "$VNP_KNOWN_GOOD_DIR" "$VNP_KNOWN_GOOD_REF" || cleanup_known_good $?
+  cp -a venv "$VNP_KNOWN_GOOD_DIR/venv" || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" --version || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -m pip check || cleanup_known_good $?
   (
     cd "$VNP_KNOWN_GOOD_DIR"
     "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I scripts/check_audio_backend.py
     "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I -c 'import shazamio'
-  )
-  sudo cp -p /etc/systemd/system/vinyl-now-playing.service "$VNP_UNIT_BACKUP"
-  trap - ERR
+  ) || cleanup_known_good $?
+  sudo cp -p /etc/systemd/system/vinyl-now-playing.service "$VNP_UNIT_BACKUP_TMP" || cleanup_known_good $?
+  sudo mv -f -- "$VNP_UNIT_BACKUP_TMP" "$VNP_UNIT_BACKUP" || cleanup_known_good $?
+  VNP_UNIT_BACKUP_TMP=
   printf 'known-good ref=%s\nknown-good venv=%s\n' "$VNP_KNOWN_GOOD_REF" \
     "$VNP_KNOWN_GOOD_DIR/venv"
 )
@@ -640,10 +648,13 @@ This does not read, print, or copy `config.yaml`.
 The detached worktree preserves the exact application source, and its copied
 venv preserves the interpreter/dependency set that was observed working. The
 block refuses an existing worktree or unit-backup target, removes a newly-added
-worktree if setup fails, and proves the relocated interpreter, dependency graph,
-audio smoke, and Shazam import before declaring the target known-good. Keep the
-recorded display/auth values with the first-boot evidence. Do not alter the
-known-good worktree while testing an upgrade.
+worktree if any post-worktree step fails, and proves the relocated interpreter,
+dependency graph, audio smoke, and Shazam import before declaring the target
+known-good. The unit backup is copied only to its exact temporary path, then
+atomically moved into place; failed attempts remove that exact temporary path so
+they cannot block a retry. Keep the recorded display/auth values with the
+first-boot evidence. Do not alter the known-good worktree while testing an
+upgrade.
 
 ### Roll back without weakening credentials
 

@@ -40,13 +40,16 @@ is active.
 
 ### Discogs credentials (only for `scripts/discogs_live_check.py`)
 
+First copy the non-secret example, but do **not** enter credentials yet:
+
 ```bash
 cp config.example.yaml config.yaml
-# Edit config.yaml — fill in discogs.user_token and discogs.username
 ```
 
-On **POSIX** (macOS/Linux, including Raspberry Pi OS), restrict the file before
-entering credentials. The commands below print only mode/path, not its contents:
+Complete one platform security gate before entering credentials.
+
+On **POSIX** (macOS/Linux, including Raspberry Pi OS), restrict the copied file
+and read back its mode. These commands print only mode/path, not its contents:
 
 ```bash
 chmod 600 config.yaml
@@ -57,10 +60,23 @@ stat -f '%Lp %N' config.yaml
 ```
 
 The readback must report mode `600`. `load_config` rejects a POSIX file with any
-group/other permission bit. On Windows or another platform without POSIX mode
-semantics, startup emits its explicit warning and continues; use that platform's
-ACL controls to restrict the credential file, because `chmod`/POSIX `stat` are
-not a portable proof there.
+group/other permission bit.
+
+On **Windows or another platform without POSIX mode semantics**, do not use the
+POSIX commands above as proof. Before editing, use that platform's file-security
+or ACL controls to restrict `config.yaml` to the current account, then read the
+ACL back in the same security inspector (or its platform ACL command) and record
+that result and the warning acknowledgement before entering credentials.
+`load_config` will emit its explicit inability-to-verify-POSIX-permissions
+warning on the first run; the warning is expected but does not prove an ACL is
+safe.
+
+Only after the applicable gate's mode/ACL readback is satisfactory may you edit
+the file and enter `discogs.user_token` and `discogs.username`:
+
+```text
+# Edit config.yaml in your editor; do not paste credentials into a shell command.
+```
 
 **Getting your token:** Discogs → Settings → [Developers](https://www.discogs.com/settings/developers)
 → Generate new token.
