@@ -9,6 +9,21 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+### Security and deployment controls
+
+- **Wave 1 software preflight controls are implemented (#418, #156, #419).**
+  Startup rejects group/other-readable POSIX `config.yaml` files before parsing;
+  CI installs PortAudio and authenticates the installed `sounddevice` API surface
+  before pytest; and the repository now owns a validated, atomic renderer for
+  the system service that CI parses with `/usr/bin/systemd-analyze verify`.
+  These controls do not claim UCA222 operation, session authorization, cold boot,
+  time sync, or shutdown success on a Pi.
+- **The #366 Discogs live probe now requires an explicit named record and write
+  authorization.** It remains read-only by default and requires a designated
+  custom-folder record plus an interactive exact `yes` (or pre-authorized
+  `--yes`) before one write. The live folder result remains pending; no
+  folder-ID propagation change is implied or closed yet.
+
 ## [1.5.35] — 2026-08-22
 
 ### Security and release trust
