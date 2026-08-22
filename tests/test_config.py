@@ -7,6 +7,7 @@ which use tmp_path.
 """
 import os
 import textwrap
+from unittest.mock import Mock
 
 import pytest
 
@@ -252,9 +253,80 @@ def test_load_config_missing_file_raises_config_error(tmp_path):
     assert "not found" in str(exc.value)
 
 
+def _write_valid_config(path, *, token="tok", mode=0o600):
+    """Write a valid config fixture with an explicit private-file mode."""
+    raw = _valid_raw()
+    raw["discogs"]["user_token"] = token
+    path.write_text(textwrap.dedent(f"""
+        audio:
+          device_name: USB Audio Codec
+          sample_rate: 44100
+          chunk_seconds: 15
+          silence_threshold_rms: 0.01
+          session_end_silence_seconds: 45
+        discogs:
+          user_token: {raw["discogs"]["user_token"]}
+          username: me
+          play_count_field_name: Play Count
+        display:
+          width: 1024
+          height: 600
+        recognition:
+          poll_interval_seconds: 30
+        lastfm:
+          scrobble_enabled: false
+    """).strip() + "\n")
+    os.chmod(path, mode)
+    return path
+
+
+def test_load_config_private_file_parses_normally(tmp_path):
+    p = _write_valid_config(tmp_path / "config.yaml")
+    cfg = load_config(str(p))
+    assert cfg.discogs.username == "me"
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
+def test_load_config_rejects_group_or_other_permissions_without_leaking_secret(
+    tmp_path, mode
+):
+    sentinel = "SUPER_SECRET_CONFIG_SENTINEL"
+    p = _write_valid_config(tmp_path / "config.yaml", token=sentinel, mode=mode)
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(p))
+    msg = str(exc.value)
+    assert str(p) in msg
+    assert f"chmod 600 {p}" in msg
+    assert sentinel not in msg
+
+
+def test_load_config_checks_open_descriptor_before_yaml_parser(tmp_path, monkeypatch):
+    p = _write_valid_config(tmp_path / "config.yaml", mode=0o644)
+    parser = Mock(side_effect=AssertionError("parser must not run"))
+    monkeypatch.setattr("src.config.yaml.safe_load", parser)
+    with pytest.raises(ConfigError) as exc:
+        load_config(str(p))
+    assert "chmod 600" in str(exc.value)
+    parser.assert_not_called()
+
+
+def test_load_config_unsupported_permission_check_warns_and_continues(
+    tmp_path, monkeypatch, caplog
+):
+    p = _write_valid_config(tmp_path / "config.yaml")
+    monkeypatch.setattr("src.config._config_file_mode", lambda _file: None)
+    with caplog.at_level("WARNING", logger="src.config"):
+        cfg = load_config(str(p))
+    assert cfg.discogs.username == "me"
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert str(p) in warnings[0].message
+
+
 def test_load_config_empty_file_raises_config_error(tmp_path):
     p = tmp_path / "empty.yaml"
     p.write_text("")
+    os.chmod(p, 0o600)
     with pytest.raises(ConfigError) as exc:
         load_config(str(p))
     assert "empty" in str(exc.value)
@@ -280,6 +352,7 @@ def test_load_config_invalid_utf8_raises_config_error(tmp_path):
     must become a ConfigError."""
     p = tmp_path / "config.yaml"
     p.write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+    os.chmod(p, 0o600)
     with pytest.raises(ConfigError) as exc:
         load_config(str(p))
     assert "UTF-8" in str(exc.value)
@@ -351,6 +424,7 @@ def test_load_config_reads_and_validates(tmp_path):
         recognition:
           poll_interval_seconds: 20
     """))
+    os.chmod(p, 0o600)
     cfg = load_config(str(p))
     assert cfg.display.width == 800
     assert cfg.recognition.poll_interval_seconds == 20
@@ -360,6 +434,7 @@ def test_load_config_reads_and_validates(tmp_path):
 def test_load_config_invalid_yaml_raises_config_error(tmp_path):
     p = tmp_path / "bad.yaml"
     p.write_text("audio: [unclosed\n")
+    os.chmod(p, 0o600)
     with pytest.raises(ConfigError):
         load_config(str(p))
 
