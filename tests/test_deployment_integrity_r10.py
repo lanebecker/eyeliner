@@ -20,6 +20,19 @@ EXPECTED_CRITICAL_STEPS = {
     },
     "Run tests": {"name": "Run tests", "run": "pytest -q"},
 }
+EXPECTED_SERVICE_STEP = {
+    "name": "Render and verify system service",
+    "run": """set -euo pipefail
+tmp_dir="$(mktemp -d)"
+app_dir="$tmp_dir/app"
+mkdir -p "$app_dir/venv/bin"
+touch "$app_dir/config.yaml" "$app_dir/main.py" "$tmp_dir/Xauthority"
+chmod 600 "$app_dir/config.yaml"
+ln -s "$(command -v python)" "$app_dir/venv/bin/python3"
+python -I scripts/render_system_service.py --user root --app-dir "$app_dir" --display :0 --xauthority "$tmp_dir/Xauthority" --output "$tmp_dir/vinyl-now-playing.service"
+systemd-analyze verify "$tmp_dir/vinyl-now-playing.service"
+""",
+}
 
 
 def _workflow(workflow_path=TESTS_WORKFLOW):
@@ -56,9 +69,45 @@ def _assert_audio_boundary_contract(workflow):
     assert portaudio_index < dependencies_index < smoke_index < pytest_index
 
 
+def _assert_system_service_contract(workflow):
+    """#419: every supported Linux leg parses a rendered representative unit."""
+    job = workflow["jobs"]["test"]
+    steps = job["steps"]
+    service_index = _step_index(steps, "Render and verify system service")
+    smoke_index = _step_index(steps, "Smoke-test audio backend")
+    pytest_index = _step_index(steps, "Run tests")
+
+    assert _named_steps(steps, "Render and verify system service") == [
+        EXPECTED_SERVICE_STEP
+    ]
+    assert "if" not in steps[service_index]
+    assert "continue-on-error" not in steps[service_index]
+    assert smoke_index < service_index < pytest_index
+
+
 def test_ci_installs_portaudio_and_smokes_the_real_backend_before_pytest():
     """#156: every supported CI leg proves the installed backend before stubbing."""
     _assert_audio_boundary_contract(_workflow())
+
+
+def test_ci_renders_and_verifies_the_versioned_system_service_before_pytest():
+    _assert_system_service_contract(_workflow())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("if", "matrix.python-version != '3.13'"), ("continue-on-error", True)),
+)
+def test_system_service_contract_rejects_ci_bypass_mutations(tmp_path, field, value):
+    """Disposable mutations prove service verification cannot go nonblocking."""
+    workflow = yaml.safe_load(TESTS_WORKFLOW.read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    steps[_step_index(steps, "Render and verify system service")][field] = value
+    mutated_workflow = tmp_path / "tests.yml"
+    mutated_workflow.write_text(yaml.safe_dump(workflow))
+
+    with pytest.raises(AssertionError):
+        _assert_system_service_contract(_workflow(mutated_workflow))
 
 
 @pytest.mark.parametrize(
