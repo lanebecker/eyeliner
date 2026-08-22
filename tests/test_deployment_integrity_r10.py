@@ -30,7 +30,7 @@ touch "$app_dir/config.yaml" "$app_dir/main.py" "$tmp_dir/Xauthority"
 chmod 600 "$app_dir/config.yaml"
 ln -s "$(command -v python)" "$app_dir/venv/bin/python3"
 python -I scripts/render_system_service.py --user root --app-dir "$app_dir" --display :0 --xauthority "$tmp_dir/Xauthority" --output "$tmp_dir/vinyl-now-playing.service"
-systemd-analyze verify "$tmp_dir/vinyl-now-playing.service"
+/usr/bin/systemd-analyze verify "$tmp_dir/vinyl-now-playing.service"
 """,
 }
 
@@ -108,6 +108,21 @@ def test_system_service_contract_rejects_ci_bypass_mutations(tmp_path, field, va
 
     with pytest.raises(AssertionError):
         _assert_system_service_contract(_workflow(mutated_workflow))
+
+
+def test_system_service_contract_keeps_using_the_os_parser_if_path_is_shadowed(tmp_path):
+    """A prior PATH mutation cannot replace the absolute Ubuntu parser binary."""
+    workflow = yaml.safe_load(TESTS_WORKFLOW.read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    service_index = _step_index(steps, "Render and verify system service")
+    steps.insert(
+        service_index,
+        {"name": "Shadow PATH", "run": "echo /tmp/fake-bin >> \"$GITHUB_PATH\""},
+    )
+    mutated_workflow = tmp_path / "tests.yml"
+    mutated_workflow.write_text(yaml.safe_dump(workflow))
+
+    _assert_system_service_contract(_workflow(mutated_workflow))
 
 
 @pytest.mark.parametrize(
