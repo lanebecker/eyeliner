@@ -402,15 +402,18 @@ date. Configure the timezone, enable the waiter, and confirm synchronization
 **before** the first `enable --now` or `start` of `vinyl-now-playing`:
 
 ```bash
-cd /home/pi/vinyl-now-playing
-sudo timedatectl set-timezone America/Chicago   # replace with your IANA timezone
-sudo systemctl enable --now systemd-time-wait-sync.service
-timedatectl
-timedatectl show --property=NTPSynchronized --value
+(
+  set -euo pipefail
+  cd /home/pi/vinyl-now-playing
+  sudo timedatectl set-timezone America/Chicago   # replace with your IANA timezone
+  sudo systemctl enable --now systemd-time-wait-sync.service
+  timedatectl
+  test "$(timedatectl show --property=NTPSynchronized --value)" = yes
+)
 ```
 
-Do not start the app until the final command prints `yes` and `timedatectl`
-shows the chosen timezone. If it does not, inspect
+Do not start the app until this block succeeds and `timedatectl` shows the chosen
+timezone. If it fails, inspect
 `systemctl status systemd-time-wait-sync.service`; an offline Pi should wait for
 network time rather than write stale dates.
 
@@ -462,19 +465,24 @@ Skip that backup only on the first installation, when the destination does not
 yet exist. Then render, parse-check, load, enable, and start the unit:
 
 ```bash
-cd /home/pi/vinyl-now-playing
-stat -c '%a %n' config.yaml
-sudo /home/pi/vinyl-now-playing/venv/bin/python3 \
-  /home/pi/vinyl-now-playing/scripts/render_system_service.py \
-  --user pi \
-  --app-dir /home/pi/vinyl-now-playing \
-  --display "$VNP_DISPLAY" \
-  --xauthority "$VNP_XAUTHORITY" \
-  --output /etc/systemd/system/vinyl-now-playing.service
-sudo /usr/bin/systemd-analyze verify /etc/systemd/system/vinyl-now-playing.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now vinyl-now-playing
-sudo systemctl status vinyl-now-playing
+(
+  set -euo pipefail
+  : "${VNP_DISPLAY:?Run the session-auth discovery block first.}"
+  : "${VNP_XAUTHORITY:?Run the session-auth discovery block first.}"
+  cd /home/pi/vinyl-now-playing
+  test "$(stat -c '%a' config.yaml)" = 600
+  sudo /home/pi/vinyl-now-playing/venv/bin/python3 \
+    /home/pi/vinyl-now-playing/scripts/render_system_service.py \
+    --user pi \
+    --app-dir /home/pi/vinyl-now-playing \
+    --display "$VNP_DISPLAY" \
+    --xauthority "$VNP_XAUTHORITY" \
+    --output /etc/systemd/system/vinyl-now-playing.service
+  sudo /usr/bin/systemd-analyze verify /etc/systemd/system/vinyl-now-playing.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now vinyl-now-playing
+  sudo systemctl status vinyl-now-playing
+)
 ```
 
 The `stat` command must report `600 config.yaml`; the renderer refuses to write
@@ -594,21 +602,47 @@ create a detached known-good worktree and copy its working virtual environment.
 This does not read, print, or copy `config.yaml`.
 
 ```bash
-cd /home/pi/vinyl-now-playing
-VNP_KNOWN_GOOD_REF="$(git rev-parse HEAD)"
-VNP_KNOWN_GOOD_DIR=/home/pi/vinyl-now-playing-known-good
-test ! -e "$VNP_KNOWN_GOOD_DIR"
-git worktree add --detach "$VNP_KNOWN_GOOD_DIR" "$VNP_KNOWN_GOOD_REF"
-cp -a venv "$VNP_KNOWN_GOOD_DIR/venv"
-sudo cp -p /etc/systemd/system/vinyl-now-playing.service \
-  /etc/systemd/system/vinyl-now-playing.service.last-known-good
-printf 'known-good ref=%s\nknown-good venv=%s\n' "$VNP_KNOWN_GOOD_REF" \
-  "$VNP_KNOWN_GOOD_DIR/venv"
+(
+  set -euo pipefail
+  cd /home/pi/vinyl-now-playing
+  VNP_KNOWN_GOOD_REF="$(git rev-parse HEAD)"
+  VNP_KNOWN_GOOD_DIR=/home/pi/vinyl-now-playing-known-good
+  VNP_UNIT_BACKUP=/etc/systemd/system/vinyl-now-playing.service.last-known-good
+  VNP_WORKTREE_ADDED=0
+  cleanup_known_good() {
+    local exit_status=$?
+    trap - ERR
+    if [ "$VNP_WORKTREE_ADDED" -eq 1 ]; then
+      git worktree remove --force "$VNP_KNOWN_GOOD_DIR" || true
+    fi
+    exit "$exit_status"
+  }
+  trap cleanup_known_good ERR
+  test ! -e "$VNP_KNOWN_GOOD_DIR"
+  test ! -e "$VNP_UNIT_BACKUP"
+  git worktree add --detach "$VNP_KNOWN_GOOD_DIR" "$VNP_KNOWN_GOOD_REF"
+  VNP_WORKTREE_ADDED=1
+  cp -a venv "$VNP_KNOWN_GOOD_DIR/venv"
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" --version
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -m pip check
+  (
+    cd "$VNP_KNOWN_GOOD_DIR"
+    "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I scripts/check_audio_backend.py
+    "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I -c 'import shazamio'
+  )
+  sudo cp -p /etc/systemd/system/vinyl-now-playing.service "$VNP_UNIT_BACKUP"
+  trap - ERR
+  printf 'known-good ref=%s\nknown-good venv=%s\n' "$VNP_KNOWN_GOOD_REF" \
+    "$VNP_KNOWN_GOOD_DIR/venv"
+)
 ```
 
 The detached worktree preserves the exact application source, and its copied
-venv preserves the interpreter/dependency set that was observed working. Keep
-the recorded display/auth values with the first-boot evidence. Do not alter the
+venv preserves the interpreter/dependency set that was observed working. The
+block refuses an existing worktree or unit-backup target, removes a newly-added
+worktree if setup fails, and proves the relocated interpreter, dependency graph,
+audio smoke, and Shazam import before declaring the target known-good. Keep the
+recorded display/auth values with the first-boot evidence. Do not alter the
 known-good worktree while testing an upgrade.
 
 ### Roll back without weakening credentials
@@ -619,24 +653,27 @@ that worktree's unit and restart it. Replace the two recorded values below with
 the values that passed the session-auth evidence gate.
 
 ```bash
-cd /home/pi/vinyl-now-playing
-VNP_KNOWN_GOOD_DIR=/home/pi/vinyl-now-playing-known-good
-VNP_DISPLAY=:0                         # replace with the recorded display
-VNP_XAUTHORITY=/absolute/auth/path      # replace with the recorded auth path
-sudo systemctl stop vinyl-now-playing
-mv /home/pi/vinyl-now-playing/config.yaml "$VNP_KNOWN_GOOD_DIR/config.yaml"
-stat -c '%a %n' "$VNP_KNOWN_GOOD_DIR/config.yaml"
-sudo "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" \
-  "$VNP_KNOWN_GOOD_DIR/scripts/render_system_service.py" \
-  --user pi \
-  --app-dir "$VNP_KNOWN_GOOD_DIR" \
-  --display "$VNP_DISPLAY" \
-  --xauthority "$VNP_XAUTHORITY" \
-  --output /etc/systemd/system/vinyl-now-playing.service
-sudo /usr/bin/systemd-analyze verify /etc/systemd/system/vinyl-now-playing.service
-sudo systemctl daemon-reload
-sudo systemctl start vinyl-now-playing
-sudo systemctl status vinyl-now-playing
+(
+  set -euo pipefail
+  cd /home/pi/vinyl-now-playing
+  VNP_KNOWN_GOOD_DIR=/home/pi/vinyl-now-playing-known-good
+  VNP_DISPLAY=:0                         # replace with the recorded display
+  VNP_XAUTHORITY=/absolute/auth/path      # replace with the recorded auth path
+  sudo systemctl stop vinyl-now-playing
+  mv /home/pi/vinyl-now-playing/config.yaml "$VNP_KNOWN_GOOD_DIR/config.yaml"
+  test "$(stat -c '%a' "$VNP_KNOWN_GOOD_DIR/config.yaml")" = 600
+  sudo "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" \
+    "$VNP_KNOWN_GOOD_DIR/scripts/render_system_service.py" \
+    --user pi \
+    --app-dir "$VNP_KNOWN_GOOD_DIR" \
+    --display "$VNP_DISPLAY" \
+    --xauthority "$VNP_XAUTHORITY" \
+    --output /etc/systemd/system/vinyl-now-playing.service
+  sudo /usr/bin/systemd-analyze verify /etc/systemd/system/vinyl-now-playing.service
+  sudo systemctl daemon-reload
+  sudo systemctl start vinyl-now-playing
+  sudo systemctl status vinyl-now-playing
+)
 ```
 
 The mode readback must remain `600`. The primary checkout intentionally has no
