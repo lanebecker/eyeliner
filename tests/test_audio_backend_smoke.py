@@ -1,6 +1,10 @@
 """Unit checks for the CI sounddevice import boundary (#156)."""
 import importlib.util
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -57,6 +61,84 @@ def test_main_redacts_import_error_and_gives_portaudio_remediation(monkeypatch, 
     assert "sounddevice" in output
     assert "libportaudio2" in output
     assert "token=not-for-output" not in output
+
+
+class _Distribution:
+    def __init__(self, root, files):
+        self.root = root
+        self.files = files
+
+    def locate_file(self, path):
+        return self.root / path
+
+
+def test_distribution_provenance_accepts_a_declared_sounddevice_module(tmp_path):
+    backend = _backend_module()
+    module_file = tmp_path / "sounddevice.py"
+    module_file.touch()
+    module = SimpleNamespace(__file__=str(module_file))
+    distribution = _Distribution(tmp_path, (Path("sounddevice.py"),))
+
+    assert backend.validate_distribution_provenance(
+        module, distribution_loader=lambda _name: distribution
+    ) is None
+
+
+def test_distribution_provenance_rejects_a_same_name_shadow_module(tmp_path):
+    backend = _backend_module()
+    installed_root = tmp_path / "installed"
+    installed_root.mkdir()
+    installed_file = installed_root / "sounddevice.py"
+    installed_file.touch()
+    shadow_file = tmp_path / "scripts" / "sounddevice.py"
+    shadow_file.parent.mkdir()
+    shadow_file.touch()
+    module = SimpleNamespace(__file__=str(shadow_file))
+    distribution = _Distribution(installed_root, (Path("sounddevice.py"),))
+
+    assert backend.validate_distribution_provenance(
+        module, distribution_loader=lambda _name: distribution
+    ) == "imported module is not declared by the installed distribution"
+
+
+def test_distribution_provenance_fails_closed_when_metadata_is_unreadable(tmp_path):
+    backend = _backend_module()
+    module_file = tmp_path / "sounddevice.py"
+    module_file.touch()
+    module = SimpleNamespace(__file__=str(module_file))
+
+    assert backend.validate_distribution_provenance(
+        module, distribution_loader=lambda _name: SimpleNamespace(files=None)
+    ) == "installed sounddevice distribution file manifest is unavailable"
+
+
+def test_cli_rejects_a_same_name_module_shadowing_from_its_script_directory(tmp_path):
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    shadow_script = script_dir / "check_audio_backend.py"
+    shutil.copyfile(SCRIPT, shadow_script)
+    (script_dir / "sounddevice.py").write_text(
+        "__version__ = 'fake-shadow'\n"
+        "def query_devices(): pass\n"
+        "def InputStream(): pass\n"
+        "def _terminate(): pass\n"
+        "def _initialize(): pass\n"
+    )
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, str(shadow_script)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "provenance" in result.stderr
+    assert "fake-shadow" not in result.stdout + result.stderr
 
 
 def test_successful_import_is_retained_without_a_conftest_owned_stub():

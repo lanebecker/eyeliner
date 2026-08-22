@@ -86,6 +86,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Smoke-test audio backend
-        run: python scripts/check_audio_backend.py
+        run: python -I scripts/check_audio_backend.py
       - name: Run tests
         run: pytest -q
