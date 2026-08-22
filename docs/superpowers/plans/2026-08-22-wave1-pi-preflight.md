@@ -191,7 +191,7 @@ and a renderer that mutates config. Resolve all confirmed findings.
 - Modify: `scripts/discogs_live_check.py`
 - Modify: `tests/test_discogs_live_check.py`
 
-- [ ] **Step 1: Write RED tests**
+- [x] **Step 1: Write RED tests**
 
 Test `--artist` and `--album` flow through every displayed/search operation.
 Test that `--test-write` aborts without calling `increment_play_count` on `n`,
@@ -210,14 +210,14 @@ cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)
 Expected RED: fixed constants and unconditional `--test-write` do not satisfy
 the selection/confirmation contract.
 
-- [ ] **Step 2: Implement selection and confirmation**
+- [x] **Step 2: Implement selection and confirmation**
 
 Make artist/album explicit CLI inputs with current constants only for read-only
 compatibility. A write requires both inputs to have been supplied explicitly.
 Prompt immediately before the one writer call; accept only `yes`. `--yes` is
 the noninteractive equivalent and must remain visually loud in the summary.
 
-- [ ] **Step 3: Verify GREEN and no-write mutations**
+- [x] **Step 3: Verify GREEN and no-write mutations**
 
 Run the focused suite and `git diff --check`. Reviewer must attempt absent
 arguments, EOF, whitespace/case variations, failed search, exception, and
