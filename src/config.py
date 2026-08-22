@@ -27,7 +27,9 @@ documented in CODE_REVIEW_2026-06-17.md (finding A-2).
 """
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import stat
 from typing import Optional
 
 import difflib
@@ -44,6 +46,23 @@ class ConfigError(Exception):
     The message is human-facing and may span multiple lines (one bullet per
     problem); ``main.py`` logs it and exits non-zero at startup.
     """
+
+
+def _config_file_mode(file_obj):
+    """Return the mode of an opened regular config file, or ``None``.
+
+    The descriptor is inspected rather than the path so the permission decision
+    applies to the exact file that will be parsed.  ``None`` is deliberately an
+    unsupported/unknown result: callers warn and continue on platforms where
+    POSIX mode semantics are unavailable.
+    """
+    try:
+        file_stat = os.fstat(file_obj.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        return stat.S_IMODE(file_stat.st_mode)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 # Sentinel marking a field that has no default — it MUST be present in the
@@ -511,6 +530,17 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         )
     try:
         with open(p, encoding="utf-8") as f:
+            mode = _config_file_mode(f)
+            if mode is None:
+                log.warning(
+                    "Could not verify POSIX permissions for %s; continuing",
+                    path,
+                )
+            elif mode & 0o077:
+                raise ConfigError(
+                    f"{path} permissions are too permissive (mode {mode:04o}); "
+                    f"run chmod 600 {path}"
+                )
             raw = yaml.safe_load(f)
     except yaml.YAMLError as e:
         raise ConfigError(f"{path} is not valid YAML: {e}")
