@@ -248,3 +248,98 @@ def test_yes_bypasses_prompt_only_for_explicit_write_selection(monkeypatch):
     assert args.yes is True
     assert args.artist == "Artist"
     assert args.album == "Album"
+
+
+@pytest.mark.parametrize("bad_value", ["", "   ", "\t\t", "Artist\x1b[2J", "Album\x00"])
+def test_main_rejects_blank_or_control_target_values_before_config(monkeypatch, bad_value):
+    monkeypatch.setattr(
+        "src.config.load_config",
+        lambda _path: pytest.fail("invalid target reached config loading"),
+    )
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--artist", bad_value, "--album", "Album"])
+    assert ei.value.code == 2
+
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--artist", "Artist", "--album", bad_value])
+    assert ei.value.code == 2
+
+
+def test_target_validation_allows_internal_spaces_without_changing_search_values():
+    client = MagicMock()
+    client.search_collection.return_value = None
+    artist = "The  Artist"
+    album = "An Album  With Spaces"
+    dlc.check_search_collection(client, artist, album)
+    client.search_collection.assert_called_once_with(artist, album)
+
+
+def test_write_target_and_prompt_redact_token_shaped_values(capsys):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count token=FIELD_SECRET"
+    client.increment_play_count.return_value = True
+    result = {"release_id": 123, "instance_id": 456}
+    prompts = []
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Artist token=ARTIST_SECRET",
+        "Album token=ALBUM_SECRET",
+        input_fn=prompts.append,
+    ) is False
+    # append returns None, which is intentionally a non-affirmative response.
+    client.increment_play_count.assert_not_called()
+    output = capsys.readouterr().out
+    assert "ARTIST_SECRET" not in output
+    assert "ALBUM_SECRET" not in output
+    assert "FIELD_SECRET" not in output
+    assert prompts and "ARTIST_SECRET" not in prompts[0]
+    assert "ALBUM_SECRET" not in prompts[0]
+    assert "FIELD_SECRET" not in prompts[0]
+
+
+def test_yes_emits_resolved_target_immediately_before_single_write(capsys):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+    client.increment_play_count.return_value = True
+    result = {"release_id": 123, "instance_id": 456}
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        confirmed=True,
+    ) is True
+    client.increment_play_count.assert_called_once_with(123, 456)
+    output = capsys.readouterr().out
+    assert "WRITE AUTHORIZED (--yes)" in output
+    assert "Selected Artist" in output
+    assert "Selected Album" in output
+    assert "Play Count" in output
+    assert "Release ID: 123" in output
+    assert "Instance ID: 456" in output
+
+
+@pytest.mark.parametrize("outcome", [False, RuntimeError("transport uncertain")])
+def test_failed_write_warns_inspect_before_rerun_and_never_retries(capsys, outcome):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+    if isinstance(outcome, Exception):
+        client.increment_play_count.side_effect = outcome
+    else:
+        client.increment_play_count.return_value = outcome
+    result = {"release_id": 123, "instance_id": 456}
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Artist",
+        "Album",
+        confirmed=True,
+    ) is False
+    client.increment_play_count.assert_called_once_with(123, 456)
+    output = capsys.readouterr().out
+    assert "inspect the current Discogs field value before rerunning" in output
+    assert "do not retry blindly" in output

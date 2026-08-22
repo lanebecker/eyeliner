@@ -6,8 +6,14 @@ All checks are read-only by default.
 
 Usage:
     python scripts/discogs_live_check.py                # read-only
-    python scripts/discogs_live_check.py --test-write   # also tests increment_play_count
-                                               # (WRITES to your Discogs collection)
+    python scripts/discogs_live_check.py --artist "Sonic Youth" --album "Sister" \
+        --test-write                                  # interactive WRITE test
+    python scripts/discogs_live_check.py --artist "Sonic Youth" --album "Sister" \
+        --test-write --yes                            # explicit noninteractive WRITE
+
+Any write test requires an explicitly selected artist and album. Use a designated
+sacrificial collection record and inspect its current field value before rerunning
+after an uncertain result.
 """
 
 import argparse
@@ -67,14 +73,15 @@ TEST_ALBUM = "Sister"
 def sep(title=""):
     width = 62
     if title:
+        title = _redact(title)
         print(f"\n{'─' * 3} {title} {'─' * max(1, width - len(title) - 5)}")
     else:
         print(f"\n{'─' * width}")
 
 
-def ok(msg):   print(f"  ✓  {msg}")
-def fail(msg): print(f"  ✗  {msg}")
-def info(msg): print(f"     {msg}")
+def ok(msg):   print(f"  ✓  {_redact(msg)}")
+def fail(msg): print(f"  ✗  {_redact(msg)}")
+def info(msg): print(f"     {_redact(msg)}")
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +229,13 @@ def check_increment_play_count(
     instance_id = collection_result["instance_id"]
 
     field_name = client.play_count_field_name
+    target = (
+        f"Artist: {_redact(artist)}; Album: {_redact(album)}; "
+        f"Field: {_redact(field_name)}; Release ID: {_redact(release_id)}; "
+        f"Instance ID: {_redact(instance_id)}"
+    )
     if not confirmed:
+        info(f"!!! WRITE TARGET — {target}")
         if input_fn is None:
             input_fn = input
         prompt = (
@@ -231,25 +244,33 @@ def check_increment_play_count(
             f"Field: {field_name}; Release ID: {release_id}; Instance ID: {instance_id}: "
         )
         try:
-            response = input_fn(prompt)
+            response = input_fn(_redact(prompt))
         except (EOFError, KeyboardInterrupt):
             response = ""
         if response != "yes":
             fail("Write declined; increment_play_count was not called.")
             return False
+    else:
+        info(f"!!! WRITE AUTHORIZED (--yes) — {target}")
 
     # Keep this as the sole writer call, immediately after explicit authorization.
     try:
         success = client.increment_play_count(release_id, instance_id)
     except Exception as e:
-        fail(f"Exception: {_redact(e)}")
+        fail(
+            f"Exception: {_redact(e)}. inspect the current Discogs field value "
+            "before rerunning; do not retry blindly because the remote state may be unknown."
+        )
         return False
 
     if success:
         ok("Play Count incremented! Check your Discogs collection to confirm.")
         info("You can reset the value manually in Discogs if needed.")
     else:
-        fail("Update failed — check the error logged above.")
+        fail(
+            "Update failed — inspect the current Discogs field value before rerunning; "
+            "do not retry blindly because the remote state may be unknown."
+        )
     return bool(success)
 
 
@@ -282,9 +303,21 @@ def _build_parser():
     return parser
 
 
+def _validate_target_value(parser, option: str, value: Optional[str]) -> None:
+    """Reject unsafe display/search targets without normalizing valid input."""
+    if value is None:
+        return
+    if not value.strip():
+        parser.error(f"{option} must contain a non-whitespace value")
+    if not value.isprintable():
+        parser.error(f"{option} must contain printable characters only")
+
+
 def main(argv=None, input_fn=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
+    _validate_target_value(parser, "--artist", args.artist)
+    _validate_target_value(parser, "--album", args.album)
     if args.yes and not args.test_write:
         parser.error("--yes requires --test-write")
     if args.test_write and (args.artist is None or args.album is None):
