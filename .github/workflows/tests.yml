@@ -87,5 +87,16 @@ jobs:
           pip install -r requirements.txt
       - name: Smoke-test audio backend
         run: python -I scripts/check_audio_backend.py
+      - name: Render and verify system service
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          app_dir="$tmp_dir/app"
+          mkdir -p "$app_dir/venv/bin"
+          touch "$app_dir/config.yaml" "$app_dir/main.py" "$tmp_dir/Xauthority"
+          chmod 600 "$app_dir/config.yaml"
+          ln -s "$(command -v python)" "$app_dir/venv/bin/python3"
+          python -I scripts/render_system_service.py --user root --app-dir "$app_dir" --display :0 --xauthority "$tmp_dir/Xauthority" --output "$tmp_dir/vinyl-now-playing.service"
+          systemd-analyze verify "$tmp_dir/vinyl-now-playing.service"
       - name: Run tests
         run: pytest -q

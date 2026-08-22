@@ -1,0 +1,21 @@
+[Unit]
+Description=vinyl-now-playing
+Wants=network-online.target
+After=network-online.target time-sync.target graphical.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory=@APP_DIR@
+Environment="DISPLAY=@DISPLAY@"
+Environment="XAUTHORITY=@XAUTHORITY@"
+ExecStart=@APP_DIR@/venv/bin/python3 @APP_DIR@/main.py
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+WantedBy=graphical.target
