@@ -35,7 +35,7 @@ on:
   # reset any schedule-disable window.)
   workflow_dispatch:
 
-# R5-35 (TQ-5 parity with sync-version-badge.yml): scope the token to read-only.
+# R5-35 (TQ-5 parity with the version-metadata workflow): scope the token to read-only.
 # This job installs the full pip dependency tree on every push/PR, so it must not
 # run with the repository-default GITHUB_TOKEN write permissions.
 permissions:

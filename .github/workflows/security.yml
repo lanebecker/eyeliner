@@ -1,0 +1,40 @@
+name: dependency audit
+
+# R10-03 / reopened #295: Dependabot settings surface fix PRs, while this gate
+# independently fails when the currently resolved requirements contain a known
+# advisory. The official PyPA action is pinned to the v1.1.0 commit.
+on:
+  push:
+    branches: [main]
+    paths:
+      - requirements.txt
+      - .github/workflows/security.yml
+  pull_request:
+    paths:
+      - requirements.txt
+      - .github/workflows/security.yml
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Audit Python ${{ matrix.python-version }} resolved requirements
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266  # v1.1.0
+        with:
+          inputs: requirements.txt
