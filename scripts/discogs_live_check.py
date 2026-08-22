@@ -9,7 +9,8 @@ Usage:
     python scripts/discogs_live_check.py --artist "Sonic Youth" --album "Sister" \
         --test-write                                  # interactive WRITE test
     python scripts/discogs_live_check.py --artist "Sonic Youth" --album "Sister" \
-        --test-write --yes                            # explicit noninteractive WRITE
+        --test-write --yes --release-id 123 --instance-id 456
+                                                        # ID-bound noninteractive WRITE
 
 Any write test requires an explicitly selected artist and album. Use a designated
 sacrificial collection record and inspect its current field value before rerunning
@@ -218,6 +219,8 @@ def check_increment_play_count(
     album: str = TEST_ALBUM,
     *,
     confirmed: bool = False,
+    expected_release_id: Optional[int] = None,
+    expected_instance_id: Optional[int] = None,
     input_fn=None,
 ) -> bool:
     sep("5 · increment_play_count  —  WRITE TEST")
@@ -225,8 +228,17 @@ def check_increment_play_count(
         fail("Skipping — requires a successful search_collection result first.")
         return False
 
-    release_id  = collection_result["release_id"]
-    instance_id = collection_result["instance_id"]
+    release_id = collection_result.get("release_id")
+    instance_id = collection_result.get("instance_id")
+    if not all(
+        type(value) is int and value > 0
+        for value in (release_id, instance_id)
+    ):
+        fail(
+            "Write declined — resolved release and instance IDs must both be "
+            "positive integers."
+        )
+        return False
 
     field_name = client.play_count_field_name
     target = (
@@ -234,7 +246,24 @@ def check_increment_play_count(
         f"Field: {_redact(field_name)}; Release ID: {_redact(release_id)}; "
         f"Instance ID: {_redact(instance_id)}"
     )
-    if not confirmed:
+    if confirmed:
+        if expected_release_id is None or expected_instance_id is None:
+            fail(
+                "Noninteractive write declined — expected release and instance IDs "
+                "are both required."
+            )
+            return False
+        if (
+            release_id != expected_release_id
+            or instance_id != expected_instance_id
+        ):
+            fail(
+                "Noninteractive write declined — the resolved collection identity "
+                "does not match the expected release and instance IDs."
+            )
+            return False
+        info(f"!!! WRITE AUTHORIZED (--yes) — {target}")
+    else:
         info(f"!!! WRITE TARGET — {target}")
         if input_fn is None:
             input_fn = input
@@ -250,8 +279,6 @@ def check_increment_play_count(
         if response != "yes":
             fail("Write declined; increment_play_count was not called.")
             return False
-    else:
-        info(f"!!! WRITE AUTHORIZED (--yes) — {target}")
 
     # Keep this as the sole writer call, immediately after explicit authorization.
     try:
@@ -298,9 +325,33 @@ def _build_parser():
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="With --test-write and explicit --artist/--album, bypass confirmation.",
+        help=(
+            "With --test-write, explicit artist/album, and matching release/instance "
+            "IDs, bypass confirmation."
+        ),
+    )
+    parser.add_argument(
+        "--release-id",
+        type=_positive_id,
+        help="Expected positive Discogs release ID (required with --yes).",
+    )
+    parser.add_argument(
+        "--instance-id",
+        type=_positive_id,
+        help="Expected positive collection instance ID (required with --yes).",
     )
     return parser
+
+
+def _positive_id(value: str) -> int:
+    """Return a positive integer ID for argparse."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _validate_target_value(parser, option: str, value: Optional[str]) -> None:
@@ -322,6 +373,10 @@ def main(argv=None, input_fn=None):
         parser.error("--yes requires --test-write")
     if args.test_write and (args.artist is None or args.album is None):
         parser.error("--test-write requires explicit --artist and --album")
+    if args.yes and (args.release_id is None or args.instance_id is None):
+        parser.error("--yes requires explicit --release-id and --instance-id")
+    if (args.release_id is not None or args.instance_id is not None) and not args.yes:
+        parser.error("--release-id and --instance-id require --yes")
 
     artist = args.artist if args.artist is not None else TEST_ARTIST
     album = args.album if args.album is not None else TEST_ALBUM
@@ -392,6 +447,8 @@ def main(argv=None, input_fn=None):
             artist,
             album,
             confirmed=args.yes,
+            expected_release_id=args.release_id,
+            expected_instance_id=args.instance_id,
             input_fn=input_fn,
         ):
             return 1
