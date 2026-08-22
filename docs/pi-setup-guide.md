@@ -346,7 +346,38 @@ appears as an input device — it should show a positive number of input channel
 
 ---
 
-## 11. First manual run
+## 11. Synchronize time, then run manually
+
+### Gate every application start on synchronized time
+
+The Raspberry Pi has no battery-backed real-time clock. Starting the app before
+network time is synchronized can write a wrong, irreversible **Last Played**
+date. The `NTPSynchronized=yes` gate applies to **every** application start,
+whether you run `main.py` manually or systemd starts
+`vinyl-now-playing.service`.
+
+Configure the timezone, enable the persistent waiter, and verify the current
+boot before this first manual run:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pi/vinyl-now-playing
+  sudo timedatectl set-timezone America/Chicago   # replace with your IANA timezone
+  sudo systemctl enable --now systemd-time-wait-sync.service
+  timedatectl
+  test "$(timedatectl show --property=NTPSynchronized --value)" = yes
+)
+```
+
+Do not start the app—manually or through systemd—until this block succeeds and
+`timedatectl` shows the chosen timezone. If it fails, inspect
+`systemctl status systemd-time-wait-sync.service`; an offline Pi should wait for
+network time rather than write stale dates. Before each later manual start,
+repeat the `NTPSynchronized` readback and require `yes`. Section 12's versioned
+system unit preserves the enabled waiter's time-ordering gate for systemd starts.
+
+### First manual run
 
 With the display connected, the UCA222 plugged in, and your turntable's RCA
 output going into the UCA222's inputs:
@@ -393,29 +424,6 @@ The supported architecture is a **system service**. Do not copy a unit into
 `/etc` or migrate to a user service as a Wayland workaround: the repository's
 versioned `deploy/vinyl-now-playing.service.in` and renderer preserve the
 network/time ordering and retry behavior already ratified in #83 and #201.
-
-### Prepare the clock gate before the first application start
-
-The Raspberry Pi has no battery-backed real-time clock. Starting the app before
-network time is synchronized can write a wrong, irreversible **Last Played**
-date. Configure the timezone, enable the waiter, and confirm synchronization
-**before** the first `enable --now` or `start` of `vinyl-now-playing`:
-
-```bash
-(
-  set -euo pipefail
-  cd /home/pi/vinyl-now-playing
-  sudo timedatectl set-timezone America/Chicago   # replace with your IANA timezone
-  sudo systemctl enable --now systemd-time-wait-sync.service
-  timedatectl
-  test "$(timedatectl show --property=NTPSynchronized --value)" = yes
-)
-```
-
-Do not start the app until this block succeeds and `timedatectl` shows the chosen
-timezone. If it fails, inspect
-`systemctl status systemd-time-wait-sync.service`; an offline Pi should wait for
-network time rather than write stale dates.
 
 From a terminal in the logged-in graphical session, record the values that the
 installed image actually uses before rendering. Raspberry Pi OS sessions vary:
