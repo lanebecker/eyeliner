@@ -94,7 +94,7 @@ finding and rerun the focused suite before explicit-path staging.
 - Modify: `.github/workflows/tests.yml`
 - Modify: a focused workflow-integrity test file selected after inspecting current ownership
 
-- [ ] **Step 1: Write RED behavior and workflow tests**
+- [x] **Step 1: Write RED behavior and workflow tests**
 
 Test a pure `validate_backend(module)` function with a complete fake and one
 missing/non-callable case for each of `query_devices`, `InputStream`,
@@ -112,7 +112,7 @@ cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)
 Expected RED: new script/API and workflow steps do not exist and conftest still
 tests only `sys.modules` membership.
 
-- [ ] **Step 2: Implement the isolated smoke and scoped fallback**
+- [x] **Step 2: Implement the isolated smoke and scoped fallback**
 
 Create a dependency-free CLI that imports `sounddevice`, validates the exact
 four callables, prints package version only as non-secret diagnostics, and exits
@@ -121,13 +121,13 @@ before pip dependencies and run `python scripts/check_audio_backend.py` before
 pytest on every matrix leg. Refactor conftest to attempt the real import and
 install/remove only its own fallback stub if that import fails.
 
-- [ ] **Step 3: Verify GREEN**
+- [x] **Step 3: Verify GREEN**
 
 Run the RED command, `tests/test_capture.py`, `tests/test_main_wiring.py`, and
 `tests/test_ops_polish_r9.py`, then `git diff --check`. Do not claim live device
 coverage.
 
-- [ ] **Step 4: Independent adversarial review**
+- [x] **Step 4: Independent adversarial review**
 
 Reviewer must mutate every required API away, move the smoke after pytest,
 remove PortAudio, simulate a pre-existing third-party module, and test teardown
