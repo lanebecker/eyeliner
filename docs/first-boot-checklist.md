@@ -60,13 +60,69 @@ contents into this checklist.
 | Gate | Command / observation | Non-secret evidence to record | Good result |
 |---|---|---|---|
 | Private config (#418) | `stat -c '%a %n' /home/pi/vinyl-now-playing/config.yaml` | Path and mode | `600`; any other mode is repaired with `chmod 600`, then the app is restarted. |
-| Real audio package and UCA222 (#156) | `cd /home/pi/vinyl-now-playing && venv/bin/python3 -I scripts/check_audio_backend.py`; then `venv/bin/python3 -c "import sounddevice; print(sounddevice.query_devices())"` | Package/API smoke result; selected UCA222 name/index/input channels; unplug/replug result | Smoke succeeds and the UCA222 is enumerated again after one unplug/replug. |
-| Display/session choice (#419) | In the logged-in graphical terminal: `printf 'DISPLAY=%s\\nXAUTHORITY=%s\\n' "$DISPLAY" "${XAUTHORITY:-<unset>}"` | Chosen `DISPLAY`, absolute Xauthority/session-auth path, and whether Xwayland was used | The selected values are rendered into the system service and it opens the display. |
-| Cold boot, clock, and shutdown (#83/#201/#419) | Reboot once; inspect `timedatectl`, `systemctl status vinyl-now-playing`, and the journal; then issue `sudo systemctl stop vinyl-now-playing` | Cold-boot result; `System clock synchronized` value; service status; SIGTERM stop outcome/time | Clock is synchronized before startup, the service survives the graphical-session race, and SIGTERM stops cleanly within `TimeoutStopSec=30`. |
-| Custom-folder Discogs probe (#366) | Follow the explicit confirmed command in `docs/testing-guide.md` for one sacrificial non-default-folder record | Artist/album, release ID, instance ID, field name, before/after values, HTTP/outcome; no token | Success disproves the hypothesis. A 404 or ambiguity is preserved as evidence with no blind retry. |
+| Real audio package and UCA222 (#156) | Follow the live InputStream/hot-plug procedure below after the package smoke | Package/API smoke result; selected UCA222 name/index/input channels; stream-open/audio evidence; loss/recovery journal lines; MainPID before/after; whether restart was needed | The app receives audio before and after one unplug/replug with the same MainPID. |
+| Display/session choice (#419) | In the logged-in graphical terminal: `printf 'DISPLAY=%s\nXAUTHORITY=%s\n' "$DISPLAY" "${XAUTHORITY:-<unset>}"`; if unset, use the read-only Xwayland `-auth` discovery in `pi-setup-guide.md` §12 | Chosen `DISPLAY`, absolute Xauthority/session-auth path, service-user readability, whether Xwayland was used, cold-boot path stability | The selected values are rendered into the system service, readable by its user, and work again after cold boot. |
+| Cold boot, clock, and shutdown (#83/#201/#419) | Reboot once; inspect `timedatectl`, `systemctl status vinyl-now-playing`, and the journal; use the timed SIGTERM procedure below | Cold-boot result; `System clock synchronized` value; service status; timed SIGTERM outcome; post-stop restart/status | Clock is synchronized before startup, the service survives the graphical-session race, and SIGTERM stops cleanly within `TimeoutStopSec=30`. |
+| Custom-folder Discogs probe (#366) | Follow the same-target read-only and one confirmed-write commands in `docs/testing-guide.md` | Artist/album, release ID, instance ID, custom-folder name/ID, field name, before/after values, HTTP/outcome; no token | Success disproves the hypothesis. A 404 or ambiguity is preserved as evidence with no blind retry. |
 
 CI has already checked the installed package/API boundary and system-unit syntax;
 it cannot close any of these hardware or external-state gates.
+
+### Real InputStream and hot-plug proof (#156)
+
+Run this only after the service is rendered and started. It does not change
+configuration or write to Discogs. Keep a journal window visible, then play a
+record long enough to produce a `Play session started.` event: that proves the
+application's real `sd.InputStream` is delivering callbacks, not merely that the
+device table can be queried.
+
+```bash
+cd /home/pi/vinyl-now-playing
+venv/bin/python3 -I scripts/check_audio_backend.py
+sudo systemctl restart vinyl-now-playing
+VNP_MAINPID_BEFORE="$(sudo systemctl show --property=MainPID --value vinyl-now-playing)"
+test "$VNP_MAINPID_BEFORE" -gt 0
+printf 'MainPID before unplug=%s\n' "$VNP_MAINPID_BEFORE"
+sudo journalctl -u vinyl-now-playing --since '2 minutes ago' -f
+```
+
+With the journal following, confirm the initial audio event, unplug the UCA222
+while capture is active, wait at least five seconds, then replug it and play
+audio again. Record the capture-loss evidence (`audio stream stalled` or `Audio
+capture error`), the post-replug audio event, and any `Using audio device [...]`
+line. Stop the journal follow with `Ctrl+C` (do not restart the service), then
+prove the process did not restart:
+
+```bash
+VNP_MAINPID_AFTER="$(sudo systemctl show --property=MainPID --value vinyl-now-playing)"
+printf 'MainPID after replug=%s\n' "$VNP_MAINPID_AFTER"
+test "$VNP_MAINPID_BEFORE" = "$VNP_MAINPID_AFTER"
+sudo systemctl status vinyl-now-playing
+```
+
+**Good:** input callbacks produce an event both before and after replug, the
+journal shows the retry/recovery path, and the MainPID is unchanged. A changed
+PID, no post-replug audio event, or a private-API degradation warning is failed
+hardware evidence; record it rather than claiming #156 complete.
+
+### Timed SIGTERM proof and restart
+
+After recording normal service behavior, measure the managed stop, inspect its
+journal result, then bring the appliance back for the remaining checklist:
+
+```bash
+VNP_STOP_STARTED="$(date +%s)"
+sudo systemctl stop vinyl-now-playing
+VNP_STOP_FINISHED="$(date +%s)"
+printf 'SIGTERM stop elapsed=%ss\n' "$((VNP_STOP_FINISHED - VNP_STOP_STARTED))"
+sudo journalctl -u vinyl-now-playing --since "@$VNP_STOP_STARTED" --no-pager
+sudo systemctl start vinyl-now-playing
+sudo systemctl status vinyl-now-playing
+```
+
+Record the elapsed seconds and relevant shutdown journal lines. The stop must
+complete within `TimeoutStopSec=30`; the final status command must show the
+service started again before moving on.
 
 ## 2. Audio input is the right device
 
