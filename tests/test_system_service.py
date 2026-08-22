@@ -30,7 +30,7 @@ def _arguments(base_app_dir: Path, base_output: Path, **overrides: str) -> list[
         "user": "pi",
         "app_dir": str(base_app_dir),
         "display": ":0",
-        "xauthority": "/home/pi/.Xauthority",
+        "xauthority": str(base_output.parent / "Xauthority"),
         "output": str(base_output),
     }
     values.update(overrides)
@@ -74,7 +74,7 @@ def _render_direct(
         "user": "pi",
         "app_dir": base_app_dir,
         "display": ":0",
-        "xauthority": "/home/pi/.Xauthority",
+        "xauthority": str(Path(base_output).parent / "Xauthority"),
         "output": base_output,
     }
     values.update(overrides)
@@ -107,7 +107,7 @@ Type=simple
 User=pi
 WorkingDirectory={app_dir}
 Environment=\"DISPLAY=:0\"
-Environment=\"XAUTHORITY=/home/pi/.Xauthority\"
+Environment=\"XAUTHORITY={xauthority}\"
 ExecStart={app_dir}/venv/bin/python3 {app_dir}/main.py
 Restart=on-failure
 RestartPreventExitStatus=78
@@ -116,7 +116,7 @@ TimeoutStopSec=30
 
 [Install]
 WantedBy=graphical.target
-""".format(app_dir=app_dir)
+""".format(app_dir=app_dir, xauthority=output.parent / "Xauthority")
     assert output.stat().st_mode & 0o777 == 0o644
 
 
@@ -208,6 +208,124 @@ def test_renderer_rejects_a_symlinked_config_descriptor(tmp_path):
     assert not output.exists()
 
 
+def test_renderer_rejects_a_double_slash_alias_to_config_before_reading_it(
+    tmp_path, monkeypatch
+):
+    """A lexical `//` alias cannot replace or expose the credential file."""
+    app_dir = _make_app(tmp_path)
+    config = app_dir / "config.yaml"
+    original = config.read_bytes()
+    original_mode = config.stat().st_mode & 0o777
+    output = "//" + str(config).lstrip("/")
+    renderer = _load_renderer_module()
+
+    monkeypatch.setattr(
+        renderer.os,
+        "read",
+        lambda *_args: pytest.fail("renderer read the config through an output alias"),
+    )
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, output)
+
+    assert config.read_bytes() == original
+    assert config.stat().st_mode & 0o777 == original_mode == 0o600
+
+
+def test_renderer_rejects_a_double_slash_alias_to_its_template(tmp_path, monkeypatch):
+    """A noncanonical template path cannot be atomically replaced as output."""
+    app_dir = _make_app(tmp_path)
+    renderer = _load_renderer_module()
+    template = tmp_path / "template.service.in"
+    template.write_text(
+        """[Unit]
+Description=vinyl-now-playing
+User=@SERVICE_USER@
+WorkingDirectory=@APP_DIR@
+Environment=\"DISPLAY=@DISPLAY@\"
+Environment=\"XAUTHORITY=@XAUTHORITY@\"
+ExecStart=@APP_DIR@/venv/bin/python3 @APP_DIR@/main.py
+"""
+    )
+    original = template.read_bytes()
+    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    monkeypatch.setattr(
+        renderer.os,
+        "read",
+        lambda *_args: pytest.fail("renderer read the template through an output alias"),
+    )
+
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, "//" + str(template).lstrip("/"))
+
+    assert template.read_bytes() == original
+
+
+@pytest.mark.parametrize("target_name", ("config", "template"))
+def test_renderer_rejects_an_existing_output_hardlink_before_reading_it(
+    tmp_path, monkeypatch, target_name
+):
+    """A hardlink cannot turn the output read into a credential/template read."""
+    app_dir = _make_app(tmp_path)
+    config = app_dir / "config.yaml"
+    renderer = _load_renderer_module()
+    target = config if target_name == "config" else renderer.TEMPLATE
+    output = tmp_path / "vinyl-now-playing.service"
+    os.link(target, output)
+    original = target.read_bytes()
+
+    monkeypatch.setattr(
+        renderer.os,
+        "read",
+        lambda *_args: pytest.fail("renderer read an identity-colliding output"),
+    )
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, output)
+
+    assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize("unsafe", ("%n", "$HOME", "'", '\"', "\\\\", "@", ";", "&", "|"))
+def test_renderer_rejects_systemd_metacharacters_in_unit_bound_paths(tmp_path, unsafe):
+    """Unit substitutions stay literal rather than invoking systemd expansion rules."""
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    xauthority = tmp_path / f"Xauthority{unsafe}"
+    xauthority.write_text("")
+    renderer = _load_renderer_module()
+
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, output, xauthority=str(xauthority))
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("kind", ("app", "output-parent", "xauthority-parent"))
+def test_renderer_rejects_symlinks_in_existing_path_ancestors(tmp_path, kind):
+    """Every existing caller-controlled path component is stable at render time."""
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+    alias_root = tmp_path / "alias-root"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    xauthority = tmp_path / "Xauthority"
+    xauthority.write_text("")
+    renderer = _load_renderer_module()
+
+    if kind == "app":
+        real_app = _make_app(real_root)
+        app_dir = alias_root / real_app.name
+    elif kind == "output-parent":
+        output = alias_root / "vinyl-now-playing.service"
+    else:
+        xauthority = alias_root / "Xauthority"
+
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, output, xauthority=str(xauthority))
+
+    assert not output.exists()
+
+
 def test_renderer_rerender_is_byte_and_inode_identical_for_identical_inputs(tmp_path):
     """A no-op re-render avoids unnecessary service-file churn."""
     app_dir = _make_app(tmp_path)
@@ -221,6 +339,24 @@ def test_renderer_rerender_is_byte_and_inode_identical_for_identical_inputs(tmp_
     assert first.returncode == second.returncode == 0
     assert after.st_ino == before.st_ino
     assert after.st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize("mode", (0o600, 0o666, 0o777))
+def test_renderer_atomically_replaces_equal_content_with_an_unsafe_mode(tmp_path, mode):
+    """Content alone is not current when the deployment artifact is writable."""
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    renderer = _load_renderer_module()
+    _render_direct(renderer, app_dir, output)
+    before = output.stat()
+    os.chmod(output, mode)
+
+    changed = _render_direct(renderer, app_dir, output)
+    after = output.stat()
+
+    assert changed is True
+    assert after.st_mode & 0o777 == 0o644
+    assert after.st_ino != before.st_ino
 
 
 def test_renderer_leaves_the_previous_complete_output_on_atomic_replace_failure(
@@ -238,17 +374,54 @@ def test_renderer_leaves_the_previous_complete_output_on_atomic_replace_failure(
 
     monkeypatch.setattr(renderer.os, "replace", fail_replace)
 
-    with pytest.raises(OSError, match="simulated replace interruption"):
+    with pytest.raises(renderer.RenderError, match="cannot atomically write output"):
         renderer.render_system_service(
             user="pi",
             app_dir=app_dir,
             display=":0",
-            xauthority=Path("/home/pi/.Xauthority"),
+            xauthority=tmp_path / "Xauthority",
             output=output,
         )
 
     assert output.read_bytes() == previous
     assert not list(tmp_path.glob(".vinyl-now-playing.service.*.tmp"))
+
+
+def test_renderer_fsyncs_the_containing_directory_after_atomic_replace(tmp_path, monkeypatch):
+    """Power loss after rename cannot discard the otherwise-complete unit entry."""
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    renderer = _load_renderer_module()
+    fsync_calls = []
+
+    monkeypatch.setattr(renderer.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+
+    _render_direct(renderer, app_dir, output)
+
+    assert len(fsync_calls) == 2
+
+
+def test_renderer_cli_normalizes_atomic_write_failures_without_a_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """Operators get one concise actionable failure if a write cannot complete."""
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    renderer = _load_renderer_module()
+
+    monkeypatch.setattr(
+        renderer.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("simulated denied write")),
+    )
+
+    exit_code = renderer.main(_arguments(app_dir, output))
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.err.startswith("error: cannot atomically write output")
+    assert "Traceback" not in captured.err
+    assert not output.exists()
 
 
 def test_renderer_refuses_to_replace_an_output_symlink(tmp_path):
