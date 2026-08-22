@@ -144,7 +144,7 @@ ownership. Resolve confirmed findings before explicit-path staging.
 - Modify: `.github/workflows/tests.yml`
 - Modify: the same focused workflow-integrity test file selected in Task 2
 
-- [ ] **Step 1: Write RED renderer and invariant tests**
+- [x] **Step 1: Write RED renderer and invariant tests**
 
 Pin exact assertions for all preserved directives, `Type=simple`, service user,
 working directory, `DISPLAY`, `XAUTHORITY`, absolute venv Python/main paths, and
@@ -162,7 +162,7 @@ cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)
 
 Expected RED: template, renderer, and CI verification do not exist.
 
-- [ ] **Step 2: Implement template and minimal renderer**
+- [x] **Step 2: Implement template and minimal renderer**
 
 Use explicit placeholders for service user, absolute app directory, display,
 and absolute Xauthority. The CLI requires all four plus `--output`; it validates
@@ -171,13 +171,13 @@ fsyncs, then atomically replaces output. It never invokes sudo/systemctl and
 never changes config mode. CI creates a temporary representative app/config,
 renders, then runs `systemd-analyze verify`.
 
-- [ ] **Step 3: Verify GREEN and static unit semantics**
+- [x] **Step 3: Verify GREEN and static unit semantics**
 
 Run the RED command and `git diff --check`. On Linux CI, require the real
 `systemd-analyze verify`; locally, unit tests must skip only the external binary
 check, never the directive contract.
 
-- [ ] **Step 4: Independent adversarial review**
+- [x] **Step 4: Independent adversarial review**
 
 Reviewer must try template injection, relative paths, symlink/output races,
 unsafe config mode, partial writes, changed historical restart/time directives,
