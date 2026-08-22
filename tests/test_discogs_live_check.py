@@ -145,3 +145,106 @@ def test_main_loads_config_from_repo_root_not_cwd(monkeypatch, tmp_path):
 
     expected = str(Path(dlc.__file__).resolve().parent.parent / "config.yaml")
     assert captured["path"] == expected
+
+
+# ---------------------------------------------------------------------------
+# #366 — explicit record selection and write authorization
+# ---------------------------------------------------------------------------
+
+def test_search_operations_use_selected_artist_and_album(capsys):
+    client = MagicMock()
+    client.search_collection.return_value = None
+    client.search_database.return_value = None
+
+    dlc.check_search_collection(client, "Selected Artist", "Selected Album")
+    dlc.check_search_database(client, "Selected Artist", "Selected Album")
+
+    client.search_collection.assert_called_once_with("Selected Artist", "Selected Album")
+    client.search_database.assert_called_once_with("Selected Artist", "Selected Album")
+    out = capsys.readouterr().out
+    assert "Selected Artist / Selected Album" in out
+
+
+@pytest.mark.parametrize("response", ["n", "", " yes", "yes ", "YES", "Yes"])
+def test_write_requires_exact_yes(response, capsys):
+    client = MagicMock()
+    result = {"release_id": 123, "instance_id": 456}
+
+    accepted = dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        input_fn=lambda _prompt: response,
+    )
+
+    assert accepted is False
+    client.increment_play_count.assert_not_called()
+    assert "Write declined" in capsys.readouterr().out
+
+
+def test_write_declines_on_eof(capsys):
+    client = MagicMock()
+    result = {"release_id": 123, "instance_id": 456}
+
+    def eof(_prompt):
+        raise EOFError
+
+    accepted = dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        input_fn=eof,
+    )
+
+    assert accepted is False
+    client.increment_play_count.assert_not_called()
+    assert "Write declined" in capsys.readouterr().out
+
+
+def test_write_prompt_contains_selection_and_ids_but_not_token(capsys):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+    client.increment_play_count.return_value = True
+    result = {"release_id": 123, "instance_id": 456}
+    prompts = []
+
+    def authorize(prompt):
+        prompts.append(prompt)
+        return "yes"
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        input_fn=authorize,
+    ) is True
+    client.increment_play_count.assert_called_once_with(123, 456)
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert "Selected Artist" in prompt
+    assert "Selected Album" in prompt
+    assert "Play Count" in prompt
+    assert "123" in prompt and "456" in prompt
+    assert "token" not in prompt.lower()
+    capsys.readouterr()
+
+
+def test_yes_bypasses_prompt_only_for_explicit_write_selection(monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--yes"])
+    assert ei.value.code == 2
+
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--test-write", "--artist", "Artist"])
+    assert ei.value.code == 2
+
+    parser = dlc._build_parser()
+    args = parser.parse_args([
+        "--test-write", "--yes", "--artist", "Artist", "--album", "Album"
+    ])
+    assert args.yes is True
+    assert args.artist == "Artist"
+    assert args.album == "Album"
