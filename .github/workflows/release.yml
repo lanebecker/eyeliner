@@ -118,6 +118,6 @@ jobs:
             "${prerelease_arg[@]}" \
             --notes "Tested SHA: [$RELEASE_SHA](https://github.com/$GITHUB_REPOSITORY/commit/$RELEASE_SHA)
 
-Supported Python: 3.11, 3.12, 3.13.
+          Supported Python: 3.11, 3.12, 3.13.
 
-Supported Raspberry Pi OS: Bookworm/Legacy (Python 3.11) and Trixie (Python 3.13). See docs/pi-setup-guide.md."
+          Supported Raspberry Pi OS: Bookworm/Legacy (Python 3.11) and Trixie (Python 3.13). See docs/pi-setup-guide.md."

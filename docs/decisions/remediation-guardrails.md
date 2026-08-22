@@ -57,6 +57,7 @@ Workspace safety is part of the contract: every handoff command block begins by 
 - VERSION, CHANGELOG, README badge, tag, GitHub Release, and tested SHA must agree.
 - Protected `main` must require the three matrix checks; direct automation writes need no broad bypass.
 - Third-party Actions remain pinned to full commit SHAs and job permissions remain least-privilege.
+- Workflow edits require GitHub Actions-aware validation; successful generic YAML parsing is insufficient because it does not reject schema-invalid workflow keys.
 
 ### Recognition and optional services
 
