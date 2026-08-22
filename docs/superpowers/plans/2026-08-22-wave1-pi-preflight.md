@@ -234,7 +234,7 @@ ambiguous response paths. No reviewer executes a live network call.
 - Modify: `docs/decisions/remediation-guardrails.md`
 - Modify: `CHANGELOG.md`
 
-- [ ] **Step 1: Replace copy/paste drift with the versioned path**
+- [x] **Step 1: Replace copy/paste drift with the versioned path**
 
 Document exact renderer usage for `/etc/systemd/system/vinyl-now-playing.service`,
 then `systemd-analyze verify`, `daemon-reload`, enable/start, and status. Preserve
@@ -242,20 +242,20 @@ the system-service decision, #83/#201 rationale, time-sync waiter, and the
 image-specific Wayland/Xwayland warning. Remove any instruction suggesting a
 user-service migration as the Wave 1 fallback.
 
-- [ ] **Step 2: Add rollback and evidence forms**
+- [x] **Step 2: Add rollback and evidence forms**
 
 Document backup/restore of the last known-good rendered unit and venv/tag,
 `config.yaml` `0600` readback, UCA222 import/enumeration/hot-plug results,
 cold-boot/display/session/time-sync outcomes, and a redacted Discogs record
 before/after/HTTP result. Explicitly say CI does not close hardware gates.
 
-- [ ] **Step 3: Update durable status without premature closure**
+- [x] **Step 3: Update durable status without premature closure**
 
 Update the guardrail and changelog with the implemented software controls.
 Leave #366 and Wave 1 hardware state pending until observed. Correct the stale
 `tests/conftest.py` reference to root `conftest.py`.
 
-- [ ] **Step 4: Independent documentation review**
+- [x] **Step 4: Independent documentation review**
 
 Review against live issues #418/#156/#419/#366 and closed #83/#201/#301.
 Search for contradictory service type, retry values, permission advice,
