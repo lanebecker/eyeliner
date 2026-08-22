@@ -194,16 +194,44 @@ Five GitHub Actions workflows live in `.github/workflows/`:
   contributors update all three in the release PR. It never commits or pushes.
 - **`release.yml`** — manually creates a controlled release from the current
   `main` SHA only after the Python 3.11/3.12/3.13 checks have succeeded for that
-  exact SHA. It creates the immutable tag and GitHub Release together.
+  exact SHA. A read-only `validate` job runs before approval; the protected
+  `release` environment then exposes the repository-scoped App credential to
+  `publish`, which creates the immutable tag and GitHub Release together.
 - **`release-consistency.yml`** — post-tag defense that verifies the tag,
   VERSION, changelog heading, and README badge still agree for out-of-band tag
-  pushes. The controlled workflow performs the same check before publication;
-  GitHub does not recursively start this push workflow for its `GITHUB_TOKEN`.
+  pushes. Ordinary `GITHUB_TOKEN` tag creation does not recursively start push
+  workflows, but the supported GitHub App-authenticated release does trigger
+  this read-only check. The controlled workflow still performs the same metadata
+  validation before publication because a post-tag check cannot prevent an
+  already-created immutable release.
 - **`security.yml`** — audits the resolved `requirements.txt` dependency graph
   for known advisories on Python 3.11, 3.12, and 3.13 on relevant pull requests,
   `main`, a weekly schedule, and manual dispatch. The matrix makes marker-only
   dependencies such as the 3.13 `audioop-lts` backport visible. Dependabot
   remains the complementary update mechanism.
+
+### Controlled release operator sequence
+
+The release identity is the private GitHub App
+`vinyl-now-playing-release-lbecker`, installed only on this repository with
+explicit Contents read/write and GitHub-mandatory Metadata read access. Its
+Client ID is the `RELEASE_APP_CLIENT_ID` variable and its private key is the
+`RELEASE_APP_PRIVATE_KEY` secret in the protected `release` environment. The
+ordinary workflow token remains read-only.
+
+1. Dispatch **Controlled release** from `main`.
+2. Wait for the read-only `validate` job to succeed.
+3. Review the validated SHA, version, and tag in the run, then approve the
+   `release` environment as Lane.
+4. Confirm `publish` mints the repository-scoped App token, creates exactly one
+   tag plus one GitHub Release, and that the read-only post-tag consistency
+   workflow succeeds.
+5. If the release API fails or times out, inspect both tag and GitHub Release
+   state before rerunning. Never retry an ambiguous creation blindly.
+
+Do not dispatch a real release until post-merge verification is green and the
+`Protect release tags` ruleset has been activated and read back with App ID
+`4684884` as its sole bypass actor.
 
 ---
 

@@ -9,23 +9,28 @@ on:
 
 permissions:
   actions: read
-  contents: write
   checks: read
+  contents: read
 
 concurrency:
   group: controlled-release
   cancel-in-progress: false
 
 jobs:
-  release:
+  validate:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      release_sha: ${{ steps.identity.outputs.release_sha }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Verify selected SHA is current main
+        id: identity
         env:
           RELEASE_SHA: ${{ github.sha }}
         run: |
@@ -36,6 +41,7 @@ jobs:
             echo "::error::selected SHA $RELEASE_SHA is not current main $current_main"
             exit 1
           fi
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Read and validate release version
         id: version
@@ -59,10 +65,31 @@ jobs:
             echo "::error::tag $TAG already exists; releases are immutable"
             exit 1
           fi
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::GitHub Release $TAG already exists"
-            exit 1
-          fi
+          release_headers="$RUNNER_TEMP/release-probe.headers"
+          release_error="$RUNNER_TEMP/release-probe.error"
+          probe_exit=0
+          gh api \
+            --include \
+            --silent \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+            > "$release_headers" 2> "$release_error" || probe_exit=$?
+          release_status=$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/ { status = $2 } END { print status }' "$release_headers")
+          case "$release_status" in
+            200)
+              echo "::error::GitHub Release $TAG already exists"
+              exit 1
+              ;;
+            404)
+              ;;
+            *)
+              echo "::error::could not verify absence of GitHub Release $TAG (HTTP ${release_status:-unavailable}, gh exit $probe_exit)"
+              if [ -s "$release_error" ]; then
+                cat "$release_error" >&2
+              fi
+              exit 1
+              ;;
+          esac
 
       - name: Fetch tests workflow and check runs for the exact SHA
         env:
@@ -91,24 +118,91 @@ jobs:
             --require 'test (3.12)' \
             --require 'test (3.13)'
 
-      - name: Create immutable tag and GitHub Release
+  publish:
+    needs: validate
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.release_sha }}
+
+      - name: Revalidate release candidate after approval
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ github.sha }}
-          TAG: ${{ steps.version.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.release_sha }}
+          EXPECTED_TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          # Close the dispatch-to-publication race: main may have advanced while
-          # this job was waiting for the API or another release invocation.
-          git fetch --no-tags origin main
-          current_main=$(git rev-parse origin/main)
-          if [ "$RELEASE_SHA" != "$current_main" ]; then
-            echo "::error::main advanced to $current_main during this job; $RELEASE_SHA will not be released"
+          python scripts/check_version_metadata.py \
+            --version-file VERSION \
+            --changelog-file CHANGELOG.md \
+            --readme-file README.md
+          actual_version=$(tr -d '[:space:]' < VERSION)
+          actual_tag="v$actual_version"
+          if [ "$actual_tag" != "$EXPECTED_TAG" ]; then
+            echo "::error::validated tag $EXPECTED_TAG changed to $actual_tag"
             exit 1
           fi
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+            echo "::error::checkout does not match validated SHA $EXPECTED_SHA"
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$actual_tag"; then
+            echo "::error::tag $actual_tag already exists; releases are immutable"
+            exit 1
+          fi
+          release_headers="$RUNNER_TEMP/release-probe.headers"
+          release_error="$RUNNER_TEMP/release-probe.error"
+          probe_exit=0
+          gh api \
+            --include \
+            --silent \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$actual_tag" \
+            > "$release_headers" 2> "$release_error" || probe_exit=$?
+          release_status=$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/ { status = $2 } END { print status }' "$release_headers")
+          case "$release_status" in
+            200)
+              echo "::error::GitHub Release $actual_tag already exists"
+              exit 1
+              ;;
+            404)
+              ;;
+            *)
+              echo "::error::could not verify absence of GitHub Release $actual_tag (HTTP ${release_status:-unavailable}, gh exit $probe_exit)"
+              if [ -s "$release_error" ]; then
+                cat "$release_error" >&2
+              fi
+              exit 1
+              ;;
+          esac
+
+      - name: Mint repository-scoped release token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Create immutable tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
           prerelease_arg=()
           if [[ "$TAG" == *-* ]]; then
             prerelease_arg=(--prerelease)
+          fi
+          git fetch --no-tags origin main
+          current_main=$(git rev-parse origin/main)
+          if [ "$RELEASE_SHA" != "$current_main" ]; then
+            echo "::error::main advanced to $current_main during approval; $RELEASE_SHA will not be released"
+            exit 1
           fi
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
