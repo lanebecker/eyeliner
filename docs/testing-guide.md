@@ -229,9 +229,13 @@ ordinary workflow token remains read-only.
 5. If the release API fails or times out, inspect both tag and GitHub Release
    state before rerunning. Never retry an ambiguous creation blindly.
 
-Do not dispatch a real release until post-merge verification is green and the
-`Protect release tags` ruleset has been activated and read back with App ID
-`4684884` as its sole bypass actor.
+Active ruleset `Protect release tags` (ID `21211977`) has been read back with App
+ID `4684884` as its sole bypass actor. A real release still requires a green
+exact-`main` matrix, successful read-only validation, and Lane's environment
+approval; never bypass that sequence or retry an ambiguous creation blindly.
+No controlled App-backed tag or GitHub Release has been published yet; #416
+remains open until the first controlled publication is Latest and its VERSION,
+newest tag, and tested SHA agree.
 
 ---
 

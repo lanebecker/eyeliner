@@ -58,7 +58,7 @@ Workspace safety is part of the contract: every handoff command block begins by 
 - Protected `main` must require the three matrix checks; direct automation writes need no broad bypass.
 - Release publication uses the private, repository-scoped GitHub App `vinyl-now-playing-release-lbecker` (App ID `4684884`, Client ID `Iv23lio63JQpLQKjuPyS`). It is installed only on `lanebecker/vinyl-now-playing`; its only explicit permission is repository Contents read/write, plus GitHub-mandatory Metadata read access. It has no webhook or subscribed events.
 - The app private key exists only as the `RELEASE_APP_PRIVATE_KEY` secret in the protected `release` environment; the Client ID is the `RELEASE_APP_CLIENT_ID` environment variable. That environment accepts only `main` and requires Lane's approval after read-only validation succeeds.
-- The approved `Protect release tags` ruleset will restrict creation, deletion, and non-fast-forward updates of `v*` tags, with `vinyl-now-playing-release-lbecker` as its sole bypass actor. The built-in GitHub Actions integration is not an eligible bypass actor for this personal repository. This ruleset is intentionally not active until the app-authenticated workflow merges and its checks pass.
+- Active ruleset `Protect release tags` (ID `21211977`) restricts creation, deletion, and non-fast-forward updates of `refs/tags/v*`, with `vinyl-now-playing-release-lbecker` (App ID `4684884`) as its sole bypass actor, mode `always`. Humans, administrators, ordinary `GITHUB_TOKEN`, and other apps have no bypass. It was activated only after PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc` and that exact SHA passed metadata, tests, and dependency audits on Python 3.11/3.12/3.13.
 - Third-party Actions remain pinned to full commit SHAs and job permissions remain least-privilege.
 - Workflow edits require GitHub Actions-aware validation; successful generic YAML parsing is insufficient because it does not reject schema-invalid workflow keys.
 
@@ -100,14 +100,9 @@ Workspace safety is part of the contract: every handoff command block begins by 
 - **#416 / R10-07:** the controlled workflow creates the GitHub Release together with the tag; the next public release, rather than rewritten historical tags, restores the Latest Release surface.
 - **#417 / R10-08:** ship the full MIT grant as `LICENSE`, copyright 2026 Lane Becker, and link the README claim to it.
 
-**Operational checkpoint (2026-08-22):** `Protect main` is active with no bypass and the exact Python 3.11/3.12/3.13 checks required. GitHub immutable releases and MIT license detection are enabled. The repository-scoped release app and protected `release` environment have been created and read back with the identities and restrictions above. The app-authenticated workflow bundle is implemented locally and independently break-reviewed, but release-tag protection is not yet active. Wave 0 is not operationally complete until the remaining ordered gates succeed:
+**Verified operational checkpoint (2026-08-22):** PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc`, and that exact SHA passed version metadata, tests, and dependency audits on Python 3.11/3.12/3.13. `Protect main` (ruleset ID `21204190`) is active with no bypass and requires the exact three Python checks. `Protect release tags` (ruleset ID `21211977`) is active for `refs/tags/v*` with App ID `4684884` as its sole `always` bypass. The repository-scoped App, protected `release` environment, immutable releases, and MIT detection have all been read back. Issues #402 and #415 are closed.
 
-1. Merge the bundle through a `codex/` branch and pull request; do not stage ignored audit artifacts, issue scripts/maps, release-note snapshots, or `config.yaml`.
-2. Observe the tests, version-metadata, and Python 3.11–3.13 dependency-audit workflows on GitHub. Address failures before proceeding.
-3. After the merge SHA is green, activate `Protect release tags` for `refs/tags/v*` with App ID `4684884` as the sole bypass actor; read the ruleset back before the first controlled release dispatch.
-4. Keep #416 open until a controlled release is Latest and its version, newest tag, and linked tested SHA agree.
-
-The pending release-tag ruleset is an intentional sequencing gate, not approval for a manual tag or an early release dispatch.
+No controlled App-backed tag or GitHub Release has been published yet. Issue #416 remains open until the first controlled publication becomes Latest and VERSION, newest tag, and linked tested SHA agree. Manual tag creation remains prohibited.
 
 ### Later waves
 
