@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.35] — 2026-08-22
+
 ### Security and release trust
 
 - **Controlled releases now authenticate the exact tested workflow run (#402 / R10-01).** A release may target only the current `main` SHA and must find one successful `push` run of `.github/workflows/tests.yml` for that SHA, with successful Python 3.11/3.12/3.13 jobs linked to that run. Missing, pending, failed, wrong-SHA, wrong-workflow, wrong-run, or mixed-suite checks fail closed. The workflow rechecks `main` immediately before creating the tag and GitHub Release together. GitHub immutable releases is enabled so published tags and assets cannot later be changed or deleted.
