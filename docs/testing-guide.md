@@ -41,15 +41,26 @@ is active.
 ### Discogs credentials (only for `scripts/discogs_live_check.py`)
 
 ```bash
-cd /home/pi/vinyl-now-playing
 cp config.example.yaml config.yaml
-chmod 600 config.yaml
-stat -c '%a %n' config.yaml
 # Edit config.yaml — fill in discogs.user_token and discogs.username
 ```
 
-The mode readback must say `600 config.yaml` before entering credentials. It
-prints no secret content; `load_config` rejects a group/other-readable file.
+On **POSIX** (macOS/Linux, including Raspberry Pi OS), restrict the file before
+entering credentials. The commands below print only mode/path, not its contents:
+
+```bash
+chmod 600 config.yaml
+# Linux / Raspberry Pi OS:
+stat -c '%a %n' config.yaml
+# macOS:
+stat -f '%Lp %N' config.yaml
+```
+
+The readback must report mode `600`. `load_config` rejects a POSIX file with any
+group/other permission bit. On Windows or another platform without POSIX mode
+semantics, startup emits its explicit warning and continues; use that platform's
+ACL controls to restrict the credential file, because `chmod`/POSIX `stat` are
+not a portable proof there.
 
 **Getting your token:** Discogs → Settings → [Developers](https://www.discogs.com/settings/developers)
 → Generate new token.
@@ -745,7 +756,6 @@ reversible record that is actually filed in a non-default Discogs folder. First,
 run the explicit read-only lookup for that **same** record:
 
 ```bash
-cd /home/pi/vinyl-now-playing
 python scripts/discogs_live_check.py \
   --artist "Artist" --album "Album"
 ```
@@ -757,7 +767,6 @@ identity or the current field value for you. Only then run exactly one confirmed
 write against the same artist/album:
 
 ```bash
-cd /home/pi/vinyl-now-playing
 python scripts/discogs_live_check.py \
   --artist "Artist" --album "Album" --test-write
 ```

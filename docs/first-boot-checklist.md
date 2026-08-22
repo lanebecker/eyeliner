@@ -60,7 +60,7 @@ contents into this checklist.
 | Gate | Command / observation | Non-secret evidence to record | Good result |
 |---|---|---|---|
 | Private config (#418) | `stat -c '%a %n' /home/pi/vinyl-now-playing/config.yaml` | Path and mode | `600`; any other mode is repaired with `chmod 600`, then the app is restarted. |
-| Real audio package and UCA222 (#156) | Follow the live InputStream/hot-plug procedure below after the package smoke | Package/API smoke result; selected UCA222 name/index/input channels; stream-open/audio evidence; loss/recovery journal lines; MainPID before/after; whether restart was needed | The app receives audio before and after one unplug/replug with the same MainPID. |
+| Real audio package and UCA222 (#156) | Follow the live InputStream/hot-plug procedure below after the package smoke | Package/API smoke result; selected UCA222 name/index/input channels; stream-open/audio evidence; loss/recovery journal lines; MainPID before/after; whether restart was needed; any Discogs/Last.fm side effect | The app receives audio before and after one unplug/replug with the same MainPID. |
 | Display/session choice (#419) | In the logged-in graphical terminal: `printf 'DISPLAY=%s\nXAUTHORITY=%s\n' "$DISPLAY" "${XAUTHORITY:-<unset>}"`; if unset, use the read-only Xwayland `-auth` discovery in `pi-setup-guide.md` §12 | Chosen `DISPLAY`, absolute Xauthority/session-auth path, service-user readability, whether Xwayland was used, cold-boot path stability | The selected values are rendered into the system service, readable by its user, and work again after cold boot. |
 | Cold boot, clock, and shutdown (#83/#201/#419) | Reboot once; inspect `timedatectl`, `systemctl status vinyl-now-playing`, and the journal; use the timed SIGTERM procedure below | Cold-boot result; `System clock synchronized` value; service status; timed SIGTERM outcome; post-stop restart/status | Clock is synchronized before startup, the service survives the graphical-session race, and SIGTERM stops cleanly within `TimeoutStopSec=30`. |
 | Custom-folder Discogs probe (#366) | Follow the same-target read-only and one confirmed-write commands in `docs/testing-guide.md` | Artist/album, release ID, instance ID, custom-folder name/ID, field name, before/after values, HTTP/outcome; no token | Success disproves the hypothesis. A 404 or ambiguity is preserved as evidence with no blind retry. |
@@ -71,10 +71,18 @@ it cannot close any of these hardware or external-state gates.
 ### Real InputStream and hot-plug proof (#156)
 
 Run this only after the service is rendered and started. It does not change
-configuration or write to Discogs. Keep a journal window visible, then play a
-record long enough to produce a `Play session started.` event: that proves the
-application's real `sd.InputStream` is delivering callbacks, not merely that the
-device table can be queried.
+configuration, but it runs the fully configured production app: recognizable
+audio can trigger its normal Discogs and Last.fm behavior, including a credit on
+failure/shutdown paths. Before restarting, the owner must authorize the probe and
+confirm the current app state is idle and unarmed (no current tracked record or
+pending completion). Start with non-recognizable audio where practical; obtain
+fresh owner authorization before using recognizable music. Record any external
+side effect—or the absence of one—alongside the hardware evidence.
+
+Keep a journal window visible, then play a record long enough to produce a
+`Play session started.` event: that proves the application's real
+`sd.InputStream` is delivering callbacks, not merely that the device table can
+be queried.
 
 ```bash
 cd /home/pi/vinyl-now-playing
