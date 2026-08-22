@@ -43,7 +43,7 @@
 - Modify: `src/config.py`
 - Modify: `tests/test_config.py`
 
-- [ ] **Step 1: Write focused RED tests**
+- [x] **Step 1: Write focused RED tests**
 
 Add a helper that writes valid YAML and explicitly chmods it `0600`. Add tests proving:
 
@@ -61,7 +61,7 @@ cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)
 
 Expected RED: only the new permission-contract tests fail because no open-file mode check exists.
 
-- [ ] **Step 2: Implement the minimum open-file guard**
+- [x] **Step 2: Implement the minimum open-file guard**
 
 Inside the existing `with open(...) as f`, call a small private helper with
 `os.fstat(f.fileno())` before reading. On POSIX, evaluate `stat.S_IMODE` and
@@ -69,7 +69,7 @@ raise `ConfigError` when `mode & 0o077`. When mode semantics are unavailable,
 log one warning and continue. Preserve all existing `ConfigError` normalization;
 do not chmod or inspect ownership in this change.
 
-- [ ] **Step 3: Verify GREEN and regression scope**
+- [x] **Step 3: Verify GREEN and regression scope**
 
 Run the focused command above, then:
 
@@ -77,7 +77,7 @@ Run the focused command above, then:
 cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_config.py tests/test_ops_polish_r9.py && git diff --check
 ```
 
-- [ ] **Step 4: Independent spec and quality review**
+- [x] **Step 4: Independent spec and quality review**
 
 Reviewer must attempt secret-bearing `0644`, parse-before-check, directory,
 missing-file, and unsupported-platform mutations. Resolve every confirmed
@@ -334,4 +334,3 @@ retry.
 Update the audit, guardrail, SDD record, issue comments, and milestone with
 exact merge SHA, run IDs, Pi image/Python, service evidence, config mode, and
 Discogs outcome. Close milestone #52 only when every exit gate is observed.
-
