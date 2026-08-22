@@ -11,16 +11,11 @@ interpreter, so each matrix leg can genuinely FAIL on an import breakage —
 on 3.13 that exercises the audioop-lts backport path specifically (3.11/3.12
 have stdlib audioop and exercise the plain import).
 
-R8-22/#363: R7-22 asked for a single-sourced release-version regex; v1.5.25
-shipped two byte-identical copies with "keep in sync" comments — the exact
-drift mechanism the finding described, one edit from recurring. Per the issue's
-accept-with-a-stronger-tripwire option: this test extracts both patterns and
-diffs them, going RED the moment they drift.
+R8-22/#363's duplicated release-version regexes were retired by R10-02/#415.
+All three workflows now execute ``scripts/check_version_metadata.py``; its
+supported and rejected release forms are behavior-tested in
+``test_version_metadata_r10.py`` instead of source-text-diffed here.
 """
-import re
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parent.parent
 
 
 def test_shazamio_imports_on_this_interpreter():
@@ -42,38 +37,3 @@ def test_recognition_probe_passes_with_the_real_importer():
 
     cfg = AppConfig.from_dict(_valid_raw())
     verify_recognition_backend_importable(cfg)   # must not raise
-
-
-def _version_regexes() -> dict:
-    """Extract the release-semver grep pattern from each workflow that carries
-    one.  Anchored single-quoted grep -Eq patterns starting ^[0-9]."""
-    out = {}
-    for wf in ("release-consistency.yml", "sync-version-badge.yml"):
-        text = (REPO / ".github" / "workflows" / wf).read_text()
-        found = re.findall(r"grep -Eq '(\^\[0-9\][^']*)'", text)
-        assert found, f"{wf}: expected a version regex (did it move?)"
-        out[wf] = set(found)
-    return out
-
-
-def test_r8_22_version_regexes_have_not_drifted():
-    """R8-22 (#363): the two workflows carry deliberately-duplicated version
-    regexes ("keep in sync" comments) — this tripwire fails the suite the
-    moment one is edited without the other."""
-    regexes = _version_regexes()
-    all_patterns = set().union(*regexes.values())
-    assert len(all_patterns) == 1, (
-        f"the release-version regexes have DRIFTED between workflows "
-        f"(R7-22/R8-22): {regexes}"
-    )
-
-
-def test_r8_22_the_shared_regex_still_accepts_release_and_prerelease():
-    """Control: the shared pattern accepts what the release flow produces —
-    plain semver and the pre-release form — and rejects the known evils."""
-    (pattern,) = set().union(*_version_regexes().values())
-    rx = re.compile(pattern)
-    for good in ("1.5.29", "10.0.1", "1.6.0-rc.1", "2.0.0-beta2"):
-        assert rx.search(good), f"{pattern!r} must accept {good!r}"
-    for bad in ("1x5x29", "v1.5.29", "1.5", "1.5.29 ", ""):
-        assert not rx.search(bad), f"{pattern!r} must reject {bad!r}"

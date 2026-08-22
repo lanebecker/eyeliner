@@ -56,6 +56,16 @@
 
 Design prototype and production renderer for a vinyl now-playing display (1024×600 Waveshare, Raspberry Pi).
 
+## Repository-specific GitHub workflow
+
+This repository's protected-main and controlled-release rules supersede the generic shared GitHub handoff notes above. Every handoff command block must begin with `cd '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing'` so no git or project command can run from the wrong directory. Put changes on a `codex/` branch and merge them through a pull request after the required checks pass. Stage explicit paths—never `git add -A`, because this project keeps local audit and handoff artifacts beside the clone. Do not create or push release tags from a handoff command: after the release commit is merged and its Python 3.11/3.12/3.13 checks are green, dispatch `.github/workflows/release.yml`; it creates the immutable tag and GitHub Release together from the tested current `main` SHA.
+
+## Remediation regression contract
+
+Before changing code, workflows, configuration, or behavior for an audit issue, read and apply [`docs/decisions/remediation-guardrails.md`](docs/decisions/remediation-guardrails.md). Record the issue-specific intended change, preserved invariants, prohibited regressions, and verification commands before implementation. Search linked/closed issues, `CHANGELOG.md`, local audit reports, `log.md`, relevant tests/comments, and product/architecture/operations docs rather than trusting the current issue in isolation.
+
+Keep the ledger current whenever Lane changes a listed decision or remediation establishes a new cross-cutting invariant. Preserve user-owned ignored/untracked files, never stage `config.yaml`, and stage explicit paths rather than `git add -A`.
+
 ## Repository Structure
 
 | Path | Purpose |
@@ -64,7 +74,8 @@ Design prototype and production renderer for a vinyl now-playing display (1024×
 | `src/` | Production Python/Pillow/pygame renderer |
 | `src/display/assets/fonts/` | Bundled OFL fonts (Inter Tight, Newsreader, JetBrains Mono) used by the production renderer |
 | `PRODUCT.md` | Product spec |
-| `DESIGN.md` | Design system and production handoff spec |
+| `DESIGN.md` | Maintained design-intent reference; tested production wins where unreconciled |
+| `docs/decisions/remediation-guardrails.md` | Tracked decisions and required regression contract for remediation |
 | `design/.impeccable/design.json` | Design system tokens for impeccable tooling |
 
 ## Prototype vs. Production

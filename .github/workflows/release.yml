@@ -1,0 +1,123 @@
+name: controlled release
+
+# R10-01 / reopened #402: a release is created only from the current main SHA
+# after all three supported-Python checks have completed successfully for that
+# exact SHA. The workflow creates the tag and GitHub Release together; operators
+# no longer push a tag while CI is still running.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  checks: read
+
+concurrency:
+  group: controlled-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify selected SHA is current main
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          current_main=$(git rev-parse origin/main)
+          if [ "$RELEASE_SHA" != "$current_main" ]; then
+            echo "::error::selected SHA $RELEASE_SHA is not current main $current_main"
+            exit 1
+          fi
+
+      - name: Read and validate release version
+        id: version
+        run: |
+          set -euo pipefail
+          python scripts/check_version_metadata.py \
+            --version-file VERSION \
+            --changelog-file CHANGELOG.md \
+            --readme-file README.md
+          version=$(tr -d '[:space:]' < VERSION)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse an existing tag or GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify --quiet "refs/tags/$TAG"; then
+            echo "::error::tag $TAG already exists; releases are immutable"
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::GitHub Release $TAG already exists"
+            exit 1
+          fi
+
+      - name: Fetch tests workflow and check runs for the exact SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/tests.yml/runs?head_sha=$RELEASE_SHA&event=push&per_page=100" \
+            > "$RUNNER_TEMP/test-workflow-runs.json"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/commits/$RELEASE_SHA/check-runs?filter=latest&per_page=100" \
+            > "$RUNNER_TEMP/release-checks.json"
+
+      - name: Require the complete supported-Python matrix
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          python scripts/release_gate.py \
+            --sha "$RELEASE_SHA" \
+            --runs-file "$RUNNER_TEMP/test-workflow-runs.json" \
+            --checks-file "$RUNNER_TEMP/release-checks.json" \
+            --require 'test (3.11)' \
+            --require 'test (3.12)' \
+            --require 'test (3.13)'
+
+      - name: Create immutable tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Close the dispatch-to-publication race: main may have advanced while
+          # this job was waiting for the API or another release invocation.
+          git fetch --no-tags origin main
+          current_main=$(git rev-parse origin/main)
+          if [ "$RELEASE_SHA" != "$current_main" ]; then
+            echo "::error::main advanced to $current_main during this job; $RELEASE_SHA will not be released"
+            exit 1
+          fi
+          prerelease_arg=()
+          if [[ "$TAG" == *-* ]]; then
+            prerelease_arg=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$RELEASE_SHA" \
+            --title "$TAG" \
+            --generate-notes \
+            "${prerelease_arg[@]}" \
+            --notes "Tested SHA: [$RELEASE_SHA](https://github.com/$GITHUB_REPOSITORY/commit/$RELEASE_SHA)
+
+Supported Python: 3.11, 3.12, 3.13.
+
+Supported Raspberry Pi OS: Bookworm/Legacy (Python 3.11) and Trixie (Python 3.13). See docs/pi-setup-guide.md."
