@@ -323,6 +323,18 @@ def test_load_config_unsupported_permission_check_warns_and_continues(
     assert str(p) in warnings[0].message
 
 
+def test_load_config_non_posix_warns_and_continues(tmp_path, monkeypatch, caplog):
+    p = _write_valid_config(tmp_path / "config.yaml", mode=0o644)
+    fake_os = type("FakeOS", (), {"name": "nt", "fstat": staticmethod(os.fstat)})
+    monkeypatch.setattr("src.config.os", fake_os)
+    with caplog.at_level("WARNING", logger="src.config"):
+        cfg = load_config(str(p))
+    assert cfg.discogs.username == "me"
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert str(p) in warnings[0].message
+
+
 def test_load_config_empty_file_raises_config_error(tmp_path):
     p = tmp_path / "empty.yaml"
     p.write_text("")
