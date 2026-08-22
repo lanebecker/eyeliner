@@ -230,12 +230,14 @@ ordinary workflow token remains read-only.
    state before rerunning. Never retry an ambiguous creation blindly.
 
 Active ruleset `Protect release tags` (ID `21211977`) has been read back with App
-ID `4684884` as its sole bypass actor. A real release still requires a green
+ID `4684884` as its sole bypass actor. Every release still requires a green
 exact-`main` matrix, successful read-only validation, and Lane's environment
 approval; never bypass that sequence or retry an ambiguous creation blindly.
-No controlled App-backed tag or GitHub Release has been published yet; #416
-remains open until the first controlled publication is Latest and its VERSION,
-newest tag, and tested SHA agree.
+The first controlled publication, immutable Latest Release `v1.5.35`, was
+created by run `32600568406` from exact tested SHA
+`4b79513b6811c1884be42dadbb1d45f2354d70a6`. Its tag and Release targets agree,
+its notes link that SHA and record supported Python/Pi OS versions, and post-tag
+consistency run `32600637687` passed. Issue #416 is closed.
 
 ---
 
