@@ -92,7 +92,7 @@ finding and rerun the focused suite before explicit-path staging.
 - Create: `tests/test_audio_backend_smoke.py`
 - Modify: `conftest.py`
 - Modify: `.github/workflows/tests.yml`
-- Modify: a focused workflow-integrity test file selected after inspecting current ownership
+- Modify: `tests/test_deployment_integrity_r10.py`
 
 - [x] **Step 1: Write RED behavior and workflow tests**
 
@@ -106,7 +106,7 @@ import is retained while import failure receives a centrally-owned stub.
 Run:
 
 ```bash
-cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_audio_backend_smoke.py tests/test_workflow_integrity_r10.py
+cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_audio_backend_smoke.py tests/test_deployment_integrity_r10.py
 ```
 
 Expected RED: new script/API and workflow steps do not exist and conftest still
@@ -142,7 +142,7 @@ ownership. Resolve confirmed findings before explicit-path staging.
 - Create: `scripts/render_system_service.py`
 - Create: `tests/test_system_service.py`
 - Modify: `.github/workflows/tests.yml`
-- Modify: the same focused workflow-integrity test file selected in Task 2
+- Modify: `tests/test_deployment_integrity_r10.py`
 
 - [x] **Step 1: Write RED renderer and invariant tests**
 
@@ -157,7 +157,7 @@ Ubuntu.
 Run:
 
 ```bash
-cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_system_service.py tests/test_workflow_integrity_r10.py
+cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_system_service.py tests/test_deployment_integrity_r10.py
 ```
 
 Expected RED: template, renderer, and CI verification do not exist.
@@ -270,7 +270,7 @@ hardware-success claims, unsafe write instructions, and stale file paths.
 - [ ] **Step 1: Run focused local verification**
 
 ```bash
-cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m py_compile src/config.py scripts/check_audio_backend.py scripts/render_system_service.py scripts/discogs_live_check.py && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_config.py tests/test_audio_backend_smoke.py tests/test_capture.py tests/test_main_wiring.py tests/test_ops_polish_r9.py tests/test_system_service.py tests/test_discogs_live_check.py tests/test_workflow_integrity_r10.py && git diff --check
+cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m py_compile src/config.py scripts/check_audio_backend.py scripts/render_system_service.py scripts/discogs_live_check.py && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_config.py tests/test_audio_backend_smoke.py tests/test_capture.py tests/test_main_wiring.py tests/test_ops_polish_r9.py tests/test_system_service.py tests/test_discogs_live_check.py tests/test_deployment_integrity_r10.py tests/test_workflow_integrity_r10.py && git diff --check
 ```
 
 - [ ] **Step 2: Run repository security/scope checks**

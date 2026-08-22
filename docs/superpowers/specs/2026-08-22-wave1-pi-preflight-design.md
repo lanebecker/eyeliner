@@ -126,4 +126,3 @@ diff/security scans. Hardware acceptance requires the real Pi checklist and
 non-secret evidence. The local macOS Python 3.9/sandbox suite is a recorded
 unsupported baseline (16 known failures); it cannot replace the supported CI
 matrix and does not block scoped RED/GREEN work.
-
