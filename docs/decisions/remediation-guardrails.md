@@ -4,7 +4,7 @@ This is the tracked ledger of decisions that remediation work must preserve. It 
 
 Update this file whenever the owner changes a listed decision, a remediation establishes a new cross-cutting invariant, or a closed/deferred issue becomes relevant again. Do not duplicate detailed implementation history here; link to its durable source.
 
-**Last reconciled:** 2026-08-22, before Round 10 remediation.
+**Last reconciled:** 2026-08-22, during Round 10 release-trust remediation.
 
 ## Authority and conflict order
 
@@ -31,7 +31,7 @@ Before changing code, configuration, workflows, or behavior:
 6. Use RED-first tests for behavior changes. Run the targeted preserved-behavior tests before and after, then the supported CI matrix.
 7. Update this ledger if the remediation creates or changes a cross-cutting decision.
 
-Workspace safety is part of the contract: every handoff command block begins by changing to `/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing` with an absolute path; preserve user-owned ignored/untracked files, never stage `config.yaml`, and stage explicit paths rather than `git add -A`.
+Workspace safety is part of the contract: every handoff command block begins by changing to the absolute path of the appropriate active checkout or worktree and verifies the expected branch before mutation. The canonical clone `/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing` is only the default when it is the active checkout. Preserve user-owned ignored/untracked files, never stage `config.yaml`, and stage explicit paths rather than `git add -A`.
 
 ## Global invariants
 
@@ -56,6 +56,9 @@ Workspace safety is part of the contract: every handoff command block begins by 
 - GitHub immutable releases remains enabled so a published release's tag and assets cannot be modified or deleted.
 - VERSION, CHANGELOG, README badge, tag, GitHub Release, and tested SHA must agree.
 - Protected `main` must require the three matrix checks; direct automation writes need no broad bypass.
+- Release publication uses the private, repository-scoped GitHub App `vinyl-now-playing-release-lbecker` (App ID `4684884`, Client ID `Iv23lio63JQpLQKjuPyS`). It is installed only on `lanebecker/vinyl-now-playing`; its only explicit permission is repository Contents read/write, plus GitHub-mandatory Metadata read access. It has no webhook or subscribed events.
+- The app private key exists only as the `RELEASE_APP_PRIVATE_KEY` secret in the protected `release` environment; the Client ID is the `RELEASE_APP_CLIENT_ID` environment variable. That environment accepts only `main` and requires Lane's approval after read-only validation succeeds.
+- The approved `Protect release tags` ruleset will restrict creation, deletion, and non-fast-forward updates of `v*` tags, with `vinyl-now-playing-release-lbecker` as its sole bypass actor. The built-in GitHub Actions integration is not an eligible bypass actor for this personal repository. This ruleset is intentionally not active until the app-authenticated workflow merges and its checks pass.
 - Third-party Actions remain pinned to full commit SHAs and job permissions remain least-privilege.
 - Workflow edits require GitHub Actions-aware validation; successful generic YAML parsing is insufficient because it does not reject schema-invalid workflow keys.
 
@@ -97,15 +100,14 @@ Workspace safety is part of the contract: every handoff command block begins by 
 - **#416 / R10-07:** the controlled workflow creates the GitHub Release together with the tag; the next public release, rather than rewritten historical tags, restores the Latest Release surface.
 - **#417 / R10-08:** ship the full MIT grant as `LICENSE`, copyright 2026 Lane Becker, and link the README claim to it.
 
-**Operational checkpoint (2026-08-22):** the first Wave 0 bundle is implemented locally and independently break-reviewed. It is not operationally complete until the following ordered gates succeed:
+**Operational checkpoint (2026-08-22):** `Protect main` is active with no bypass and the exact Python 3.11/3.12/3.13 checks required. GitHub immutable releases and MIT license detection are enabled. The repository-scoped release app and protected `release` environment have been created and read back with the identities and restrictions above. The app-authenticated workflow bundle is implemented locally and independently break-reviewed, but release-tag protection is not yet active. Wave 0 is not operationally complete until the remaining ordered gates succeed:
 
 1. Merge the bundle through a `codex/` branch and pull request; do not stage ignored audit artifacts, issue scripts/maps, release-note snapshots, or `config.yaml`.
-2. Observe the tests, version-metadata, and Python 3.11–3.13 dependency-audit workflows on GitHub. Address failures before making any new check required.
-3. Activate the `main` ruleset only after the read-only metadata workflow is present on `main`: require pull requests and `test (3.11)`, `test (3.12)`, and `test (3.13)`; block force-push and deletion; include administrators and grant no broad bypass.
-4. Activate a `v*` tag-creation ruleset that permits the controlled release workflow while preventing ad-hoc release-tag creation. Do this before the first controlled release dispatch.
-5. Verify GitHub detects `LICENSE` as MIT before closing #417. Keep #416 open until a controlled release is Latest and its version, newest tag, and linked tested SHA agree.
+2. Observe the tests, version-metadata, and Python 3.11–3.13 dependency-audit workflows on GitHub. Address failures before proceeding.
+3. After the merge SHA is green, activate `Protect release tags` for `refs/tags/v*` with App ID `4684884` as the sole bypass actor; read the ruleset back before the first controlled release dispatch.
+4. Keep #416 open until a controlled release is Latest and its version, newest tag, and linked tested SHA agree.
 
-GitHub immutable releases is already enabled. The pre-merge live-state check still reports unprotected `main` and no rulesets; that is an intentional sequencing gate, not approval to dispatch a release.
+The pending release-tag ruleset is an intentional sequencing gate, not approval for a manual tag or an early release dispatch.
 
 ### Later waves
 

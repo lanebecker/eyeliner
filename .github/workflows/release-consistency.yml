@@ -5,11 +5,12 @@ name: Release consistency
 # release metadata can silently drift apart. Read-only.
 #
 # R10-01 / reopened #402: this remains a post-tag defense for out-of-band human
-# or app-created tags. The supported release.yml path performs the same metadata
-# check before publication because GitHub intentionally does not recursively
-# trigger push workflows for tags created with GITHUB_TOKEN. release.yml also
-# authenticates the tests.yml push run for the exact current main SHA before it
-# creates the tag and GitHub Release together.
+# or app-created tags. Ordinary GITHUB_TOKEN tag creation does not recursively
+# trigger push workflows, but the supported App-authenticated release.yml path
+# does trigger this read-only check. release.yml performs the same metadata check
+# before publication because a post-tag workflow cannot prevent an already-created
+# immutable release. It also authenticates the tests.yml push run for the exact
+# current main SHA before it creates the tag and GitHub Release together.
 #
 # Security (TQ-5/R8-22): scripts/check_version_metadata.py is the single source
 # for strict VERSION validation and VERSION/CHANGELOG/README agreement. The tag
