@@ -1,8 +1,8 @@
 # Dedicated Release App Design
 
-**Status:** Implemented and externally verified; first controlled publication remains pending
+**Status:** Implemented and externally verified; first controlled publication succeeded
 **Date:** 2026-08-22
-**Issues:** #402 closed; #415 closed; #416 open pending first controlled Latest Release
+**Issues:** #402 closed; #415 closed; #416 closed after first controlled Latest Release
 **Decision authority:** `docs/decisions/remediation-guardrails.md`
 
 ## Outcome
@@ -11,7 +11,7 @@ Public `v*` tags and GitHub Releases will be created only by a repository-scoped
 
 This closes the gap exposed when GitHub rejected its built-in Actions integration as a tag-ruleset bypass actor for this personal repository. It preserves the existing rule that the tag and GitHub Release are created together by one controlled API call.
 
-This trust boundary is implemented and externally verified. PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc`; `Protect main` (ID `21204190`) and `Protect release tags` (ID `21211977`) are active with their approved no-bypass and sole-App-bypass policies. No controlled App-backed tag or GitHub Release has been published yet.
+This trust boundary is implemented and externally verified. PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc`; `Protect main` (ID `21204190`) and `Protect release tags` (ID `21211977`) are active with their approved no-bypass and sole-App-bypass policies. Controlled run `32600568406` published immutable Latest Release `v1.5.35` from exact tested SHA `4b79513b6811c1884be42dadbb1d45f2354d70a6` after protected-environment approval; post-tag consistency run `32600637687` passed.
 
 ## Security requirements
 
@@ -164,9 +164,11 @@ Verified after Task 7 creation and API readback:
 
 - `Protect release tags` is active with only the release app bypass;
 
-Still pending — after the first controlled publication:
+Verified after the first controlled publication:
 
-- the first controlled publication produces one immutable tag and one GitHub Release for the same tested current-main SHA.
+- `v1.5.35` is one immutable tag and one GitHub Release for the same tested current-main SHA `4b79513b6811c1884be42dadbb1d45f2354d70a6`;
+- the Release is Latest and its notes link the tested SHA and record supported Python/Pi OS versions;
+- post-tag consistency run `32600637687` passed for that SHA.
 
 ## Deliberately rejected alternatives
 

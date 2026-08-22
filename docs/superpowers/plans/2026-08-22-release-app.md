@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-22-release-app-design.md`
 
-**Completion readback (2026-08-22):** PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc`. `Protect main` (ID `21204190`) and `Protect release tags` (ID `21211977`) are active with the verified policies below. Issues #402 and #415 are closed. No controlled App-backed tag or GitHub Release has been published; #416 remains open until the first controlled publication becomes Latest and VERSION, newest tag, and tested SHA agree.
+**Completion readback (2026-08-22):** PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc`. `Protect main` (ID `21204190`) and `Protect release tags` (ID `21211977`) are active with the verified policies below. Controlled run `32600568406` published immutable Latest Release `v1.5.35` from exact tested SHA `4b79513b6811c1884be42dadbb1d45f2354d70a6` after Lane approved the protected environment; post-tag consistency run `32600637687` passed. Issues #402, #415, and #416 are closed.
 
 ## Global Constraints
 
@@ -425,7 +425,7 @@ Under release governance, record:
 - After the bundle merged and its checks passed, Task 7 created active `Protect release tags` ruleset ID `21211977`, permitting only App ID `4684884` to bypass creation, deletion, or non-fast-forward-update restrictions for `v*` tags. The built-in GitHub Actions integration is not an eligible bypass actor for this personal repository.
 ```
 
-The Wave 0 operational checkpoint now records the API-verified live state, exact merge SHA, both ruleset IDs, issue closures, and the still-pending first controlled publication.
+The Wave 0 operational checkpoint now records the API-verified live state, exact merge and release SHAs, both ruleset IDs, issue closures, and the successful first controlled publication.
 
 - [x] **Step 2: Update the testing guide**
 
@@ -633,6 +633,10 @@ release.yml: ordinary token read-only, publish job environment-gated,
 
 Append the verified ruleset/environment/app IDs and post-merge SHA to the ignored audit report and `log.md`. Mark #415 complete only after main and tag protection readbacks both match. Keep #416 open until the first real app-backed release becomes Latest and its VERSION/tag/tested SHA agree.
 
+Result: #416 remained open through validation and protected-environment approval, then closed only after API readback proved immutable Latest Release `v1.5.35`, VERSION, tag target, Release target, and tested SHA `4b79513b6811c1884be42dadbb1d45f2354d70a6` agree and post-tag consistency passed.
+
 - [x] **Step 5: Prepare the first controlled-release checklist**
 
 Before the next version dispatch, confirm the version bump updates VERSION, CHANGELOG, and the rendered README badge in one PR. After the merge SHA's three tests pass, dispatch from `main`, wait for `validate`, approve `release`, observe `publish`, and inspect the resulting immutable Release before any retry or issue closure.
+
+Result: PR #436 updated exactly those three metadata files; exact-SHA tests and dependency audits passed; controlled run `32600568406` paused for and received Lane's approval; publication succeeded without retry; and independent API readback plus post-tag run `32600637687` verified the result before #416 closed.
