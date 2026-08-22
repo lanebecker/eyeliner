@@ -1,8 +1,8 @@
 # Dedicated Release App Design
 
-**Status:** Owner-approved design; implementation in progress; release-tag ruleset pending post-merge Task 7
+**Status:** Implemented and externally verified; first controlled publication remains pending
 **Date:** 2026-08-22
-**Issues:** #402, #415, #416
+**Issues:** #402 closed; #415 closed; #416 open pending first controlled Latest Release
 **Decision authority:** `docs/decisions/remediation-guardrails.md`
 
 ## Outcome
@@ -11,7 +11,7 @@ Public `v*` tags and GitHub Releases will be created only by a repository-scoped
 
 This closes the gap exposed when GitHub rejected its built-in Actions integration as a tag-ruleset bypass actor for this personal repository. It preserves the existing rule that the tag and GitHub Release are created together by one controlled API call.
 
-This document defines the approved target trust boundary. The App and protected environment are live and the workflow implementation is in progress, but no release-tag ruleset is active until Task 7 creates it after merge and verifies it by API readback.
+This trust boundary is implemented and externally verified. PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc`; `Protect main` (ID `21204190`) and `Protect release tags` (ID `21211977`) are active with their approved no-bypass and sole-App-bypass policies. No controlled App-backed tag or GitHub Release has been published yet.
 
 ## Security requirements
 
@@ -23,7 +23,7 @@ This document defines the approved target trust boundary. The App and protected 
 - The environment permits deployments only from `main`, requires Lane Becker (`lanebecker`, user ID `3211673`) as reviewer, and permits self-review so the sole owner can approve a release they dispatched.
 - The workflow's ordinary `GITHUB_TOKEN` has `contents: read`, `actions: read`, and `checks: read`; it cannot publish.
 - The app token explicitly requests only `contents: write`, is scoped to the current repository, is masked, expires within one hour, and is revoked automatically after its job.
-- After Task 7 activation and API readback, the `v*` tag ruleset names the installed release app as its sole bypass actor and restricts creation, deletion, and non-fast-forward updates. Until then this is approved target state, not a live control.
+- The API-verified `Protect release tags` ruleset targets `refs/tags/v*`, names the installed release app as its sole bypass actor in `always` mode, and restricts creation, deletion, and non-fast-forward updates. Humans, administrators, ordinary `GITHUB_TOKEN`, and other apps have no bypass.
 - GitHub immutable releases remains enabled.
 
 ## External objects
@@ -54,20 +54,20 @@ The app is not public and is not installed on any other repository.
 
 GitHub must withhold the environment secret until the required reviewer approves the job.
 
-### Release-tag ruleset (approved target; pending Task 7)
+### Release-tag ruleset (active and API-verified)
 
 - **Name:** `Protect release tags`
 - **Target:** tags matching `refs/tags/v*`
-- **Current state:** not active; creation is intentionally deferred until the merged workflow and post-merge checks are green
-- **Target enforcement after Task 7 API readback:** active
+- **Ruleset ID:** `21211977`
+- **Current enforcement:** active; created only after PR #433 merged and exact-SHA post-merge checks passed
 - **Bypass actors:** the installed `vinyl-now-playing-release-lbecker` app only, mode `always`
 - **Rules:** restrict creation, restrict deletion, block non-fast-forward updates
 
-The existing `Protect main` ruleset remains separate and retains no bypass actors.
+`Protect main` (ruleset ID `21204190`) remains separate and retains no bypass actors.
 
 ## Workflow architecture
 
-`.github/workflows/release.yml` becomes a two-job workflow.
+`.github/workflows/release.yml` is a two-job workflow.
 
 ```mermaid
 flowchart LR
@@ -153,18 +153,18 @@ Before merge:
 - `git diff --check` passes;
 - the PR's Python 3.11/3.12/3.13 tests and dependency audits pass.
 
-After merge and post-merge checks:
+Verified after merge and post-merge checks:
 
 - the app installation lists only `vinyl-now-playing`;
 - the environment lists only `main`, Lane as reviewer, the Client ID variable, and the private-key secret;
 - `Protect main` remains active with no bypass;
 - the built-in `GITHUB_TOKEN` no longer has write permission in `release.yml`;
 
-After Task 7 creates the ruleset and API readback verifies it:
+Verified after Task 7 creation and API readback:
 
 - `Protect release tags` is active with only the release app bypass;
 
-After the first controlled publication:
+Still pending — after the first controlled publication:
 
 - the first controlled publication produces one immutable tag and one GitHub Release for the same tested current-main SHA.
 
