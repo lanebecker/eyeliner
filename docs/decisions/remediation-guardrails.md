@@ -127,7 +127,9 @@ The first controlled App-backed publication is immutable Latest Release `v1.5.35
   proves the installed `sounddevice` distribution exposes `query_devices`,
   `InputStream`, `_terminate`, and `_initialize` before pytest. Root
   `conftest.py` owns a fallback stub only when real import fails. CI is not USB
-  or stream-operation proof.
+  or stream-operation proof; Pi acceptance still requires the app-level real
+  `InputStream`/unplug/replug procedure, capture recovery, and an unchanged
+  system-service MainPID.
 - **#419 / R10-15:** `deploy/vinyl-now-playing.service.in` plus
   `scripts/render_system_service.py` are the only supported service source and
   renderer. Rendering validates literal-safe values, a `0600` config, and
@@ -140,9 +142,9 @@ The first controlled App-backed publication is immutable Latest Release `v1.5.35
 
 ### Later waves
 
-- Wave 1 software controls are implemented; #418/#419 Pi evidence and #366's
-  real custom-folder result remain pending. The system-service decision is
-  preserved throughout.
+- Wave 1 software controls are implemented; #418/#419 Pi evidence, #156's real
+  InputStream/hot-plug recovery, and #366's real custom-folder result remain
+  pending. The system-service decision is preserved throughout.
 - Wave 2 preserves immortal positive collection reads during normal operation; only a definitive missing-instance write may invalidate, refresh, and permit one identity-safe retry.
 - Wave 3 preserves recognition freshness, confirmation timestamps, epoch gates, and spin deduplication while isolating Last.fm latency.
 - Wave 4 keeps floor-based dependency manifests and Python 3.11 compatibility; it does not introduce a platform-specific lockfile implicitly.

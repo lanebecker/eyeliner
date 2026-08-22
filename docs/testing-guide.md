@@ -41,9 +41,15 @@ is active.
 ### Discogs credentials (only for `scripts/discogs_live_check.py`)
 
 ```bash
+cd /home/pi/vinyl-now-playing
 cp config.example.yaml config.yaml
+chmod 600 config.yaml
+stat -c '%a %n' config.yaml
 # Edit config.yaml — fill in discogs.user_token and discogs.username
 ```
+
+The mode readback must say `600 config.yaml` before entering credentials. It
+prints no secret content; `load_config` rejects a group/other-readable file.
 
 **Getting your token:** Discogs → Settings → [Developers](https://www.discogs.com/settings/developers)
 → Generate new token.
@@ -632,7 +638,7 @@ Key cases:
   block clear of the bottom meta/prev-next, and font floors + hierarchy at every
   size. (Backs CLAUDE.md's "resolution-independent" claim for the static layout;
   the renderer's runtime title push-down is content-dependent and remains a
-  hardware/visual check — see `docs/first-boot-checklist.md` §5.)
+  hardware/visual check — see `docs/first-boot-checklist.md` §6.)
 
 ### `test_cover_cache.py` — Cover fetch + disk cache (new in v1.5.1)
 
@@ -727,18 +733,31 @@ TEST 4: Collection custom fields
 | `✗` | Failed — API error or unexpected response |
 | `·` | Skipped — e.g. *Sister* not in your collection; collection-specific tests N/A |
 
-If *Sister* isn't in your collection, TEST 1 will show `·` and TEST 3 will use the
-release ID from TEST 2 instead. That's fine — the important thing is that your token
-is valid and the `Play Count` field is found.
+If *Sister* isn't in your collection, TEST 1 and TEST 3 are skipped; the script
+does not use the database-search result as a tracklist fallback. That is still a
+useful read-only credential check, but choose a record you own when you need the
+collection/field evidence.
 
 ### With the custom-folder write probe (modifies your Discogs collection)
 
 This is the pending #366 hardware/external-state gate. Select a sacrificial or
 reversible record that is actually filed in a non-default Discogs folder. First,
-run the explicit read-only lookup and record the non-secret release/instance IDs
-and the current Play Count field value. Then run exactly one confirmed write:
+run the explicit read-only lookup for that **same** record:
 
 ```bash
+cd /home/pi/vinyl-now-playing
+python scripts/discogs_live_check.py \
+  --artist "Artist" --album "Album"
+```
+
+In the Discogs collection UI, confirm that the resolved release/instance is the
+designated sacrificial record, and record its non-secret custom-folder **name and
+ID** plus the current Play Count field value. The script does not expose folder
+identity or the current field value for you. Only then run exactly one confirmed
+write against the same artist/album:
+
+```bash
+cd /home/pi/vinyl-now-playing
 python scripts/discogs_live_check.py \
   --artist "Artist" --album "Album" --test-write
 ```
@@ -748,11 +767,11 @@ type the exact lowercase `yes` only after confirming it is the designated record
 For an already-authorized noninteractive run, add `--yes` to that complete
 command—never run a bare `--test-write`.
 
-Record the before value, after value, and HTTP/outcome without tokens. A success
-disproves the folder-identity hypothesis. On a `404`, preserve the evidence and
-open the deferred folder-ID propagation change; do not retry. On a failed or
-ambiguous result, inspect the field state before any rerun because the write may
-already have applied.
+Record the custom-folder name/ID, before value, after value, and HTTP/outcome
+without tokens. A success disproves the folder-identity hypothesis. On a `404`,
+preserve the evidence and open the deferred folder-ID propagation change; do not
+retry. On a failed or ambiguous result, inspect the field state before any rerun
+because the write may already have applied.
 
 ---
 
