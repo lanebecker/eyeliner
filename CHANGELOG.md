@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [Unreleased]
+
+### Security and release trust
+
+- **Controlled releases now authenticate the exact tested workflow run (#402 / R10-01).** A release may target only the current `main` SHA and must find one successful `push` run of `.github/workflows/tests.yml` for that SHA, with successful Python 3.11/3.12/3.13 jobs linked to that run. Missing, pending, failed, wrong-SHA, wrong-workflow, wrong-run, or mixed-suite checks fail closed. The workflow rechecks `main` immediately before creating the tag and GitHub Release together. GitHub immutable releases is enabled so published tags and assets cannot later be changed or deleted.
+- **Version metadata validation moved before merge (#415 / R10-02).** The historical badge workflow is now a read-only pull-request check: VERSION, CHANGELOG, and the README badge must be updated together. It no longer holds `contents: write` or pushes a repair commit directly to `main`. All three release workflows use one behavior-tested metadata checker.
+- **Dependency advisories now fail CI (#295 / R10-03).** Repository vulnerability alerts and automated security updates are enabled, and a SHA-pinned official PyPA action audits the resolved requirements on relevant changes, weekly, and on demand.
+- **Every public version now has a controlled GitHub Release path (#416 / R10-07).** Generated notes link the tested commit and state the supported Python and Raspberry Pi OS versions; prerelease VERSION suffixes create prereleases.
+- **The promised MIT grant now ships with the repository (#417 / R10-08).** `LICENSE` contains the full MIT text for Copyright (c) 2026 Lane Becker, and README links it.
+
+### Process
+
+- Added a tracked remediation decision ledger and mandatory per-issue regression contract at `docs/decisions/remediation-guardrails.md`, including accepted/deferred alternatives that previously lived only in closed issues and gitignored local audit history.
+
 ## [1.5.34] — 2026-08-13
 
 **R9 Wave 3 — ops & polish (milestone `R9 Wave 3 — ops & polish`; #395–#404).**

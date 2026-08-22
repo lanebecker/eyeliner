@@ -66,6 +66,7 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 - [Pi setup guide](docs/pi-setup-guide.md) — hardware bring-up from bare Pi to running app
 - [First-boot checklist](docs/first-boot-checklist.md) — what to verify the first time the appliance runs
 - [Hardware guide](docs/hardware-guide.md) — wiring diagram and parts list
+- [Remediation decision guardrails](docs/decisions/remediation-guardrails.md) — prior decisions and the required regression contract for audit fixes
 
 ## Inspired By
 
@@ -74,4 +75,4 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 
 ## License
 
-MIT
+[MIT](LICENSE) — Copyright (c) 2026 Lane Becker.
