@@ -6,9 +6,9 @@ import argparse
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
-import tempfile
 from typing import Mapping, Sequence
 
 
@@ -115,18 +115,20 @@ def _template_metadata() -> os.stat_result:
 
 def _validate_output(
     output: Path,
+    output_parent_descriptor: int,
     config_path: Path,
     template_path: Path,
     config: os.stat_result,
     template: os.stat_result,
 ) -> os.stat_result | None:
-    _directory(output.parent, "output parent")
     if output == config_path:
         raise RenderError("output must not refer to config.yaml")
     if output == template_path:
         raise RenderError("output must not refer to the unit template")
     try:
-        metadata = os.lstat(output)
+        metadata = os.stat(
+            output.name, dir_fd=output_parent_descriptor, follow_symlinks=False
+        )
     except FileNotFoundError:
         return None
     except OSError as error:
@@ -217,6 +219,7 @@ def _render_template(
 
 def _existing_output_matches(
     output: Path,
+    output_parent_descriptor: int,
     rendered: bytes,
     expected: os.stat_result | None,
     config: os.stat_result,
@@ -226,7 +229,7 @@ def _existing_output_matches(
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(output, flags)
+        descriptor = os.open(output.name, flags, dir_fd=output_parent_descriptor)
     except FileNotFoundError:
         return False
     except OSError as error:
@@ -265,28 +268,77 @@ def _existing_output_matches(
                 raise RenderError(f"cannot safely read output: {output}") from error
 
 
-def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
+def _open_output_parent(output: Path) -> tuple[int, os.stat_result]:
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise RenderError("rendering requires POSIX directory-descriptor support")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    descriptor = os.open(directory, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _atomic_write(output: Path, rendered: bytes) -> None:
     descriptor: int | None = None
-    temporary: Path | None = None
-    write_error: OSError | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+        descriptor = os.open(output.parent, flags)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise RenderError(f"cannot safely open output parent: {output.parent}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise RenderError(f"output parent must be a real directory: {output.parent}")
+    try:
+        path_metadata = os.lstat(output.parent)
+    except OSError as error:
+        os.close(descriptor)
+        raise RenderError(f"cannot inspect output parent: {output.parent}") from error
+    if stat.S_ISLNK(path_metadata.st_mode) or not _same_file(path_metadata, metadata):
+        os.close(descriptor)
+        raise RenderError(f"output parent changed while it was being opened: {output.parent}")
+    return descriptor, metadata
+
+
+def _verify_output_parent(output: Path, expected: os.stat_result) -> None:
+    try:
+        metadata = os.lstat(output.parent)
+    except OSError as error:
+        raise RenderError(f"output parent changed while rendering: {output.parent}") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or not _same_file(metadata, expected)
+    ):
+        raise RenderError(f"output parent changed while rendering: {output.parent}")
+
+
+def _temporary_output_name(output: Path, output_parent_descriptor: int) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    for _attempt in range(128):
+        name = f".{output.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=output_parent_descriptor)
+        except FileExistsError:
+            continue
+        return descriptor, name
+    raise RenderError(f"cannot create unique temporary output: {output}")
+
+
+def _atomic_write(
+    output: Path,
+    rendered: bytes,
+    output_parent_descriptor: int,
+    output_parent: os.stat_result,
+) -> None:
+    descriptor: int | None = None
+    temporary_name: str | None = None
+    write_error: BaseException | None = None
+    try:
+        descriptor, temporary_name = _temporary_output_name(
+            output, output_parent_descriptor
         )
-        temporary = Path(temporary_name)
         os.fchmod(descriptor, 0o644)
         unit_file = os.fdopen(descriptor, "wb")
         descriptor = None
@@ -294,8 +346,18 @@ def _atomic_write(output: Path, rendered: bytes) -> None:
             unit_file.write(rendered)
             unit_file.flush()
             os.fsync(unit_file.fileno())
-        os.replace(temporary, output)
-        _fsync_directory(output.parent)
+        _verify_output_parent(output, output_parent)
+        os.replace(
+            temporary_name,
+            output.name,
+            src_dir_fd=output_parent_descriptor,
+            dst_dir_fd=output_parent_descriptor,
+        )
+        os.fsync(output_parent_descriptor)
+        _verify_output_parent(output, output_parent)
+    except RenderError as error:
+        write_error = error
+        raise
     except OSError as error:
         write_error = error
         raise RenderError(f"cannot atomically write output: {output}") from error
@@ -306,9 +368,9 @@ def _atomic_write(output: Path, rendered: bytes) -> None:
             except OSError as error:
                 if write_error is None:
                     raise RenderError(f"cannot close temporary output: {output}") from error
-        if temporary is not None:
+        if temporary_name is not None:
             try:
-                os.unlink(temporary)
+                os.unlink(temporary_name, dir_fd=output_parent_descriptor)
             except FileNotFoundError:
                 pass
             except OSError as error:
@@ -343,10 +405,17 @@ def render_system_service(
     config = _validate_config(config_path)
     expected_template = _template_metadata()
     template_descriptor, template = _open_template(expected_template, config)
+    output_parent_descriptor: int | None = None
     template_error: BaseException | None = None
     try:
+        output_parent_descriptor, output_parent = _open_output_parent(output)
         existing_output = _validate_output(
-            output, config_path, TEMPLATE, config, template
+            output,
+            output_parent_descriptor,
+            config_path,
+            TEMPLATE,
+            config,
+            template,
         )
         rendered = _render_template(
             template_descriptor,
@@ -358,19 +427,38 @@ def render_system_service(
                 "@XAUTHORITY@": str(xauthority),
             },
         )
+        if _existing_output_matches(
+            output,
+            output_parent_descriptor,
+            rendered,
+            existing_output,
+            config,
+            template,
+        ):
+            _verify_output_parent(output, output_parent)
+            return False
+        _atomic_write(
+            output,
+            rendered,
+            output_parent_descriptor,
+            output_parent,
+        )
+        return True
     except BaseException as error:
         template_error = error
         raise
     finally:
+        if output_parent_descriptor is not None:
+            try:
+                os.close(output_parent_descriptor)
+            except OSError as error:
+                if template_error is None:
+                    raise RenderError(f"cannot close output parent: {output.parent}") from error
         try:
             os.close(template_descriptor)
         except OSError as error:
             if template_error is None:
                 raise RenderError(f"cannot close system-service template: {TEMPLATE}") from error
-    if _existing_output_matches(output, rendered, existing_output, config, template):
-        return False
-    _atomic_write(output, rendered)
-    return True
 
 
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:

@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -455,6 +456,48 @@ def test_renderer_rejects_symlinks_in_existing_path_ancestors(tmp_path, kind):
     assert not output.exists()
 
 
+def test_renderer_detects_output_parent_swap_without_publishing_outside_pinned_directory(
+    tmp_path, monkeypatch
+):
+    """A post-validation parent swap cannot redirect publication onto protected files."""
+    app_dir = _make_app(tmp_path)
+    config = app_dir / "config.yaml"
+    config_before = config.read_bytes()
+    config_mode_before = stat.S_IMODE(config.stat().st_mode)
+    renderer = _load_renderer_module()
+    template = tmp_path / "template.service.in"
+    template.write_bytes(renderer.TEMPLATE.read_bytes())
+    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    template_before = template.read_bytes()
+    output_parent = tmp_path / "output"
+    output_parent.mkdir()
+    pinned_parent = tmp_path / "pinned-output"
+    output = output_parent / "config.yaml"
+    original_matches = renderer._existing_output_matches
+    swapped = False
+
+    def swap_parent_after_validation(*args, **kwargs):
+        nonlocal swapped
+        matches = original_matches(*args, **kwargs)
+        output_parent.rename(pinned_parent)
+        output_parent.symlink_to(app_dir, target_is_directory=True)
+        swapped = True
+        return matches
+
+    monkeypatch.setattr(renderer, "_existing_output_matches", swap_parent_after_validation)
+
+    with pytest.raises(renderer.RenderError, match="output parent changed"):
+        _render_direct(renderer, app_dir, output)
+
+    assert swapped
+    assert output_parent.is_symlink()
+    assert config.read_bytes() == config_before
+    assert stat.S_IMODE(config.stat().st_mode) == config_mode_before == 0o600
+    assert template.read_bytes() == template_before
+    assert not pinned_parent.joinpath(output.name).exists()
+    assert not list(pinned_parent.glob(f".{output.name}.*.tmp"))
+
+
 def test_renderer_rerender_is_byte_and_inode_identical_for_identical_inputs(tmp_path):
     """A no-op re-render avoids unnecessary service-file churn."""
     app_dir = _make_app(tmp_path)
@@ -498,7 +541,7 @@ def test_renderer_leaves_the_previous_complete_output_on_atomic_replace_failure(
     output.write_bytes(previous)
     renderer = _load_renderer_module()
 
-    def fail_replace(source, destination):
+    def fail_replace(source, destination, **_kwargs):
         raise OSError("simulated replace interruption")
 
     monkeypatch.setattr(renderer.os, "replace", fail_replace)
@@ -541,7 +584,9 @@ def test_renderer_cli_normalizes_atomic_write_failures_without_a_traceback(
     monkeypatch.setattr(
         renderer.os,
         "replace",
-        lambda *_args: (_ for _ in ()).throw(PermissionError("simulated denied write")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("simulated denied write")
+        ),
     )
 
     exit_code = renderer.main(_arguments(app_dir, output))
@@ -567,10 +612,10 @@ def test_renderer_cli_normalizes_existing_output_io_failures_without_a_traceback
     original_close = renderer.os.close
     output_descriptor = None
 
-    def remember_output_descriptor(path, flags, mode=0o777):
+    def remember_output_descriptor(path, flags, mode=0o777, **kwargs):
         nonlocal output_descriptor
-        descriptor = original_open(path, flags, mode)
-        if Path(path) == output:
+        descriptor = original_open(path, flags, mode, **kwargs)
+        if path == output.name and kwargs.get("dir_fd") is not None:
             output_descriptor = descriptor
         return descriptor
 
