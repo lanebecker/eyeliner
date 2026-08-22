@@ -4,11 +4,13 @@
 
 **Goal:** Make the protected `release` environment and a repository-scoped GitHub App the only path that can create immutable `v*` tags and GitHub Releases.
 
-**Architecture:** Split the controlled release into a read-only `validate` job and an environment-gated `publish` job. The publish job mints a one-hour, current-repository app token immediately before one `gh release create` call. In the approved target state, the installed app becomes the sole release-tag-ruleset bypass actor only after post-merge Task 7 creates the ruleset and verifies it by API readback; that control is not active yet.
+**Architecture:** Split the controlled release into a read-only `validate` job and an environment-gated `publish` job. The publish job mints a one-hour, current-repository app token immediately before one `gh release create` call. Active ruleset `Protect release tags` (ID `21211977`) makes the installed app the sole release-tag-ruleset bypass actor; it was created only after post-merge Task 7 checks and API readback succeeded.
 
 **Tech Stack:** GitHub Apps, GitHub Actions, repository environments, repository rulesets, `actions/create-github-app-token` v3.2.0, GitHub CLI, Python/pytest, PyYAML, actionlint.
 
 **Spec:** `docs/superpowers/specs/2026-08-22-release-app-design.md`
+
+**Completion readback (2026-08-22):** PR #433 merged at `05a1c7b55cccde92786918ab18ee85a6de2aa5cc`. `Protect main` (ID `21204190`) and `Protect release tags` (ID `21211977`) are active with the verified policies below. Issues #402 and #415 are closed. No controlled App-backed tag or GitHub Release has been published; #416 remains open until the first controlled publication becomes Latest and VERSION, newest tag, and tested SHA agree.
 
 ## Global Constraints
 
@@ -21,7 +23,7 @@
 - The app token requests only `contents: write`, targets only the current repository, and is automatically revoked.
 - The exact token action pin is `actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1` (`v3.2.0`).
 - `Protect main` remains active with no bypass actors and requires `test (3.11)`, `test (3.12)`, and `test (3.13)` from GitHub Actions integration ID `15368`.
-- Approved Task 7 target: `Protect release tags` targets `refs/tags/v*`; its sole bypass actor is the installed release app; it restricts creation and deletion and blocks non-fast-forward updates. It is pending and must not be described as active before Task 7 API readback.
+- Verified Task 7 state: active `Protect release tags` ruleset ID `21211977` targets `refs/tags/v*`; its sole bypass actor is installed release App ID `4684884`; it restricts creation and deletion and blocks non-fast-forward updates.
 - Published releases remain immutable. Never overwrite, delete, move, or blindly retry an ambiguous tag/Release creation.
 - Local git is read-only for Codex. Codex performs every other available operation; the sole unavoidable handoff is explicit-path branch/commit/push.
 - Every unavoidable handoff begins with `cd` to the absolute path of the appropriate active checkout or worktree and verifies its expected branch before mutation. The canonical clone is only the default when it is the active checkout. Handoffs never use `git add -A`.
@@ -420,10 +422,10 @@ Under release governance, record:
 ```markdown
 - Release publication uses the repository-scoped `vinyl-now-playing-release-lbecker` GitHub App. Its only explicit permission is repository Contents read/write, plus GitHub-mandatory Metadata read access; it is installed only on this repository.
 - The app private key exists only as `RELEASE_APP_PRIVATE_KEY` in the protected `release` environment; its Client ID is `RELEASE_APP_CLIENT_ID`. Lane approves the environment after validation succeeds.
-- After the bundle merges and its checks pass, `Protect release tags` will permit only that app to create, delete, or non-fast-forward-update `v*` tags. The built-in GitHub Actions integration is not an eligible bypass actor for this personal repository. Do not record the ruleset as active until Task 7 API readback succeeds.
+- After the bundle merged and its checks passed, Task 7 created active `Protect release tags` ruleset ID `21211977`, permitting only App ID `4684884` to bypass creation, deletion, or non-fast-forward-update restrictions for `v*` tags. The built-in GitHub Actions integration is not an eligible bypass actor for this personal repository.
 ```
 
-Change the Wave 0 operational checkpoint from pending ruleset setup to the actual live state only after API readback succeeds.
+The Wave 0 operational checkpoint now records the API-verified live state, exact merge SHA, both ruleset IDs, issue closures, and the still-pending first controlled publication.
 
 - [x] **Step 2: Update the testing guide**
 
@@ -527,7 +529,7 @@ For each accepted finding: add or strengthen a RED-first test, observe RED, make
 - Consumes: locally verified diff and independent PASS/conditional-PASS verdict.
 - Produces: the already-existing `codex/release-app-identity` branch pushed for a pull request; post-merge current-main SHA with green workflows.
 
-- [ ] **Step 1: Perform the sole unavoidable git handoff**
+- [x] **Step 1: Perform the sole unavoidable git handoff**
 
 The branch already exists and is checked out in the isolated worktree; do not create it again. The handoff must use this one failure-stopping chain, verify the branch before mutation, stage only the named files, run the cached diff check, commit with the issue references, and push:
 
@@ -553,15 +555,15 @@ git push -u origin codex/release-app-identity
 
 It must not stage audit reports, issue scripts/maps, release-note snapshots, `config.yaml`, any private key, or any file not listed above. It must never use `git add -A` or create/push a release tag.
 
-- [ ] **Step 2: Create the PR directly with GitHub CLI**
+- [x] **Step 2: Create the PR directly with GitHub CLI**
 
 Codex creates the PR, listing local verification, external app/environment scope, independent review verdict, and the remaining post-merge tag-ruleset gate.
 
-- [ ] **Step 3: Monitor every PR check**
+- [x] **Step 3: Monitor every PR check**
 
 Require version metadata; dependency audit on 3.11/3.12/3.13; and tests on 3.11/3.12/3.13. Verify the PR file list contains only intended files and GitHub reports `MERGEABLE/CLEAN` before asking Lane to merge.
 
-- [ ] **Step 4: Verify post-merge current main**
+- [x] **Step 4: Verify post-merge current main**
 
 Wait for the merge-SHA metadata, dependency-audit matrix, and test matrix. Do not create tag protection while any post-merge check is pending or failing.
 
@@ -576,7 +578,7 @@ Wait for the merge-SHA metadata, dependency-audit matrix, and test matrix. Do no
 - Consumes: installed release App ID and merged app-authenticated workflow.
 - Produces: only the release app can create/update/delete matching `v*` tags.
 
-- [ ] **Step 1: Create the ruleset payload with the Task 1 App ID**
+- [x] **Step 1: Create the ruleset payload with the Task 1 App ID**
 
 Store the numeric App ID read in Task 1 in the shell variable `release_app_id`, then generate the payload without stringifying the ID:
 
@@ -605,11 +607,11 @@ jq -n --argjson app_id "$release_app_id" '{
 
 Run `jq -e '.bypass_actors[0].actor_id | type == "number"' /tmp/vnp-release-tag-ruleset.json` before POSTing.
 
-- [ ] **Step 2: Create and read back the ruleset**
+- [x] **Step 2: Create and read back the ruleset**
 
 POST the payload to `repos/lanebecker/vinyl-now-playing/rulesets`, capture the returned ID, then GET that exact ID. Expected: active tag target, `refs/tags/v*`, exactly one bypass actor matching the custom app, and exactly the three specified rules.
 
-- [ ] **Step 3: Verify the complete live release trust boundary**
+- [x] **Step 3: Verify the complete live release trust boundary**
 
 Read back:
 
@@ -627,10 +629,10 @@ release.yml: ordinary token read-only, publish job environment-gated,
              final GH_TOKEN comes only from app-token output
 ```
 
-- [ ] **Step 4: Update status records**
+- [x] **Step 4: Update status records**
 
 Append the verified ruleset/environment/app IDs and post-merge SHA to the ignored audit report and `log.md`. Mark #415 complete only after main and tag protection readbacks both match. Keep #416 open until the first real app-backed release becomes Latest and its VERSION/tag/tested SHA agree.
 
-- [ ] **Step 5: Prepare the first controlled-release checklist**
+- [x] **Step 5: Prepare the first controlled-release checklist**
 
 Before the next version dispatch, confirm the version bump updates VERSION, CHANGELOG, and the rendered README badge in one PR. After the merge SHA's three tests pass, dispatch from `main`, wait for `validate`, approve `release`, observe `publish`, and inspect the resulting immutable Release before any retry or issue closure.
