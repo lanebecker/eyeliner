@@ -21,14 +21,15 @@ above the traceback (ARCH-10). Three failure modes:
   could not open a video device. Check, in order: (1) the HDMI cable is seated and
   the panel was powered on **before** the Pi booted (HDMI hot-plug is unreliable on
   the Pi); (2) a desktop / X server is actually running on the target `DISPLAY`
-  (default `:0`) — the systemd unit sets `Environment="DISPLAY=:0"` and
-  `Environment="XAUTHORITY=/home/pi/.Xauthority"`, so those must match your logged-in
-  session; `echo $DISPLAY` in the Pi's desktop terminal confirms the value.
+  (often `:0`) — the rendered systemd unit's `DISPLAY` and `XAUTHORITY` values
+  must match the logged-in session; `echo $DISPLAY` in the Pi's desktop terminal
+  confirms only the display value.
   ⚠️ On current Raspberry Pi OS the default session is **Wayland** (labwc/wayfire):
   `DISPLAY=:0` reaches it via Xwayland, but `/home/pi/.Xauthority` often doesn't
-  exist there, so if the unit can't open the display see the "Wayland note" beside
-  the systemd unit in `pi-setup-guide.md` §12 (point `XAUTHORITY` at the Xwayland
-  auth file, or use a systemd *user* service). Check the live mode with
+  exist there, so if the unit can't open the display see the "Wayland/Xwayland
+  evidence required" note in `pi-setup-guide.md` §12. Keep the system service;
+  point its rendered `XAUTHORITY` at the selected session-auth file. Check the
+  live mode with
   `wlr-randr`, not `xrandr` (the latter shows only an XWAYLAND virtual output).
 - **"Failed to construct the application components … cover_art_cache_dir … not
   writable."** The on-disk cover cache directory can't be created. Check that
@@ -51,7 +52,23 @@ times and then drop to a `failed` state rather than loop forever — so `systemc
 status vinyl-now-playing` showing `failed`/`start-limit-hit` here means "fix the
 above and `systemctl reset-failed`", not "the Pi is wedged".
 
-## 1. Audio input is the right device
+## 1. Wave 1 deployability evidence (record before calling it complete)
+
+Record values only; never paste a config value, Discogs token, or auth-file
+contents into this checklist.
+
+| Gate | Command / observation | Non-secret evidence to record | Good result |
+|---|---|---|---|
+| Private config (#418) | `stat -c '%a %n' /home/pi/vinyl-now-playing/config.yaml` | Path and mode | `600`; any other mode is repaired with `chmod 600`, then the app is restarted. |
+| Real audio package and UCA222 (#156) | `cd /home/pi/vinyl-now-playing && venv/bin/python3 -I scripts/check_audio_backend.py`; then `venv/bin/python3 -c "import sounddevice; print(sounddevice.query_devices())"` | Package/API smoke result; selected UCA222 name/index/input channels; unplug/replug result | Smoke succeeds and the UCA222 is enumerated again after one unplug/replug. |
+| Display/session choice (#419) | In the logged-in graphical terminal: `printf 'DISPLAY=%s\\nXAUTHORITY=%s\\n' "$DISPLAY" "${XAUTHORITY:-<unset>}"` | Chosen `DISPLAY`, absolute Xauthority/session-auth path, and whether Xwayland was used | The selected values are rendered into the system service and it opens the display. |
+| Cold boot, clock, and shutdown (#83/#201/#419) | Reboot once; inspect `timedatectl`, `systemctl status vinyl-now-playing`, and the journal; then issue `sudo systemctl stop vinyl-now-playing` | Cold-boot result; `System clock synchronized` value; service status; SIGTERM stop outcome/time | Clock is synchronized before startup, the service survives the graphical-session race, and SIGTERM stops cleanly within `TimeoutStopSec=30`. |
+| Custom-folder Discogs probe (#366) | Follow the explicit confirmed command in `docs/testing-guide.md` for one sacrificial non-default-folder record | Artist/album, release ID, instance ID, field name, before/after values, HTTP/outcome; no token | Success disproves the hypothesis. A 404 or ambiguity is preserved as evidence with no blind retry. |
+
+CI has already checked the installed package/API boundary and system-unit syntax;
+it cannot close any of these hardware or external-state gates.
+
+## 2. Audio input is the right device
 
 The config matches `audio.device_name` as a **case-insensitive substring** against
 the device list and uses the *first* match.
@@ -65,7 +82,7 @@ the device list and uses the *first* match.
 
 **Good:** one clean "Using audio device" line naming the UCA222, no multi-match warning.
 
-## 2. Tune `audio.silence_threshold_rms` to the room (the big knob)
+## 3. Tune `audio.silence_threshold_rms` to the room (the big knob)
 
 This is the one value that genuinely can't be set without the hardware — it's the
 RMS energy line between "music" and "silence," and it depends on your turntable,
@@ -94,7 +111,7 @@ though the log shows no `MUSIC_STOPPED`, the run-out noise is sitting in the
 hysteresis dead band `[½·threshold, threshold)`; raise the threshold so the dead
 band clears it.
 
-## 3. Cover-art download works over the real network (S-7 smoke test)
+## 4. Cover-art download works over the real network (S-7 smoke test)
 
 The SSRF-hardened, **IP-pinned HTTPS** cover fetch (resolve once → connect to the
 vetted IP → TLS verified against the hostname) is unit-tested with a *mocked*
@@ -127,7 +144,7 @@ real CDN**. Verify it once on the Pi.
 - If a cover fails to decode and you see it re-fetch within the track, that's the
   B-18 corrupt-file recovery working as intended.
 
-## 4. Recognition + the churn breadcrumb
+## 5. Recognition + the churn breadcrumb
 
 Real Shazam calls only happen on hardware.
 
@@ -138,7 +155,7 @@ Real Shazam calls only happen on hardware.
   records bleeding, room noise), not failing outright. Conservative by design; the
   log is the signal, not a bug.
 
-## 5. Display geometry at the real resolution
+## 6. Display geometry at the real resolution
 
 The layout is resolution-independent and unit-tested across a matrix, but the
 renderer's **runtime title push-down** (long track titles shrinking/wrapping in
@@ -148,7 +165,7 @@ renderer's **runtime title push-down** (long track titles shrinking/wrapping in
   shrinks/wraps without colliding the artist/album/chips or the bottom
   meta/prev-next strip, at your actual 1024×600 panel.
 
-## 6. Full pipeline + autostart
+## 7. Full pipeline + autostart
 
 - Let a full side play through to the end and confirm: last track detected →
   after silence, `SESSION_ENDED` → **Discogs Play Count increments** (and Last
@@ -159,17 +176,17 @@ renderer's **runtime title push-down** (long track titles shrinking/wrapping in
 
 ---
 
-## 7. R8 bring-up probes (one-time checks from the Round-8 audit; R8-19/#362)
+## 8. R8 bring-up probes (one-time checks from the Round-8 audit; R8-19/#362)
 
 - **Pre-flight the recognition import on the Pi's own Python** before first run:
   `python3 -c "import shazamio"`. CI now hard-imports it per matrix leg
   (R8-08/#361), but the Pi's interpreter is the one that matters — a broken
   import surfaces only as NO MATCH FOUND under a healthy-looking service.
-- **Credit a record filed in a NON-default Discogs folder (R8-10/#366).** The
-  field write POSTs to virtual folder `0`; Discogs may 404 field edits for
-  instances filed in a custom folder. Watch the write succeed — if it 404s,
-  #366 jumps from hypothesis to fix (store the instance's real `folder_id` in
-  the index).
+- **Credit a record filed in a NON-default Discogs folder (R8-10/#366).** Follow
+  the explicit, interactive custom-folder probe in `docs/testing-guide.md` and
+  fill the evidence row above. The field write still uses virtual folder `0`; a
+  404 is evidence for a separate folder-ID propagation change, not a reason to
+  retry or to edit source constants.
 - **One Discogs token = one rate budget** for reader AND writer: during a long
   honoured Retry-After on a credit, recognition resolves may 429 and the
   display may briefly show NO MATCH FOUND. Self-heals — don't misdiagnose it
