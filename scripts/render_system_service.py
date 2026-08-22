@@ -114,9 +114,17 @@ def _template_metadata() -> os.stat_result:
 
 
 def _validate_output(
-    output: Path, config: os.stat_result, template: os.stat_result
+    output: Path,
+    config_path: Path,
+    template_path: Path,
+    config: os.stat_result,
+    template: os.stat_result,
 ) -> os.stat_result | None:
     _directory(output.parent, "output parent")
+    if output == config_path:
+        raise RenderError("output must not refer to config.yaml")
+    if output == template_path:
+        raise RenderError("output must not refer to the unit template")
     try:
         metadata = os.lstat(output)
     except FileNotFoundError:
@@ -134,11 +142,69 @@ def _validate_output(
     return metadata
 
 
-def _render_template(values: Mapping[str, str]) -> bytes:
+def _open_template(
+    expected: os.stat_result, config: os.stat_result
+) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
     try:
-        template = TEMPLATE.read_text(encoding="utf-8")
+        descriptor = os.open(TEMPLATE, flags)
+    except OSError as error:
+        raise RenderError(f"cannot safely open system-service template: {TEMPLATE}") from error
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise RenderError(f"cannot inspect system-service template: {TEMPLATE}") from error
+
+    if not stat.S_ISREG(metadata.st_mode):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise RenderError(f"system-service template must be a regular file: {TEMPLATE}")
+    if not _same_file(metadata, expected):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise RenderError(f"system-service template changed while it was being rendered: {TEMPLATE}")
+    if _same_file(metadata, config):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise RenderError("system-service template must not refer to config.yaml")
+    return descriptor, metadata
+
+
+def _render_template(
+    descriptor: int, expected: os.stat_result, values: Mapping[str, str]
+) -> bytes:
+    chunks = []
+    try:
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after_read = os.fstat(descriptor)
     except OSError as error:
         raise RenderError(f"cannot read system-service template: {TEMPLATE}") from error
+    if (
+        not _same_file(after_read, expected)
+        or after_read.st_size != expected.st_size
+        or after_read.st_mtime_ns != expected.st_mtime_ns
+    ):
+        raise RenderError(f"system-service template changed while it was being read: {TEMPLATE}")
+    try:
+        template = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RenderError(f"cannot decode system-service template as UTF-8: {TEMPLATE}") from error
 
     for placeholder, expected_count in _PLACEHOLDER_COUNTS.items():
         if template.count(placeholder) != expected_count:
@@ -165,6 +231,7 @@ def _existing_output_matches(
         return False
     except OSError as error:
         raise RenderError(f"cannot safely read output: {output}") from error
+    failure: BaseException | None = None
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -184,8 +251,18 @@ def _existing_output_matches(
                 break
             chunks.append(chunk)
         return b"".join(chunks) == rendered
+    except OSError as error:
+        failure = error
+        raise RenderError(f"cannot safely read output: {output}") from error
+    except RenderError as error:
+        failure = error
+        raise
     finally:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if failure is None:
+                raise RenderError(f"cannot safely read output: {output}") from error
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -264,17 +341,32 @@ def render_system_service(
     _directory(app_dir, "app-dir")
     config_path = app_dir / "config.yaml"
     config = _validate_config(config_path)
-    template = _template_metadata()
-    existing_output = _validate_output(output, config, template)
-
-    rendered = _render_template(
-        {
-            "@SERVICE_USER@": user,
-            "@APP_DIR@": str(app_dir),
-            "@DISPLAY@": display,
-            "@XAUTHORITY@": str(xauthority),
-        }
-    )
+    expected_template = _template_metadata()
+    template_descriptor, template = _open_template(expected_template, config)
+    template_error: BaseException | None = None
+    try:
+        existing_output = _validate_output(
+            output, config_path, TEMPLATE, config, template
+        )
+        rendered = _render_template(
+            template_descriptor,
+            template,
+            {
+                "@SERVICE_USER@": user,
+                "@APP_DIR@": str(app_dir),
+                "@DISPLAY@": display,
+                "@XAUTHORITY@": str(xauthority),
+            },
+        )
+    except BaseException as error:
+        template_error = error
+        raise
+    finally:
+        try:
+            os.close(template_descriptor)
+        except OSError as error:
+            if template_error is None:
+                raise RenderError(f"cannot close system-service template: {TEMPLATE}") from error
     if _existing_output_matches(output, rendered, existing_output, config, template):
         return False
     _atomic_write(output, rendered)

@@ -284,6 +284,135 @@ def test_renderer_rejects_an_existing_output_hardlink_before_reading_it(
     assert target.read_bytes() == original
 
 
+def _template_with_secret_marker(marker: str) -> str:
+    return SCRIPT.parent.parent.joinpath("deploy", "vinyl-now-playing.service.in").read_text() + marker
+
+
+@pytest.mark.parametrize("swap_kind", ("regular", "config-symlink"))
+def test_renderer_rejects_template_swaps_before_the_template_descriptor_is_read(
+    tmp_path, monkeypatch, swap_kind
+):
+    """A post-check template swap cannot publish attacker or config bytes."""
+    app_dir = _make_app(tmp_path)
+    config = app_dir / "config.yaml"
+    config.write_text(_template_with_secret_marker("\n# config-secret-marker\n"))
+    os.chmod(config, 0o600)
+    renderer = _load_renderer_module()
+    template = tmp_path / "template.service.in"
+    template.write_text(_template_with_secret_marker("\n# trusted-template\n"))
+    output = tmp_path / "vinyl-now-playing.service"
+    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    original_open = renderer.os.open
+    swapped = False
+
+    def swap_before_template_open(path, flags, mode=0o777):
+        nonlocal swapped
+        if Path(path) == template and not swapped:
+            swapped = True
+            template.unlink()
+            if swap_kind == "regular":
+                template.write_text(_template_with_secret_marker("\n# raced-template\n"))
+            else:
+                template.symlink_to(config)
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(renderer.os, "open", swap_before_template_open)
+
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, output)
+
+    assert swapped
+    assert not output.exists()
+    assert config.read_text().endswith("# config-secret-marker\n")
+    assert config.stat().st_mode & 0o777 == 0o600
+
+
+def test_renderer_rejects_a_template_that_is_already_a_hardlink_to_config(tmp_path, monkeypatch):
+    """The template descriptor itself can never be the private config inode."""
+    app_dir = _make_app(tmp_path)
+    config = app_dir / "config.yaml"
+    config.write_text(_template_with_secret_marker("\n# config-secret-marker\n"))
+    os.chmod(config, 0o600)
+    renderer = _load_renderer_module()
+    template = tmp_path / "template.service.in"
+    os.link(config, template)
+    output = tmp_path / "vinyl-now-playing.service"
+    monkeypatch.setattr(renderer, "TEMPLATE", template)
+
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, output)
+
+    assert not output.exists()
+    assert config.read_text().endswith("# config-secret-marker\n")
+    assert config.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("target_name", ("config", "template"))
+def test_renderer_rejects_canonical_output_collisions_after_identity_races(
+    tmp_path, monkeypatch, target_name
+):
+    """A path-string collision remains forbidden if the target inode changes."""
+    app_dir = _make_app(tmp_path)
+    config = app_dir / "config.yaml"
+    renderer = _load_renderer_module()
+    template = tmp_path / "template.service.in"
+    template.write_text(_template_with_secret_marker("\n# trusted-template\n"))
+    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    output = config if target_name == "config" else template
+    replacement = _template_with_secret_marker("\n# replacement-must-not-be-overwritten\n").encode()
+    original_template_metadata = renderer._template_metadata
+
+    def replace_target_after_first_identity_check():
+        metadata = original_template_metadata()
+        output.unlink()
+        output.write_bytes(replacement)
+        os.chmod(output, 0o600)
+        return metadata
+
+    monkeypatch.setattr(renderer, "_template_metadata", replace_target_after_first_identity_check)
+
+    with pytest.raises(renderer.RenderError):
+        _render_direct(renderer, app_dir, output)
+
+    assert output.read_bytes() == replacement
+
+
+def test_renderer_reads_the_template_only_from_its_verified_descriptor(tmp_path, monkeypatch):
+    """A path-level `read_text()` call would reintroduce the template TOCTOU gap."""
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    renderer = _load_renderer_module()
+
+    monkeypatch.setattr(
+        renderer.Path,
+        "read_text",
+        lambda *_args, **_kwargs: pytest.fail("renderer reopened the template by path"),
+    )
+
+    assert _render_direct(renderer, app_dir, output) is True
+    assert output.exists()
+
+
+def test_renderer_cli_normalizes_invalid_template_utf8_without_a_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """A corrupted checked-in unit template gives operators one concise error."""
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    renderer = _load_renderer_module()
+    template = tmp_path / "template.service.in"
+    template.write_bytes(b"\xff\xfe")
+    monkeypatch.setattr(renderer, "TEMPLATE", template)
+
+    exit_code = renderer.main(_arguments(app_dir, output))
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.err.startswith("error: cannot decode system-service template")
+    assert "Traceback" not in captured.err
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("unsafe", ("%n", "$HOME", "'", '\"', "\\\\", "@", ";", "&", "|"))
 def test_renderer_rejects_systemd_metacharacters_in_unit_bound_paths(tmp_path, unsafe):
     """Unit substitutions stay literal rather than invoking systemd expansion rules."""
@@ -422,6 +551,58 @@ def test_renderer_cli_normalizes_atomic_write_failures_without_a_traceback(
     assert captured.err.startswith("error: cannot atomically write output")
     assert "Traceback" not in captured.err
     assert not output.exists()
+
+
+@pytest.mark.parametrize("failure", ("read", "close"))
+def test_renderer_cli_normalizes_existing_output_io_failures_without_a_traceback(
+    tmp_path, monkeypatch, capsys, failure
+):
+    """A verification read failure cannot escape the renderer's CLI boundary."""
+    app_dir = _make_app(tmp_path)
+    output = tmp_path / "vinyl-now-playing.service"
+    renderer = _load_renderer_module()
+    _render_direct(renderer, app_dir, output)
+
+    original_open = renderer.os.open
+    original_close = renderer.os.close
+    output_descriptor = None
+
+    def remember_output_descriptor(path, flags, mode=0o777):
+        nonlocal output_descriptor
+        descriptor = original_open(path, flags, mode)
+        if Path(path) == output:
+            output_descriptor = descriptor
+        return descriptor
+
+    monkeypatch.setattr(renderer.os, "open", remember_output_descriptor)
+
+    if failure == "read":
+        original_read = renderer.os.read
+
+        def fail_output_read(descriptor, *args):
+            if descriptor == output_descriptor:
+                raise OSError("simulated read failure")
+            return original_read(descriptor, *args)
+
+        monkeypatch.setattr(
+            renderer.os,
+            "read",
+            fail_output_read,
+        )
+    else:
+        def fail_output_close(descriptor):
+            if descriptor == output_descriptor:
+                raise OSError("simulated close failure")
+            return original_close(descriptor)
+
+        monkeypatch.setattr(renderer.os, "close", fail_output_close)
+
+    exit_code = renderer.main(_arguments(app_dir, output))
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.err.startswith("error: cannot safely read output")
+    assert "Traceback" not in captured.err
 
 
 def test_renderer_refuses_to_replace_an_output_symlink(tmp_path):
