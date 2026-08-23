@@ -17,6 +17,7 @@ import pytest
 
 from src.audio.recognizer import RawRecognitionResult
 from src.metadata.models import MetadataSource, TracklistEntry
+from src.metadata.discogs.outcomes import CollectionRefreshResult, CollectionRefreshState
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,9 @@ def mock_discogs():
     # refresh the index and re-check ownership. Default to "still not owned" so
     # these tests exercise the DATABASE/FALLBACK tiers as before; the C-upgrade
     # path has its own tests in test_cache_expiry.py.
-    m.refresh_index_and_research.return_value = None
+    m.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.CLEAN_NO_MATCH
+    )
     # #61: the resolver now dispatches Discogs searches through reader.run(fn, …)
     # (the dedicated-executor delegate) instead of loop.run_in_executor(None, …).
     # The mock's run awaits and simply calls the target, so return values /

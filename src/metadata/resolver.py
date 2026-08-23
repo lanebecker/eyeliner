@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING
 
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.metadata.coverart import CoverArtFallback
+from src.metadata.discogs.outcomes import CollectionRefreshState
 from src.metadata.errors import is_transient, http_status
 from src.util.cache import BoundedCache
 
@@ -251,7 +252,7 @@ class MetadataResolver:
                 # pinning the no-instance_id DATABASE downgrade.
                 if discogs_completed:
                     try:
-                        upgraded = await self.reader.run(
+                        refresh_outcome = await self.reader.run(
                             self.reader.refresh_index_and_research, raw.artist, raw.album
                         )
                     except Exception as e:
@@ -266,8 +267,11 @@ class MetadataResolver:
                         # collection success re-arms it) rather than an orphan key
                         # that never re-arms.
                         self._log_discogs_error("collection", e)
-                        upgraded = None
-                    if upgraded:
+                        refresh_outcome = None
+                    if refresh_outcome is None:
+                        pass
+                    elif refresh_outcome.state is CollectionRefreshState.OWNED:
+                        upgraded = dict(refresh_outcome.result)
                         log.info(
                             f"Collection index was stale — {raw.artist} / {raw.album} "
                             f"is owned after a refresh; crediting via the collection."
@@ -277,6 +281,13 @@ class MetadataResolver:
                         return self._from_discogs(
                             raw, upgraded, MetadataSource.DISCOGS_COLLECTION
                         )
+                    elif refresh_outcome.state is CollectionRefreshState.CLEAN_NO_MATCH:
+                        pass
+                    elif refresh_outcome.state is CollectionRefreshState.COOLDOWN_SKIPPED:
+                        if not refresh_outcome.cooldown_follows_successful_rebuild:
+                            discogs_completed = False
+                    else:
+                        raise ValueError(f"unknown collection refresh state: {refresh_outcome.state}")
                 # Only cache the database downgrade if BOTH the collection lookup
                 # and the refresh above completed cleanly (a transient error must
                 # stay retryable, B-4).
