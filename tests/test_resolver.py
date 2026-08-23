@@ -112,7 +112,7 @@ def _put_collection(resolver, key, result):
 class _CancellationBarrierReader:
     """Real executor seam: cancelling its await does not stop its worker."""
 
-    def __init__(self):
+    def __init__(self, raise_first=False):
         self._executor = ThreadPoolExecutor(max_workers=2)
         self.started = threading.Event()
         self.release = threading.Event()
@@ -120,6 +120,7 @@ class _CancellationBarrierReader:
         self.calls = 0
         self.active = 0
         self.maximum_active = 0
+        self.raise_first = raise_first
 
     async def run(self, fn, *args):
         return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
@@ -137,13 +138,18 @@ class _CancellationBarrierReader:
         finally:
             with self._state_lock:
                 self.active -= 1
+        return call
 
     def search_collection(self, artist, album):
-        self._block_first_worker()
+        call = self._block_first_worker()
+        if self.raise_first and call == 1:
+            raise RuntimeError("late worker exception")
         return make_discogs_result(100, 200)
 
     def rebuild_collection_and_research(self, artist, album):
-        self._block_first_worker()
+        call = self._block_first_worker()
+        if self.raise_first and call == 1:
+            raise RuntimeError("late worker exception")
         return make_discogs_result(100, 200)
 
     def close(self):
@@ -200,6 +206,64 @@ async def test_cancelled_recovery_worker_keeps_gate_until_thread_completes(resol
         await asyncio.sleep(0.05)
         assert reader.active == 1
         assert reader.calls == 1
+        assert not first.done()
+        assert not second.done()
+
+        reader.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert await second == CollectionIdentity(100, 300)
+        assert reader.calls == 2
+        assert reader.maximum_active == 1
+    finally:
+        reader.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ordinary_reader_exception_still_propagates_cancellation(resolver):
+    """A late worker error must be drained, not replace caller cancellation."""
+    reader = _CancellationBarrierReader(raise_first=True)
+    resolver.reader = reader
+    resolver._reader_gate = asyncio.Lock()
+    first = asyncio.create_task(resolver.resolve(make_raw(album="First error")))
+    try:
+        await _wait_for_thread_event(reader.started)
+        first.cancel()
+        await asyncio.sleep(0)
+        second = asyncio.create_task(resolver.resolve(make_raw(album="Second error")))
+        await asyncio.sleep(0.05)
+        assert reader.calls == 1
+        assert reader.active == 1
+        assert not first.done()
+        assert not second.done()
+
+        reader.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+        assert reader.calls == 2
+        assert reader.maximum_active == 1
+    finally:
+        reader.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_reader_exception_still_propagates_cancellation(resolver):
+    """Recovery's late rebuild error likewise cannot turn cancellation into None."""
+    reader = _CancellationBarrierReader(raise_first=True)
+    resolver.reader = reader
+    resolver._reader_gate = asyncio.Lock()
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+    first = asyncio.create_task(resolver.recover_collection_instance(key, 100, 200, (300,)))
+    try:
+        await _wait_for_thread_event(reader.started)
+        first.cancel()
+        await asyncio.sleep(0)
+        second = asyncio.create_task(resolver.recover_collection_instance(key, 100, 200, (300,)))
+        await asyncio.sleep(0.05)
+        assert reader.calls == 1
+        assert reader.active == 1
         assert not first.done()
         assert not second.done()
 
