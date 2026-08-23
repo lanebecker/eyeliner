@@ -6,6 +6,7 @@ album to a downgraded fallback result for the rest of the session.  A clean
 "searched everywhere, no match" still caches the fallback (the existing,
 desired behaviour).
 """
+import asyncio
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
@@ -37,6 +38,7 @@ def make_resolver():
     r.coverart = MagicMock()
     r.coverart.get_cover_art_url.return_value = "https://coverartarchive.org/x/front"
     r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
+    r._reader_gate = asyncio.Lock()
     r._logged_discogs_config = {}
     return r
 

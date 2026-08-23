@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING
 
 from src.metadata.models import TrackMetadata, MetadataSource
 from src.metadata.coverart import CoverArtFallback
-from src.metadata.discogs.outcomes import CollectionRefreshState
+from src.metadata.discogs.outcomes import CollectionIdentity, CollectionRefreshState
 from src.metadata.errors import is_transient, http_status
 from src.util.cache import BoundedCache
 
@@ -100,6 +100,10 @@ class MetadataResolver:
         # shared with the renderer's six caches rather than re-hand-rolled here.
         # The #191 downgrade TTL lives on top of it in _cache_get/_cache_store.
         self._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
+        # Reader methods mutate the collection index and the one-entry database
+        # memo.  Both ordinary resolves and stale-instance recovery share this
+        # gate; the executor is a transport boundary, not a state lock.
+        self._reader_gate = asyncio.Lock()
         # #189: a dead Discogs credential (401/403) or wrong username (404) is a
         # PERMANENT error that recurs on EVERY track's resolve — so its
         # actionable warning is logged once and then suppressed until a Discogs
@@ -213,6 +217,66 @@ class MetadataResolver:
             log.debug(f"Album cache hit for: {raw.artist} / {raw.album}")
             return self._from_cache(raw, cached)
 
+        # A concurrent miss may have completed while this task waited.  Keep
+        # only mutable Discogs work inside the gate; cover-art fallback remains
+        # independent and cannot delay a collection cache hit.
+        async with self._reader_gate:
+            cached = self._cache_get(key)
+            if cached is not None:
+                log.debug(f"Album cache hit after reader gate: {raw.artist} / {raw.album}")
+                return self._from_cache(raw, cached)
+            discogs_result, discogs_completed = await self._resolve_discogs_locked(raw, key)
+        if discogs_result is not None:
+            return discogs_result
+
+        # Step 3: Fallback — Shazam data + MusicBrainz cover art
+        log.info(f"Using fallback metadata for: {raw.artist} / {raw.album}")
+        # #190: a TRANSIENT MusicBrainz outage must not be cached as this
+        # album's FALLBACK payload — otherwise the album is pinned coverless
+        # for the whole session even after the service recovers.  Mirror the
+        # discogs_completed pattern: on a transient cover-art failure, return
+        # the fallback for THIS track but skip the cache so the next track
+        # retries.  A clean "no art exists" (None) still caches — that
+        # negative result is load-bearing for MusicBrainz rate limits.
+        cover_completed = True
+        try:
+            cover_url = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, self.coverart.get_cover_art_url, raw.artist, raw.album
+                ),
+                timeout=_COVER_ART_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            cover_url = None
+            cover_completed = False
+            log.warning(
+                "Cover art lookup exceeded %ss for '%s / %s'; abandoning it and "
+                "continuing (the commit pipeline is not blocked).",
+                _COVER_ART_TIMEOUT_SECONDS, raw.artist, raw.album,
+            )
+        except Exception as e:
+            cover_url = None
+            if is_transient(e):
+                cover_completed = False
+                log.info(f"Cover art couldn't determine (transient): {e}")
+            else:
+                log.warning(f"Unexpected error in cover art lookup: {e}")
+        if discogs_completed and cover_completed:
+            self._cache_store(key, MetadataSource.FALLBACK, cover_url)
+        return TrackMetadata(
+            title=raw.title,
+            artist=raw.artist,
+            album=raw.album,
+            cover_art_url=cover_url,
+            source=MetadataSource.FALLBACK,
+            resolve_key=key,
+        )
+
+    async def _resolve_discogs_locked(
+        self, raw: "RawRecognitionResult", key: tuple[str, str]
+    ) -> tuple["Optional[TrackMetadata]", bool]:
+        """Run the mutable Discogs sequence while ``_reader_gate`` is held."""
+
         # Tracks whether both Discogs tiers ran to completion.  Only a clean
         # "looked everywhere, found nothing" outcome may cache the fallback —
         # a raised exception (network blip, 429) must stay retryable.
@@ -230,7 +294,7 @@ class MetadataResolver:
                 log.debug(f"Resolved from Discogs collection: {raw.artist} / {raw.album}")
                 self._logged_discogs_config.pop("collection", None)   # #189: re-arm THIS tier
                 self._cache_store(key, MetadataSource.DISCOGS_COLLECTION, result)
-                return self._from_discogs(raw, result, MetadataSource.DISCOGS_COLLECTION)
+                return self._from_discogs(raw, result, MetadataSource.DISCOGS_COLLECTION), True
         except Exception as e:
             discogs_completed = False
             self._log_discogs_error("collection", e)
@@ -280,7 +344,7 @@ class MetadataResolver:
                         self._cache_store(key, MetadataSource.DISCOGS_COLLECTION, upgraded)
                         return self._from_discogs(
                             raw, upgraded, MetadataSource.DISCOGS_COLLECTION
-                        )
+                        ), True
                     elif refresh_outcome.state is CollectionRefreshState.CLEAN_NO_MATCH:
                         pass
                     elif refresh_outcome.state is CollectionRefreshState.COOLDOWN_SKIPPED:
@@ -293,58 +357,95 @@ class MetadataResolver:
                 # stay retryable, B-4).
                 if discogs_completed:
                     self._cache_store(key, MetadataSource.DISCOGS_DATABASE, result)
-                return self._from_discogs(raw, result, MetadataSource.DISCOGS_DATABASE)
+                return self._from_discogs(raw, result, MetadataSource.DISCOGS_DATABASE), discogs_completed
         except Exception as e:
             discogs_completed = False
             self._log_discogs_error("database", e)
 
-        # Step 3: Fallback — Shazam data + MusicBrainz cover art
-        log.info(f"Using fallback metadata for: {raw.artist} / {raw.album}")
-        # #190: a TRANSIENT MusicBrainz outage must not be cached as this
-        # album's FALLBACK payload — otherwise the album is pinned coverless
-        # for the whole session even after the service recovers.  Mirror the
-        # discogs_completed pattern: on a transient cover-art failure, return
-        # the fallback for THIS track but skip the cache so the next track
-        # retries.  A clean "no art exists" (None) still caches — that
-        # negative result is load-bearing for MusicBrainz rate limits.
-        cover_completed = True
-        try:
-            cover_url = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, self.coverart.get_cover_art_url, raw.artist, raw.album
-                ),
-                timeout=_COVER_ART_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            # R5-08: the cover-art call outran its ceiling. Treat it like any
-            # transient outage — return the fallback for THIS track but DON'T
-            # cache, so the next track retries — and let the abandoned executor
-            # thread wind down on the coverart socket-timeout floor. The pipeline
-            # is unblocked NOW rather than frozen until restart.
-            cover_url = None
-            cover_completed = False
-            log.warning(
-                "Cover art lookup exceeded %ss for '%s / %s'; abandoning it and "
-                "continuing (the commit pipeline is not blocked).",
-                _COVER_ART_TIMEOUT_SECONDS, raw.artist, raw.album,
-            )
-        except Exception as e:
-            cover_url = None
-            if is_transient(e):
-                cover_completed = False
-                log.info(f"Cover art couldn't determine (transient): {e}")
-            else:
-                log.warning(f"Unexpected error in cover art lookup: {e}")
-        if discogs_completed and cover_completed:
-            self._cache_store(key, MetadataSource.FALLBACK, cover_url)
-        return TrackMetadata(
-            title=raw.title,
-            artist=raw.artist,
-            album=raw.album,
-            cover_art_url=cover_url,
-            source=MetadataSource.FALLBACK,
-            resolve_key=key,
+        return None, discogs_completed
+
+    @staticmethod
+    def _valid_recovery_key(key) -> bool:
+        return (
+            isinstance(key, tuple)
+            and len(key) == 2
+            and all(isinstance(part, str) and bool(part.strip()) for part in key)
         )
+
+    @staticmethod
+    def _collection_pair(entry) -> "Optional[tuple[int, int]]":
+        if entry is None:
+            return None
+        source, payload, _stored_at = entry
+        if source is not MetadataSource.DISCOGS_COLLECTION or not isinstance(payload, dict):
+            return None
+        release_id = payload.get("release_id")
+        instance_id = payload.get("instance_id")
+        if type(release_id) is not int or release_id <= 0:
+            return None
+        if type(instance_id) is not int or instance_id <= 0:
+            return None
+        return release_id, instance_id
+
+    async def recover_collection_instance(
+        self,
+        resolve_key: tuple[str, str],
+        expected_release_id: int,
+        expected_instance_id: int,
+        observed_instance_ids: tuple[int, ...],
+    ) -> "Optional[CollectionIdentity]":
+        """Replace exactly one definitively stale collection identity safely."""
+        if (
+            not self._valid_recovery_key(resolve_key)
+            or type(expected_release_id) is not int or expected_release_id <= 0
+            or type(expected_instance_id) is not int or expected_instance_id <= 0
+            or not isinstance(observed_instance_ids, tuple)
+            or len(set(observed_instance_ids)) != len(observed_instance_ids)
+            or any(type(value) is not int or value <= 0 for value in observed_instance_ids)
+        ):
+            log.warning("Refusing invalid Discogs collection recovery evidence.")
+            return None
+
+        async with self._reader_gate:
+            entry = self._album_cache.get(resolve_key)
+            pair = self._collection_pair(entry)
+            stale_pair = (expected_release_id, expected_instance_id)
+            if pair == stale_pair:
+                self._album_cache.pop(resolve_key)
+            elif entry is not None:
+                # Another resolve has replaced this key.  It is already safe
+                # only when it exactly agrees with the writer's singleton proof.
+                if (
+                    len(observed_instance_ids) == 1
+                    and pair == (expected_release_id, observed_instance_ids[0])
+                ):
+                    return CollectionIdentity(*pair)
+                log.info("Discogs collection recovery found a newer cache entry; leaving it intact.")
+                return None
+
+            if len(observed_instance_ids) != 1 or observed_instance_ids[0] == expected_instance_id:
+                log.info("Discogs collection recovery refused non-singleton replacement evidence.")
+                return None
+            replacement_instance_id = observed_instance_ids[0]
+            try:
+                fresh = await self.reader.run(
+                    self.reader.rebuild_collection_and_research,
+                    resolve_key[0], resolve_key[1],
+                )
+            except Exception as exc:
+                log.warning("Discogs collection recovery rebuild failed: %s", exc)
+                return None
+            if not isinstance(fresh, dict):
+                log.info("Discogs collection recovery found no unambiguous fresh match.")
+                return None
+            release_id = fresh.get("release_id")
+            if type(release_id) is not int or release_id != expected_release_id:
+                log.info("Discogs collection recovery resolved a different release.")
+                return None
+            recovered = dict(fresh)
+            recovered["instance_id"] = replacement_instance_id
+            self._cache_store(resolve_key, MetadataSource.DISCOGS_COLLECTION, recovered)
+            return CollectionIdentity(expected_release_id, replacement_instance_id)
 
     def _from_discogs(
         self,

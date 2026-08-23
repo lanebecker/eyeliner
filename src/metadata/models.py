@@ -467,6 +467,9 @@ class PlaySession:
     potential_last_track: bool = False
     album_release_id: Optional[int] = None
     album_instance_id: Optional[int] = None
+    # The exact normalized resolver key of the track that latched the write
+    # identity.  It must not follow later tracks' split-detection evidence.
+    album_resolve_key: Optional[tuple[str, str]] = None
     # Most recent release ID seen from ANY source that carries one — including
     # DISCOGS_DATABASE results, which never latch the album_* pair above.
     # Used by ListenTracker's album-change auto-split (v1.3.5): comparing
@@ -766,3 +769,4 @@ class PlaySession:
         ):
             self.album_release_id = track.discogs_release_id
             self.album_instance_id = track.discogs_instance_id
+            self.album_resolve_key = track.resolve_key

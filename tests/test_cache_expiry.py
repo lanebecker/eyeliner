@@ -19,6 +19,7 @@ Fix: monotonic-clock TTL on the index (B1) and on the resolver's DATABASE/FALLBA
 entries only — COLLECTION hits never expire (B2) — plus a cooldown'd
 staleness-triggered refresh (C).
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -83,6 +84,7 @@ def _make_resolver(reader=None, coverart=None):
     r.coverart = coverart or MagicMock()
     r.coverart.get_cover_art_url.return_value = None
     r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
+    r._reader_gate = asyncio.Lock()
     r._logged_discogs_config = {}
     return r
 

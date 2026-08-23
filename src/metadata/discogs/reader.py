@@ -677,12 +677,10 @@ class DiscogsReader:
             # the "memo is ready" flag the check above reads. A reader that observes
             # the new key is then guaranteed to also see the matching new page —
             # never this query's page returned for a different query's key. The
-            # reader path is single-caller today (the resolver serializes reader
-            # calls, so this races with nothing), making key-last defence-in-depth
-            # on the 2-worker Discogs pool rather than a lock: a reader that catches
-            # the stale key mid-fetch merely re-fetches (fail-safe redundant GET),
-            # it never mismatches. NOT a general thread-safety guarantee — the
-            # check-then-return is only safe because callers are serialized.
+            # The resolver-owned reader gate serializes every caller of this
+            # mutable memo. Publishing the key last remains a narrow defensive
+            # guarantee if a future reader caller is added incorrectly: it may
+            # issue a redundant fetch, but cannot pair a new key with old data.
             self._db_search_page = list(results.page(1))
             self._db_search_stamp = now
             self._db_search_key = key            # published LAST
@@ -891,6 +889,19 @@ class DiscogsReader:
         if match is not None:
             return CollectionRefreshResult(CollectionRefreshState.OWNED, result=match)
         return CollectionRefreshResult(CollectionRefreshState.CLEAN_NO_MATCH)
+
+    def rebuild_collection_and_research(self, artist: str, album: str) -> Optional[dict]:
+        """Strictly rebuild and re-match without changing speculative cooldown.
+
+        Recovery needs fresh ownership evidence even during the ordinary
+        speculative-refresh cooldown.  This deliberately consumes the separate
+        failed-build backoff and keeps the build's swap-on-success semantics,
+        but never reads or writes speculative cooldown/provenance state.
+        """
+        if self._collection_build_is_backed_off(time.monotonic()):
+            raise CollectionOwnershipUnknown("collection index rebuild is backed off")
+        self._build_collection_index()
+        return self.search_collection(artist, album)
 
     def _build_result(self, release, instance_id: Optional[int]) -> dict:
         """Build a standardised result dict from a Discogs Release object.
