@@ -1094,13 +1094,15 @@ class ListenTracker:
                             )
                         except asyncio.CancelledError:
                             raise
-                        except Exception as exc:
+                        except Exception:
                             log.warning(
-                                "Discogs collection recovery failed for release %s / "
-                                "instance %s: %s; suppressing both field writes.",
-                                stale_release_id, stale_instance_id, exc,
+                                "Discogs collection recovery "
+                                "stage=recovery-callback-failed "
+                                "expected_release_id=%d expected_instance_id=%d; "
+                                "suppressing both field writes.",
+                                stale_release_id, stale_instance_id,
                             )
-                            raise _DefinitiveMissingInstance(result) from exc
+                            raise _DefinitiveMissingInstance(result) from None
                         if (
                             not isinstance(identity, CollectionIdentity)
                             or identity.release_id != stale_release_id
