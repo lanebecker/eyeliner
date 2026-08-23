@@ -17,6 +17,10 @@ from src.tracking.listen_tracker import (
     _HONORED_RETRY_AFTER_CAP_SECONDS,
 )
 from src.metadata.discogs.transport import DiscogsRateLimited
+from src.metadata.discogs.outcomes import (
+    CollectionIdentity, PlayCountReadResult, PlayCountReadState,
+)
+from src.metadata.models import PlaySession
 from tests.test_listen_tracker import make_writer_mock
 
 
@@ -102,3 +106,32 @@ async def test_finalize_generic_exception_still_linear_backoff():
         _FINALIZE_RETRY_BACKOFF_SECONDS * n
         for n in range(1, _FINALIZE_WRITE_ATTEMPTS)
     ]
+
+
+async def test_rate_limited_replacement_read_does_not_replenish_recovery_budget():
+    """#229 can retry a throttled replacement read, never the recovery itself."""
+    writer = make_writer_mock()
+    writer.read_play_count.side_effect = [
+        PlayCountReadResult(
+            PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+            observed_instance_ids=(88,),
+        ),
+        DiscogsRateLimited(60),
+        PlayCountReadResult(PlayCountReadState.READY, 3, 4),
+    ]
+    recovery = AsyncMock(return_value=CollectionIdentity(999, 88))
+    tracker = ListenTracker(writer=writer, recover_collection_instance=recovery)
+    session = PlaySession(
+        album_release_id=999,
+        album_instance_id=77,
+        album_resolve_key=("sonic youth", "sister"),
+    )
+
+    with patch(
+        "src.tracking.listen_tracker.asyncio.sleep", new_callable=AsyncMock
+    ) as sleep:
+        await tracker._credit_completed_album(session)
+
+    recovery.assert_awaited_once_with(("sonic youth", "sister"), 999, 77, (88,))
+    writer.set_play_count.assert_called_once_with(999, 88, 3, 4, 5)
+    assert [call.args[0] for call in sleep.call_args_list] == [60.0]

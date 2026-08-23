@@ -80,13 +80,15 @@ never trigger a split.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from src.metadata.models import MetadataSource, PlaySession, TrackMetadata
 from src.metadata.normalize import fold_text
 from src.audio.silence import AudioEvent
 from src.metadata.discogs.transport import DiscogsRateLimited
-from src.metadata.discogs.outcomes import PlayCountReadResult, PlayCountReadState
+from src.metadata.discogs.outcomes import (
+    CollectionIdentity, PlayCountReadResult, PlayCountReadState,
+)
 from src.tracking.spin_memory import SpinMemory
 from src.util.clock import clock_is_trustworthy
 
@@ -172,6 +174,10 @@ class _DefinitiveMissingInstance(Exception):
         super().__init__("collection instance is definitively missing")
         self.result = result
 
+
+class _ReplacementReadAborted(Exception):
+    """A safely recovered identity whose one replacement read was inconclusive."""
+
 # R7-03 (flip-resume): how far back a newly-armed session may reach to inherit an
 # immediately-prior UNARMED session's closing-side rows (Lane, 2026-08-11: fixed
 # 5-minute wall-clock, same closing side only).  R8-01 (#345, Lane 2026-08-12):
@@ -192,6 +198,10 @@ class ListenTracker:
         self,
         writer: "DiscogsCollectionWriter",
         lastfm: Optional["LastFmClient"] = None,
+        recover_collection_instance: Optional[
+            Callable[[tuple[str, str], int, int, tuple[int, ...]],
+                     Awaitable[Optional[CollectionIdentity]]]
+        ] = None,
     ):
         # A-4: depend only on the Discogs WRITE half (Play Count / Last Played),
         # injected at the composition root (main.py).  A-3 had already moved this
@@ -199,6 +209,11 @@ class ListenTracker:
         # to just the collection writer.
         self.writer = writer
         self.lastfm = lastfm
+        # #421: the tracker gets one narrow, async recovery port rather than a
+        # metadata reader/resolver dependency.  It is used only before an
+        # absolute Play Count target exists, after the writer has conclusively
+        # proven the latched collection instance missing.
+        self._recover_collection_instance = recover_collection_instance
         # R5-22: love-on-completion needs a WORKING Last.fm client. If the user
         # asked for it but the client is disabled (scrobble_enabled off, missing
         # creds, pylast absent, or init failure), warn ONCE at startup — otherwise
@@ -1009,24 +1024,109 @@ class ListenTracker:
         # leaves `plan` unset so the next attempt safely re-reads (the GET is
         # idempotent), while a landed-but-unobserved POST re-POSTs the SAME target.
         plan: dict = {}
+        # #421: this budget belongs to the detached session, not the retry loop.
+        # A replacement read that is rate-limited may retry under #229, but it
+        # must never restart resolver recovery or select another identity.
+        recovery_spent = False
+        replacement_identity_established = False
+
+        def _valid_resolve_key(key) -> bool:
+            return (
+                isinstance(key, tuple)
+                and len(key) == 2
+                and all(isinstance(part, str) and bool(part.strip()) for part in key)
+            )
+
+        async def _read_replacement() -> None:
+            """Perform the replacement read without opening another recovery path."""
+            result = await self.writer.run(
+                self.writer.read_play_count,
+                session.album_release_id,
+                session.album_instance_id,
+            )
+            if result.state is PlayCountReadState.DEFINITIVE_INSTANCE_MISSING:
+                # A second complete snapshot says the just-established target is
+                # stale too.  Neither field may write to it and recovery is spent.
+                raise _DefinitiveMissingInstance(result)
+            if result.state is not PlayCountReadState.READY:
+                # The identity is still safe for META-7 Last Played, but an
+                # inconclusive replacement read must not get a second recovery or
+                # fabricate an absolute Play Count target.
+                raise _ReplacementReadAborted()
+            plan["field_id"] = result.field_id
+            plan["current"] = result.current_count
+            plan["target"] = result.current_count + 1
 
         async def _credit_attempt() -> bool:
+            nonlocal recovery_spent, replacement_identity_established
             if not plan:
-                result = await self.writer.run(
-                    self.writer.read_play_count,
-                    session.album_release_id,
-                    session.album_instance_id,
-                )
-                if result.state is PlayCountReadState.DEFINITIVE_INSTANCE_MISSING:
-                    raise _DefinitiveMissingInstance(result)
-                if result.state is not PlayCountReadState.READY:
-                    # Field missing / unreadable / non-integer — abort WITHOUT
-                    # writing (META-1/META-2), already logged loud by the reader.
-                    # Treated as a failed attempt so a transient read is retried.
-                    return False
-                plan["field_id"] = result.field_id
-                plan["current"] = result.current_count
-                plan["target"] = result.current_count + 1
+                if replacement_identity_established:
+                    # #229 can re-enter here after a rate-limited replacement
+                    # GET.  It retries that GET only; the recovery budget remains
+                    # spent and the established pair cannot change.
+                    await _read_replacement()
+                else:
+                    result = await self.writer.run(
+                        self.writer.read_play_count,
+                        session.album_release_id,
+                        session.album_instance_id,
+                    )
+                    if result.state is PlayCountReadState.DEFINITIVE_INSTANCE_MISSING:
+                        if recovery_spent:
+                            raise _DefinitiveMissingInstance(result)
+                        recovery_spent = True  # spend BEFORE an await/cancellation point
+                        stale_release_id = session.album_release_id
+                        stale_instance_id = session.album_instance_id
+                        resolve_key = session.album_resolve_key
+                        if (
+                            self._recover_collection_instance is None
+                            or not _valid_resolve_key(resolve_key)
+                            or type(stale_release_id) is not int or stale_release_id <= 0
+                            or type(stale_instance_id) is not int or stale_instance_id <= 0
+                        ):
+                            raise _DefinitiveMissingInstance(result)
+                        try:
+                            identity = await self._recover_collection_instance(
+                                resolve_key,
+                                stale_release_id,
+                                stale_instance_id,
+                                result.observed_instance_ids,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            log.warning(
+                                "Discogs collection recovery failed for release %s / "
+                                "instance %s: %s; suppressing both field writes.",
+                                stale_release_id, stale_instance_id, exc,
+                            )
+                            raise _DefinitiveMissingInstance(result) from exc
+                        if (
+                            not isinstance(identity, CollectionIdentity)
+                            or identity.release_id != stale_release_id
+                            or identity.instance_id == stale_instance_id
+                        ):
+                            log.info(
+                                "Discogs collection recovery refused release %s / "
+                                "instance %s; suppressing both field writes.",
+                                stale_release_id, stale_instance_id,
+                            )
+                            raise _DefinitiveMissingInstance(result)
+                        # Update the detached session only after the narrow port
+                        # has established the same-release replacement safely.
+                        session.album_release_id = identity.release_id
+                        session.album_instance_id = identity.instance_id
+                        replacement_identity_established = True
+                        await _read_replacement()
+                    elif result.state is not PlayCountReadState.READY:
+                        # Field missing / unreadable / non-integer — abort WITHOUT
+                        # writing (META-1/META-2), already logged loud by the reader.
+                        # Treated as a failed attempt so a transient read is retried.
+                        return False
+                    else:
+                        plan["field_id"] = result.field_id
+                        plan["current"] = result.current_count
+                        plan["target"] = result.current_count + 1
             return await self.writer.run(
                 self.writer.set_play_count,
                 session.album_release_id,
@@ -1047,6 +1147,17 @@ class ListenTracker:
                 session.album_release_id, session.album_instance_id,
             )
             return
+        except _ReplacementReadAborted:
+            # Recovery established a safe replacement, so META-7 retains its
+            # independent one-shot Last Played attempt.  Only the Play Count
+            # plan is absent; do not retry this ambiguous read or recover again.
+            success = False
+            log.error(
+                "⚠ Discogs Play Count credit FAILED for recovered release %s / "
+                "instance %s: replacement read was inconclusive; no count write "
+                "was attempted.",
+                session.album_release_id, session.album_instance_id,
+            )
         if success:
             session.credited = True  # committed ONLY after the write landed (#163)
             # R8-02 (#346): remember that this release was credited THIS SPIN so

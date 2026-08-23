@@ -299,7 +299,9 @@ def build_components(config, state: PlayerState) -> "Components":
         # late) — not wall-clock windowed, so the tracker no longer needs the
         # silence timeout injected.
         tracker = ListenTracker(
-            DiscogsCollectionWriter(discogs_http, config.discogs), lastfm,
+            DiscogsCollectionWriter(discogs_http, config.discogs),
+            lastfm,
+            recover_collection_instance=resolver.recover_collection_instance,
         )
         # A-9: the application-layer commit service owns resolve → state → track →
         # scrobble; the recognition loop just confirms a result and hands it off.

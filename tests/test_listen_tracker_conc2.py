@@ -18,6 +18,11 @@ import asyncio
 import pytest
 
 from src.audio.silence import AudioEvent
+from src.metadata.discogs.outcomes import (
+    CollectionIdentity, PlayCountReadResult, PlayCountReadState,
+)
+from src.metadata.models import PlaySession
+from src.tracking.listen_tracker import ListenTracker
 from tests.test_listen_tracker import make_tracker, make_track
 
 
@@ -133,3 +138,99 @@ async def test_conc2_finalizes_are_serialized_no_concurrent_writer_calls():
     assert max_inside == 1                    # never two writer calls at once
     assert writer.increment_play_count.call_count == 2  # both did credit, serially
     assert writer.set_play_count.call_count == 2            # the serialized write ran twice
+
+
+@pytest.mark.asyncio
+async def test_conc2_recovery_finalizer_does_not_hold_lifecycle_lock():
+    """Recovery is finalize work, so a waiting resolver must not stall recognition."""
+    tracker, writer = make_tracker()
+    writer.read_play_count.return_value = PlayCountReadResult(
+        PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+        observed_instance_ids=(88,),
+    )
+    entered_recovery = asyncio.Event()
+    release_recovery = asyncio.Event()
+
+    async def recovery(*_args):
+        entered_recovery.set()
+        await release_recovery.wait()
+        return None
+
+    tracker = ListenTracker(writer, recover_collection_instance=recovery)
+    stale = PlaySession()
+    stale.log_track(
+        make_track(
+            "Master-Dik", release_id=999, instance_id=77,
+            resolve_key=("sonic youth", "sister"),
+        )
+    )
+    finalize = asyncio.create_task(tracker._finalize_detached(stale))
+    await asyncio.wait_for(entered_recovery.wait(), timeout=1)
+
+    try:
+        await asyncio.wait_for(
+            tracker.on_track_identified(make_track("So What", release_id=333, instance_id=444)),
+            timeout=1,
+        )
+        recognized = True
+    except asyncio.TimeoutError:
+        recognized = False
+    finally:
+        release_recovery.set()
+        await finalize
+
+    assert recognized, "recovery finalizer held _lifecycle_lock"
+    assert tracker._session is not None
+    assert tracker._session.album_release_id == 333
+
+
+@pytest.mark.asyncio
+async def test_conc2_recovery_finalizers_remain_serialized():
+    """The recovery callback runs under the finalize queue, not concurrently."""
+    _tracker, writer = make_tracker()
+    recovery_entered = asyncio.Event()
+    release_recovery = asyncio.Event()
+    second_read_started = asyncio.Event()
+
+    def read(release_id, instance_id):
+        if instance_id == 77:
+            return PlayCountReadResult(
+                PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+                observed_instance_ids=(88,),
+            )
+        second_read_started.set()
+        return PlayCountReadResult(PlayCountReadState.READY, 3, 0)
+
+    writer.read_play_count.side_effect = read
+    original_run = writer.run
+
+    async def run(fn, *args):
+        return await original_run(fn, *args)
+
+    writer.run = run
+
+    async def recovery(*_args):
+        recovery_entered.set()
+        await release_recovery.wait()
+        return CollectionIdentity(999, 88)
+
+    tracker = ListenTracker(writer, recover_collection_instance=recovery)
+    stale = PlaySession()
+    stale.log_track(
+        make_track(
+            "Master-Dik", release_id=999, instance_id=77,
+            resolve_key=("sonic youth", "sister"),
+        )
+    )
+    independent = PlaySession()
+    independent.log_track(make_track("Master-Dik", release_id=333, instance_id=444))
+    first = asyncio.create_task(tracker._finalize_detached(stale))
+    await asyncio.wait_for(recovery_entered.wait(), timeout=1)
+    second = asyncio.create_task(tracker._finalize_detached(independent))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not second_read_started.is_set(), "second finalizer bypassed _finalize_lock"
+
+    release_recovery.set()
+    await asyncio.gather(first, second)
+    assert second_read_started.is_set()
