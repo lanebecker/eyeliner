@@ -55,3 +55,20 @@ HANDOFF-*.md
 
 # Local audit archive (handoffs, reviews, patches) - never committed
 /docs/archive/
+
+# AI-assistant / development-process files — kept LOCAL, never on the public repo.
+# The public repo tracks product artifacts only (code, product/ops docs, tests).
+# AI-agent instructions and config
+CLAUDE.md
+AGENTS.md
+.claude/
+.mcp.json
+# Wave / round / remediation audit working artifacts (durable record is CHANGELOG
+# + GitHub issues)
+/r*-issue-map.tsv
+/file_issues_r*.sh
+/RELEASE-NOTES-v*.md
+/docs/superpowers/
+/docs/decisions/remediation-guardrails.md
+# Impeccable design-tool data (local design workflow, not a product artifact)
+/design/.impeccable/

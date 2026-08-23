@@ -9,6 +9,31 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+### Recognition and scrobbling reliability
+
+- **Last.fm scrobbling no longer blocks recognition, and failed scrobbles are
+  retried (#422, #423).** The confirmed-track scrobble is handed to a new
+  bounded, single-consumer `ScrobbleDispatcher` through a non-blocking enqueue
+  instead of being awaited inside the sole recognition consumer, so a slow or
+  failing Last.fm call can no longer delay the next audio dequeue (the finding
+  measured a 400 ms Last.fm delay adding 404.6 ms to a commit). A *definite*
+  failure that provably did not apply is retried a bounded number of times in
+  memory using the original confirmation timestamp; an *ambiguous* outcome is
+  never retried, since it may already have applied. Scrobbling is best-effort
+  with no durable cross-restart outbox, and the queue drains (bounded) at
+  shutdown. Per-spin de-duplication, confirmation-time timestamps (#383), the
+  #61 executor serialization, and epoch gating are preserved. PRODUCT.md and
+  README.md now describe scrobbling as best-effort.
+- **Recognition resumes on fresh audio after a backend stall (#424, software
+  portion).** When the dequeued chunk is already older than one capture hop
+  (chunk_seconds − overlap_seconds), the consumer drains the backlog to the
+  newest chunk before recognizing and
+  emits a throttled queue-age health line, so a stall no longer spends requests
+  on ~40–50 s of stale within-session audio. Drop-oldest enqueue (#48), the hard
+  queue bound, the throttled drop-health signal, two-hit confirmation, and
+  per-chunk epoch binding (PCONC-1) are preserved. The final freshness policy is
+  pending a physical record test on the Pi; **#424 remains open**.
+
 ### Metadata safety
 
 - **Long-uptime Discogs ownership recovery is now bounded and identity-safe

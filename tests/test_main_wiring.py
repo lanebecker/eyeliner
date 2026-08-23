@@ -173,6 +173,15 @@ def _drainable_tracker():
     return t
 
 
+def _drainable_dispatcher():
+    """A ScrobbleDispatcher stub whose drain() is an awaitable no-op — R10-09
+    (#422): run_pipeline awaits it on shutdown so queued scrobbles flush (bounded)
+    before the shared I/O pool closes."""
+    d = MagicMock()
+    d.drain = AsyncMock()
+    return d
+
+
 @pytest.mark.asyncio
 async def test_run_pipeline_cancels_pending_and_stops():
     capture, display = MagicMock(), MagicMock()
@@ -186,7 +195,7 @@ async def test_run_pipeline_cancels_pending_and_stops():
     done_leg = asyncio.create_task(quick())
     pending_leg = asyncio.create_task(forever())
 
-    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
+    await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock(), _drainable_dispatcher())
 
     assert pending_leg.cancelled()
     capture.stop.assert_called_once()
@@ -206,8 +215,10 @@ async def test_run_pipeline_drains_then_stops_subsystems_then_closes_pools():
     tracker = _drainable_tracker()
     discogs_http = MagicMock()
     io_executor = MagicMock()
+    dispatcher = _drainable_dispatcher()
     order = []
     tracker.drain.side_effect = lambda *a, **k: order.append("drain")
+    dispatcher.drain.side_effect = lambda *a, **k: order.append("scrobble.drain")
     capture.stop.side_effect = lambda: order.append("capture.stop")
     display.stop.side_effect = lambda: order.append("display.stop")
     discogs_http.close.side_effect = lambda: order.append("discogs.close")
@@ -216,13 +227,20 @@ async def test_run_pipeline_drains_then_stops_subsystems_then_closes_pools():
     async def quick():
         return
 
-    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker, discogs_http, io_executor)
+    await run_pipeline([asyncio.create_task(quick())], capture, display, tracker, discogs_http, io_executor, dispatcher)
 
     tracker.drain.assert_awaited_once()
+    dispatcher.drain.assert_awaited_once()
     discogs_http.close.assert_called_once()
     io_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
     assert order[0] == "drain"                 # credit finishes before anything else
-    assert order == ["drain", "capture.stop", "display.stop", "discogs.close", "io.shutdown"]
+    # R10-09 (#422): the scrobble queue also drains BEFORE the shared I/O pool
+    # closes (its worker runs the scrobble on that pool), and after the tracker
+    # credit — both credit-bearing drains complete before capture/display stop.
+    assert order == [
+        "drain", "scrobble.drain", "capture.stop", "display.stop",
+        "discogs.close", "io.shutdown",
+    ]
 
 
 @pytest.mark.asyncio
@@ -237,7 +255,7 @@ async def test_run_pipeline_still_drains_when_a_leg_faults():
 
     discogs_http = MagicMock()
     with pytest.raises(RuntimeError, match="leg died"):
-        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker, discogs_http, MagicMock())
+        await run_pipeline([asyncio.create_task(boom())], capture, display, tracker, discogs_http, MagicMock(), _drainable_dispatcher())
 
     tracker.drain.assert_awaited_once()
     capture.stop.assert_called_once()
@@ -267,7 +285,7 @@ async def test_run_pipeline_logs_a_pending_leg_that_raises_while_unwinding(caplo
     done_leg = asyncio.create_task(finisher())
     pending_leg = asyncio.create_task(bad_on_cancel())
     with caplog.at_level(_logging.ERROR):
-        await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
+        await run_pipeline([done_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock(), _drainable_dispatcher())
 
     assert any("unwinding shutdown" in r.getMessage() for r in caplog.records)
 
@@ -286,7 +304,7 @@ async def test_run_pipeline_reraises_faulted_leg_and_still_cleans_up():
     pending_leg = asyncio.create_task(forever())
 
     with pytest.raises(RuntimeError, match="leg died"):
-        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
+        await run_pipeline([boom_leg, pending_leg], capture, display, _drainable_tracker(), MagicMock(), MagicMock(), _drainable_dispatcher())
 
     # finally ran despite the re-raise…
     capture.stop.assert_called_once()
@@ -316,7 +334,7 @@ async def test_run_pipeline_logs_every_faulted_leg(caplog):
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises((RuntimeError, ValueError)):
-            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker(), MagicMock(), MagicMock())
+            await run_pipeline([leg_a, leg_b], capture, display, _drainable_tracker(), MagicMock(), MagicMock(), _drainable_dispatcher())
 
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "leg A died" in logged
@@ -359,7 +377,7 @@ async def test_run_pipeline_shuts_down_the_io_executor_dropping_queued_work():
 
     await run_pipeline(
         [asyncio.create_task(quick())], capture, display,
-        _drainable_tracker(), MagicMock(), io_executor,
+        _drainable_tracker(), MagicMock(), io_executor, _drainable_dispatcher(),
     )
 
     # The executor was shut down — new submissions are rejected…
@@ -433,6 +451,7 @@ def test_build_components_returns_wired_bundle(tmp_path):
     from src.audio.recognizer import RecognitionLoop
     from src.audio.capture import AudioCapture
     from src.tracking.listen_tracker import ListenTracker
+    from src.tracking.scrobble_dispatcher import ScrobbleDispatcher
 
     cfg = _app_config(cover_art_cache_dir=str(tmp_path / "cache"))
     components = build_components(cfg, PlayerState())
@@ -442,6 +461,29 @@ def test_build_components_returns_wired_bundle(tmp_path):
     assert isinstance(components.recognizer, RecognitionLoop)
     assert isinstance(components.capture, AudioCapture)
     assert isinstance(components.tracker, ListenTracker)
+    # R10-09 (#422): the scrobble dispatcher is constructed and returned in the
+    # bundle so main() can start() and drain() it over the pipeline lifecycle.
+    assert isinstance(components.scrobble_dispatcher, ScrobbleDispatcher)
+    # R10-11 (#424): the recognizer's staleness threshold is one capture hop
+    # (default chunk 15 − overlap 5 = 10s).
+    assert components.recognizer._stale_after_seconds == 10
+
+
+def test_build_components_uses_full_chunk_as_hop_when_overlap_disabled(tmp_path):
+    """R10-11: config ALLOWS overlap >= chunk (AudioCapture disables overlap), so
+    the effective hop is the full chunk, never ≤ 0. The wired recognizer's
+    staleness threshold must reflect that — not a degenerate zero/negative."""
+    from src.config import AppConfig
+
+    base = _app_config(cover_art_cache_dir=str(tmp_path / "cache"))
+    # overlap == chunk → overlap disabled → hop is the full chunk (8s), not 0.
+    cfg = AppConfig(
+        audio=make_audio_config(chunk_seconds=8, overlap_seconds=8),
+        discogs=base.discogs, display=base.display,
+        recognition=base.recognition, lastfm=base.lastfm,
+    )
+    components = build_components(cfg, PlayerState())
+    assert components.recognizer._stale_after_seconds == 8   # full chunk, positive
 
 
 def test_build_components_injects_only_resolver_recovery_bound_method(monkeypatch, tmp_path):
@@ -469,7 +511,7 @@ def test_build_components_injects_only_resolver_recovery_bound_method(monkeypatc
     monkeypatch.setattr(main_module, "TrackCommitService", lambda *_args: MagicMock())
     monkeypatch.setattr(main_module, "DisplayRenderer", lambda *_args: MagicMock())
     monkeypatch.setattr(main_module, "SilenceDetector", lambda *_args: MagicMock())
-    monkeypatch.setattr(main_module, "RecognitionLoop", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "RecognitionLoop", lambda *_args, **_kw: MagicMock())
     from src.audio import capture as capture_module
     monkeypatch.setattr(capture_module, "AudioCapture", lambda *_args: MagicMock())
 
@@ -624,6 +666,9 @@ async def test_main_closes_both_pools_when_start_display_aborts(monkeypatch):
     io_executor = MagicMock()
     monkeypatch.setattr(main_module, "install_io_executor", lambda loop: io_executor)
     components = MagicMock()
+    # R10-09 (#422): the abort finally now bounded-drains the dispatcher (if the
+    # abort landed after it could have started) before closing the pools.
+    components.scrobble_dispatcher.drain = AsyncMock()
     monkeypatch.setattr(main_module, "build_components", lambda config, state: components)
     monkeypatch.setattr(main_module, "wire_silence_listeners", lambda *a, **k: None)
     monkeypatch.setattr(main_module, "read_version", lambda: "test")
@@ -635,6 +680,7 @@ async def test_main_closes_both_pools_when_start_display_aborts(monkeypatch):
     with pytest.raises(RuntimeError, match="no HDMI"):
         await main()
 
+    components.scrobble_dispatcher.drain.assert_awaited_once()
     components.discogs_http.close.assert_called_once()
     io_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
 

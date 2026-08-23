@@ -42,6 +42,7 @@ from src.display.renderer import DisplayRenderer
 from src.state.player_state import PlayerState, PlayerStatus
 from src.tracking.lastfm_client import LastFmClient
 from src.tracking.listen_tracker import ListenTracker
+from src.tracking.scrobble_dispatcher import ScrobbleDispatcher
 
 logging.basicConfig(
     level=logging.INFO,
@@ -269,7 +270,8 @@ def install_io_executor(loop) -> ThreadPoolExecutor:
 # lets build_components own the construction (and its failure message) while main()
 # stays a thin wiring/lifecycle body.
 Components = namedtuple(
-    "Components", "discogs_http display silence recognizer capture tracker"
+    "Components",
+    "discogs_http display silence recognizer capture tracker scrobble_dispatcher",
 )
 
 
@@ -305,10 +307,31 @@ def build_components(config, state: PlayerState) -> "Components":
         )
         # A-9: the application-layer commit service owns resolve → state → track →
         # scrobble; the recognition loop just confirms a result and hands it off.
-        commit_service = TrackCommitService(state, resolver, tracker, lastfm)
+        # R10-09 (#422): the confirmed-track scrobble is dispatched off the sole
+        # recognition consumer through this lifecycle-owned, single-consumer
+        # queue (started in main(), drained in run_pipeline).  It wraps the SAME
+        # LastFmClient the tracker uses for love(); the client's own lock keeps
+        # scrobble and love serialized against the shared pylast Network (CRIT-10).
+        scrobble_dispatcher = ScrobbleDispatcher(lastfm)
+        commit_service = TrackCommitService(
+            state, resolver, tracker, scrobble_dispatcher
+        )
         display = DisplayRenderer(config.display, state)
         silence = SilenceDetector(config.audio)
-        recognizer = RecognitionLoop(config.recognition, state, commit_service.commit)
+        # R10-11 (#424): the recognizer flags a queued chunk as stale once it has
+        # waited longer than ONE CAPTURE HOP — the cadence fresh audio arrives at.
+        # The hop lives in the audio config. AudioCapture DISABLES overlap when
+        # overlap_seconds >= chunk_seconds (a benign, config-ALLOWED degradation —
+        # config validation enforces only overlap >= 0, not overlap < chunk), so
+        # mirror that here: the effective hop is chunk − overlap while overlap is
+        # smaller than the chunk, otherwise the full (non-overlapping) chunk. Since
+        # chunk_seconds > 0 is enforced, the result is always positive.
+        chunk_s = config.audio.chunk_seconds
+        overlap_s = config.audio.overlap_seconds
+        hop_seconds = chunk_s - overlap_s if overlap_s < chunk_s else chunk_s
+        recognizer = RecognitionLoop(
+            config.recognition, state, commit_service.commit, hop_seconds=hop_seconds
+        )
         from src.audio.capture import AudioCapture   # R9-13: lazy (see import note)
         capture = AudioCapture(config.audio, silence, recognizer)
     except Exception:
@@ -329,6 +352,7 @@ def build_components(config, state: PlayerState) -> "Components":
         recognizer=recognizer,
         capture=capture,
         tracker=tracker,
+        scrobble_dispatcher=scrobble_dispatcher,
     )
 
 
@@ -407,7 +431,9 @@ def wire_silence_listeners(silence, state: PlayerState, tracker: ListenTracker):
     silence.on_event(tracker.on_silence_event)
 
 
-async def run_pipeline(tasks, capture, display, tracker, discogs_http, io_executor):
+async def run_pipeline(
+    tasks, capture, display, tracker, discogs_http, io_executor, scrobble_dispatcher
+):
     """Run the pipeline legs until the first one finishes, then shut down.
 
     Extracted from main() (T-1) so the shutdown semantics are testable without
@@ -467,6 +493,12 @@ async def run_pipeline(tasks, capture, display, tracker, discogs_http, io_execut
         # shield: if a future change ever cancels run_pipeline directly, wrap the
         # body below in `asyncio.shield` or move the awaited drain last.
         await tracker.drain()
+        # R10-09 (#422): flush the confirmed-track scrobble queue (bounded) before
+        # the shared I/O pool closes — its worker runs the scrobble via
+        # run_in_executor on that pool, exactly like the tracker's love() credit.
+        # Bounded like tracker.drain() so a wedged Last.fm call can't hang
+        # shutdown; anything still queued at the bound is dropped (best-effort).
+        await scrobble_dispatcher.drain()
         capture.stop()
         display.stop()
         # Close BOTH thread pools LAST — after drain() has awaited the credit
@@ -555,6 +587,13 @@ async def main():
         # failure (no HDMI / X down) is now an actionable message before the re-raise.
         start_display(components.display)
 
+        # R10-09 (#422): start the scrobble dispatcher's single consumer task now
+        # that the loop is running and the shared I/O executor is installed. It is
+        # NOT a FIRST_COMPLETED pipeline leg (it never exits on its own, and its
+        # exit must not trigger shutdown); it is a tracked background task that
+        # run_pipeline's finally drains and cancels, like the tracker's credit tasks.
+        components.scrobble_dispatcher.start()
+
         # The three long-running pipeline coroutines as named tasks.
         tasks = [
             asyncio.create_task(components.capture.run(), name="capture"),
@@ -583,7 +622,7 @@ async def main():
         started_pipeline = True
         await run_pipeline(
             tasks, components.capture, components.display, components.tracker,
-            components.discogs_http, io_executor,
+            components.discogs_http, io_executor, components.scrobble_dispatcher,
         )
     finally:
         # #170: only the PRE-run_pipeline abort path reaches here with cleanup
@@ -593,6 +632,11 @@ async def main():
         # cheap no-op, and both close idempotently.
         if not started_pipeline:
             if components is not None:
+                # If the abort landed AFTER the dispatcher's consumer task was
+                # started (between start() and started_pipeline), drain+cancel it
+                # so it isn't left pending for loop teardown to reap. Bounded and
+                # never-raises; a no-op if start() was never reached.
+                await components.scrobble_dispatcher.drain()
                 components.discogs_http.close()
             io_executor.shutdown(wait=False, cancel_futures=True)
 

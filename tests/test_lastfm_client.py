@@ -364,3 +364,86 @@ def test_r6_25_placeholder_credentials_disable_with_a_warning(caplog):
     msgs = [r.getMessage() for r in caplog.records]
     assert any("placeholder" in m.lower() for m in msgs)
     assert not any("initialised" in m for m in msgs)   # no false success
+
+
+# ---------------------------------------------------------------------------
+# R10-10 (#423) — scrobble_result three-way classification: definite failures
+# are RETRYABLE, ambiguous outcomes are not. scrobble() stays a bool shim.
+# ---------------------------------------------------------------------------
+
+from src.tracking.lastfm_client import ScrobbleResult  # noqa: E402
+
+
+# Exception classes whose NAMES match pylast's, so _classify_scrobble_exception
+# (which walks the MRO by name, to survive a mocked pylast) routes them. Kept
+# local so the tests don't depend on importing the real pylast.
+class NetworkError(Exception):
+    pass
+
+
+class WSError(Exception):
+    pass
+
+
+class MalformedResponseError(Exception):
+    pass
+
+
+def _client_whose_scrobble_raises(exc):
+    client, pylast_mock = _make_enabled_client()
+    client._network.scrobble = MagicMock(side_effect=exc)
+    return client
+
+
+def test_scrobble_result_delivered_on_success():
+    client, _ = _make_enabled_client()
+    assert client.scrobble_result(_make_track(), 1) is ScrobbleResult.DELIVERED
+
+
+def test_scrobble_result_delivered_when_disabled():
+    client = LastFmClient(_DISABLED_CONFIG)
+    assert client.scrobble_result(_make_track(), 1) is ScrobbleResult.DELIVERED
+
+
+def test_scrobble_result_network_error_is_retryable():
+    client = _client_whose_scrobble_raises(NetworkError("connection refused"))
+    assert client.scrobble_result(_make_track(), 1) is ScrobbleResult.RETRYABLE
+
+
+def test_scrobble_result_ws_error_is_retryable():
+    client = _client_whose_scrobble_raises(WSError("service temporarily unavailable"))
+    assert client.scrobble_result(_make_track(), 1) is ScrobbleResult.RETRYABLE
+
+
+def test_scrobble_result_malformed_response_is_ambiguous():
+    client = _client_whose_scrobble_raises(MalformedResponseError("bad XML"))
+    assert client.scrobble_result(_make_track(), 1) is ScrobbleResult.AMBIGUOUS
+
+
+def test_scrobble_result_unknown_exception_is_ambiguous():
+    """An unclassified error is conservatively AMBIGUOUS (never auto-retried) —
+    we cannot prove the scrobble did not already apply."""
+    client = _client_whose_scrobble_raises(ValueError("who knows"))
+    assert client.scrobble_result(_make_track(), 1) is ScrobbleResult.AMBIGUOUS
+
+
+def test_scrobble_bool_shim_true_only_on_delivered():
+    delivered = _make_enabled_client()[0]
+    assert delivered.scrobble(_make_track(), 1) is True
+    retryable = _client_whose_scrobble_raises(NetworkError("x"))
+    assert retryable.scrobble(_make_track(), 1) is False
+    ambiguous = _client_whose_scrobble_raises(MalformedResponseError("x"))
+    assert ambiguous.scrobble(_make_track(), 1) is False
+
+
+def test_scrobble_result_runs_under_the_network_lock():
+    """CRIT-10: the pylast call in scrobble_result executes under the lock."""
+    client, _ = _make_enabled_client(_LOVE_CONFIG)
+    held = {}
+
+    def fake_scrobble(**kwargs):
+        held["locked"] = client._lock.locked()
+
+    client._network.scrobble = fake_scrobble
+    client.scrobble_result(_make_track(), 12345)
+    assert held["locked"] is True
