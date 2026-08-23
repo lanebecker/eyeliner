@@ -306,6 +306,10 @@ class MetadataResolver:
                     # A repeated cancellation must still not release the gate
                     # while the executor worker owns mutable reader state.
                     continue
+                except BaseException:
+                    # A late reader failure is retrieved below. It must not
+                    # replace the caller's already-pending cancellation.
+                    break
             try:
                 reader_task.result()
             except BaseException:
