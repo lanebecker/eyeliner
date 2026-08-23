@@ -25,6 +25,7 @@ from src.audio.silence import AudioEvent
 from src.metadata.models import (
     MetadataSource, TracklistEntry, TrackMetadata, PlaySession
 )
+from src.metadata.discogs.outcomes import PlayCountReadResult, PlayCountReadState
 from src.tracking.listen_tracker import ListenTracker
 
 
@@ -53,7 +54,9 @@ def make_writer_mock(
     # instance) — so one credit landing == one increment_play_count call, and any
     # return_value/side_effect a test configures on increment_play_count still
     # drives the set's outcome (success, failure, raise, DiscogsRateLimited).
-    writer.read_play_count.return_value = (3, 0)
+    writer.read_play_count.return_value = PlayCountReadResult(
+        PlayCountReadState.READY, 3, 0
+    )
     writer.set_play_count.side_effect = (
         lambda release_id, instance_id, field_id, current, target:
         writer.increment_play_count(release_id, instance_id)

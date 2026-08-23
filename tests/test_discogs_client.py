@@ -42,6 +42,7 @@ import pytest
 import requests
 
 from src.metadata.discogs.writer import _READ_FAILED
+from src.metadata.discogs.outcomes import PlayCountReadResult, PlayCountReadState
 from tests.factories import make_discogs_config, make_discogs_writer, make_discogs_reader
 
 
@@ -114,6 +115,158 @@ def instance_response(instance_id: int, field_id: int, value: str):
             }
         ]
     }
+
+
+def complete_single_page_response(release_id: int, instances: list[dict]):
+    """Build a complete one-page collection snapshot for typed-read tests."""
+    return {
+        "pagination": {
+            "page": 1,
+            "pages": 1,
+            "items": len(instances),
+            "per_page": max(1, len(instances)),
+        },
+        "releases": [
+            {
+                "instance_id": instance["instance_id"],
+                "folder_id": instance.get("folder_id", 0),
+                "basic_information": {"id": instance.get("release_id", release_id)},
+                "notes": instance.get("notes", []),
+            }
+            for instance in instances
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# read_play_count — typed outcomes / definitive missing-instance evidence (#421)
+# ---------------------------------------------------------------------------
+
+def test_read_play_count_returns_ready_with_integer_count():
+    """A found instance exposes the field and parsed count in a READY result."""
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=make_get_response(
+        200, complete_single_page_response(111, [{
+            "instance_id": 42, "notes": [{"field_id": _FIELD_ID, "value": "5"}],
+        }]),
+    ))
+
+    result = client.read_play_count(111, 42)
+
+    assert result == PlayCountReadResult(PlayCountReadState.READY, _FIELD_ID, 5)
+
+
+def test_read_play_count_returns_ready_for_confirmed_blank():
+    """An existing instance with no value is a safe, confirmed zero."""
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=make_get_response(
+        200, complete_single_page_response(111, [{"instance_id": 42}]),
+    ))
+
+    result = client.read_play_count(111, 42)
+
+    assert result == PlayCountReadResult(PlayCountReadState.READY, _FIELD_ID, 0)
+
+
+def test_read_play_count_definitively_missing_only_from_valid_complete_single_page():
+    """Only a validated complete snapshot may prove the old instance is gone."""
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=make_get_response(
+        200, complete_single_page_response(111, [
+            {"instance_id": 18}, {"instance_id": 91},
+        ]),
+    ))
+
+    result = client.read_play_count(111, 42)
+
+    assert result == PlayCountReadResult(
+        PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+        observed_instance_ids=(18, 91),
+    )
+
+
+def test_read_play_count_definitively_missing_with_empty_observed_tuple():
+    """A valid empty collection response is different from an ambiguous abort."""
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=make_get_response(
+        200, complete_single_page_response(111, []),
+    ))
+
+    result = client.read_play_count(111, 42)
+
+    assert result == PlayCountReadResult(
+        PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+        observed_instance_ids=(),
+    )
+
+
+def test_found_expected_instance_is_ready_not_missing():
+    """A target found in a response never needs absence-proof validation."""
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=make_get_response(200, {
+        "releases": [{"instance_id": 42, "notes": []}],
+    }))
+
+    result = client.read_play_count(111, 42)
+
+    assert result == PlayCountReadResult(PlayCountReadState.READY, _FIELD_ID, 0)
+
+
+def test_noninteger_count_is_abort_not_missing():
+    """Real nonnumeric field data must not be overwritten or mistaken for removal."""
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=make_get_response(
+        200, complete_single_page_response(111, [{
+            "instance_id": 42, "notes": [{"field_id": _FIELD_ID, "value": "five"}],
+        }]),
+    ))
+
+    result = client.read_play_count(111, 42)
+
+    assert result == PlayCountReadResult(PlayCountReadState.ABORT)
+
+
+@pytest.mark.parametrize("body", [
+    {"releases": []},
+    {"pagination": {"page": 1, "pages": 2, "items": 1, "per_page": 1}, "releases": [{"instance_id": 18, "folder_id": 0, "basic_information": {"id": 111}}]},
+    {"pagination": {"page": 1, "pages": 1, "items": 2, "per_page": 2}, "releases": [{"instance_id": 18, "folder_id": 0, "basic_information": {"id": 111}}]},
+    {"pagination": {"page": 1, "pages": 1, "items": 2, "per_page": 1}, "releases": [{"instance_id": 18, "folder_id": 0, "basic_information": {"id": 111}}, {"instance_id": 19, "folder_id": 0, "basic_information": {"id": 111}}]},
+    {"pagination": {"page": 1, "pages": 1, "items": 1, "per_page": 0}, "releases": [{"instance_id": 18, "folder_id": 0, "basic_information": {"id": 111}}]},
+    complete_single_page_response(111, [{"instance_id": 18}, {"instance_id": 18}]),
+    complete_single_page_response(111, [{"instance_id": True}]),
+    complete_single_page_response(111, [{"instance_id": 18, "release_id": 112}]),
+    {"pagination": {"page": 1, "pages": 1, "items": 1, "per_page": 1}, "releases": [{"instance_id": 18, "folder_id": True, "basic_information": {"id": 111}}]},
+])
+def test_missing_instance_evidence_remains_abort(body):
+    """Incomplete or malformed snapshots must never expose replacement IDs."""
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=make_get_response(200, body))
+
+    result = client.read_play_count(111, 42)
+
+    assert result == PlayCountReadResult(PlayCountReadState.ABORT)
+    assert result.observed_instance_ids == ()
+
+
+@pytest.mark.parametrize("response", [
+    make_get_response(404, {}), make_get_response(500, {}),
+])
+def test_non_200_or_transport_failure_remains_abort(response):
+    client = make_client()
+    client._http.session.get = MagicMock(return_value=response)
+
+    assert client.read_play_count(111, 42) == PlayCountReadResult(PlayCountReadState.ABORT)
+
+
+def test_malformed_json_or_transport_failure_remains_abort():
+    client = make_client()
+    response = make_get_response(200, {})
+    response.json.side_effect = ValueError("bad JSON")
+    client._http.session.get = MagicMock(return_value=response)
+    assert client.read_play_count(111, 42) == PlayCountReadResult(PlayCountReadState.ABORT)
+
+    client._http.session.get = MagicMock(side_effect=requests.ConnectionError("offline"))
+    assert client.read_play_count(111, 42) == PlayCountReadResult(PlayCountReadState.ABORT)
 
 
 # ---------------------------------------------------------------------------

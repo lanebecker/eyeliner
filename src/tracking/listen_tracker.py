@@ -86,6 +86,7 @@ from src.metadata.models import MetadataSource, PlaySession, TrackMetadata
 from src.metadata.normalize import fold_text
 from src.audio.silence import AudioEvent
 from src.metadata.discogs.transport import DiscogsRateLimited
+from src.metadata.discogs.outcomes import PlayCountReadResult, PlayCountReadState
 from src.tracking.spin_memory import SpinMemory
 from src.util.clock import clock_is_trustworthy
 
@@ -162,6 +163,14 @@ _HONORED_RETRY_AFTER_CAP_SECONDS = 90.0
 # IN-THREAD by the transport rather than honoured; such a credit also exceeds the cap
 # and is backgrounded too — harmless, the credit still lands via _bg_tasks.)
 _SPLIT_CREDIT_INLINE_WAIT_SECONDS = 5.0
+
+
+class _DefinitiveMissingInstance(Exception):
+    """Terminal signal for an old collection instance proven stale."""
+
+    def __init__(self, result: PlayCountReadResult):
+        super().__init__("collection instance is definitively missing")
+        self.result = result
 
 # R7-03 (flip-resume): how far back a newly-armed session may reach to inherit an
 # immediately-prior UNARMED session's closing-side rows (Lane, 2026-08-11: fixed
@@ -962,6 +971,8 @@ class ListenTracker:
                     "wait in the event loop (sleeping %ss) before retrying (#229).",
                     label, n, _FINALIZE_WRITE_ATTEMPTS, e.retry_after, backoff,
                 )
+            except _DefinitiveMissingInstance:
+                raise
             except Exception as e:
                 log.warning(
                     "%s attempt %d/%d raised: %s", label, n, _FINALIZE_WRITE_ATTEMPTS, e
@@ -1001,20 +1012,21 @@ class ListenTracker:
 
         async def _credit_attempt() -> bool:
             if not plan:
-                state = await self.writer.run(
+                result = await self.writer.run(
                     self.writer.read_play_count,
                     session.album_release_id,
                     session.album_instance_id,
                 )
-                if state is None:
+                if result.state is PlayCountReadState.DEFINITIVE_INSTANCE_MISSING:
+                    raise _DefinitiveMissingInstance(result)
+                if result.state is not PlayCountReadState.READY:
                     # Field missing / unreadable / non-integer — abort WITHOUT
                     # writing (META-1/META-2), already logged loud by the reader.
                     # Treated as a failed attempt so a transient read is retried.
                     return False
-                field_id, current_count = state
-                plan["field_id"] = field_id
-                plan["current"] = current_count
-                plan["target"] = current_count + 1
+                plan["field_id"] = result.field_id
+                plan["current"] = result.current_count
+                plan["target"] = result.current_count + 1
             return await self.writer.run(
                 self.writer.set_play_count,
                 session.album_release_id,
@@ -1024,9 +1036,17 @@ class ListenTracker:
                 plan["target"],
             )
 
-        success = await self._finalize_write_with_retry(
-            "Discogs Play Count increment", _credit_attempt
-        )
+        try:
+            success = await self._finalize_write_with_retry(
+                "Discogs Play Count increment", _credit_attempt
+            )
+        except _DefinitiveMissingInstance:
+            log.error(
+                "⚠ Discogs Play Count credit FAILED for release %s / instance %s: "
+                "the collection instance is definitively missing; suppressing Last Played.",
+                session.album_release_id, session.album_instance_id,
+            )
+            return
         if success:
             session.credited = True  # committed ONLY after the write landed (#163)
             # R8-02 (#346): remember that this release was credited THIS SPIN so
