@@ -283,6 +283,24 @@ def test_advertised_pages_beyond_cap_never_promotes_candidate_index(monkeypatch)
     assert client._collection_index is prior
 
 
+def test_advertised_extra_empty_final_page_never_promotes_candidate_index():
+    """The metadata cannot advertise a second empty page after all claimed
+    items were already supplied by page one."""
+    from src.metadata.discogs import reader as reader_mod
+
+    client = make_discogs_reader()
+    client._collection_index = None
+    client._http.request = MagicMock(side_effect=[
+        _page([_item(1, 1, "One", ["A"])], 1, 2, per_page=1, items=1),
+        _page([], 2, 2, per_page=1, items=1),
+    ])
+
+    with pytest.raises(reader_mod.CollectionIndexIncomplete):
+        client._get_collection_index()
+
+    assert client._collection_index is None
+
+
 @pytest.mark.parametrize("responses", [
     [{"releases": [], "pagination": None}],
     [{"releases": [], "pagination": {"page": 2, "pages": 1, "per_page": 100, "items": 0}}],
