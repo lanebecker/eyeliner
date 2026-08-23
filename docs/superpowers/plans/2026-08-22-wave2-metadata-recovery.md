@@ -639,7 +639,7 @@ git commit -m 'feat: retry one credit on safe Discogs replacement'
 - Modify: `docs/superpowers/specs/2026-08-22-wave2-metadata-recovery-design.md` only if implementation review resolves a documented interface detail
 - Modify: `docs/superpowers/plans/2026-08-22-wave2-metadata-recovery.md` checkboxes/status only after fresh evidence
 
-- [ ] **Step 1: Add the cross-layer acceptance matrix**
+- [x] **Step 1: Add the cross-layer acceptance matrix**
 
 Use real resolver/tracker orchestration with mocked HTTP/reader/writer seams. Add:
 
@@ -649,7 +649,7 @@ Use real resolver/tracker orchestration with mocked HTTP/reader/writer seams. Ad
 
 The first test records two displayed database results, zero cache entries, and no second page walk. The second begins with cached `(release=999, instance=77)`, gets a strict MISSING result carrying `(88,)`, rebuilds the same release, reads 88 once, and posts one absolute target. The duplicate test carries `(88, 89)`, clears only stale state, performs no field POST, and leaves the key uncached for the next play.
 
-- [ ] **Step 2: Run the integrated Wave 2 suite**
+- [x] **Step 2: Run the integrated Wave 2 suite**
 
 ```bash
 cd '/private/tmp/vnp-wave2-metadata-recovery'
@@ -657,7 +657,7 @@ cd '/private/tmp/vnp-wave2-metadata-recovery'
 git diff --check
 ```
 
-- [ ] **Step 3: Update durable decisions and changelog**
+- [x] **Step 3: Update durable decisions and changelog**
 
 In the Wave 2 guardrail section record:
 
@@ -671,7 +671,7 @@ In the Wave 2 guardrail section record:
 
 In `CHANGELOG.md` under Unreleased, describe user-visible long-uptime ownership recovery and safe replacement crediting without claiming live Discogs validation.
 
-- [ ] **Step 4: Independent documentation/spec review and commit**
+- [x] **Step 4: Independent documentation/spec review and commit**
 
 Review current implementation, issue contracts, and historical #191/#242/#169/#186/#229/META-7 behavior. Reject any claim that ambiguous or multi-page absence is definitive or that positive entries now expire.
 
