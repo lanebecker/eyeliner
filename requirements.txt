@@ -4,7 +4,7 @@
 
 # Audio capture
 sounddevice>=0.5.5
-numpy>=1.24.0
+numpy>=2.4.6
 soundfile>=0.14.0
 
 # Music recognition
@@ -17,7 +17,7 @@ shazamio>=0.8.1
 # so the default image works; the marker keeps it off 3.11 (Bookworm/Legacy),
 # which still has audioop in the stdlib. main.py probes the import at startup and
 # fails loud if this is somehow missing.
-audioop-lts>=0.2; python_version >= "3.13"
+audioop-lts>=0.2.2; python_version >= "3.13"
 
 # Discogs
 python3-discogs-client>=2.9
@@ -27,14 +27,14 @@ requests>=2.34.2  # Used directly in the Discogs transport (also transitive dep 
 musicbrainzngs>=0.7.1
 
 # Display
-pygame>=2.5.0
+pygame>=2.6.1
 Pillow>=12.3.0
 # R8-03 (#352): reads each bundled font's cmap once at FIRST USE (cached per
 # file) so the display can split text into primary/fallback runs (Noto Sans JP
 # for CJK + the Cyrillic/Greek gaps in Newsreader-Italic). Pure Python, no
 # per-frame work; if absent the display degrades to single-face rendering with
 # one WARNING.
-fonttools>=4.38.0
+fonttools>=4.63.0
 # Cover-art fetch pins the connection to a vetted IP (S-7); these are imported
 # directly by src/display/cover_cache.py, not just transitively via requests.
 # urllib3>=2.0 is required: the IP-pinned HTTPSConnectionPool relies on the
@@ -47,7 +47,7 @@ fonttools>=4.38.0
 # test_cover_cache.py builds a real HTTPSConnectionPool to catch it in CI, not
 # on the Pi (TQ-4, #116).
 urllib3>=2.7.0,<3.0.0
-certifi>=2023.7.22
+certifi>=2026.7.22
 
 # Config
 PyYAML>=6.0.3
