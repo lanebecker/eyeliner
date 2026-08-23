@@ -251,6 +251,35 @@ async def test_recovery_rebuild_failure_log_redacts_exception_value(resolver, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expected_release_id, expected_instance_id, observed_instance_ids, safe_fields, sentinel",
+    [
+        (100, "invalid-instance-sentinel", (300,), ("expected_release_id=100",), "invalid-instance-sentinel"),
+        ("invalid-release-sentinel", 200, (300,), ("expected_instance_id=200",), "invalid-release-sentinel"),
+        (100, 200, ("invalid-observed-sentinel",),
+         ("expected_release_id=100", "expected_instance_id=200"), "invalid-observed-sentinel"),
+    ],
+)
+async def test_invalid_recovery_evidence_log_keeps_only_independently_valid_ids(
+    resolver, mock_discogs, caplog, expected_release_id, expected_instance_id,
+    observed_instance_ids, safe_fields, sentinel,
+):
+    """Malformed evidence is diagnosable without emitting its raw values."""
+    caplog.set_level("WARNING", logger="src.metadata.resolver")
+
+    result = await resolver.recover_collection_instance(
+        ("miles davis", "kind of blue"), expected_release_id,
+        expected_instance_id, observed_instance_ids,
+    )
+
+    assert result is None
+    assert "stage=invalid-evidence" in caplog.text
+    for safe_field in safe_fields:
+        assert safe_field in caplog.text
+    assert sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_recovery_refuses_same_instance(resolver, mock_discogs):
     key = ("miles davis", "kind of blue")
     _put_collection(resolver, key, make_discogs_result(100, 200))
