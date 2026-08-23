@@ -262,7 +262,7 @@ class MetadataResolver:
             else:
                 log.warning(f"Unexpected error in cover art lookup: {e}")
         if discogs_completed and cover_completed:
-            self._cache_store(key, MetadataSource.FALLBACK, cover_url)
+            await self._cache_fallback_if_absent(key, cover_url)
         return TrackMetadata(
             title=raw.title,
             artist=raw.artist,
@@ -271,6 +271,18 @@ class MetadataResolver:
             source=MetadataSource.FALLBACK,
             resolve_key=key,
         )
+
+    async def _cache_fallback_if_absent(self, key: tuple[str, str], cover_url) -> None:
+        """Store a clean fallback only if no gated resolve/recovery superseded it.
+
+        Cover-art I/O intentionally happens outside the reader gate.  A recovery
+        can therefore publish a fresh immortal collection identity while that
+        I/O is pending; re-entering the gate and compare-storing prevents the
+        old fallback completion from clobbering it.
+        """
+        async with self._reader_gate:
+            if self._cache_get(key) is None:
+                self._cache_store(key, MetadataSource.FALLBACK, cover_url)
 
     async def _resolve_discogs_locked(
         self, raw: "RawRecognitionResult", key: tuple[str, str]
@@ -420,11 +432,24 @@ class MetadataResolver:
                     and pair == (expected_release_id, observed_instance_ids[0])
                 ):
                     return CollectionIdentity(*pair)
-                log.info("Discogs collection recovery found a newer cache entry; leaving it intact.")
+                cached_release_id, cached_instance_id = pair if pair is not None else (None, None)
+                log.info(
+                    "Discogs collection recovery stage=newer-cache-refusal "
+                    "expected_release_id=%d expected_instance_id=%d "
+                    "observed_instance_ids=%s cached_release_id=%s "
+                    "cached_instance_id=%s; leaving cache intact.",
+                    expected_release_id, expected_instance_id, observed_instance_ids,
+                    cached_release_id, cached_instance_id,
+                )
                 return None
 
             if len(observed_instance_ids) != 1 or observed_instance_ids[0] == expected_instance_id:
-                log.info("Discogs collection recovery refused non-singleton replacement evidence.")
+                log.info(
+                    "Discogs collection recovery stage=observed-evidence-refusal "
+                    "expected_release_id=%d expected_instance_id=%d "
+                    "observed_instance_ids=%s.",
+                    expected_release_id, expected_instance_id, observed_instance_ids,
+                )
                 return None
             replacement_instance_id = observed_instance_ids[0]
             try:
@@ -432,15 +457,32 @@ class MetadataResolver:
                     self.reader.rebuild_collection_and_research,
                     resolve_key[0], resolve_key[1],
                 )
-            except Exception as exc:
-                log.warning("Discogs collection recovery rebuild failed: %s", exc)
+            except Exception:
+                log.warning(
+                    "Discogs collection recovery stage=rebuild-failed "
+                    "expected_release_id=%d expected_instance_id=%d "
+                    "observed_instance_id=%d.",
+                    expected_release_id, expected_instance_id, replacement_instance_id,
+                )
                 return None
             if not isinstance(fresh, dict):
-                log.info("Discogs collection recovery found no unambiguous fresh match.")
+                log.info(
+                    "Discogs collection recovery stage=rebuild-no-match "
+                    "expected_release_id=%d expected_instance_id=%d "
+                    "observed_instance_id=%d.",
+                    expected_release_id, expected_instance_id, replacement_instance_id,
+                )
                 return None
             release_id = fresh.get("release_id")
             if type(release_id) is not int or release_id != expected_release_id:
-                log.info("Discogs collection recovery resolved a different release.")
+                rebuilt_release_id = release_id if type(release_id) is int else None
+                log.info(
+                    "Discogs collection recovery stage=rebuild-release-refusal "
+                    "expected_release_id=%d expected_instance_id=%d "
+                    "observed_instance_id=%d rebuilt_release_id=%s.",
+                    expected_release_id, expected_instance_id, replacement_instance_id,
+                    rebuilt_release_id,
+                )
                 return None
             recovered = dict(fresh)
             recovered["instance_id"] = replacement_instance_id
