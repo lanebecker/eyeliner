@@ -15,6 +15,7 @@ The backend is replaced with a MagicMock; we drive _handle_result() directly.
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import asyncio
+import time
 
 import numpy as np
 import pytest
@@ -36,12 +37,13 @@ def make_raw(title="So What", artist="Miles Davis", album="Kind of Blue"):
     return RawRecognitionResult(title=title, artist=artist, album=album)
 
 
-def make_loop(confirmation_required=2):
+def make_loop(confirmation_required=2, hop_seconds=None):
     """Build a RecognitionLoop with a mock state and an AsyncMock on_confirmed.
 
     Returns (loop, state, on_confirmed).  on_confirmed stands in for
     TrackCommitService.commit; assert on it to check whether a confirmed track
-    was emitted.
+    was emitted.  ``hop_seconds`` sets the R10-11 staleness threshold; when None
+    the loop falls back to poll_interval (as a direct construction would).
     """
     config = make_recognition_config(confirmation_required=confirmation_required)
     state = MagicMock()
@@ -52,7 +54,7 @@ def make_loop(confirmation_required=2):
 
     # Bypass _init_backend so we don't need ShazamIO installed during tests
     with patch.object(RecognitionLoop, "_init_backend", return_value=MagicMock()):
-        loop = RecognitionLoop(config, state, on_confirmed)
+        loop = RecognitionLoop(config, state, on_confirmed, hop_seconds=hop_seconds)
 
     return loop, state, on_confirmed
 
@@ -751,7 +753,7 @@ async def test_enqueue_binds_the_current_epoch_to_the_chunk():
     state.session_epoch = 7
     await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)
 
-    _audio, _sr, epoch = loop._audio_queue.get_nowait()
+    _audio, _sr, epoch, _enqueued_at = loop._audio_queue.get_nowait()
     assert epoch == 7
 
 
@@ -767,7 +769,7 @@ async def test_queued_epoch_is_frozen_at_enqueue_not_read_later():
 
     state.session_epoch = 4          # needle lifts AFTER the chunk is queued
 
-    _audio, _sr, epoch = loop._audio_queue.get_nowait()
+    _audio, _sr, epoch, _enqueued_at = loop._audio_queue.get_nowait()
     assert epoch == 3                # frozen at enqueue, not re-read as 4
 
 
@@ -935,3 +937,131 @@ async def test_rec1_alternating_recovery_survives_the_r5_04_fix():
 
     on_confirmed.assert_awaited_once()
     assert on_confirmed.await_args.args[0].title == "B"
+
+
+# ---------------------------------------------------------------------------
+# R10-11 (#424) — consumer-side freshness: when the dequeued head chunk is STALE
+# (older than one poll hop, i.e. the backend has fallen behind), drain the
+# backlog to the NEWEST chunk and surface throttled queue-age telemetry. In
+# steady state (fresh head) this is a no-op.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stale_head_drains_to_newest_and_logs_queue_lag(caplog):
+    """A post-stall backlog resumes on the FRESHEST audio, not oldest-first, and
+    logs a queue-lag health line — while still handing the kept chunk's own epoch
+    to on_confirmed (PCONC-1)."""
+    import logging
+
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
+    raw = make_raw()
+    seen = {}
+
+    async def recognize(audio, sample_rate):
+        seen["audio"] = np.array(audio)
+        return raw
+
+    loop.backend.recognize = recognize
+
+    # Seed the queue directly with a STALE backlog (age >> poll_interval = 30s).
+    # The newest chunk carries a distinct marker AND a distinct epoch (7).
+    old = time.monotonic() - 100.0
+    loop._audio_queue.put_nowait((np.full(4, 1.0, dtype=np.float32), 44100, 0, old))
+    loop._audio_queue.put_nowait((np.full(4, 2.0, dtype=np.float32), 44100, 0, old))
+    loop._audio_queue.put_nowait((np.full(4, 99.0, dtype=np.float32), 44100, 7, old))
+
+    with caplog.at_level(logging.WARNING, logger="src.audio.recognizer"):
+        task = asyncio.create_task(loop.run())
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if on_confirmed.await_count:
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Recognized the NEWEST chunk (marker 99.0), not the oldest (1.0).
+    assert list(seen["audio"]) == [99.0, 99.0, 99.0, 99.0]
+    # …committed under the NEWEST chunk's epoch (7), not a dropped chunk's.
+    on_confirmed.assert_awaited_once_with(raw, 7)
+    # …and the lag was surfaced (throttled) so #424 tuning is evidence-driven.
+    assert any("queue lag" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_fresh_head_does_not_drain_or_log(caplog):
+    """Steady state: a promptly-dequeued (fresh) chunk is processed as-is — no
+    drain, no lag log — so two-hit confirmation and normal cadence are unchanged."""
+    import logging
+
+    loop, state, on_confirmed = make_loop(confirmation_required=1)
+    raw = make_raw()
+    loop.backend.recognize = AsyncMock(return_value=raw)
+
+    await loop.enqueue(np.zeros(4, dtype=np.float32), 44100)   # fresh: age ≈ 0
+
+    with caplog.at_level(logging.WARNING, logger="src.audio.recognizer"):
+        task = asyncio.create_task(loop.run())
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if on_confirmed.await_count:
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    loop.backend.recognize.assert_awaited_once()
+    assert not any("queue lag" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_lag_surfaced_at_one_hop_not_only_at_poll_interval(caplog):
+    """R10-11 acceptance: queue age is observable when it exceeds ONE HOP, not
+    only at the coarser idle poll_interval. With hop_seconds=10 and
+    poll_interval=30, a head chunk aged ~15s (> one hop, < poll_interval) must
+    drain-to-newest and log the lag — which a poll_interval-only gate would miss."""
+    import logging
+
+    loop, state, on_confirmed = make_loop(confirmation_required=1, hop_seconds=10)
+    assert loop.poll_interval == 30 and loop._stale_after_seconds == 10
+    raw = make_raw()
+    seen = {}
+
+    async def recognize(audio, sample_rate):
+        seen["audio"] = np.array(audio)
+        return raw
+
+    loop.backend.recognize = recognize
+
+    midlag = time.monotonic() - 15.0    # > one hop (10s), < poll_interval (30s)
+    loop._audio_queue.put_nowait((np.full(4, 1.0, dtype=np.float32), 44100, 0, midlag))
+    loop._audio_queue.put_nowait((np.full(4, 9.0, dtype=np.float32), 44100, 5, midlag))
+
+    with caplog.at_level(logging.WARNING, logger="src.audio.recognizer"):
+        task = asyncio.create_task(loop.run())
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if on_confirmed.await_count:
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert list(seen["audio"]) == [9.0, 9.0, 9.0, 9.0]     # drained to newest
+    on_confirmed.assert_awaited_once_with(raw, 5)          # newest chunk's epoch
+    assert any("queue lag" in r.getMessage() for r in caplog.records)
+
+
+def test_nonpositive_hop_falls_back_to_poll_interval():
+    """R10-11 guard: a degenerate hop (≤ 0 — reachable via the config-ALLOWED
+    overlap ≥ chunk degradation) must NOT make the staleness threshold ≤ 0, which
+    would flag every fresh chunk stale and drain fresh audio every turn. It falls
+    back to poll_interval instead."""
+    loop_zero, _, _ = make_loop(hop_seconds=0)
+    assert loop_zero._stale_after_seconds == loop_zero.poll_interval
+    loop_neg, _, _ = make_loop(hop_seconds=-3)
+    assert loop_neg._stale_after_seconds == loop_neg.poll_interval
+    loop_ok, _, _ = make_loop(hop_seconds=10)
+    assert loop_ok._stale_after_seconds == 10
+    loop_none, _, _ = make_loop(hop_seconds=None)          # direct construction
+    assert loop_none._stale_after_seconds == loop_none.poll_interval

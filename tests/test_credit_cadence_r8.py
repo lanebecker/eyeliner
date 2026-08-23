@@ -378,18 +378,28 @@ async def test_r8_09_commit_service_consults_the_scrobble_memory(clock):
     """Pins the WIRING (the R7-14 lesson: an unpinned driver is a surviving
     mutant): TrackCommitService.commit must consult should_scrobble/
     record_scrobble, so a swing-back re-commit of the same physical play
-    dispatches exactly ONE Last.fm scrobble."""
+    dispatches exactly ONE Last.fm scrobble.
+
+    R10-09 (#422): the scrobble is now handed to a ScrobbleDispatcher, so this
+    drives a REAL dispatcher (with a mock client returning DELIVERED) and drains
+    it before asserting — the dedup still lives in commit(), so a swing-back
+    still yields exactly one delivered scrobble for the physical play."""
     from unittest.mock import MagicMock
     from src.state.player_state import PlayerState
     from src.app.track_commit_service import TrackCommitService
     from src.audio.recognizer import RawRecognitionResult
+    from src.tracking.lastfm_client import ScrobbleResult
+    from src.tracking.scrobble_dispatcher import ScrobbleDispatcher
 
     tracker, _ = make_tracker()
     state = PlayerState()
     lastfm = MagicMock()
     lastfm.enabled = True
     lastfm.love_on_completion = False
-    lastfm.scrobble = MagicMock(return_value=True)
+    lastfm.scrobble_result = MagicMock(return_value=ScrobbleResult.DELIVERED)
+
+    dispatcher = ScrobbleDispatcher(lastfm, backoff=())
+    dispatcher.start()
 
     class Resolver:
         async def resolve(self, raw):
@@ -398,7 +408,8 @@ async def test_r8_09_commit_service_consults_the_scrobble_memory(clock):
             return make_track(raw.title)
 
     svc = TrackCommitService(
-        state=state, resolver=Resolver(), tracker=tracker, lastfm=lastfm
+        state=state, resolver=Resolver(), tracker=tracker,
+        scrobble_dispatcher=dispatcher,
     )
 
     async def commit(title, artist="Sonic Youth"):
@@ -413,8 +424,9 @@ async def test_r8_09_commit_service_consults_the_scrobble_memory(clock):
     await commit("X1", "Other Band");      clock.advance(25)   # foreign swing
     await commit("Catholic Block");        clock.advance(25)   # swing-back re-commit
     await tracker._end_session()
+    await dispatcher.drain()   # flush the queue so delivered scrobbles are recorded
 
-    cb = [c for c in lastfm.scrobble.call_args_list
+    cb = [c for c in lastfm.scrobble_result.call_args_list
           if getattr(c.args[0], "title", "") == "Catholic Block"]
     assert len(cb) == 1, (
         f"swing-back re-commit scrobbled the same physical play "

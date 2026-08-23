@@ -194,7 +194,7 @@ real bugs and hardening opportunities.
   track changes, so the new lerp doesn't jump back to a stale start
 - Adaptive render cadence (30 fps during palette transition, 10 fps
   otherwise) for the pulsing dot animation, easing CPU load on the Pi
-- Fixed several documentation inaccuracies (CLAUDE.md `discogs.token`,
+- Fixed several documentation inaccuracies (the `discogs.token` config key,
   outdated PlaySession description, architecture-diagram LastFmClient
   placement, current-state test count)
 - README now mentions the `venv` setup step

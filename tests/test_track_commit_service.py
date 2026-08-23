@@ -29,15 +29,33 @@ def make_raw(title="So What", artist="Miles Davis", album="Kind of Blue"):
     return RawRecognitionResult(title=title, artist=artist, album=album)
 
 
-def make_service(lastfm=None):
-    """TrackCommitService on a real PlayerState; resolver + tracker mocked."""
+def make_service(dispatcher=None):
+    """TrackCommitService on a real PlayerState; resolver + tracker mocked.
+
+    R10-09 (#422): the confirmed-track scrobble is now handed to a
+    ScrobbleDispatcher via a non-blocking ``enqueue`` rather than awaited inline,
+    so tests that exercise the scrobble branch pass a dispatcher mock and assert
+    on ``enqueue`` (the network call itself, its retry, and error isolation are
+    covered by tests/test_scrobble_dispatcher.py).  ``should_scrobble`` defaults
+    to True (permit) and ``record_scrobble`` is a spy so the in-flight-reservation
+    ordering can be asserted; override per-test as needed.
+    """
     state = PlayerState()
     resolver = MagicMock()
     resolver.resolve = AsyncMock(return_value=MagicMock())
     tracker = MagicMock()
     tracker.on_track_identified = AsyncMock()
-    service = TrackCommitService(state, resolver, tracker, lastfm)
+    tracker.should_scrobble = MagicMock(return_value=True)
+    tracker.record_scrobble = MagicMock()
+    service = TrackCommitService(state, resolver, tracker, dispatcher)
     return service, state, resolver, tracker
+
+
+def _dispatcher():
+    """A ScrobbleDispatcher stub whose enqueue() is a synchronous spy."""
+    d = MagicMock()
+    d.enqueue = MagicMock()
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +142,10 @@ async def test_tracker_failure_does_not_advance_current_raw():
 @pytest.mark.asyncio
 async def test_tracker_failure_defers_the_scrobble_to_the_retry():
     """LB-1: a tracker failure must not scrobble on the doomed commit — the
-    scrobble sits after set_raw, so it is deferred to the successful retry rather
+    enqueue sits after set_raw, so it is deferred to the successful retry rather
     than double-firing (the retry re-runs the whole commit)."""
-    lastfm = MagicMock()
-    lastfm.scrobble = MagicMock()
-    service, state, resolver, tracker = make_service(lastfm=lastfm)
+    disp = _dispatcher()
+    service, state, resolver, tracker = make_service(dispatcher=disp)
     state.set_status(PlayerStatus.LISTENING)
     resolver.resolve = AsyncMock(return_value=MagicMock())
     tracker.on_track_identified = AsyncMock(side_effect=RuntimeError("boom"))
@@ -136,7 +153,7 @@ async def test_tracker_failure_defers_the_scrobble_to_the_retry():
     with pytest.raises(RuntimeError):
         await service.commit(make_raw(), state.session_epoch)
 
-    lastfm.scrobble.assert_not_called()
+    disp.enqueue.assert_not_called()
     assert state.current_raw is None
 
 
@@ -234,56 +251,75 @@ async def test_commit_discarded_when_audio_predates_the_current_session():
 
 
 # ---------------------------------------------------------------------------
-# Last.fm scrobble branch (T-2 — previously never exercised)
+# Last.fm scrobble branch — now a NON-BLOCKING enqueue to the ScrobbleDispatcher
+# (R10-09/#422).  The commit path does all epoch/dedup/clock gating on the loop
+# thread and hands the scrobble off; delivery, retry, and error isolation are the
+# dispatcher's concern (tests/test_scrobble_dispatcher.py).  These tests own the
+# COMMIT-SIDE contract: what is enqueued, and — crucially — what is NOT.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_scrobble_called_with_metadata_and_timestamp():
-    lastfm = MagicMock()
-    lastfm.scrobble = MagicMock()
-    service, state, resolver, tracker = make_service(lastfm=lastfm)
+async def test_scrobble_enqueued_with_metadata_and_timestamp():
+    disp = _dispatcher()
+    service, state, resolver, tracker = make_service(dispatcher=disp)
     meta = MagicMock()
     resolver.resolve = AsyncMock(return_value=meta)
 
     await service.commit(make_raw(), state.session_epoch)
 
-    lastfm.scrobble.assert_called_once()
-    args = lastfm.scrobble.call_args[0]
+    disp.enqueue.assert_called_once()
+    args = disp.enqueue.call_args[0]
     assert args[0] is meta
     assert isinstance(args[1], int)  # a unix timestamp
 
 
 @pytest.mark.asyncio
-async def test_no_scrobble_when_lastfm_absent():
-    service, state, resolver, tracker = make_service(lastfm=None)
-    # Must not raise despite no Last.fm client.
+async def test_record_scrobble_reserved_before_enqueue():
+    """#163 in-flight reservation: the per-spin latch is recorded (so a concurrent
+    swing-back re-commit is suppressed) BEFORE the scrobble is handed off."""
+    disp = _dispatcher()
+    service, state, resolver, tracker = make_service(dispatcher=disp)
+    order = []
+    tracker.record_scrobble = MagicMock(side_effect=lambda m: order.append("record"))
+    disp.enqueue = MagicMock(side_effect=lambda *a: order.append("enqueue"))
+    resolver.resolve = AsyncMock(return_value=MagicMock())
+
+    await service.commit(make_raw(), state.session_epoch)
+
+    assert order == ["record", "enqueue"]
+
+
+@pytest.mark.asyncio
+async def test_swing_back_duplicate_is_not_enqueued():
+    """R8-09: a track already scrobbled this spin (should_scrobble False) must not
+    be enqueued again, and the reservation latch is not re-recorded."""
+    disp = _dispatcher()
+    service, state, resolver, tracker = make_service(dispatcher=disp)
+    tracker.should_scrobble = MagicMock(return_value=False)
+    resolver.resolve = AsyncMock(return_value=MagicMock())
+
+    committed = await service.commit(make_raw(), state.session_epoch)
+
+    assert committed is True
+    disp.enqueue.assert_not_called()
+    tracker.record_scrobble.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_scrobble_when_dispatcher_absent():
+    service, state, resolver, tracker = make_service(dispatcher=None)
+    # Must not raise despite no dispatcher (scrobbling effectively disabled).
     committed = await service.commit(make_raw(), state.session_epoch)
     assert committed is True
 
 
 @pytest.mark.asyncio
-async def test_scrobble_failure_does_not_break_commit():
-    """A throwing scrobble is logged and swallowed — the track still commits."""
-    lastfm = MagicMock()
-    lastfm.scrobble = MagicMock(side_effect=RuntimeError("last.fm down"))
-    service, state, resolver, tracker = make_service(lastfm=lastfm)
-    meta = MagicMock()
-    resolver.resolve = AsyncMock(return_value=meta)
-
-    committed = await service.commit(make_raw(), state.session_epoch)
-
-    assert committed is True
-    assert state.current_track is meta  # commit completed despite scrobble error
-
-
-@pytest.mark.asyncio
-async def test_scrobble_skipped_when_session_ends_during_tracker_tail():
+async def test_scrobble_not_enqueued_when_session_ends_during_tracker_tail():
     """B-19: on_track_identified can yield (its album-split path awaits a Discogs
     write).  If the needle lifts during that window, the scrobble for the now-
-    ended track must be skipped — even though the display commit already ran."""
-    lastfm = MagicMock()
-    lastfm.scrobble = MagicMock()
-    service, state, resolver, tracker = make_service(lastfm=lastfm)
+    ended track must NOT be enqueued — even though the display commit already ran."""
+    disp = _dispatcher()
+    service, state, resolver, tracker = make_service(dispatcher=disp)
     state.set_status(PlayerStatus.LISTENING)
     meta = MagicMock()
     resolver.resolve = AsyncMock(return_value=meta)
@@ -296,15 +332,14 @@ async def test_scrobble_skipped_when_session_ends_during_tracker_tail():
     await service.commit(make_raw(), state.session_epoch)
 
     tracker.on_track_identified.assert_awaited_once()  # the tail did run...
-    lastfm.scrobble.assert_not_called()                # ...but the scrobble was skipped
+    disp.enqueue.assert_not_called()                   # ...but nothing was enqueued
 
 
 @pytest.mark.asyncio
-async def test_stale_commit_does_not_scrobble():
-    """When the session ends mid-resolve, nothing is scrobbled."""
-    lastfm = MagicMock()
-    lastfm.scrobble = MagicMock()
-    service, state, resolver, tracker = make_service(lastfm=lastfm)
+async def test_stale_commit_does_not_enqueue():
+    """When the session ends mid-resolve, nothing is enqueued."""
+    disp = _dispatcher()
+    service, state, resolver, tracker = make_service(dispatcher=disp)
     state.set_status(PlayerStatus.LISTENING)
 
     async def resolve_then_needle_lifts(raw):
@@ -315,7 +350,7 @@ async def test_stale_commit_does_not_scrobble():
 
     await service.commit(make_raw(), state.session_epoch)
 
-    lastfm.scrobble.assert_not_called()
+    disp.enqueue.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -343,13 +378,15 @@ async def test_commit_hands_tracker_an_epoch_staleness_predicate():
 
 
 @pytest.mark.asyncio
-async def test_scrobble_skipped_when_clock_untrustworthy():
+async def test_scrobble_not_enqueued_when_clock_untrustworthy():
     """STAB-2: a pre-NTP clock captured an epoch/stale timestamp at the top of
-    commit(); the scrobble is skipped rather than submitting a wrong time that
-    Last.fm would silently drop or mis-place. The rest of the commit still runs."""
-    lastfm = MagicMock()
-    lastfm.scrobble = MagicMock()
-    service, state, resolver, tracker = make_service(lastfm=lastfm)
+    commit(); the scrobble is skipped (never enqueued) rather than queuing a wrong
+    time that Last.fm would silently drop or mis-place. The clock gate stays on the
+    commit path — BEFORE enqueue — so doomed work is never queued. The rest of the
+    commit still runs. The in-flight reservation latch is still recorded, matching
+    the prior record-then-skip ordering (R9-08)."""
+    disp = _dispatcher()
+    service, state, resolver, tracker = make_service(dispatcher=disp)
     state.set_status(PlayerStatus.LISTENING)
     meta = MagicMock()
     resolver.resolve = AsyncMock(return_value=meta)
@@ -359,4 +396,57 @@ async def test_scrobble_skipped_when_clock_untrustworthy():
 
     assert committed is True              # commit still succeeds (display + tracker)
     assert state.current_track is meta
-    lastfm.scrobble.assert_not_called()   # only the scrobble is skipped
+    disp.enqueue.assert_not_called()      # only the scrobble is skipped
+    tracker.record_scrobble.assert_called_once()  # reservation still recorded (R9-08)
+
+
+# ---------------------------------------------------------------------------
+# R10-09 (#422) integration: commit latency is INDEPENDENT of Last.fm latency —
+# a real dispatcher + a blocking Last.fm client, driven through commit().
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_commit_does_not_block_on_a_slow_scrobble():
+    """The finding measured a 400 ms Last.fm delay making a zero-cost commit take
+    404.6 ms — the sole recognition consumer paused for the network. With the
+    dispatcher, commit() returns as soon as it ENQUEUES; the slow scrobble runs
+    off the commit path. Uses a REAL ScrobbleDispatcher and a blocking client."""
+    import asyncio
+    import threading
+    import time as _time
+    from src.tracking.lastfm_client import ScrobbleResult
+    from src.tracking.scrobble_dispatcher import ScrobbleDispatcher
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingLastfm:
+        enabled = True
+
+        def scrobble_result(self, track, timestamp):
+            started.set()
+            release.wait(2.0)
+            return ScrobbleResult.DELIVERED
+
+    dispatcher = ScrobbleDispatcher(BlockingLastfm(), backoff=())
+    dispatcher.start()
+    service, state, resolver, tracker = make_service(dispatcher=dispatcher)
+    resolver.resolve = AsyncMock(return_value=MagicMock())
+    try:
+        t0 = _time.monotonic()
+        committed = await service.commit(make_raw(), state.session_epoch)
+        elapsed = _time.monotonic() - t0
+
+        assert committed is True
+        assert elapsed < 0.2                    # commit did NOT wait on the scrobble
+
+        # Yield to the loop (do NOT block it) so the worker can pick up the job
+        # and dispatch it to the executor — proving the scrobble runs off-path.
+        for _ in range(400):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert started.is_set()
+    finally:
+        release.set()
+        await dispatcher.drain()

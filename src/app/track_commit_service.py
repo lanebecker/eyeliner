@@ -29,7 +29,6 @@ invariants that lived in the old ``_commit_track`` are preserved exactly:
     re-attempt it.
 """
 
-import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Optional
@@ -38,11 +37,10 @@ from src.util.clock import clock_is_trustworthy
 
 if TYPE_CHECKING:
     from src.audio.recognizer import RawRecognitionResult
-    from src.metadata.models import TrackMetadata
     from src.metadata.resolver import MetadataResolver
     from src.state.player_state import PlayerState
-    from src.tracking.lastfm_client import LastFmClient
     from src.tracking.listen_tracker import ListenTracker
+    from src.tracking.scrobble_dispatcher import ScrobbleDispatcher
 
 log = logging.getLogger(__name__)
 
@@ -61,12 +59,16 @@ class TrackCommitService:
         state: "PlayerState",
         resolver: "MetadataResolver",
         tracker: "ListenTracker",
-        lastfm: Optional["LastFmClient"] = None,
+        scrobble_dispatcher: Optional["ScrobbleDispatcher"] = None,
     ):
         self.state = state
         self.resolver = resolver
         self.tracker = tracker
-        self.lastfm = lastfm
+        # R10-09 (#422): the confirmed-track scrobble is handed to this
+        # lifecycle-owned, single-consumer dispatcher via a NON-blocking enqueue
+        # instead of being awaited inline — so slow/failing Last.fm I/O can no
+        # longer stall the sole recognition consumer.  None disables scrobbling.
+        self.scrobble_dispatcher = scrobble_dispatcher
 
     async def commit(self, raw: "RawRecognitionResult", audio_epoch: int) -> bool:
         """Resolve full metadata for *raw* and commit it everywhere.
@@ -178,13 +180,16 @@ class TrackCommitService:
             f"{metadata.title} [{metadata.source.name}]"
         )
 
-        # Scrobble is the last commit-path side effect and the natural spot a
-        # future await (v1.6 play-history) would be added, so it goes through
-        # guard.run() — the sanctioned pattern (#217): run() re-checks the epoch
-        # (B-19: on_track_identified's album-split path can yield on a Discogs
-        # write, and a SESSION_ENDED there means the needle lifted) and skips the
-        # step for a session that has already ended, neither re-committing nor
-        # scrobbling.
+        # Scrobble is the last commit-path side effect.  R10-09 (#422): it is now
+        # HANDED OFF to the ScrobbleDispatcher via a non-blocking enqueue rather
+        # than awaited here, so slow/failing Last.fm I/O can no longer stall the
+        # sole recognition consumer that drives this commit.  Every epoch gate has
+        # already passed above (the B-1 resolve gate and the #196 post-tracker
+        # gate both return before this point, and there is NO await between the
+        # #196 gate and here), so the audio's session is still current — the
+        # guard.run() epoch re-check the awaited scrobble relied on (B-19) is no
+        # longer needed; a defensive still_current() check is kept, mirroring the
+        # one on set_raw above.
         #
         # R8-09 (#348): gate on the tracker's per-spin scrobble memory first.
         # An attribution ping-pong's swing-back re-commits the same physical
@@ -195,15 +200,31 @@ class TrackCommitService:
         # still scrobble; R9-03 caps tallies at the tracklist's same-title row
         # count so a duplicated-title album's second row scrobbles too; R9-01's
         # drop-on-genuine-credit advances the memory past other releases.
-        # Recorded at dispatch (in-flight-latch pattern, see record_scrobble).
-        # R9-08 corrected the old note here: there is NO await between the
-        # epoch gate above and this record, so the "recorded-then-skipped"
-        # overhang it described cannot occur — and no finalize "clears" the
-        # live memory anyway (the swap replaces it wholesale at boundaries).
-        if self.lastfm:
+        # record_scrobble is the in-flight RESERVATION (in-flight-latch pattern,
+        # #163): recorded at dispatch so a concurrent swing-back re-commit is
+        # suppressed and never enqueues a second copy of the same spin.  Delivery
+        # — and the R10-10 (#423) bounded retry of a *definite* failure — is the
+        # dispatcher's own concern and never re-enters the tracker, so retries can
+        # recover a transient outage without disturbing the dedup memory.
+        if self.scrobble_dispatcher is not None:
             if self.tracker.should_scrobble(metadata):
                 self.tracker.record_scrobble(metadata)
-                await guard.run(lambda: self._scrobble(metadata, timestamp))
+                # Clock-sanity gate (STAB-2): validate the EXACT confirmation
+                # timestamp captured at the top of commit() BEFORE enqueuing. A
+                # pre-NTP boot (the Pi has no RTC) stamps an epoch/stale time;
+                # Last.fm silently drops or mis-places a wrong-time scrobble while
+                # reporting success either way. Skip with one WARNING rather than
+                # queue a doomed write.  (Kept here, not in the dispatcher, so the
+                # doomed work is never enqueued and the skip is deterministic.)
+                if not clock_is_trustworthy(timestamp):
+                    log.warning(
+                        "Skipping Last.fm scrobble for %s — %s: the system clock is "
+                        "not yet trustworthy (pre-NTP boot?); a wrong timestamp would "
+                        "be dropped or land at the wrong point in listening history.",
+                        metadata.artist, metadata.title,
+                    )
+                elif guard.still_current():
+                    self.scrobble_dispatcher.enqueue(metadata, timestamp)
             else:
                 log.info(
                     "R8-09: suppressing duplicate Last.fm scrobble for '%s' — "
@@ -213,28 +234,3 @@ class TrackCommitService:
                 )
 
         return True
-
-    async def _scrobble(self, metadata: "TrackMetadata", timestamp: int) -> None:
-        """Submit the Last.fm scrobble, off the event loop. Run ONLY via
-        ``guard.run`` so it can't fire for an ended session (B-19).
-
-        Clock-sanity gate (STAB-2): validates the EXACT timestamp captured at the
-        top of commit(). A pre-NTP boot (the Pi has no RTC) stamps an epoch/stale
-        time; Last.fm silently drops a scrobble that is too old or in the future —
-        or lands it at the wrong point in listening history — while reporting
-        success either way. Skip with one WARNING rather than submit a wrong time.
-        """
-        if not clock_is_trustworthy(timestamp):
-            log.warning(
-                "Skipping Last.fm scrobble for %s — %s: the system clock is not yet "
-                "trustworthy (pre-NTP boot?); a wrong timestamp would be dropped or land "
-                "at the wrong point in listening history.",
-                metadata.artist, metadata.title,
-            )
-            return
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                None, self.lastfm.scrobble, metadata, timestamp
-            )
-        except Exception as e:
-            log.warning(f"Last.fm scrobble error: {e}")
