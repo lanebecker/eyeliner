@@ -1144,7 +1144,10 @@ def test_reader_collection_index_percent_encodes_username_in_url():
     resp = MagicMock()
     resp.status_code = 200
     resp.raise_for_status.return_value = None
-    resp.json.return_value = {"releases": [], "pagination": {"pages": 1}}
+    resp.json.return_value = {
+        "releases": [],
+        "pagination": {"page": 1, "pages": 1, "per_page": 100, "items": 0},
+    }
     reader._http.request = MagicMock(return_value=resp)
 
     reader._get_collection_index()

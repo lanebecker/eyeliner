@@ -43,11 +43,14 @@ def test_database_search_returns_empty_on_genuine_no_match():
 # ---------------------------------------------------------------------------
 
 def test_collection_index_build_error_propagates():
+    from src.metadata.discogs.reader import CollectionIndexIncomplete
+
     client = make_discogs_reader()
     client._collection_index = None
     client._http.request = MagicMock(side_effect=requests.exceptions.Timeout("slow"))
-    with pytest.raises(requests.exceptions.Timeout):
+    with pytest.raises(CollectionIndexIncomplete) as raised:
         client.search_collection("artist", "album")
+    assert isinstance(raised.value.__cause__, requests.exceptions.Timeout)
 
 
 # ---------------------------------------------------------------------------
