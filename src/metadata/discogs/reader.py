@@ -738,6 +738,8 @@ class DiscogsReader:
                     raise CollectionIndexIncomplete("collection pagination was incomplete")
                 if reported_page != page or pages < page or pages > _MAX_COLLECTION_PAGES:
                     raise CollectionIndexIncomplete("collection pagination was incomplete")
+                if pages != max(1, (items + per_page - 1) // per_page):
+                    raise CollectionIndexIncomplete("collection pagination shape was inconsistent")
                 if expected_pages is None:
                     expected_pages, expected_per_page, expected_items = pages, per_page, items
                 elif (pages, per_page, items) != (expected_pages, expected_per_page, expected_items):
