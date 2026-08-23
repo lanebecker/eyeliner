@@ -1129,8 +1129,7 @@ async def test_full_album_increments_via_public_session_ended_path():
     await tracker.on_track_identified(make_track("Master-Dik"))  # the album closer
 
     tracker.on_silence_event(AudioEvent.SESSION_ENDED)
-    for _ in range(5):                  # let the scheduled task run to completion
-        await asyncio.sleep(0)
+    await tracker.drain()                # production completion contract for bg finalizers
 
     writer.increment_play_count.assert_called_once_with(12345, 67890)
     assert tracker._session is None
