@@ -247,10 +247,13 @@ def check_increment_play_count(
         f"Instance ID: {_redact(instance_id)}"
     )
     if confirmed:
-        if expected_release_id is None or expected_instance_id is None:
+        if not all(
+            type(value) is int and value > 0
+            for value in (expected_release_id, expected_instance_id)
+        ):
             fail(
                 "Noninteractive write declined — expected release and instance IDs "
-                "are both required."
+                "must both be positive integers."
             )
             return False
         if (
