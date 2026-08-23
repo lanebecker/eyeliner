@@ -9,6 +9,17 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+### Metadata safety
+
+- **Long-uptime Discogs ownership recovery is now bounded and identity-safe
+  (#420, #421).** A failed collection refresh can still show database metadata
+  without caching an unproven downgrade; a strictly proven removed collection
+  instance may be replaced for one Play Count attempt only when the same release
+  has exactly one validated new instance. Ambiguous, paginated, malformed, or
+  duplicate-copy responses make no replacement write. This behavior is covered
+  with mocked transport seams; it does not claim a live Discogs write
+  validation.
+
 ### Security and deployment controls
 
 - **Wave 1 software preflight controls are implemented (#418, #156, #419).**

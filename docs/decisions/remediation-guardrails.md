@@ -145,7 +145,28 @@ The first controlled App-backed publication is immutable Latest Release `v1.5.35
 - Wave 1 software controls are implemented; #418/#419 Pi evidence, #156's real
   InputStream/hot-plug recovery, and #366's real custom-folder result remain
   pending. The system-service decision is preserved throughout.
-- Wave 2 preserves immortal positive collection reads during normal operation; only a definitive missing-instance write may invalidate, refresh, and permit one identity-safe retry.
+- **Wave 2 — metadata recovery (#420/#421):** collection refreshes expose
+  explicit `OWNED`, `CLEAN_NO_MATCH`, and `COOLDOWN_SKIPPED` states. A database
+  downgrade is cacheable only after owned or completed-clean ownership evidence;
+  a skip following a failed or unknown refresh remains displayable but uncached.
+  Collection-index promotion requires a complete, internally consistent page
+  walk. Failed/incomplete walks retain the last complete snapshot under #242 and
+  use their own bounded build-failure backoff; they neither create clean-negative
+  truth nor reset the #191 speculative-refresh cooldown.
+- **Wave 2 — write identity:** only a validated collection-items-by-release
+  response whose pagination proves page 1 of exactly 1 page may prove an
+  expected instance missing.
+  The writer carries its immutable, unique positive observed-instance tuple to
+  the tracker; malformed, partial, multi-page, non-200, or ambiguous responses
+  are `ABORT`, never permission to recover. One session may recover only the
+  same release and exactly one new observed instance. Multiple/zero candidates
+  never select a target and leave only a stale or absent album key uncached; a
+  newer nonmatching cache entry is preserved.
+- **Wave 2 — preserved boundaries:** ordinary positive collection cache entries
+  remain immortal and the collection index remains process-local and memory-only
+  (#169). The narrow pre-plan recovery does not reopen #186's read-once,
+  absolute-set writes or #229's bounded rate-limit behavior; after a safe
+  replacement META-7 retains its independent one-shot Last Played behavior.
 - Wave 3 preserves recognition freshness, confirmation timestamps, epoch gates, and spin deduplication while isolating Last.fm latency.
 - Wave 4 keeps floor-based dependency manifests and Python 3.11 compatibility; it does not introduce a platform-specific lockfile implicitly.
 - Wave 5 begins with design-source reconciliation and owner-visible render approval; it cannot use outdated `DESIGN.md` alone as evidence that production is defective.

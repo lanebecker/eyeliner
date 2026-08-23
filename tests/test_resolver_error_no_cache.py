@@ -6,14 +6,17 @@ album to a downgraded fallback result for the rest of the session.  A clean
 "searched everywhere, no match" still caches the fallback (the existing,
 desired behaviour).
 """
+import asyncio
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
 from src.audio.recognizer import RawRecognitionResult
 from src.metadata.models import MetadataSource
+from src.metadata.discogs.outcomes import CollectionRefreshResult, CollectionRefreshState
 from src.metadata.resolver import MetadataResolver, _ALBUM_CACHE_MAX
 from src.util.cache import BoundedCache
+from tests.factories import make_discogs_reader
 
 
 def make_raw():
@@ -29,10 +32,13 @@ def make_resolver():
     r.reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     # #191 (C): default the staleness-refresh to "still not owned" so a clean
     # collection miss + database hit degrades to DATABASE as these tests expect.
-    r.reader.refresh_index_and_research.return_value = None
+    r.reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.CLEAN_NO_MATCH
+    )
     r.coverart = MagicMock()
     r.coverart.get_cover_art_url.return_value = "https://coverartarchive.org/x/front"
     r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
+    r._reader_gate = asyncio.Lock()
     r._logged_discogs_config = {}
     return r
 
@@ -82,6 +88,31 @@ async def test_clean_collection_miss_then_database_hit_is_cached():
 
     assert result.source == MetadataSource.DISCOGS_DATABASE
     assert len(r._album_cache) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_then_cooldown_skip_keeps_database_uncached():
+    """#420: a failed speculative rebuild leaves the next cooldown skip
+    non-authoritative, so both displayed database results remain retryable."""
+    reader = make_discogs_reader()
+    reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
+    reader.search_collection = MagicMock(return_value=None)
+    reader.search_database = MagicMock(return_value={
+        "release_id": 100, "instance_id": None, "album": "Kind of Blue",
+    })
+    reader._build_collection_index = MagicMock(side_effect=ConnectionError("blip"))
+    reader._http.request = MagicMock()
+
+    r = make_resolver()
+    r.reader = reader
+
+    first = await r.resolve(make_raw())
+    second = await r.resolve(make_raw())
+
+    assert first.source is MetadataSource.DISCOGS_DATABASE
+    assert second.source is MetadataSource.DISCOGS_DATABASE
+    assert len(r._album_cache) == 0
+    assert reader._http.request.call_count == 0
 
 
 @pytest.mark.asyncio
