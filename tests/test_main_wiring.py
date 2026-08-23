@@ -444,6 +444,44 @@ def test_build_components_returns_wired_bundle(tmp_path):
     assert isinstance(components.tracker, ListenTracker)
 
 
+def test_build_components_injects_only_resolver_recovery_bound_method(monkeypatch, tmp_path):
+    """#421 keeps tracker metadata access to one narrow bound recovery port."""
+    captured = {}
+
+    class Resolver:
+        async def recover_collection_instance(self, *_args):
+            return None
+
+    resolver = Resolver()
+    monkeypatch.setattr(main_module, "DiscogsHttp", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "DiscogsReader", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "MetadataResolver", lambda *_args: resolver)
+    monkeypatch.setattr(main_module, "LastFmClient", lambda *_args: MagicMock())
+
+    def tracker_ctor(writer, lastfm, **kwargs):
+        captured["writer"] = writer
+        captured["lastfm"] = lastfm
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(main_module, "ListenTracker", tracker_ctor)
+    monkeypatch.setattr(main_module, "DiscogsCollectionWriter", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "TrackCommitService", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "DisplayRenderer", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "SilenceDetector", lambda *_args: MagicMock())
+    monkeypatch.setattr(main_module, "RecognitionLoop", lambda *_args: MagicMock())
+    from src.audio import capture as capture_module
+    monkeypatch.setattr(capture_module, "AudioCapture", lambda *_args: MagicMock())
+
+    build_components(
+        _app_config(cover_art_cache_dir=str(tmp_path / "cache")), PlayerState(),
+    )
+
+    injected = captured["recover_collection_instance"]
+    assert injected.__self__ is resolver
+    assert injected.__func__ is resolver.recover_collection_instance.__func__
+
+
 @pytest.mark.asyncio
 async def test_install_io_executor_routes_default_run_in_executor():
     """CRIT-3: after install_io_executor, every run_in_executor(None, …) runs on

@@ -16,6 +16,7 @@ import requests
 
 from src.tracking.listen_tracker import ListenTracker
 from src.metadata.models import PlaySession
+from src.metadata.discogs.outcomes import CollectionIdentity
 from tests.factories import make_discogs_writer, make_discogs_http, make_discogs_config
 
 
@@ -202,3 +203,70 @@ async def test_definitively_missing_instance_skips_post_last_played_and_retry():
     assert calls == {"get": 1, "post": 0, "last_played": 0}
     sleep.assert_not_awaited()
     assert session.credited is False
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_old_instance_post_never_invokes_recovery():
+    """A response-lost absolute POST is not missing-instance evidence."""
+    writer, _server, _posts = _writer_with_seam(first_post="lost", start=5)
+    recovery = AsyncMock(return_value=CollectionIdentity(999, 888))
+    tracker = ListenTracker(writer=writer, recover_collection_instance=recovery)
+    session = _session()
+
+    await tracker._credit_completed_album(session)
+
+    recovery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovered_absolute_post_retry_reuses_one_target():
+    """A recovered credit still retries only one precomputed absolute value."""
+    http = make_discogs_http()
+    writer = make_discogs_writer(
+        http=http, config=make_discogs_config(last_played_field_name=None)
+    )
+    writer._collection_fields = {"Play Count": 3}
+    server = {"count": 5}
+    post_bodies = []
+    gets = {"n": 0}
+
+    def fake_get(url, **kw):
+        gets["n"] += 1
+        response = MagicMock(); response.status_code = 200
+        if gets["n"] == 1:
+            response.json.return_value = {
+                "pagination": {"page": 1, "pages": 1, "items": 1, "per_page": 1},
+                "releases": [{
+                    "instance_id": 888, "folder_id": 0,
+                    "basic_information": {"id": 999}, "notes": [],
+                }],
+            }
+        else:
+            response.json.return_value = {"releases": [{
+                "instance_id": 888,
+                "notes": [{"field_id": 3, "value": str(server["count"])}],
+            }]}
+        return response
+
+    def fake_post(url, **kw):
+        post_bodies.append(kw["json"])
+        server["count"] = int(kw["json"]["value"])
+        if len(post_bodies) == 1:
+            raise requests.exceptions.ReadTimeout("response lost after apply")
+        response = MagicMock(); response.status_code = 204
+        return response
+
+    http.session.get = fake_get
+    http.session.post = fake_post
+    recovery = AsyncMock(return_value=CollectionIdentity(999, 888))
+    tracker = ListenTracker(writer=writer, recover_collection_instance=recovery)
+    session = _session()
+    session.album_resolve_key = ("sonic youth", "sister")
+
+    await tracker._credit_completed_album(session)
+
+    recovery.assert_awaited_once_with(("sonic youth", "sister"), 999, 777, (888,))
+    assert gets["n"] == 2
+    assert post_bodies == [{"value": "6"}, {"value": "6"}]
+    assert server["count"] == 6
+    assert session.credited is True
