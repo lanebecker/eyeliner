@@ -789,8 +789,26 @@ python scripts/discogs_live_check.py \
 
 The prompt names the resolved artist, album, field, release ID, and instance ID;
 type the exact lowercase `yes` only after confirming it is the designated record.
-For an already-authorized noninteractive run, add `--yes` to that complete
-command—never run a bare `--test-write`.
+
+For an already-authorized noninteractive run, bind the owner's approval to the
+exact positive release and instance IDs already observed for that sacrificial
+record. Replace both quoted angle-bracket placeholders with those approved
+integer IDs:
+
+```bash
+python scripts/discogs_live_check.py \
+  --artist "Artist" --album "Album" \
+  --test-write --yes \
+  --release-id "<approved positive release ID>" \
+  --instance-id "<approved positive instance ID>"
+```
+
+Artist and album are search selectors; they do not authorize a noninteractive
+write by themselves. The script resolves the collection record again and aborts
+without writing if either resolved ID differs from the approved IDs. Treat any
+identity mismatch as a stop: do not retry, inspect the collection state, and
+obtain fresh owner approval before any later attempt. Never run a bare
+`--test-write`.
 
 Record the custom-folder name/ID, before value, after value, and HTTP/outcome
 without tokens. A success disproves the folder-identity hypothesis. On a `404`,
