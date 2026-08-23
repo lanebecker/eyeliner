@@ -160,7 +160,8 @@ The first controlled App-backed publication is immutable Latest Release `v1.5.35
   the tracker; malformed, partial, multi-page, non-200, or ambiguous responses
   are `ABORT`, never permission to recover. One session may recover only the
   same release and exactly one new observed instance. Multiple/zero candidates
-  never select a target and leave the album key uncached.
+  never select a target and leave only a stale or absent album key uncached; a
+  newer nonmatching cache entry is preserved.
 - **Wave 2 — preserved boundaries:** ordinary positive collection cache entries
   remain immortal and the collection index remains process-local and memory-only
   (#169). The narrow pre-plan recovery does not reopen #186's read-once,

@@ -180,7 +180,12 @@ async def test_stale_instance_recovers_to_safe_replacement_and_credits_once():
 
     assert reader.rebuild_calls == 1
     assert len(gets) == 2
-    assert [body for _url, body in posts] == [{"value": "6"}]
+    assert len(posts) == 1
+    post_url, post_body = posts[0]
+    assert post_url.endswith(
+        "/collection/folders/0/releases/999/instances/88/fields/3"
+    )
+    assert post_body == {"value": "6"}
     assert (session.album_release_id, session.album_instance_id) == (_STALE_RELEASE_ID, 88)
     assert session.credited is True
     cached = resolver._cache_get(_KEY)
