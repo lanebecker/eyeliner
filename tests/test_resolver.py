@@ -17,6 +17,7 @@ import time
 from unittest.mock import MagicMock, AsyncMock
 import pytest
 
+import src.metadata.resolver as resolver_mod
 from src.audio.recognizer import RawRecognitionResult
 from src.metadata.models import MetadataSource, TracklistEntry
 from src.metadata.discogs.outcomes import (
@@ -107,6 +108,38 @@ def _put_collection(resolver, key, result):
 
 
 @pytest.mark.asyncio
+async def test_fallback_outside_reader_gate_cannot_clobber_recovered_collection_identity(
+    resolver, mock_discogs, monkeypatch,
+):
+    """A delayed fallback must not replace a recovery's positive collection cache."""
+    resolver._reader_gate = asyncio.Lock()
+    cover_started, release_cover = asyncio.Event(), asyncio.Event()
+
+    async def delayed_wait_for(awaitable, timeout):
+        cover_started.set()
+        await release_cover.wait()
+        return await awaitable
+
+    monkeypatch.setattr(resolver_mod.asyncio, "wait_for", delayed_wait_for)
+    mock_discogs.rebuild_collection_and_research.return_value = make_discogs_result(100, 200)
+
+    ordinary = asyncio.create_task(resolver.resolve(make_raw()))
+    await cover_started.wait()
+    recovered = await resolver.recover_collection_instance(
+        ("miles davis", "kind of blue"), 100, 200, (300,)
+    )
+    assert recovered == CollectionIdentity(100, 300)
+    assert resolver._album_cache.get(("miles davis", "kind of blue"))[1]["instance_id"] == 300
+
+    release_cover.set()
+    await ordinary
+
+    cached = resolver._album_cache.get(("miles davis", "kind of blue"))
+    assert cached[0] is MetadataSource.DISCOGS_COLLECTION
+    assert cached[1]["instance_id"] == 300
+
+
+@pytest.mark.asyncio
 async def test_recovery_invalidates_exact_stale_positive_and_returns_same_release_new_instance(
     resolver, mock_discogs,
 ):
@@ -186,6 +219,35 @@ async def test_recovery_failure_leaves_known_stale_album_entry_invalidated(resol
 
     assert await resolver.recover_collection_instance(key, 100, 200, (300,)) is None
     assert resolver._album_cache.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_refusal_log_includes_safe_identity_stage(resolver, mock_discogs, caplog):
+    caplog.set_level("INFO", logger="src.metadata.resolver")
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+
+    assert await resolver.recover_collection_instance(key, 100, 200, (200,)) is None
+
+    assert "stage=observed-evidence-refusal" in caplog.text
+    assert "expected_release_id=100" in caplog.text
+    assert "expected_instance_id=200" in caplog.text
+    assert "observed_instance_ids=(200,)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_recovery_rebuild_failure_log_redacts_exception_value(resolver, mock_discogs, caplog):
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+    mock_discogs.rebuild_collection_and_research.side_effect = RuntimeError("secret response body")
+
+    assert await resolver.recover_collection_instance(key, 100, 200, (300,)) is None
+
+    assert "stage=rebuild-failed" in caplog.text
+    assert "expected_release_id=100" in caplog.text
+    assert "expected_instance_id=200" in caplog.text
+    assert "observed_instance_id=300" in caplog.text
+    assert "secret response body" not in caplog.text
 
 
 @pytest.mark.asyncio
