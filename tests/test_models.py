@@ -225,6 +225,47 @@ def test_log_track_latches_release_id_from_first_discogs_track():
     assert session.album_instance_id == 200
 
 
+def test_log_track_latches_resolve_key_with_first_collection_identity():
+    """Dropping the key assignment would make recovery target a later album."""
+    session = PlaySession()
+    track = make_track("Catholic Block", release_id=100, instance_id=200)
+    track.resolve_key = ("sonic youth", "sister")
+
+    session.log_track(track)
+
+    assert (session.album_release_id, session.album_instance_id) == (100, 200)
+    assert session.album_resolve_key == ("sonic youth", "sister")
+
+
+def test_latched_album_resolve_key_does_not_follow_later_track():
+    """A later recognition may update split evidence but cannot retarget credit."""
+    session = PlaySession()
+    first = make_track("Catholic Block", release_id=100, instance_id=200)
+    first.resolve_key = ("sonic youth", "sister")
+    later = make_track("Pipeline/Kill Time", release_id=999, instance_id=888)
+    later.resolve_key = ("sonic youth", "daydream nation")
+
+    session.log_track(first)
+    session.log_track(later)
+
+    assert session.album_resolve_key == ("sonic youth", "sister")
+    assert session.last_release_resolve_key == ("sonic youth", "daydream nation")
+
+
+def test_database_track_does_not_latch_album_resolve_key():
+    """A database-only match has no collection identity to recover."""
+    session = PlaySession()
+    track = make_track(
+        "Catholic Block", release_id=100, instance_id=None,
+        source=MetadataSource.DISCOGS_DATABASE,
+    )
+    track.resolve_key = ("sonic youth", "sister")
+
+    session.log_track(track)
+
+    assert session.album_resolve_key is None
+
+
 def test_log_track_does_not_latch_fallback_track():
     """Fallback tracks have no discogs_release_id — should not latch."""
     session = PlaySession()

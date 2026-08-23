@@ -14,6 +14,7 @@ It has no knowledge of the write side (play-count / last-played) — that lives 
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import quote
 
@@ -21,7 +22,8 @@ import discogs_client
 
 from src.metadata.models import TracklistEntry
 from src.metadata.discogs.transport import DiscogsHttp, _API_BASE, _HTTP_TIMEOUT
-from src.metadata.errors import is_transient
+from src.metadata.discogs.outcomes import CollectionRefreshResult, CollectionRefreshState
+from src.metadata.errors import TransientMetadataError, is_transient
 from src.metadata.normalize import fold_text, strip_album_decoration
 
 if TYPE_CHECKING:
@@ -69,6 +71,25 @@ _DB_SEARCH_MEMO_TTL_SECONDS = 60.0
 # every genuinely-unowned record too. Seeded to -inf so the first refresh is
 # always allowed regardless of the monotonic epoch.
 _INDEX_REFRESH_COOLDOWN_SECONDS = 15 * 60
+
+# A failed pagination walk cannot prove an index miss.  Keep its retry rate
+# independent from the speculative-refresh cooldown so a malformed response or
+# service outage cannot cause a fresh collection walk for every album.
+_COLLECTION_BUILD_FAILURE_BACKOFF_SECONDS = 15 * 60
+
+
+class CollectionIndexIncomplete(TransientMetadataError):
+    """The collection endpoint did not yield one complete, trustworthy index."""
+
+
+class CollectionOwnershipUnknown(TransientMetadataError):
+    """A stale snapshot can answer a positive, but cannot prove a miss."""
+
+
+@dataclass(frozen=True)
+class _CollectionIndexView:
+    index: dict
+    misses_are_authoritative: bool
 
 # #179: Discogs disambiguates same-named artists by appending " (2)", " (3)",
 # etc. to the NAME field ("Nirvana (2)" is the UK 60s band).  The suffix is a
@@ -263,6 +284,10 @@ class DiscogsReader:
         # #191 (C): monotonic timestamp of the last forced staleness-refresh,
         # for the cooldown. -inf so the first refresh always runs.
         self._last_index_refresh_at: float = float("-inf")
+        # A separate failure-backoff protects strict full-index builds.  Unlike
+        # the speculative cooldown it is about index truth, not request policy.
+        self._last_collection_build_failure_at: Optional[float] = None
+        self._last_speculative_refresh_succeeded = False
         # R5-20: one-entry memo of the last database search. Within a single
         # resolve the SAME (artist, album) query is issued up to 3 times —
         # strategy 1 (limit 25), the database tier (limit 3), and the staleness
@@ -336,7 +361,8 @@ class DiscogsReader:
             )
             return None
 
-        index = self._get_collection_index()
+        index_view = self._get_collection_index()
+        index = index_view.index
 
         artist_key = _normalize_artist(artist)
         album_key = _normalize_term(album)
@@ -493,6 +519,10 @@ class DiscogsReader:
             ]
 
         if not matches:
+            if not index_view.misses_are_authoritative:
+                raise CollectionOwnershipUnknown(
+                    "the available collection index is a stale snapshot"
+                )
             return None
         if len(matches) > 1:
             # Refuse to guess (#179, SEC-1 principle): two owned entries
@@ -647,18 +677,127 @@ class DiscogsReader:
             # the "memo is ready" flag the check above reads. A reader that observes
             # the new key is then guaranteed to also see the matching new page —
             # never this query's page returned for a different query's key. The
-            # reader path is single-caller today (the resolver serializes reader
-            # calls, so this races with nothing), making key-last defence-in-depth
-            # on the 2-worker Discogs pool rather than a lock: a reader that catches
-            # the stale key mid-fetch merely re-fetches (fail-safe redundant GET),
-            # it never mismatches. NOT a general thread-safety guarantee — the
-            # check-then-return is only safe because callers are serialized.
+            # The resolver-owned reader gate serializes every caller of this
+            # mutable memo. Publishing the key last remains a narrow defensive
+            # guarantee if a future reader caller is added incorrectly: it may
+            # issue a redundant fetch, but cannot pair a new key with old data.
             self._db_search_page = list(results.page(1))
             self._db_search_stamp = now
             self._db_search_key = key            # published LAST
         return self._db_search_page[:limit]
 
-    def _get_collection_index(self) -> dict:
+    def _collection_build_is_backed_off(self, now: float) -> bool:
+        return (
+            self._last_collection_build_failure_at is not None
+            and now - self._last_collection_build_failure_at
+            < _COLLECTION_BUILD_FAILURE_BACKOFF_SECONDS
+        )
+
+    @staticmethod
+    def _positive_int(value) -> bool:
+        return type(value) is int and value > 0
+
+    def _build_collection_index(self) -> dict:
+        """Fetch and validate every advertised collection page before swap-in.
+
+        The candidate remains local until the entire response is internally
+        consistent.  This makes an old complete snapshot safer than an apparent
+        partial replacement: its positives are still useful, but its misses are
+        explicitly marked non-authoritative by :meth:`_get_collection_index`.
+        """
+        candidate: dict = {}
+        expected_pages = expected_per_page = expected_items = None
+        raw_rows = 0
+        page = 1
+        try:
+            while True:
+                if page > _MAX_COLLECTION_PAGES:
+                    raise CollectionIndexIncomplete("collection pagination exceeded the page cap")
+                resp = self._http.request(
+                    "GET",
+                    f"{_API_BASE}/users/{self._username_path}/collection/folders/0/releases",
+                    params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise CollectionIndexIncomplete("collection response was not an object")
+                releases = data.get("releases")
+                pagination = data.get("pagination")
+                if not isinstance(releases, list) or not isinstance(pagination, dict):
+                    raise CollectionIndexIncomplete("collection pagination was incomplete")
+                reported_page = pagination.get("page")
+                pages = pagination.get("pages")
+                per_page = pagination.get("per_page")
+                items = pagination.get("items")
+                if not all(self._positive_int(v) for v in (reported_page, pages, per_page)):
+                    raise CollectionIndexIncomplete("collection pagination was incomplete")
+                if type(items) is not int or items < 0:
+                    raise CollectionIndexIncomplete("collection pagination was incomplete")
+                if reported_page != page or pages < page or pages > _MAX_COLLECTION_PAGES:
+                    raise CollectionIndexIncomplete("collection pagination was incomplete")
+                if pages != max(1, (items + per_page - 1) // per_page):
+                    raise CollectionIndexIncomplete("collection pagination shape was inconsistent")
+                if expected_pages is None:
+                    expected_pages, expected_per_page, expected_items = pages, per_page, items
+                elif (pages, per_page, items) != (expected_pages, expected_per_page, expected_items):
+                    raise CollectionIndexIncomplete("collection pagination changed during the walk")
+                if page < pages and len(releases) != per_page:
+                    raise CollectionIndexIncomplete("a non-final collection page was not full")
+                if page == pages and len(releases) > per_page:
+                    raise CollectionIndexIncomplete("the final collection page exceeded its size")
+
+                raw_rows += len(releases)
+                if raw_rows > items:
+                    raise CollectionIndexIncomplete("collection row count exceeded pagination total")
+                for item in releases:
+                    if not isinstance(item, dict):
+                        raise CollectionIndexIncomplete("collection release was malformed")
+                    basic = item.get("basic_information")
+                    release_id = basic.get("id") if isinstance(basic, dict) else None
+                    instance_id = item.get("instance_id")
+                    if not self._positive_int(release_id) or not self._positive_int(instance_id):
+                        raise CollectionIndexIncomplete("collection release identifiers were malformed")
+                    artists = basic.get("artists")
+                    title = basic.get("title")
+                    if not isinstance(title, str) or not isinstance(artists, list):
+                        raise CollectionIndexIncomplete("collection release was malformed")
+                    if any(not isinstance(a, dict) or not isinstance(a.get("name"), str) for a in artists):
+                        raise CollectionIndexIncomplete("collection release was malformed")
+                    if release_id not in candidate:
+                        artist_credit = _reconstruct_artist_credit(artists)
+                        candidate[release_id] = {
+                            "instance_id": instance_id,
+                            "title": title,
+                            "artists": [a["name"] for a in artists],
+                            "artist_credit": artist_credit,
+                            "_title_key": _normalize_term(title),
+                            "_artist_keys": [
+                                _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", a["name"]))
+                                for a in artists
+                            ],
+                            "_credit_key": _normalize_artist(_ARTIST_DISAMBIG_RE.sub(
+                                "", artist_credit)),
+                            "master_id": basic.get("master_id") or None,
+                        }
+                if page == pages:
+                    if raw_rows != items:
+                        raise CollectionIndexIncomplete("collection row count did not match pagination total")
+                    break
+                page += 1
+        except Exception as exc:
+            self._last_collection_build_failure_at = time.monotonic()
+            if isinstance(exc, CollectionIndexIncomplete):
+                raise
+            raise CollectionIndexIncomplete("collection pagination was incomplete") from exc
+
+        self._collection_index = candidate
+        self._collection_index_built_at = time.monotonic()
+        self._last_collection_build_failure_at = None
+        log.debug("Built complete collection index: %d release(s).", len(candidate))
+        return candidate
+
+    def _get_collection_index(self) -> _CollectionIndexView:
         """Build (once per session) and return an in-memory index of the user's
         collection: ``{release_id: {"instance_id", "title", "artists", "master_id"}}``.
 
@@ -690,96 +829,32 @@ class DiscogsReader:
         that pins a downgrade for the session (B-4/B-13).  A successfully built
         (possibly empty) index is cached.
         """
+        now = time.monotonic()
+        if self._collection_build_is_backed_off(now):
+            if self._collection_index is not None:
+                return _CollectionIndexView(
+                    self._collection_index, misses_are_authoritative=False
+                )
+            raise CollectionOwnershipUnknown("collection index rebuild is backed off")
+
         # #191: serve the cached index only while it is within the TTL. A
         # built_at of None means the index was injected (tests) rather than built
         # here — trust it and never expire it. A real build stamps built_at, so
         # the TTL applies and a stale index rebuilds from the API below.
         if self._collection_index is not None and (
             self._collection_index_built_at is None
-            or time.monotonic() - self._collection_index_built_at
+            or now - self._collection_index_built_at
             < _COLLECTION_INDEX_TTL_SECONDS
         ):
-            return self._collection_index
-
-        index: dict = {}
-        page = 1
-        while True:
-            resp = self._http.request(
-                "GET",
-                f"{_API_BASE}/users/{self._username_path}/collection/folders/0/releases",
-                params={"page": page, "per_page": 100, "sort": "added", "sort_order": "desc"},
+            return _CollectionIndexView(
+                self._collection_index, misses_are_authoritative=True
             )
-            resp.raise_for_status()
-            data = resp.json()
 
-            releases = data.get("releases", [])
-            if not releases:
-                break
+        return _CollectionIndexView(
+            self._build_collection_index(), misses_are_authoritative=True
+        )
 
-            for item in releases:
-                basic = item.get("basic_information", {})
-                release_id = basic.get("id")
-                if release_id is None:
-                    continue
-                # Keep the first instance seen per release (mirrors the old
-                # "use instances[0]" behaviour for users who own duplicates).
-                if release_id not in index:
-                    index[release_id] = {
-                        "instance_id": item.get("instance_id"),
-                        "title": basic.get("title", ""),
-                        "artists": [a.get("name", "") for a in basic.get("artists", [])],
-                        # R5-07: the reconstructed multi-artist credit string, so a
-                        # Shazam joint credit ("A & B") can match a collaboration
-                        # album whose index names are ["A", "B"].
-                        "artist_credit": _reconstruct_artist_credit(basic.get("artists", [])),
-                        # R5-27: precompute the folded match keys ONCE at build,
-                        # so search_collection's #226 distinct-albums scan and
-                        # tier-1 comparisons don't re-fold every index entry on
-                        # every call (~8ms/miss at 3k records on x86, ~4-5x on the
-                        # Pi). Behaviour-identical to folding on the fly.
-                        "_title_key": _normalize_term(basic.get("title", "")),
-                        "_artist_keys": [
-                            _normalize_artist(_ARTIST_DISAMBIG_RE.sub("", a.get("name", "")))
-                            for a in basic.get("artists", [])
-                        ],
-                        "_credit_key": _normalize_artist(_ARTIST_DISAMBIG_RE.sub(
-                            "", _reconstruct_artist_credit(basic.get("artists", [])))),
-                        # #226: the master groups a work's pressings.  Two owned
-                        # entries at the same (artist, title) with DIFFERENT
-                        # masters are distinct albums (Peter Gabriel I/III), not
-                        # pressings — strategy 1 defers to refuse-to-guess.  0 /
-                        # missing means "no master": treated as absent (pressings
-                        # of a master-less release stay a valid single target).
-                        "master_id": basic.get("master_id") or None,
-                    }
-
-            pagination = data.get("pagination", {})
-            if page >= pagination.get("pages", 1):
-                break
-            if page >= _MAX_COLLECTION_PAGES:
-                # STAB-4: absolute safety ceiling.  Reaching it means the
-                # pagination response is malformed (no real personal collection
-                # has 100,000+ records), so stop with the partial index rather
-                # than paging without bound and hammering the rate limit.  The
-                # partial index is still cached below, so this build is not
-                # re-attempted per track.  A partial index can only cause
-                # false-negatives (an album beyond the cap resolves via the
-                # database tier with no instance_id) — never a wrong write target.
-                log.warning(
-                    "Collection paging hit the absolute cap of %d pages "
-                    "(%d releases indexed); stopping with a partial index. "
-                    "Suspect a malformed Discogs pagination response.",
-                    _MAX_COLLECTION_PAGES, len(index),
-                )
-                break
-            page += 1
-
-        self._collection_index = index
-        self._collection_index_built_at = time.monotonic()   # #191: stamp for the TTL
-        log.debug(f"Built collection index: {len(index)} release(s).")
-        return index
-
-    def refresh_index_and_research(self, artist: str, album: str) -> Optional[dict]:
+    def refresh_index_and_research(self, artist: str, album: str) -> CollectionRefreshResult:
         """#191 (C): force a stale-index rebuild and re-check ownership, once per
         cooldown.
 
@@ -787,44 +862,60 @@ class DiscogsReader:
         DATABASE knows the album — the signature of a record the owner may have
         just added (the index is a snapshot from up to the TTL ago). It discards
         the cached index and re-runs :meth:`search_collection` against a freshly
-        built one, returning the owned release if it is now present, else None.
+        built one. It returns an immutable :class:`CollectionRefreshResult`:
+
+        * ``OWNED`` carries the validated owned-release mapping in ``result``.
+        * ``CLEAN_NO_MATCH`` carries no ``result`` and means the complete rebuild
+          succeeded but found no unambiguous owned match.
+        * ``COOLDOWN_SKIPPED`` carries no ``result`` and means no rebuild was
+          attempted because the global cooldown is active.
+
+        For ``COOLDOWN_SKIPPED``, ``cooldown_follows_successful_rebuild`` records
+        the provenance of the active cooldown. It is true only when the cooldown
+        follows a successfully completed full collection rebuild; it is false
+        after a failed or otherwise incomplete attempt. Other states always carry
+        false provenance. Transport, parsing, and index-build failures remain
+        exceptions rather than becoming refresh results.
 
         The cooldown is load-bearing, not cosmetic: the same "missed collection,
         hit database" signal fires on EVERY record the user genuinely does not
         own (the common database-tier case), so without it every unowned-record
         play would trigger a full collection re-page. Within the cooldown this
-        returns None immediately and re-pages nothing. The cooldown is stamped on
-        the ATTEMPT (before the re-page), so a transiently-failing refresh does
-        not hammer Discogs — search_collection's build error still propagates so
-        the resolver leaves the album uncached/retryable (B-4).
+        returns ``COOLDOWN_SKIPPED`` immediately and re-pages nothing. The
+        cooldown is stamped on the ATTEMPT (before the re-page), so a
+        transiently-failing refresh does not hammer Discogs — the build error
+        still propagates so the resolver leaves the album uncached/retryable
+        (B-4).
         """
         now = time.monotonic()
         if now - self._last_index_refresh_at < _INDEX_REFRESH_COOLDOWN_SECONDS:
-            return None
+            return CollectionRefreshResult(
+                CollectionRefreshState.COOLDOWN_SKIPPED,
+                cooldown_follows_successful_rebuild=self._last_speculative_refresh_succeeded,
+            )
+        if self._collection_build_is_backed_off(now):
+            raise CollectionOwnershipUnknown("collection index rebuild is backed off")
         self._last_index_refresh_at = now
-        # R5-18: force a rebuild WITHOUT discarding the current index up front.
-        # Invalidating before the re-page meant a transient failure mid-rebuild
-        # (a dropped GET) left the reader with NO index at all, forcing a full
-        # re-page on every subsequent resolve until the next success — throwing
-        # away a snapshot that was fine seconds ago. Save the current snapshot,
-        # invalidate to force _get_collection_index to rebuild, and restore it if
-        # the rebuild raises (swap-on-success). The error still propagates so the
-        # resolver leaves the album uncached/retryable (B-4).
-        saved_index = self._collection_index
-        saved_built_at = self._collection_index_built_at
-        self._collection_index = None
-        self._collection_index_built_at = None
-        try:
-            return self.search_collection(artist, album)
-        except Exception:
-            # _get_collection_index assigns the new index only after a fully
-            # successful re-page, so on a raise self._collection_index is still
-            # None here — restore the previously-valid snapshot rather than
-            # leaving the reader index-less.
-            if self._collection_index is None:
-                self._collection_index = saved_index
-                self._collection_index_built_at = saved_built_at
-            raise
+        self._last_speculative_refresh_succeeded = False
+        self._build_collection_index()
+        self._last_speculative_refresh_succeeded = True
+        match = self.search_collection(artist, album)
+        if match is not None:
+            return CollectionRefreshResult(CollectionRefreshState.OWNED, result=match)
+        return CollectionRefreshResult(CollectionRefreshState.CLEAN_NO_MATCH)
+
+    def rebuild_collection_and_research(self, artist: str, album: str) -> Optional[dict]:
+        """Strictly rebuild and re-match without changing speculative cooldown.
+
+        Recovery needs fresh ownership evidence even during the ordinary
+        speculative-refresh cooldown.  This deliberately consumes the separate
+        failed-build backoff and keeps the build's swap-on-success semantics,
+        but never reads or writes speculative cooldown/provenance state.
+        """
+        if self._collection_build_is_backed_off(time.monotonic()):
+            raise CollectionOwnershipUnknown("collection index rebuild is backed off")
+        self._build_collection_index()
+        return self.search_collection(artist, album)
 
     def _build_result(self, release, instance_id: Optional[int]) -> dict:
         """Build a standardised result dict from a Discogs Release object.

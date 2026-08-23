@@ -19,11 +19,13 @@ Fix: monotonic-clock TTL on the index (B1) and on the resolver's DATABASE/FALLBA
 entries only — COLLECTION hits never expire (B2) — plus a cooldown'd
 staleness-triggered refresh (C).
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.metadata.models import MetadataSource, TracklistEntry
+from src.metadata.discogs.outcomes import CollectionRefreshResult, CollectionRefreshState
 from tests.factories import make_discogs_reader
 
 
@@ -31,10 +33,18 @@ from tests.factories import make_discogs_reader
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _page(releases, page=1, pages=1):
+def _page(releases, page=1, pages=1, per_page=100, items=None):
     resp = MagicMock()
     resp.status_code = 200
-    resp.json.return_value = {"releases": releases, "pagination": {"page": page, "pages": pages}}
+    resp.json.return_value = {
+        "releases": releases,
+        "pagination": {
+            "page": page,
+            "pages": pages,
+            "per_page": per_page,
+            "items": len(releases) if items is None else items,
+        },
+    }
     return resp
 
 
@@ -67,11 +77,14 @@ def _make_resolver(reader=None, coverart=None):
     if reader is None:
         r.reader.search_collection.return_value = None
         r.reader.search_database.return_value = None
-        r.reader.refresh_index_and_research.return_value = None
+        r.reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+            CollectionRefreshState.CLEAN_NO_MATCH
+        )
         r.reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     r.coverart = coverart or MagicMock()
     r.coverart.get_cover_art_url.return_value = None
     r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
+    r._reader_gate = asyncio.Lock()
     r._logged_discogs_config = {}
     return r
 
@@ -155,7 +168,7 @@ def test_index_not_rebuilt_within_ttl(monkeypatch):
 # C — cooldown'd staleness-triggered refresh (reader).
 # ---------------------------------------------------------------------------
 
-def test_refresh_and_research_upgrades_a_just_added_record(monkeypatch):
+def test_refresh_returns_owned_after_complete_rebuild(monkeypatch):
     """refresh_index_and_research force-rebuilds a stale index and re-checks
     ownership, finding a record added after the original build."""
     import src.metadata.discogs.reader as reader_mod
@@ -172,9 +185,80 @@ def test_refresh_and_research_upgrades_a_just_added_record(monkeypatch):
                             _item(555, 77, "Sister", ["Sonic Youth"])])
     )
 
-    upgraded = reader.refresh_index_and_research("Sonic Youth", "Sister")
-    assert upgraded is not None
-    assert upgraded["instance_id"] == 77          # the just-added record's instance
+    outcome = reader.refresh_index_and_research("Sonic Youth", "Sister")
+    assert outcome.state is CollectionRefreshState.OWNED
+    assert outcome.result["instance_id"] == 77          # the just-added record's instance
+
+
+def test_refresh_returns_clean_no_match_after_complete_rebuild(monkeypatch):
+    import src.metadata.discogs.reader as reader_mod
+    clock = _Clock()
+    monkeypatch.setattr(reader_mod.time, "monotonic", clock)
+    reader = make_discogs_reader()
+    reader._collection_index = {}
+    reader._collection_index_built_at = clock.t
+    reader._database_search = MagicMock(return_value=[])
+    reader._http.request = MagicMock(return_value=_page([]))
+
+    outcome = reader.refresh_index_and_research("Sonic Youth", "Sister")
+
+    assert outcome.state is CollectionRefreshState.CLEAN_NO_MATCH
+    assert outcome.result is None
+
+
+def test_refresh_returns_cooldown_skipped_after_successful_rebuild(monkeypatch):
+    import src.metadata.discogs.reader as reader_mod
+    clock = _Clock()
+    monkeypatch.setattr(reader_mod.time, "monotonic", clock)
+    reader = make_discogs_reader()
+    reader._collection_index = {}
+    reader._collection_index_built_at = clock.t
+    reader._database_search = MagicMock(return_value=[])
+    reader._http.request = MagicMock(return_value=_page([]))
+
+    reader.refresh_index_and_research("Sonic Youth", "Sister")
+    calls = reader._http.request.call_count
+    outcome = reader.refresh_index_and_research("Sonic Youth", "Sister")
+
+    assert outcome.state is CollectionRefreshState.COOLDOWN_SKIPPED
+    assert outcome.cooldown_follows_successful_rebuild is True
+    assert reader._http.request.call_count == calls
+
+
+def test_failed_refresh_marks_cooldown_provenance_unknown(monkeypatch):
+    import src.metadata.discogs.reader as reader_mod
+    clock = _Clock()
+    monkeypatch.setattr(reader_mod.time, "monotonic", clock)
+    reader = make_discogs_reader()
+    reader._collection_index = {111: {"instance_id": 42, "title": "Goo", "artists": ["Sonic Youth"]}}
+    reader._collection_index_built_at = clock.t
+    reader._http.request = MagicMock(side_effect=ConnectionError("blip"))
+
+    with pytest.raises(reader_mod.CollectionIndexIncomplete):
+        reader.refresh_index_and_research("Sonic Youth", "Sister")
+
+    outcome = reader.refresh_index_and_research("Sonic Youth", "Sister")
+    assert outcome.state is CollectionRefreshState.COOLDOWN_SKIPPED
+    assert outcome.cooldown_follows_successful_rebuild is False
+
+
+def test_cooldown_skip_after_failed_refresh_does_not_repage(monkeypatch):
+    import src.metadata.discogs.reader as reader_mod
+    clock = _Clock()
+    monkeypatch.setattr(reader_mod.time, "monotonic", clock)
+    reader = make_discogs_reader()
+    reader._collection_index = {}
+    reader._collection_index_built_at = clock.t
+    reader._http.request = MagicMock(side_effect=ConnectionError("blip"))
+
+    with pytest.raises(reader_mod.CollectionIndexIncomplete):
+        reader.refresh_index_and_research("Sonic Youth", "Sister")
+    calls = reader._http.request.call_count
+    outcome = reader.refresh_index_and_research("Sonic Youth", "Sister")
+
+    assert outcome.state is CollectionRefreshState.COOLDOWN_SKIPPED
+    assert outcome.cooldown_follows_successful_rebuild is False
+    assert reader._http.request.call_count == calls
 
 
 def test_refresh_preserves_the_prior_index_on_a_transient_rebuild_failure(monkeypatch):
@@ -193,7 +277,7 @@ def test_refresh_preserves_the_prior_index_on_a_transient_rebuild_failure(monkey
     reader._collection_index_built_at = clock.t
     reader._http.request = MagicMock(side_effect=ConnectionError("blip"))
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(reader_mod.CollectionIndexIncomplete):
         reader.refresh_index_and_research("Someone", "New Album")
 
     # The previously-valid index survived; the error still propagated (B-4).
@@ -242,7 +326,9 @@ async def test_database_downgrade_cache_expires_and_re_resolves(monkeypatch):
     reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     reader.search_collection.return_value = None
     reader.search_database.return_value = _db_result()
-    reader.refresh_index_and_research.return_value = None       # C finds nothing yet
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.CLEAN_NO_MATCH
+    )
     resolver = _make_resolver(reader=reader)
 
     first = await resolver.resolve(make_raw())
@@ -276,7 +362,9 @@ async def test_collection_cache_never_expires(monkeypatch):
     reader.search_collection.return_value = {"release_id": 555, "instance_id": 77,
                                              "album": "Sister", "tracklist": []}
     reader.search_database.return_value = None
-    reader.refresh_index_and_research.return_value = None
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.CLEAN_NO_MATCH
+    )
     resolver = _make_resolver(reader=reader)
 
     first = await resolver.resolve(make_raw())
@@ -303,9 +391,10 @@ async def test_resolver_upgrades_via_refresh_on_database_hit():
     reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     reader.search_collection.return_value = None                # stale index misses
     reader.search_database.return_value = _db_result()          # DB knows the album
-    reader.refresh_index_and_research.return_value = {          # refresh finds it owned
-        "release_id": 555, "instance_id": 77, "album": "Sister", "tracklist": [],
-    }
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.OWNED,
+        {"release_id": 555, "instance_id": 77, "album": "Sister", "tracklist": []},
+    )
     resolver = _make_resolver(reader=reader)
 
     result = await resolver.resolve(make_raw())
@@ -323,7 +412,9 @@ async def test_refresh_is_not_triggered_when_the_collection_lookup_errored():
     reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     reader.search_collection.side_effect = ConnectionError("blip")   # errored, not a clean miss
     reader.search_database.return_value = _db_result()
-    reader.refresh_index_and_research.return_value = None
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.CLEAN_NO_MATCH
+    )
     resolver = _make_resolver(reader=reader)
 
     result = await resolver.resolve(make_raw())
@@ -339,9 +430,64 @@ async def test_resolver_keeps_database_when_refresh_finds_nothing():
     reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
     reader.search_collection.return_value = None
     reader.search_database.return_value = _db_result()
-    reader.refresh_index_and_research.return_value = None       # still not owned
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.CLEAN_NO_MATCH
+    )
     resolver = _make_resolver(reader=reader)
 
     result = await resolver.resolve(make_raw())
     assert result.source is MetadataSource.DISCOGS_DATABASE
     reader.refresh_index_and_research.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resolver_caches_database_after_clean_no_match():
+    reader = MagicMock()
+    reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
+    reader.search_collection.return_value = None
+    reader.search_database.return_value = _db_result()
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.CLEAN_NO_MATCH
+    )
+    resolver = _make_resolver(reader=reader)
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source is MetadataSource.DISCOGS_DATABASE
+    assert len(resolver._album_cache) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolver_caches_database_on_cooldown_after_proven_success():
+    reader = MagicMock()
+    reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
+    reader.search_collection.return_value = None
+    reader.search_database.return_value = _db_result()
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.COOLDOWN_SKIPPED,
+        cooldown_follows_successful_rebuild=True,
+    )
+    resolver = _make_resolver(reader=reader)
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source is MetadataSource.DISCOGS_DATABASE
+    assert len(resolver._album_cache) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolver_does_not_cache_database_on_cooldown_after_failed_refresh():
+    reader = MagicMock()
+    reader.run = AsyncMock(side_effect=lambda fn, *a: fn(*a))
+    reader.search_collection.return_value = None
+    reader.search_database.return_value = _db_result()
+    reader.refresh_index_and_research.return_value = CollectionRefreshResult(
+        CollectionRefreshState.COOLDOWN_SKIPPED,
+        cooldown_follows_successful_rebuild=False,
+    )
+    resolver = _make_resolver(reader=reader)
+
+    result = await resolver.resolve(make_raw())
+
+    assert result.source is MetadataSource.DISCOGS_DATABASE
+    assert len(resolver._album_cache) == 0

@@ -34,7 +34,10 @@ def _release(rid):
 def _page(items):
     def make(pn, pg):
         resp = MagicMock(); resp.status_code = 200
-        resp.json.return_value = {"releases": items, "pagination": {"page": pn, "pages": pg}}
+        resp.json.return_value = {
+            "releases": items,
+            "pagination": {"page": pn, "pages": pg, "per_page": len(items) or 1, "items": len(items)},
+        }
         return resp
     return make
 
@@ -66,7 +69,9 @@ def test_r5_20_same_query_is_searched_once_across_collection_and_database():
         return m
 
     reader._client.search = MagicMock(side_effect=fake_search)
-    reader._get_collection_index = MagicMock(return_value={})
+    reader._get_collection_index = MagicMock(return_value=reader_mod._CollectionIndexView(
+        index={}, misses_are_authoritative=True
+    ))
 
     reader.search_collection("Radiohead", "Kid A")   # strategy 1, limit 25
     reader.search_database("Radiohead", "Kid A")       # database tier, limit 3
@@ -103,7 +108,7 @@ def test_r5_20_memo_respects_the_requested_limit():
 def test_r5_27_index_titles_are_not_refolded_on_every_search():
     reader = make_discogs_reader()
     reader._http.request = MagicMock(
-        return_value=_page([_item(i, i, f"Album {i}", [f"Artist {i}"]) for i in range(200)])(1, 1)
+        return_value=_page([_item(i, i, f"Album {i}", [f"Artist {i}"]) for i in range(1, 201)])(1, 1)
     )
     reader._database_search = MagicMock(return_value=[])
     reader._get_collection_index()          # builds + precomputes the folded keys
