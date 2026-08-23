@@ -6,6 +6,20 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 
+@dataclass(frozen=True)
+class CollectionIdentity:
+    """A validated, credit-safe Discogs collection identity."""
+
+    release_id: int
+    instance_id: int
+
+    def __post_init__(self):
+        if type(self.release_id) is not int or self.release_id <= 0:
+            raise ValueError("release_id must be a positive integer")
+        if type(self.instance_id) is not int or self.instance_id <= 0:
+            raise ValueError("instance_id must be a positive integer")
+
+
 class CollectionRefreshState(Enum):
     OWNED = auto()
     CLEAN_NO_MATCH = auto()

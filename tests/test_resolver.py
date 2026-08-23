@@ -12,12 +12,18 @@ Verifies:
   - NotImplementedError (stub) falls through gracefully
   - All TrackMetadata fields are populated correctly from each source
 """
+import asyncio
+import time
 from unittest.mock import MagicMock, AsyncMock
 import pytest
 
 from src.audio.recognizer import RawRecognitionResult
 from src.metadata.models import MetadataSource, TracklistEntry
-from src.metadata.discogs.outcomes import CollectionRefreshResult, CollectionRefreshState
+from src.metadata.discogs.outcomes import (
+    CollectionIdentity,
+    CollectionRefreshResult,
+    CollectionRefreshState,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +95,252 @@ def resolver(mock_discogs, mock_coverart):
     r.reader = mock_discogs
     r.coverart = mock_coverart
     r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)  # Normally created in __init__ (bypassed via __new__)
+    r._reader_gate = asyncio.Lock()
     r._logged_discogs_config = {}
     return r
+
+
+def _put_collection(resolver, key, result):
+    resolver._album_cache.put(
+        key, (MetadataSource.DISCOGS_COLLECTION, result, time.monotonic())
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_invalidates_exact_stale_positive_and_returns_same_release_new_instance(
+    resolver, mock_discogs,
+):
+    """Using reader's collapsed instance would credit the wrong surviving copy."""
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+    mock_discogs.rebuild_collection_and_research.return_value = make_discogs_result(100, 200)
+
+    identity = await resolver.recover_collection_instance(key, 100, 200, (300,))
+
+    assert identity == CollectionIdentity(100, 300)
+    cached = resolver._album_cache.get(key)
+    assert cached[0] is MetadataSource.DISCOGS_COLLECTION
+    assert cached[1]["instance_id"] == 300
+
+
+@pytest.mark.asyncio
+async def test_recovery_allows_absent_cache_entry_after_lru_eviction(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    mock_discogs.rebuild_collection_and_research.return_value = make_discogs_result(100, 999)
+
+    identity = await resolver.recover_collection_instance(key, 100, 200, (300,))
+
+    assert identity == CollectionIdentity(100, 300)
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_erase_newer_nonmatching_cache_entry(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    newer = make_discogs_result(101, 301)
+    _put_collection(resolver, key, newer)
+
+    assert await resolver.recover_collection_instance(key, 100, 200, (300,)) is None
+    assert resolver._album_cache.get(key)[1] == newer
+    mock_discogs.rebuild_collection_and_research.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recovery_accepts_newer_cache_only_when_it_matches_proven_singleton(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    newer = make_discogs_result(100, 300)
+    _put_collection(resolver, key, newer)
+
+    identity = await resolver.recover_collection_instance(key, 100, 200, (300,))
+
+    assert identity == CollectionIdentity(100, 300)
+    mock_discogs.rebuild_collection_and_research.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed", [(200,), (), (300, 400)])
+async def test_recovery_refuses_same_instance_or_non_singleton_evidence(resolver, mock_discogs, observed):
+    """Missing/multiple/same evidence must evict only the known stale entry."""
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+
+    assert await resolver.recover_collection_instance(key, 100, 200, observed) is None
+    assert resolver._album_cache.get(key) is None
+    mock_discogs.rebuild_collection_and_research.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recovery_refuses_different_release(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+    mock_discogs.rebuild_collection_and_research.return_value = make_discogs_result(101, 300)
+
+    assert await resolver.recover_collection_instance(key, 100, 200, (300,)) is None
+    assert resolver._album_cache.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_leaves_known_stale_album_entry_invalidated(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+    mock_discogs.rebuild_collection_and_research.side_effect = ConnectionError("offline")
+
+    assert await resolver.recover_collection_instance(key, 100, 200, (300,)) is None
+    assert resolver._album_cache.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_refuses_same_instance(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+
+    assert await resolver.recover_collection_instance(key, 100, 200, (200,)) is None
+    assert resolver._album_cache.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_refuses_zero_or_multiple_replacement_instances(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    for observed in ((), (300, 400)):
+        _put_collection(resolver, key, make_discogs_result(100, 200))
+        assert await resolver.recover_collection_instance(key, 100, 200, observed) is None
+        assert resolver._album_cache.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_empty_enumeration_invalidates_stale_entry_and_refuses(resolver, mock_discogs):
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+
+    assert await resolver.recover_collection_instance(key, 100, 200, ()) is None
+    assert resolver._album_cache.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_instances_leave_album_key_uncached(resolver, mock_discogs):
+    """Invalid writer proof must not touch an immortal cache entry."""
+    key = ("miles davis", "kind of blue")
+    stale = make_discogs_result(100, 200)
+    _put_collection(resolver, key, stale)
+
+    assert await resolver.recover_collection_instance(key, 100, 200, (300, 300)) is None
+    assert resolver._album_cache.get(key)[1] == stale
+
+
+@pytest.mark.asyncio
+async def test_recovery_during_failed_speculative_cooldown_does_not_change_cooldown_state(
+    resolver, mock_discogs,
+):
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+    mock_discogs.rebuild_collection_and_research.return_value = make_discogs_result(100, 200)
+    mock_discogs._last_index_refresh_at = 123.0
+    mock_discogs._last_speculative_refresh_succeeded = False
+
+    await resolver.recover_collection_instance(key, 100, 200, (300,))
+
+    assert mock_discogs._last_index_refresh_at == 123.0
+    assert mock_discogs._last_speculative_refresh_succeeded is False
+
+
+@pytest.mark.asyncio
+async def test_waiting_resolve_rechecks_cache_after_acquiring_reader_gate(resolver, mock_discogs):
+    """Removing the post-lock check causes a second reader sequence."""
+    # pytest-asyncio's synchronous fixture runs before this test's loop on
+    # Python 3.9, so bind the contention lock in the active loop.
+    resolver._reader_gate = asyncio.Lock()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def run(fn, *args):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return fn(*args)
+
+    mock_discogs.run = AsyncMock(side_effect=run)
+    mock_discogs.search_collection.return_value = make_discogs_result()
+    first = asyncio.create_task(resolver.resolve(make_raw()))
+    await started.wait()
+    second = asyncio.create_task(resolver.resolve(make_raw(title="All Blues")))
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cache_misses_serialize_reader_sequences(resolver, mock_discogs):
+    """A removed gate lets the mutable reader sequence overlap."""
+    resolver._reader_gate = asyncio.Lock()
+    started, release = asyncio.Event(), asyncio.Event()
+    in_reader = maximum = 0
+
+    async def run(fn, *args):
+        nonlocal in_reader, maximum
+        in_reader += 1
+        maximum = max(maximum, in_reader)
+        started.set()
+        await release.wait()
+        try:
+            return fn(*args)
+        finally:
+            in_reader -= 1
+
+    mock_discogs.run = AsyncMock(side_effect=run)
+    mock_discogs.search_collection.return_value = make_discogs_result()
+    first = asyncio.create_task(resolver.resolve(make_raw(album="First")))
+    await started.wait()
+    second = asyncio.create_task(resolver.resolve(make_raw(album="Second")))
+    await asyncio.sleep(0)
+    assert maximum == 1
+    release.set()
+    await asyncio.gather(first, second)
+    assert maximum == 1
+
+
+@pytest.mark.asyncio
+async def test_collection_cache_fast_path_does_not_enter_reader_gate(resolver, mock_discogs):
+    """A positive cache hit must not wait behind unrelated recovery I/O."""
+    resolver._reader_gate = asyncio.Lock()
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result())
+    await resolver._reader_gate.acquire()
+    try:
+        result = await asyncio.wait_for(resolver.resolve(make_raw()), timeout=0.05)
+    finally:
+        resolver._reader_gate.release()
+    assert result.source is MetadataSource.DISCOGS_COLLECTION
+    mock_discogs.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_resolve_and_recovery_are_serialized_by_one_gate(resolver, mock_discogs):
+    """Recovery and ordinary resolution share, rather than race through, reader.run."""
+    resolver._reader_gate = asyncio.Lock()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def run(fn, *args):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return fn(*args)
+
+    mock_discogs.run = AsyncMock(side_effect=run)
+    mock_discogs.rebuild_collection_and_research.return_value = make_discogs_result(100, 200)
+    mock_discogs.search_collection.return_value = make_discogs_result(101, 301)
+    recovery = asyncio.create_task(
+        resolver.recover_collection_instance(("miles davis", "kind of blue"), 100, 200, (300,))
+    )
+    await started.wait()
+    ordinary = asyncio.create_task(resolver.resolve(make_raw(album="Other")))
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    await asyncio.gather(recovery, ordinary)
+    assert calls == 2
 
 
 # ---------------------------------------------------------------------------

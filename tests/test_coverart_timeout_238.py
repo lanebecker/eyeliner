@@ -32,6 +32,7 @@ def _resolver(cover_fn):
     r.coverart = MagicMock()
     r.coverart.get_cover_art_url = cover_fn
     r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
+    r._reader_gate = asyncio.Lock()
     r._logged_discogs_config = {}
     return r
 

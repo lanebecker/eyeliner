@@ -7,6 +7,7 @@ B-10 — numbered tracklists ('1'..'N', no side letters) now yield prev/next
 B-9  — TracklistEntry is frozen; each track of an album gets its own tracklist
        list; an explicit None tracklist is normalized to [].
 """
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -125,6 +126,7 @@ def _resolver():
     r.reader = MagicMock()
     r.coverart = MagicMock()
     r._album_cache = BoundedCache(_ALBUM_CACHE_MAX)
+    r._reader_gate = asyncio.Lock()
     r._logged_discogs_config = {}
     return r
 
