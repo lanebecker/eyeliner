@@ -164,7 +164,7 @@ class DiscogsCollectionWriter:
             # (META-2). Abort rather than clobber.
             log.error(
                 f"Aborting Play Count increment for release {release_id} / instance "
-                f"{instance_id}: existing value {raw_value!r} is not an integer, so "
+                f"{instance_id}: existing field value is not an integer or is negative; "
                 f"refusing to overwrite it with 1."
             )
             return PlayCountReadResult(PlayCountReadState.ABORT)
