@@ -21,14 +21,15 @@ above the traceback (ARCH-10). Three failure modes:
   could not open a video device. Check, in order: (1) the HDMI cable is seated and
   the panel was powered on **before** the Pi booted (HDMI hot-plug is unreliable on
   the Pi); (2) a desktop / X server is actually running on the target `DISPLAY`
-  (default `:0`) — the systemd unit sets `Environment="DISPLAY=:0"` and
-  `Environment="XAUTHORITY=/home/pi/.Xauthority"`, so those must match your logged-in
-  session; `echo $DISPLAY` in the Pi's desktop terminal confirms the value.
+  (often `:0`) — the rendered systemd unit's `DISPLAY` and `XAUTHORITY` values
+  must match the logged-in session; `echo $DISPLAY` in the Pi's desktop terminal
+  confirms only the display value.
   ⚠️ On current Raspberry Pi OS the default session is **Wayland** (labwc/wayfire):
   `DISPLAY=:0` reaches it via Xwayland, but `/home/pi/.Xauthority` often doesn't
-  exist there, so if the unit can't open the display see the "Wayland note" beside
-  the systemd unit in `pi-setup-guide.md` §12 (point `XAUTHORITY` at the Xwayland
-  auth file, or use a systemd *user* service). Check the live mode with
+  exist there, so if the unit can't open the display see the "Wayland/Xwayland
+  evidence required" note in `pi-setup-guide.md` §12. Keep the system service;
+  point its rendered `XAUTHORITY` at the selected session-auth file. Check the
+  live mode with
   `wlr-randr`, not `xrandr` (the latter shows only an XWAYLAND virtual output).
 - **"Failed to construct the application components … cover_art_cache_dir … not
   writable."** The on-disk cover cache directory can't be created. Check that
@@ -51,7 +52,87 @@ times and then drop to a `failed` state rather than loop forever — so `systemc
 status vinyl-now-playing` showing `failed`/`start-limit-hit` here means "fix the
 above and `systemctl reset-failed`", not "the Pi is wedged".
 
-## 1. Audio input is the right device
+## 1. Wave 1 deployability evidence (record before calling it complete)
+
+Record values only; never paste a config value, Discogs token, or auth-file
+contents into this checklist.
+
+| Gate | Command / observation | Non-secret evidence to record | Good result |
+|---|---|---|---|
+| Private config (#418) | `stat -c '%a %n' /home/pi/vinyl-now-playing/config.yaml` | Path and mode | `600`; any other mode is repaired with `chmod 600`, then the app is restarted. |
+| Real audio package and UCA222 (#156) | Follow the live InputStream/hot-plug procedure below after the package smoke | Package/API smoke result; selected UCA222 name/index/input channels; stream-open/audio evidence; loss/recovery journal lines; MainPID before/after; whether restart was needed; any Discogs/Last.fm side effect | The app receives audio before and after one unplug/replug with the same MainPID. |
+| Display/session choice (#419) | In the logged-in graphical terminal: `printf 'DISPLAY=%s\nXAUTHORITY=%s\n' "$DISPLAY" "${XAUTHORITY:-<unset>}"`; if unset, use the read-only Xwayland `-auth` discovery in `pi-setup-guide.md` §12 | Chosen `DISPLAY`, absolute Xauthority/session-auth path, service-user readability, whether Xwayland was used, cold-boot path stability | The selected values are rendered into the system service, readable by its user, and work again after cold boot. |
+| Cold boot, clock, and shutdown (#83/#201/#419) | Reboot once; inspect `timedatectl`, `systemctl status vinyl-now-playing`, and the journal; use the timed SIGTERM procedure below | Cold-boot result; `System clock synchronized` value; service status; timed SIGTERM outcome; post-stop restart/status | Clock is synchronized before startup, the service survives the graphical-session race, and SIGTERM stops cleanly within `TimeoutStopSec=30`. |
+| Custom-folder Discogs probe (#366) | Follow the same-target read-only and one confirmed-write commands in `docs/testing-guide.md` | Artist/album, release ID, instance ID, custom-folder name/ID, field name, before/after values, HTTP/outcome; no token | Success disproves the hypothesis. A 404 or ambiguity is preserved as evidence with no blind retry. |
+
+CI has already checked the installed package/API boundary and system-unit syntax;
+it cannot close any of these hardware or external-state gates.
+
+### Real InputStream and hot-plug proof (#156)
+
+Run this only after the service is rendered and started. It does not change
+configuration, but it runs the fully configured production app: recognizable
+audio can trigger its normal Discogs and Last.fm behavior, including a credit on
+failure/shutdown paths. Before restarting, the owner must authorize the probe and
+confirm the current app state is idle and unarmed (no current tracked record or
+pending completion). Start with non-recognizable audio where practical; obtain
+fresh owner authorization before using recognizable music. Record any external
+side effect—or the absence of one—alongside the hardware evidence.
+
+Keep a journal window visible, then play a record long enough to produce a
+`Play session started.` event: that proves the application's real
+`sd.InputStream` is delivering callbacks, not merely that the device table can
+be queried.
+
+```bash
+cd /home/pi/vinyl-now-playing
+venv/bin/python3 -I scripts/check_audio_backend.py
+sudo systemctl restart vinyl-now-playing
+VNP_MAINPID_BEFORE="$(sudo systemctl show --property=MainPID --value vinyl-now-playing)"
+test "$VNP_MAINPID_BEFORE" -gt 0
+printf 'MainPID before unplug=%s\n' "$VNP_MAINPID_BEFORE"
+sudo journalctl -u vinyl-now-playing --since '2 minutes ago' -f
+```
+
+With the journal following, confirm the initial audio event, unplug the UCA222
+while capture is active, wait at least five seconds, then replug it and play
+audio again. Record the capture-loss evidence (`audio stream stalled` or `Audio
+capture error`), the post-replug audio event, and any `Using audio device [...]`
+line. Stop the journal follow with `Ctrl+C` (do not restart the service), then
+prove the process did not restart:
+
+```bash
+VNP_MAINPID_AFTER="$(sudo systemctl show --property=MainPID --value vinyl-now-playing)"
+printf 'MainPID after replug=%s\n' "$VNP_MAINPID_AFTER"
+test "$VNP_MAINPID_BEFORE" = "$VNP_MAINPID_AFTER"
+sudo systemctl status vinyl-now-playing
+```
+
+**Good:** input callbacks produce an event both before and after replug, the
+journal shows the retry/recovery path, and the MainPID is unchanged. A changed
+PID, no post-replug audio event, or a private-API degradation warning is failed
+hardware evidence; record it rather than claiming #156 complete.
+
+### Timed SIGTERM proof and restart
+
+After recording normal service behavior, measure the managed stop, inspect its
+journal result, then bring the appliance back for the remaining checklist:
+
+```bash
+VNP_STOP_STARTED="$(date +%s)"
+sudo systemctl stop vinyl-now-playing
+VNP_STOP_FINISHED="$(date +%s)"
+printf 'SIGTERM stop elapsed=%ss\n' "$((VNP_STOP_FINISHED - VNP_STOP_STARTED))"
+sudo journalctl -u vinyl-now-playing --since "@$VNP_STOP_STARTED" --no-pager
+sudo systemctl start vinyl-now-playing
+sudo systemctl status vinyl-now-playing
+```
+
+Record the elapsed seconds and relevant shutdown journal lines. The stop must
+complete within `TimeoutStopSec=30`; the final status command must show the
+service started again before moving on.
+
+## 2. Audio input is the right device
 
 The config matches `audio.device_name` as a **case-insensitive substring** against
 the device list and uses the *first* match.
@@ -65,7 +146,7 @@ the device list and uses the *first* match.
 
 **Good:** one clean "Using audio device" line naming the UCA222, no multi-match warning.
 
-## 2. Tune `audio.silence_threshold_rms` to the room (the big knob)
+## 3. Tune `audio.silence_threshold_rms` to the room (the big knob)
 
 This is the one value that genuinely can't be set without the hardware — it's the
 RMS energy line between "music" and "silence," and it depends on your turntable,
@@ -94,7 +175,7 @@ though the log shows no `MUSIC_STOPPED`, the run-out noise is sitting in the
 hysteresis dead band `[½·threshold, threshold)`; raise the threshold so the dead
 band clears it.
 
-## 3. Cover-art download works over the real network (S-7 smoke test)
+## 4. Cover-art download works over the real network (S-7 smoke test)
 
 The SSRF-hardened, **IP-pinned HTTPS** cover fetch (resolve once → connect to the
 vetted IP → TLS verified against the hostname) is unit-tested with a *mocked*
@@ -127,7 +208,7 @@ real CDN**. Verify it once on the Pi.
 - If a cover fails to decode and you see it re-fetch within the track, that's the
   B-18 corrupt-file recovery working as intended.
 
-## 4. Recognition + the churn breadcrumb
+## 5. Recognition + the churn breadcrumb
 
 Real Shazam calls only happen on hardware.
 
@@ -138,7 +219,7 @@ Real Shazam calls only happen on hardware.
   records bleeding, room noise), not failing outright. Conservative by design; the
   log is the signal, not a bug.
 
-## 5. Display geometry at the real resolution
+## 6. Display geometry at the real resolution
 
 The layout is resolution-independent and unit-tested across a matrix, but the
 renderer's **runtime title push-down** (long track titles shrinking/wrapping in
@@ -148,7 +229,7 @@ renderer's **runtime title push-down** (long track titles shrinking/wrapping in
   shrinks/wraps without colliding the artist/album/chips or the bottom
   meta/prev-next strip, at your actual 1024×600 panel.
 
-## 6. Full pipeline + autostart
+## 7. Full pipeline + autostart
 
 - Let a full side play through to the end and confirm: last track detected →
   after silence, `SESSION_ENDED` → **Discogs Play Count increments** (and Last
@@ -159,17 +240,17 @@ renderer's **runtime title push-down** (long track titles shrinking/wrapping in
 
 ---
 
-## 7. R8 bring-up probes (one-time checks from the Round-8 audit; R8-19/#362)
+## 8. R8 bring-up probes (one-time checks from the Round-8 audit; R8-19/#362)
 
 - **Pre-flight the recognition import on the Pi's own Python** before first run:
   `python3 -c "import shazamio"`. CI now hard-imports it per matrix leg
   (R8-08/#361), but the Pi's interpreter is the one that matters — a broken
   import surfaces only as NO MATCH FOUND under a healthy-looking service.
-- **Credit a record filed in a NON-default Discogs folder (R8-10/#366).** The
-  field write POSTs to virtual folder `0`; Discogs may 404 field edits for
-  instances filed in a custom folder. Watch the write succeed — if it 404s,
-  #366 jumps from hypothesis to fix (store the instance's real `folder_id` in
-  the index).
+- **Credit a record filed in a NON-default Discogs folder (R8-10/#366).** Follow
+  the explicit, interactive custom-folder probe in `docs/testing-guide.md` and
+  fill the evidence row above. The field write still uses virtual folder `0`; a
+  404 is evidence for a separate folder-ID propagation change, not a reason to
+  retry or to edit source constants.
 - **One Discogs token = one rate budget** for reader AND writer: during a long
   honoured Retry-After on a credit, recognition resolves may 429 and the
   display may briefly show NO MATCH FOUND. Self-heals — don't misdiagnose it

@@ -199,7 +199,16 @@ nano config.yaml
 > 🔒 `config.yaml` holds two write-scope secrets (the Discogs user token and the
 > Last.fm session key). `cp` creates it world-readable (`644`) under the default
 > umask, so `chmod 600` restricts it to your user — matching the `0600` the
-> session-key helper already used for its own output.
+> session-key helper already used for its own output. Startup and the system-unit
+> renderer reject any group/other-readable mode before parsing or deploying the
+> file; verify the mode without printing its contents:
+
+```bash
+stat -c '%a %n' config.yaml
+```
+
+**Good:** `600 config.yaml`. Repair any other result with `chmod 600 config.yaml`;
+do not place secrets on a command line or in the service unit.
 
 Key values to fill in:
 
@@ -311,9 +320,15 @@ python scripts/discogs_live_check.py
 
 Up to four read-only tests run (`get_tracklist` runs only if your test album is
 found in the collection, so a collection miss shows three). All that run should
-pass. If test 1 (search_collection) misses, see `docs/testing-guide.md` — the
-album strings at the top of the script may need adjusting to match a record you
-actually own. (R8-25/#365)
+pass. If test 1 (`search_collection`) misses, pass the desired record explicitly,
+without editing source constants:
+
+```bash
+python scripts/discogs_live_check.py --artist "Artist" --album "Album"
+```
+
+The write probe is documented in `docs/testing-guide.md`; it must use a named,
+reversible custom-folder record and explicit authorization. (R8-25/#365)
 
 ---
 
@@ -331,7 +346,38 @@ appears as an input device — it should show a positive number of input channel
 
 ---
 
-## 11. First manual run
+## 11. Synchronize time, then run manually
+
+### Gate every application start on synchronized time
+
+The Raspberry Pi has no battery-backed real-time clock. Starting the app before
+network time is synchronized can write a wrong, irreversible **Last Played**
+date. The `NTPSynchronized=yes` gate applies to **every** application start,
+whether you run `main.py` manually or systemd starts
+`vinyl-now-playing.service`.
+
+Configure the timezone, enable the persistent waiter, and verify the current
+boot before this first manual run:
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pi/vinyl-now-playing
+  sudo timedatectl set-timezone America/Chicago   # replace with your IANA timezone
+  sudo systemctl enable --now systemd-time-wait-sync.service
+  timedatectl
+  test "$(timedatectl show --property=NTPSynchronized --value)" = yes
+)
+```
+
+Do not start the app—manually or through systemd—until this block succeeds and
+`timedatectl` shows the chosen timezone. If it fails, inspect
+`systemctl status systemd-time-wait-sync.service`; an offline Pi should wait for
+network time rather than write stale dates. Before each later manual start,
+repeat the `NTPSynchronized` readback and require `yes`. Section 12's versioned
+system unit preserves the enabled waiter's time-ordering gate for systemd starts.
+
+### First manual run
 
 With the display connected, the UCA222 plugged in, and your turntable's RCA
 output going into the UCA222's inputs:
@@ -372,52 +418,99 @@ To exit: `Ctrl+C`.
 
 ---
 
-## 12. Set up autostart with systemd
+## 12. Set up autostart with the versioned system service
 
-Once the manual run works, set it up to start automatically on boot.
+The supported architecture is a **system service**. Do not copy a unit into
+`/etc` or migrate to a user service as a Wayland workaround: the repository's
+versioned `deploy/vinyl-now-playing.service.in` and renderer preserve the
+network/time ordering and retry behavior already ratified in #83 and #201.
 
-Create the service file:
+From a terminal in the logged-in graphical session, record the values that the
+installed image actually uses before rendering. Raspberry Pi OS sessions vary:
+on Wayland, pygame reaches the desktop through Xwayland and the correct
+Xauthority/session-auth path is image-specific. Do not assume
+`/home/pi/.Xauthority` exists.
 
 ```bash
-sudo nano /etc/systemd/system/vinyl-now-playing.service
+cd /home/pi/vinyl-now-playing
+VNP_DISPLAY="${DISPLAY:?Run this in the logged-in graphical session.}"
+if [ -n "${XAUTHORITY:-}" ]; then
+  VNP_XAUTHORITY="$XAUTHORITY"
+else
+  VNP_XWAYLAND_PID="$(pgrep -n -u "$USER" Xwayland)" || {
+    echo "No Xwayland process found for $USER; inspect the active graphical session." >&2
+    exit 1
+  }
+  VNP_XAUTHORITY="$(tr '\0' '\n' < "/proc/$VNP_XWAYLAND_PID/cmdline" | \
+    awk 'previous == "-auth" { print; exit } { previous = $0 }')"
+fi
+if ! { test -n "$VNP_XAUTHORITY" && test -f "$VNP_XAUTHORITY" && test -r "$VNP_XAUTHORITY"; }; then
+  echo "No readable Xauthority path was found; do not render the service yet." >&2
+  exit 1
+fi
+if ! sudo -u pi test -r "$VNP_XAUTHORITY"; then
+  echo "The system-service user pi cannot read $VNP_XAUTHORITY; do not render yet." >&2
+  exit 1
+fi
+printf 'DISPLAY=%s\nXAUTHORITY=%s\n' "$VNP_DISPLAY" "$VNP_XAUTHORITY"
 ```
 
-Paste this (adjust the username if you're not using `pi`):
+The fallback branch reads the running Xwayland command line only, extracts the
+argument after `-auth`, and verifies that the system-service user (`pi` in this
+guide) can read it. Keep this shell open: the variables are passed directly to
+the renderer. The renderer accepts only literal-safe absolute paths. A later
+cold boot must prove that the selected auth path remains valid; a path found in
+one desktop session is not universal evidence.
 
-```ini
-[Unit]
-Description=vinyl-now-playing
-Wants=network-online.target
-After=network-online.target time-sync.target graphical.target
-StartLimitIntervalSec=300
-StartLimitBurst=10
+Before replacing an existing known-good unit, preserve it for rollback:
 
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/vinyl-now-playing
-Environment="DISPLAY=:0"
-Environment="XAUTHORITY=/home/pi/.Xauthority"
-ExecStart=/home/pi/vinyl-now-playing/venv/bin/python3 main.py
-Restart=on-failure
-RestartPreventExitStatus=78
-RestartSec=15
-TimeoutStopSec=30
-
-[Install]
-WantedBy=graphical.target
+```bash
+sudo cp -p /etc/systemd/system/vinyl-now-playing.service \
+  /etc/systemd/system/vinyl-now-playing.service.last-known-good
 ```
 
-> ⚠️ **Wayland note (#200) — verify on your image.** This unit assumes the app can
-> reach an **X11** display via `DISPLAY=:0` + `~/.Xauthority`. The app uses
-> pygame/SDL2, which reaches the default Wayland session through Xwayland — but
-> `/home/pi/.Xauthority` may not exist on a Wayland session, in which case SDL2
-> can fail to open the display and the service won't start. After enabling the
-> unit, confirm it actually comes up: `journalctl -u vinyl-now-playing -n 50`. If
-> it can't open the display, the fix is session-specific (point `XAUTHORITY` at
-> the running Xwayland auth file, or run this as a systemd **user** service, which
-> inherits the session's `DISPLAY`/`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`) — treat it
-> as a bring-up step, since the right value depends on your flashed image.
+Skip that backup only on the first installation, when the destination does not
+yet exist. Then render, parse-check, load, enable, and start the unit:
+
+```bash
+(
+  set -euo pipefail
+  : "${VNP_DISPLAY:?Run the session-auth discovery block first.}"
+  : "${VNP_XAUTHORITY:?Run the session-auth discovery block first.}"
+  cd /home/pi/vinyl-now-playing
+  test "$(stat -c '%a' config.yaml)" = 600
+  sudo /home/pi/vinyl-now-playing/venv/bin/python3 \
+    /home/pi/vinyl-now-playing/scripts/render_system_service.py \
+    --user pi \
+    --app-dir /home/pi/vinyl-now-playing \
+    --display "$VNP_DISPLAY" \
+    --xauthority "$VNP_XAUTHORITY" \
+    --output /etc/systemd/system/vinyl-now-playing.service
+  sudo /usr/bin/systemd-analyze verify /etc/systemd/system/vinyl-now-playing.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now vinyl-now-playing
+  sudo systemctl status vinyl-now-playing
+)
+```
+
+The `stat` command must report `600 config.yaml`; the renderer refuses to write
+the unit otherwise and never changes that mode for you. It is idempotent:
+re-running it with the same inputs reports that the service is already current.
+`/usr/bin/systemd-analyze verify` checks unit syntax before systemd consumes it;
+it does not prove that the selected display/auth file is valid on this Pi.
+
+The rendered unit preserves `Wants=network-online.target`,
+`After=network-online.target time-sync.target graphical.target`,
+`StartLimitIntervalSec=300`, `StartLimitBurst=10`, `RestartSec=15`,
+`RestartPreventExitStatus=78`, and `TimeoutStopSec=30`. Those are operational
+requirements, not values to tune ad hoc in `/etc`.
+
+> ⚠️ **Wayland/Xwayland evidence required.** If the service cannot open the
+> display, keep the system-service design and correct the selected
+> `DISPLAY`/Xauthority path from the live session, then re-render and re-verify.
+> Record the observed session values and the result in
+> `docs/first-boot-checklist.md`; they cannot be inferred from CI or another Pi
+> image.
 
 `TimeoutStopSec=30` (CRIT-3) is the backstop for shutdown. On SIGTERM the app
 cancels its legs, drains any in-flight end-of-session Discogs credit (bounded to
@@ -452,7 +545,7 @@ crash still exits with a different non-zero code and restarts as normal.
 > `Restart=on-failure` restarts a *crash* (non-zero exit) but NOT a clean exit (`0`)
 > — and closing the display window or pressing **ESC** quits the app cleanly. So a
 > stray keyboard tap or an accidental window close stops the service until you run
-> `sudo systemctl restart vinyl-now-playing` (or `--user` for a user unit). If this
+> `sudo systemctl restart vinyl-now-playing`. If this
 > bites in practice, avoid ESC on the appliance; the window is fullscreen, so an
 > accidental close is unlikely.
 
@@ -488,36 +581,12 @@ with the in-process absolute page cap (`_MAX_COLLECTION_PAGES`, `reader.py`) tha
 bounds any *single* index build; the two together mean neither a runaway build nor
 a runaway restart can sit on the rate limit.
 
-**Why the `[Unit]` ordering matters — read this before enabling.** The Raspberry
-Pi has no battery-backed real-time clock, so at boot its clock is whatever
-`fake-hwclock` last saved — stale, sometimes by hours or days — until
-`systemd-timesyncd` reaches an NTP server *over the network*. If the app starts
-before that happens, every **Last Played** date it stamps into your Discogs
-collection is wrong, and the error is silent and irreversible. The ordering above
-holds the service until the network is actually up (`network-online.target`,
-which must be pulled in by the matching `Wants=` — ordering after it alone does
-nothing) and the clock has been synchronized (`time-sync.target`).
-
-One catch: `After=time-sync.target` only has teeth if the unit that *waits* for
-the clock is enabled. With plain `systemd-timesyncd`, `time-sync.target` can be
-reached **before** the clock is actually set. Enable the waiter once:
-
-```bash
-sudo systemctl enable systemd-time-wait-sync.service
-```
-
-Also set the Pi's timezone, so Last Played is stamped in your local time rather
-than the default zone:
-
-```bash
-sudo raspi-config
-```
-
-Choose **Localisation Options → Timezone**. (Non-interactive equivalent, using
-your own zone: `sudo timedatectl set-timezone America/Los_Angeles`.)
-
-Confirm both took effect with `timedatectl` — it should report
-`System clock synchronized: yes` and your chosen `Time zone`.
+**Why the `[Unit]` ordering matters.** The pre-start clock gate above gives
+`After=time-sync.target` real force: the unit waits for an actual synchronized
+clock and for `network-online.target`, which the matching `Wants=` pulls in.
+Without `systemd-time-wait-sync.service`, plain `systemd-timesyncd` can reach
+`time-sync.target` before the clock is set. The required `timedatectl` readback
+is therefore a first-start gate, not a best-effort post-install check.
 
 Two things to know about this gate. Enabling `systemd-time-wait-sync.service` is
 system-wide — it delays *every* unit ordered after `time-sync.target`; on this
@@ -528,25 +597,108 @@ systemd-time-wait-sync.service` shows it still starting, blocking on the clock,
 and `journalctl -u vinyl-now-playing` stays quiet rather than logging an error).
 It needs the network for recognition anyway, so this costs nothing in practice.
 
-Enable and start:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable vinyl-now-playing
-sudo systemctl start vinyl-now-playing
-```
-
-Check status:
-
-```bash
-sudo systemctl status vinyl-now-playing
-```
-
 View live logs:
 
 ```bash
 journalctl -u vinyl-now-playing -f
 ```
+
+### Prepare a concrete known-good rollback target before upgrading
+
+After a successful first boot and **before** upgrading the primary checkout,
+create a detached known-good worktree and copy its working virtual environment.
+This does not read, print, or copy `config.yaml`.
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pi/vinyl-now-playing
+  VNP_KNOWN_GOOD_REF="$(git rev-parse HEAD)"
+  VNP_KNOWN_GOOD_DIR=/home/pi/vinyl-now-playing-known-good
+  VNP_UNIT_BACKUP=/etc/systemd/system/vinyl-now-playing.service.last-known-good
+  VNP_UNIT_BACKUP_TMP=/etc/systemd/system/.vinyl-now-playing.service.last-known-good.$$.tmp
+  VNP_WORKTREE_ATTEMPTED=0
+  cleanup_known_good() {
+    local exit_status="$1"
+    # Work from a directory outside the worktree before removing that worktree.
+    cd /home/pi || exit "$exit_status"
+    if [ "$VNP_WORKTREE_ATTEMPTED" -eq 1 ]; then
+      git -C /home/pi/vinyl-now-playing worktree remove --force "$VNP_KNOWN_GOOD_DIR" || true
+    fi
+    # This is the one exact temporary file used for the atomic unit backup.
+    if [ -e "$VNP_UNIT_BACKUP_TMP" ]; then
+      sudo rm -f -- "$VNP_UNIT_BACKUP_TMP" || true
+    fi
+    exit "$exit_status"
+  }
+  test ! -e "$VNP_KNOWN_GOOD_DIR" || exit 1
+  test ! -e "$VNP_UNIT_BACKUP" || exit 1
+  test ! -e "$VNP_UNIT_BACKUP_TMP" || exit 1
+  test -f /etc/systemd/system/vinyl-now-playing.service || exit 1
+  VNP_WORKTREE_ATTEMPTED=1
+  git worktree add --detach "$VNP_KNOWN_GOOD_DIR" "$VNP_KNOWN_GOOD_REF" || cleanup_known_good $?
+  cp -a venv "$VNP_KNOWN_GOOD_DIR/venv" || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" --version || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -m pip check || cleanup_known_good $?
+  cd "$VNP_KNOWN_GOOD_DIR" || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I scripts/check_audio_backend.py || cleanup_known_good $?
+  "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" -I -c 'import shazamio' || cleanup_known_good $?
+  sudo cp -p /etc/systemd/system/vinyl-now-playing.service "$VNP_UNIT_BACKUP_TMP" || cleanup_known_good $?
+  sudo mv -f -- "$VNP_UNIT_BACKUP_TMP" "$VNP_UNIT_BACKUP" || cleanup_known_good $?
+  VNP_UNIT_BACKUP_TMP=
+  printf 'known-good ref=%s\nknown-good venv=%s\n' "$VNP_KNOWN_GOOD_REF" \
+    "$VNP_KNOWN_GOOD_DIR/venv"
+)
+```
+
+The detached worktree preserves the exact application source, and its copied
+venv preserves the interpreter/dependency set that was observed working. The
+block refuses an existing worktree or unit-backup target, removes a newly-added
+worktree if any post-worktree step fails, and proves the relocated interpreter,
+dependency graph, audio smoke, and Shazam import before declaring the target
+known-good. The unit backup is copied only to its exact temporary path, then
+atomically moved into place; failed attempts remove that exact temporary path so
+they cannot block a retry. Keep the recorded display/auth values with the
+first-boot evidence. Do not alter the known-good worktree while testing an
+upgrade.
+
+### Roll back without weakening credentials
+
+If an upgrade must be reversed, stop the failed service, **move** (never print
+or copy) the already-private config into the known-good worktree, then render
+that worktree's unit and restart it. Replace the two recorded values below with
+the values that passed the session-auth evidence gate.
+
+```bash
+(
+  set -euo pipefail
+  cd /home/pi/vinyl-now-playing
+  VNP_KNOWN_GOOD_DIR=/home/pi/vinyl-now-playing-known-good
+  VNP_DISPLAY=:0                         # replace with the recorded display
+  VNP_XAUTHORITY=/absolute/auth/path      # replace with the recorded auth path
+  sudo systemctl stop vinyl-now-playing
+  mv /home/pi/vinyl-now-playing/config.yaml "$VNP_KNOWN_GOOD_DIR/config.yaml"
+  test "$(stat -c '%a' "$VNP_KNOWN_GOOD_DIR/config.yaml")" = 600
+  sudo "$VNP_KNOWN_GOOD_DIR/venv/bin/python3" \
+    "$VNP_KNOWN_GOOD_DIR/scripts/render_system_service.py" \
+    --user pi \
+    --app-dir "$VNP_KNOWN_GOOD_DIR" \
+    --display "$VNP_DISPLAY" \
+    --xauthority "$VNP_XAUTHORITY" \
+    --output /etc/systemd/system/vinyl-now-playing.service
+  sudo /usr/bin/systemd-analyze verify /etc/systemd/system/vinyl-now-playing.service
+  sudo systemctl daemon-reload
+  sudo systemctl start vinyl-now-playing
+  sudo systemctl status vinyl-now-playing
+)
+```
+
+The mode readback must remain `600`. The primary checkout intentionally has no
+`config.yaml` after a rollback; leave it that way until a deliberate retry. When
+preparing that retry, stop the service and move the same file back, verify `0600`,
+then render the selected worktree again. Never use a destructive checkout, loosen
+permissions, copy credential contents, or hand-edit the generated unit as a
+recovery shortcut.
 
 ### Cap the log disk usage (recommended for the SD card)
 
@@ -674,8 +826,9 @@ discogs.com/settings/developers.
 
 **systemd service fails to start**
 Check `journalctl -u vinyl-now-playing -n 50` for the actual error. Common
-causes: `DISPLAY` not set (add `Environment="DISPLAY=:0"` to the service file),
-or the venv path is wrong (verify with `which python3` inside the activated venv).
+causes: an incorrect observed `DISPLAY`/Xauthority path or a wrong app/venv path.
+Correct the renderer inputs, then render and run `/usr/bin/systemd-analyze verify`
+again; do not edit the generated unit in place.
 
 **App starts but pygame window is invisible, or the unit lands in `failed`**
 The system service can start before the autologin *session* is up and accepting
@@ -685,9 +838,8 @@ target exists only in the per-*user* systemd manager, and the system manager
 silently ignores ordering on units it doesn't have. The unit above already
 mitigates the race with `RestartSec=15` + `StartLimitBurst=10` (#201), retrying
 across ~2.5 min of session bring-up instead of exhausting five tries in ~50s. If a
-slow cold boot still outlasts that, either:
-- recover with `sudo systemctl reset-failed vinyl-now-playing && sudo systemctl start vinyl-now-playing`, or
-- make startup wait for the display socket by adding, under `[Service]`:
-  `ExecStartPre=/bin/sh -c 'until [ -S /tmp/.X11-unix/X0 ]; do sleep 1; done'`
-  (bounded by `TimeoutStartSec`; on the Wayland-default session the socket
-  appears once Xwayland is up).
+slow cold boot still outlasts that, recover with
+`sudo systemctl reset-failed vinyl-now-playing && sudo systemctl start vinyl-now-playing`
+after diagnosing the selected session-auth path. Preserve the versioned unit;
+capture the evidence and make any additional readiness behavior a reviewed
+template change rather than an ad hoc edit under `/etc`.

@@ -40,9 +40,42 @@ is active.
 
 ### Discogs credentials (only for `scripts/discogs_live_check.py`)
 
+First copy the non-secret example, but do **not** enter credentials yet:
+
 ```bash
 cp config.example.yaml config.yaml
-# Edit config.yaml — fill in discogs.user_token and discogs.username
+```
+
+Complete one platform security gate before entering credentials.
+
+On **POSIX** (macOS/Linux, including Raspberry Pi OS), restrict the copied file
+and read back its mode. These commands print only mode/path, not its contents:
+
+```bash
+chmod 600 config.yaml
+# Linux / Raspberry Pi OS:
+stat -c '%a %n' config.yaml
+# macOS:
+stat -f '%Lp %N' config.yaml
+```
+
+The readback must report mode `600`. `load_config` rejects a POSIX file with any
+group/other permission bit.
+
+On **Windows or another platform without POSIX mode semantics**, do not use the
+POSIX commands above as proof. Before editing, use that platform's file-security
+or ACL controls to restrict `config.yaml` to the current account, then read the
+ACL back in the same security inspector (or its platform ACL command) and record
+that result and the warning acknowledgement before entering credentials.
+`load_config` will emit its explicit inability-to-verify-POSIX-permissions
+warning on the first run; the warning is expected but does not prove an ACL is
+safe.
+
+Only after the applicable gate's mode/ACL readback is satisfactory may you edit
+the file and enter `discogs.user_token` and `discogs.username`:
+
+```text
+# Edit config.yaml in your editor; do not paste credentials into a shell command.
 ```
 
 **Getting your token:** Discogs → Settings → [Developers](https://www.discogs.com/settings/developers)
@@ -63,7 +96,7 @@ The table groups related files; for the live, authoritative file list run
 | `test_silence.py`, `test_silence_liveness.py` | Silence detector state machine + the B-6 liveness tick |
 | `test_signal.py` | `Signal[T]` log-and-continue observer |
 | `test_chunking.py` | ChunkAssembler overlapping-window logic |
-| `test_capture.py` | AudioCapture device match, config guards, drop-oldest `_enqueue_block`, `stop()` (stubbed sounddevice) |
+| `test_capture.py` | AudioCapture device match, config guards, drop-oldest `_enqueue_block`, `stop()` (mocked capture surface; CI separately proves the installed backend) |
 | `test_player_state.py` | PlayerState transitions & change notifications |
 | `test_recognizer.py`, `_encode.py`, `_parse.py`, `_epoch.py`, `_progress.py` | Confirmation gate, `run()` loop, the encode/`_call_shazam`/`_parse` split, B-1 epoch + B-7 progress |
 | `test_track_commit_service.py` | `TrackCommitService.commit` — B-1 epoch guard, B-11 ordering, Last.fm scrobble branch (T-2) |
@@ -183,11 +216,15 @@ diagnostic aid, not a gate — the suite does not enforce a minimum percentage.
 
 Five GitHub Actions workflows live in `.github/workflows/`:
 
-- **`tests.yml`** — runs `pytest -q` on every `main` push and pull request across
-  Python 3.11, 3.12, and 3.13. It sets `SDL_VIDEODRIVER=dummy` /
-  `SDL_AUDIODRIVER=dummy` so pygame is headless, and `tests/conftest.py` stubs
-  `sounddevice` before any test module loads, so no PortAudio or display
-  hardware is needed on the runner.
+- **`tests.yml`** — runs on every `main` push and pull request across Python 3.11,
+  3.12, and 3.13. Each Ubuntu leg installs `libportaudio2`, runs
+  `python -I scripts/check_audio_backend.py` to authenticate the installed
+  `sounddevice` distribution and require the four production-used APIs, renders
+  the versioned system unit, and runs `/usr/bin/systemd-analyze verify` before
+  `pytest -q`. It sets `SDL_VIDEODRIVER=dummy` / `SDL_AUDIODRIVER=dummy` so
+  pygame is headless. Root `conftest.py` first retains a real `sounddevice`
+  import and installs its owned fallback stub only when import fails, keeping the
+  ordinary unit suite hardware-free.
 - **`sync-version-badge.yml`** — despite its historical filename, this is now a
   read-only version-metadata check on pull requests and `main`. It fails unless
   `VERSION`, the `CHANGELOG.md` release heading, and the README badge agree;
@@ -311,11 +348,12 @@ Key cases:
 
 ### `test_capture.py` — AudioCapture device matching & guards (new in v1.3.5)
 
-First-ever coverage for `capture.py`. The module imports `sounddevice` at the
-top level (which needs PortAudio at import time), so the suite plants a stub
-into `sys.modules["sounddevice"]` before importing — and every test patches
-`src.audio.capture.sd` explicitly, so the real module is never exercised even
-on machines where it is installed.
+`capture.py` imports `sounddevice` at the top level. Root `conftest.py` keeps a
+real installed import when available and installs a centrally owned fallback stub
+only when it is unavailable; each capture test still patches
+`src.audio.capture.sd` explicitly. CI separately authenticates the installed
+distribution and checks its production API surface before pytest, so the unit
+suite's mocks cannot mask a missing or incompatible package.
 
 Key cases:
 - Constructor reads the audio config; `overlap_seconds` defaults to 5
@@ -627,7 +665,7 @@ Key cases:
   block clear of the bottom meta/prev-next, and font floors + hierarchy at every
   size. (Backs CLAUDE.md's "resolution-independent" claim for the static layout;
   the renderer's runtime title push-down is content-dependent and remains a
-  hardware/visual check — see `docs/first-boot-checklist.md` §5.)
+  hardware/visual check — see `docs/first-boot-checklist.md` §6.)
 
 ### `test_cover_cache.py` — Cover fetch + disk cache (new in v1.5.1)
 
@@ -656,8 +694,10 @@ Key cases:
 
 ## Running the live Discogs integration test
 
-`scripts/discogs_live_check.py` (in `scripts/`, not in `tests/`) makes real network calls
-to the Discogs API. It uses Sonic Youth's *Sister* as the test album.
+`scripts/discogs_live_check.py` (in `scripts/`, not in `tests/`) makes real
+network calls to the Discogs API. Its default Sonic Youth *Sister* selection is
+read-only compatibility only; choose another record with `--artist` and `--album`
+rather than editing source constants.
 
 > **Requires `config.yaml`** with a valid `user_token` and `username`.
 
@@ -720,20 +760,61 @@ TEST 4: Collection custom fields
 | `✗` | Failed — API error or unexpected response |
 | `·` | Skipped — e.g. *Sister* not in your collection; collection-specific tests N/A |
 
-If *Sister* isn't in your collection, TEST 1 will show `·` and TEST 3 will use the
-release ID from TEST 2 instead. That's fine — the important thing is that your token
-is valid and the `Play Count` field is found.
+If *Sister* isn't in your collection, TEST 1 and TEST 3 are skipped; the script
+does not use the database-search result as a tracklist fallback. That is still a
+useful read-only credential check, but choose a record you own when you need the
+collection/field evidence.
 
-### With the write test (modifies your Discogs collection)
+### With the custom-folder write probe (modifies your Discogs collection)
+
+This is the pending #366 hardware/external-state gate. Select a sacrificial or
+reversible record that is actually filed in a non-default Discogs folder. First,
+run the explicit read-only lookup for that **same** record:
 
 ```bash
-python scripts/discogs_live_check.py --test-write
+python scripts/discogs_live_check.py \
+  --artist "Artist" --album "Album"
 ```
 
-This additionally tests `increment_play_count`. It will prompt for confirmation before
-making any changes. The field is a running counter — running this test will increment
-the Play Count by 1 on the test release. If you want to correct it afterward, adjust
-the value manually in your Discogs collection.
+In the Discogs collection UI, confirm that the resolved release/instance is the
+designated sacrificial record, and record its non-secret custom-folder **name and
+ID** plus the current Play Count field value. The script does not expose folder
+identity or the current field value for you. Only then run exactly one confirmed
+write against the same artist/album:
+
+```bash
+python scripts/discogs_live_check.py \
+  --artist "Artist" --album "Album" --test-write
+```
+
+The prompt names the resolved artist, album, field, release ID, and instance ID;
+type the exact lowercase `yes` only after confirming it is the designated record.
+
+For an already-authorized noninteractive run, bind the owner's approval to the
+exact positive release and instance IDs already observed for that sacrificial
+record. Replace both quoted angle-bracket placeholders with those approved
+integer IDs:
+
+```bash
+python scripts/discogs_live_check.py \
+  --artist "Artist" --album "Album" \
+  --test-write --yes \
+  --release-id "<approved positive release ID>" \
+  --instance-id "<approved positive instance ID>"
+```
+
+Artist and album are search selectors; they do not authorize a noninteractive
+write by themselves. The script resolves the collection record again and aborts
+without writing if either resolved ID differs from the approved IDs. Treat any
+identity mismatch as a stop: do not retry, inspect the collection state, and
+obtain fresh owner approval before any later attempt. Never run a bare
+`--test-write`.
+
+Record the custom-folder name/ID, before value, after value, and HTTP/outcome
+without tokens. A success disproves the folder-identity hypothesis. On a `404`,
+preserve the evidence and open the deferred folder-ID propagation change; do not
+retry. On a failed or ambiguous result, inspect the field state before any rerun
+because the write may already have applied.
 
 ---
 
@@ -770,7 +851,7 @@ These components need the actual Pi + USB audio interface + display to test:
 - `src/audio/capture.py` — only the live `sd.InputStream` integration with
   the UCA222 now: the overlapping-window logic is covered by
   `tests/test_chunking.py`, and device matching / config guards by
-  `tests/test_capture.py` (stubbed sounddevice)
+  `tests/test_capture.py` (mocked capture surface)
 - `src/audio/recognizer.py` → `ShazamIOBackend.recognize()` — real Shazam API calls with real audio
 - `src/display/renderer.py` — pygame rendering on the HDMI display (the
   bounded caches and palette color math are covered hardware-free by
@@ -786,3 +867,9 @@ powers on — audio-device match, `silence_threshold_rms` tuning, the live cover
 fetch / S-7 IP-pinned-TLS smoke test, the recognition churn breadcrumb, the
 runtime title push-down, and full-pipeline + autostart checks — see
 **`docs/first-boot-checklist.md`**.
+
+CI proves the installed Linux package, its required Python APIs, and system-unit
+syntax. It does **not** prove UCA222 enumeration or stream operation, USB
+hot-plug recovery, Wayland/Xwayland authorization, cold-boot timing, SIGTERM
+shutdown, or a live Discogs custom-folder write; those remain first-boot evidence
+gates.

@@ -6,8 +6,15 @@ All checks are read-only by default.
 
 Usage:
     python scripts/discogs_live_check.py                # read-only
-    python scripts/discogs_live_check.py --test-write   # also tests increment_play_count
-                                               # (WRITES to your Discogs collection)
+    python scripts/discogs_live_check.py --artist "Sonic Youth" --album "Sister" \
+        --test-write                                  # interactive WRITE test
+    python scripts/discogs_live_check.py --artist "Sonic Youth" --album "Sister" \
+        --test-write --yes --release-id 123 --instance-id 456
+                                                        # ID-bound noninteractive WRITE
+
+Any write test requires an explicitly selected artist and album. Use a designated
+sacrificial collection record and inspect its current field value before rerunning
+after an uncertain result.
 """
 
 import argparse
@@ -67,32 +74,35 @@ TEST_ALBUM = "Sister"
 def sep(title=""):
     width = 62
     if title:
+        title = _redact(title)
         print(f"\n{'─' * 3} {title} {'─' * max(1, width - len(title) - 5)}")
     else:
         print(f"\n{'─' * width}")
 
 
-def ok(msg):   print(f"  ✓  {msg}")
-def fail(msg): print(f"  ✗  {msg}")
-def info(msg): print(f"     {msg}")
+def ok(msg):   print(f"  ✓  {_redact(msg)}")
+def fail(msg): print(f"  ✗  {_redact(msg)}")
+def info(msg): print(f"     {_redact(msg)}")
 
 
 # ---------------------------------------------------------------------------
 # Individual tests
 # ---------------------------------------------------------------------------
 
-def check_search_collection(client) -> Optional[dict]:
-    sep(f"1 · search_collection  —  {TEST_ARTIST} / {TEST_ALBUM}")
+def check_search_collection(
+    client, artist: str = TEST_ARTIST, album: str = TEST_ALBUM
+) -> Optional[dict]:
+    sep(f"1 · search_collection  —  {artist} / {album}")
     try:
-        result = client.search_collection(TEST_ARTIST, TEST_ALBUM)
+        result = client.search_collection(artist, album)
     except Exception as e:
         fail(f"Exception: {_redact(e)}")
         return None
 
     if result is None:
         fail("Not found in your collection.")
-        info(f"Is '{TEST_ALBUM}' by {TEST_ARTIST} in your Discogs?")
-        info("If so, try adjusting the artist/album strings at the top of this script.")
+        info(f"Is '{album}' by {artist} in your Discogs?")
+        info("If so, try adjusting --artist and --album and running the check again.")
         return None
 
     ok(f"Album:      {result['album']}")
@@ -112,10 +122,12 @@ def check_search_collection(client) -> Optional[dict]:
     return result
 
 
-def check_search_database(client):
-    sep(f"2 · search_database  —  {TEST_ARTIST} / {TEST_ALBUM}")
+def check_search_database(
+    client, artist: str = TEST_ARTIST, album: str = TEST_ALBUM
+):
+    sep(f"2 · search_database  —  {artist} / {album}")
     try:
-        result = client.search_database(TEST_ARTIST, TEST_ALBUM)
+        result = client.search_database(artist, album)
     except Exception as e:
         fail(f"Exception: {_redact(e)}")
         return
@@ -200,45 +212,177 @@ def check_collection_fields(client):
              "(optional; set it in config.yaml if you have that custom field).")
 
 
-def check_increment_play_count(client, collection_result: Optional[dict]):
+def check_increment_play_count(
+    client,
+    collection_result: Optional[dict],
+    artist: str = TEST_ARTIST,
+    album: str = TEST_ALBUM,
+    *,
+    confirmed: bool = False,
+    expected_release_id: Optional[int] = None,
+    expected_instance_id: Optional[int] = None,
+    input_fn=None,
+) -> bool:
     sep("5 · increment_play_count  —  WRITE TEST")
     if collection_result is None:
         fail("Skipping — requires a successful search_collection result first.")
-        return
+        return False
 
-    release_id  = collection_result["release_id"]
-    instance_id = collection_result["instance_id"]
+    release_id = collection_result.get("release_id")
+    instance_id = collection_result.get("instance_id")
+    if not all(
+        type(value) is int and value > 0
+        for value in (release_id, instance_id)
+    ):
+        fail(
+            "Write declined — resolved release and instance IDs must both be "
+            "positive integers."
+        )
+        return False
 
-    info(f"About to increment '{client.play_count_field_name}'")
-    info(f"Release {release_id}, instance {instance_id}")
+    field_name = client.play_count_field_name
+    target = (
+        f"Artist: {_redact(artist)}; Album: {_redact(album)}; "
+        f"Field: {_redact(field_name)}; Release ID: {_redact(release_id)}; "
+        f"Instance ID: {_redact(instance_id)}"
+    )
+    if confirmed:
+        if not all(
+            type(value) is int and value > 0
+            for value in (expected_release_id, expected_instance_id)
+        ):
+            fail(
+                "Noninteractive write declined — expected release and instance IDs "
+                "must both be positive integers."
+            )
+            return False
+        if (
+            release_id != expected_release_id
+            or instance_id != expected_instance_id
+        ):
+            fail(
+                "Noninteractive write declined — the resolved collection identity "
+                "does not match the expected release and instance IDs."
+            )
+            return False
+        info(f"!!! WRITE AUTHORIZED (--yes) — {target}")
+    else:
+        info(f"!!! WRITE TARGET — {target}")
+        if input_fn is None:
+            input_fn = input
+        prompt = (
+            "Authorize Discogs WRITE? Type exact lowercase 'yes' to continue, "
+            f"or anything else to decline. Artist: {artist}; Album: {album}; "
+            f"Field: {field_name}; Release ID: {release_id}; Instance ID: {instance_id}: "
+        )
+        try:
+            response = input_fn(_redact(prompt))
+        except (EOFError, KeyboardInterrupt):
+            response = ""
+        if response != "yes":
+            fail("Write declined; increment_play_count was not called.")
+            return False
 
+    # Keep this as the sole writer call, immediately after explicit authorization.
     try:
         success = client.increment_play_count(release_id, instance_id)
     except Exception as e:
-        fail(f"Exception: {_redact(e)}")
-        return
+        fail(
+            f"Exception: {_redact(e)}. inspect the current Discogs field value "
+            "before rerunning; do not retry blindly because the remote state may be unknown."
+        )
+        return False
 
     if success:
         ok("Play Count incremented! Check your Discogs collection to confirm.")
         info("You can reset the value manually in Discogs if needed.")
     else:
-        fail("Update failed — check the error logged above.")
+        fail(
+            "Update failed — inspect the current Discogs field value before rerunning; "
+            "do not retry blindly because the remote state may be unknown."
+        )
+    return bool(success)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def _build_parser():
     parser = argparse.ArgumentParser(
         description="Live integration test for the vinyl-now-playing Discogs client."
+    )
+    parser.add_argument(
+        "--artist",
+        help=f"Artist to inspect (read-only default: {TEST_ARTIST!r}).",
+    )
+    parser.add_argument(
+        "--album",
+        help=f"Album to inspect (read-only default: {TEST_ALBUM!r}).",
     )
     parser.add_argument(
         "--test-write",
         action="store_true",
         help="Also run increment_play_count — WRITES to your Discogs collection.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "With --test-write, explicit artist/album, and matching release/instance "
+            "IDs, bypass confirmation."
+        ),
+    )
+    parser.add_argument(
+        "--release-id",
+        type=_positive_id,
+        help="Expected positive Discogs release ID (required with --yes).",
+    )
+    parser.add_argument(
+        "--instance-id",
+        type=_positive_id,
+        help="Expected positive collection instance ID (required with --yes).",
+    )
+    return parser
+
+
+def _positive_id(value: str) -> int:
+    """Return a positive integer ID for argparse."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _validate_target_value(parser, option: str, value: Optional[str]) -> None:
+    """Reject unsafe display/search targets without normalizing valid input."""
+    if value is None:
+        return
+    if not value.strip():
+        parser.error(f"{option} must contain a non-whitespace value")
+    if not value.isprintable():
+        parser.error(f"{option} must contain printable characters only")
+
+
+def main(argv=None, input_fn=None):
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _validate_target_value(parser, "--artist", args.artist)
+    _validate_target_value(parser, "--album", args.album)
+    if args.yes and not args.test_write:
+        parser.error("--yes requires --test-write")
+    if args.test_write and (args.artist is None or args.album is None):
+        parser.error("--test-write requires explicit --artist and --album")
+    if args.yes and (args.release_id is None or args.instance_id is None):
+        parser.error("--yes requires explicit --release-id and --instance-id")
+    if (args.release_id is not None or args.instance_id is not None) and not args.yes:
+        parser.error("--release-id and --instance-id require --yes")
+
+    artist = args.artist if args.artist is not None else TEST_ARTIST
+    album = args.album if args.album is not None else TEST_ALBUM
 
     print()
     print("  ╔══════════════════════════════════════════════════════╗")
@@ -281,15 +425,18 @@ def main():
     print()
     info(f"User:             {reader.username}")
     info(f"Play Count field: '{writer.play_count_field_name}'")
-    info(f"Test album:       {TEST_ARTIST} / {TEST_ALBUM}")
+    info(f"Test album:       {artist} / {album}")
     if args.test_write:
-        info("Mode:             READ + WRITE (--test-write)")
+        if args.yes:
+            info("Mode:             READ + WRITE (--test-write --yes; confirmation bypassed)")
+        else:
+            info("Mode:             READ + WRITE (--test-write; exact 'yes' required)")
     else:
         info("Mode:             read-only  (pass --test-write to also test the field update)")
 
     # Run tests
-    collection_result = check_search_collection(reader)
-    check_search_database(reader)
+    collection_result = check_search_collection(reader, artist, album)
+    check_search_database(reader, artist, album)
 
     if collection_result:
         check_get_tracklist(reader, collection_result["release_id"])
@@ -297,14 +444,25 @@ def main():
     check_collection_fields(writer)
 
     if args.test_write:
-        check_increment_play_count(writer, collection_result)
+        if not check_increment_play_count(
+            writer,
+            collection_result,
+            artist,
+            album,
+            confirmed=args.yes,
+            expected_release_id=args.release_id,
+            expected_instance_id=args.instance_id,
+            input_fn=input_fn,
+        ):
+            return 1
     else:
         sep("5 · increment_play_count  —  skipped (read-only mode)")
         info("Run with --test-write to also test the Play Count increment.")
 
     sep()
     print("  Done.\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -996,7 +996,10 @@ The only remaining feature/validation work requires hardware:
   `sd.InputStream` integration only: the overlapping-window logic is
   unit-tested hardware-free via `tests/test_chunking.py`, and device
   matching, config guards, and constructor plumbing via `tests/test_capture.py`
-  (v1.3.5, using a stubbed sounddevice module)
+  (v1.3.5, explicitly patching the capture surface). Root `conftest.py` retains
+  a real `sounddevice` import when available and installs an owned fallback only
+  when import fails; CI separately authenticates the installed backend before
+  pytest.
 - **Shazam recognition testing** — needs real audio input
 - **Display rendering testing** — needs the Waveshare HDMI display
 - **End-to-end integration** — full needle-drop → Discogs-updated flow on hardware
