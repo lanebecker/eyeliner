@@ -32,9 +32,11 @@ Note: an empty Shazam album string ("") keys all of an artist's unknown-album
 tracks together.  Those tracks would resolve identically anyway, so the
 collision is harmless and saves further duplicate lookups.
 
-Concurrency: resolve() is only ever awaited sequentially from
-TrackCommitService.commit on the single event loop, so the cache needs
-no locking.
+Concurrency: ordinary resolution and finalizer recovery can both enter the
+resolver.  The resolver-owned reader gate serializes each complete mutable
+reader sequence, including a submitted executor worker after its awaiting
+coroutine is cancelled.  Album-cache hits remain a lock-free fast path, and
+cover-art I/O remains outside the gate.
 """
 
 import asyncio
@@ -284,6 +286,34 @@ class MetadataResolver:
             if self._cache_get(key) is None:
                 self._cache_store(key, MetadataSource.FALLBACK, cover_url)
 
+    async def _run_reader_locked(self, fn, *args):
+        """Await one reader sequence without releasing the gate on cancellation.
+
+        ``run_in_executor`` cancellation only stops the await, not an already
+        running worker.  Shield the reader awaitable, then, when this caller is
+        cancelled, keep ownership of ``_reader_gate`` until that worker is done
+        before re-propagating cancellation.  The cancelled caller never consumes
+        the late result, so it cannot publish a cache entry after cancellation.
+        """
+        reader_task = asyncio.ensure_future(self.reader.run(fn, *args))
+        try:
+            return await asyncio.shield(reader_task)
+        except asyncio.CancelledError:
+            while not reader_task.done():
+                try:
+                    await asyncio.shield(reader_task)
+                except asyncio.CancelledError:
+                    # A repeated cancellation must still not release the gate
+                    # while the executor worker owns mutable reader state.
+                    continue
+            try:
+                reader_task.result()
+            except BaseException:
+                # The caller is already cancelled; retrieve a late reader error
+                # to avoid an unhandled-task warning, then preserve cancellation.
+                pass
+            raise
+
     async def _resolve_discogs_locked(
         self, raw: "RawRecognitionResult", key: tuple[str, str]
     ) -> tuple["Optional[TrackMetadata]", bool]:
@@ -299,7 +329,7 @@ class MetadataResolver:
         # the album uncached/retryable (B-4); anything else is an unexpected bug
         # and is logged loudly so it isn't mistaken for a routine miss.
         try:
-            result = await self.reader.run(
+            result = await self._run_reader_locked(
                 self.reader.search_collection, raw.artist, raw.album
             )
             if result:
@@ -313,7 +343,7 @@ class MetadataResolver:
 
         # Step 2: Discogs database
         try:
-            result = await self.reader.run(
+            result = await self._run_reader_locked(
                 self.reader.search_database, raw.artist, raw.album
             )
             if result:
@@ -328,7 +358,7 @@ class MetadataResolver:
                 # pinning the no-instance_id DATABASE downgrade.
                 if discogs_completed:
                     try:
-                        refresh_outcome = await self.reader.run(
+                        refresh_outcome = await self._run_reader_locked(
                             self.reader.refresh_index_and_research, raw.artist, raw.album
                         )
                     except Exception as e:
@@ -480,7 +510,7 @@ class MetadataResolver:
                 return None
             replacement_instance_id = observed_instance_ids[0]
             try:
-                fresh = await self.reader.run(
+                fresh = await self._run_reader_locked(
                     self.reader.rebuild_collection_and_research,
                     resolve_key[0], resolve_key[1],
                 )

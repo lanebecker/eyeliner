@@ -14,6 +14,8 @@ Verifies:
 """
 import asyncio
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, AsyncMock
 import pytest
 
@@ -105,6 +107,110 @@ def _put_collection(resolver, key, result):
     resolver._album_cache.put(
         key, (MetadataSource.DISCOGS_COLLECTION, result, time.monotonic())
     )
+
+
+class _CancellationBarrierReader:
+    """Real executor seam: cancelling its await does not stop its worker."""
+
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(max_workers=2)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._state_lock = threading.Lock()
+        self.calls = 0
+        self.active = 0
+        self.maximum_active = 0
+
+    async def run(self, fn, *args):
+        return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
+
+    def _block_first_worker(self):
+        with self._state_lock:
+            self.calls += 1
+            call = self.calls
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+        try:
+            if call == 1:
+                self.started.set()
+                self.release.wait(timeout=5)
+        finally:
+            with self._state_lock:
+                self.active -= 1
+
+    def search_collection(self, artist, album):
+        self._block_first_worker()
+        return make_discogs_result(100, 200)
+
+    def rebuild_collection_and_research(self, artist, album):
+        self._block_first_worker()
+        return make_discogs_result(100, 200)
+
+    def close(self):
+        self.release.set()
+        self._executor.shutdown(wait=True)
+
+
+async def _wait_for_thread_event(event):
+    await asyncio.get_running_loop().run_in_executor(None, event.wait)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ordinary_reader_worker_keeps_gate_until_thread_completes(resolver):
+    """Cancelling the await must not let a second executor sequence overlap it."""
+    reader = _CancellationBarrierReader()
+    resolver.reader = reader
+    resolver._reader_gate = asyncio.Lock()
+    first = asyncio.create_task(resolver.resolve(make_raw(album="First")))
+    try:
+        await _wait_for_thread_event(reader.started)
+        first.cancel()
+        await asyncio.sleep(0)
+        second = asyncio.create_task(resolver.resolve(make_raw(album="Second")))
+        await asyncio.sleep(0.05)
+        assert reader.active == 1
+        assert reader.calls == 1
+        assert not first.done()
+        assert not second.done()
+
+        reader.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+        assert reader.calls == 2
+        assert reader.maximum_active == 1
+    finally:
+        reader.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_worker_keeps_gate_until_thread_completes(resolver):
+    """Recovery uses the same cancellation-safe reader boundary as resolve."""
+    reader = _CancellationBarrierReader()
+    resolver.reader = reader
+    resolver._reader_gate = asyncio.Lock()
+    key = ("miles davis", "kind of blue")
+    _put_collection(resolver, key, make_discogs_result(100, 200))
+    first = asyncio.create_task(resolver.recover_collection_instance(key, 100, 200, (300,)))
+    try:
+        await _wait_for_thread_event(reader.started)
+        first.cancel()
+        await asyncio.sleep(0)
+        second = asyncio.create_task(resolver.recover_collection_instance(key, 100, 200, (300,)))
+        await asyncio.sleep(0.05)
+        assert reader.active == 1
+        assert reader.calls == 1
+        assert not first.done()
+        assert not second.done()
+
+        reader.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert await second == CollectionIdentity(100, 300)
+        assert reader.calls == 2
+        assert reader.maximum_active == 1
+    finally:
+        reader.close()
 
 
 @pytest.mark.asyncio
