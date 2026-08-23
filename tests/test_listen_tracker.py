@@ -197,6 +197,34 @@ async def test_recovery_refusal_writes_neither_discogs_field():
 
 
 @pytest.mark.asyncio
+async def test_recovery_callback_exception_logs_only_safe_stage_and_identity_context(caplog):
+    """Recovery failures cannot expose raw response/custom-field exception text."""
+    writer = make_writer_mock(last_played_field_name="Last Played")
+    writer.read_play_count.return_value = PlayCountReadResult(
+        PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+        observed_instance_ids=(88,),
+    )
+    secret_body = "PRIVATE-CUSTOM-FIELD-BODY"
+    sentinel = "UNREDACTED-RECOVERY-SENTINEL"
+
+    async def failing_recovery(*_args):
+        raise RuntimeError(f"{secret_body} {sentinel}")
+
+    tracker = ListenTracker(writer, recover_collection_instance=failing_recovery)
+    with caplog.at_level(logging.WARNING):
+        await tracker._credit_completed_album(_latched_session())
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "stage=recovery-callback-failed" in messages
+    assert "expected_release_id=999" in messages
+    assert "expected_instance_id=77" in messages
+    assert secret_body not in messages
+    assert sentinel not in messages
+    writer.set_play_count.assert_not_called()
+    writer.update_last_played.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("observed_instance_ids", "callback_instance_id"),
     [
