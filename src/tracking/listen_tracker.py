@@ -986,7 +986,7 @@ class ListenTracker:
                     "wait in the event loop (sleeping %ss) before retrying (#229).",
                     label, n, _FINALIZE_WRITE_ATTEMPTS, e.retry_after, backoff,
                 )
-            except _DefinitiveMissingInstance:
+            except (_DefinitiveMissingInstance, _ReplacementReadAborted):
                 raise
             except Exception as e:
                 log.warning(
@@ -1105,6 +1105,8 @@ class ListenTracker:
                             not isinstance(identity, CollectionIdentity)
                             or identity.release_id != stale_release_id
                             or identity.instance_id == stale_instance_id
+                            or len(result.observed_instance_ids) != 1
+                            or identity.instance_id != result.observed_instance_ids[0]
                         ):
                             log.info(
                                 "Discogs collection recovery refused release %s / "

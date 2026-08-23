@@ -197,6 +197,42 @@ async def test_recovery_refusal_writes_neither_discogs_field():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observed_instance_ids", "callback_instance_id"),
+    [
+        ((88,), 89),
+        ((88, 89), 88),
+        ((), 88),
+    ],
+    ids=["different-singleton", "multiple-observed", "empty-observed"],
+)
+async def test_recovery_requires_the_writer_proven_singleton_replacement(
+    observed_instance_ids, callback_instance_id,
+):
+    """A callback cannot turn incomplete or mismatched evidence into a write."""
+    writer = make_writer_mock(last_played_field_name="Last Played")
+    writer.read_play_count.side_effect = [
+        PlayCountReadResult(
+            PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+            observed_instance_ids=observed_instance_ids,
+        ),
+        PlayCountReadResult(PlayCountReadState.READY, 3, 4),
+    ]
+    recovery = AsyncMock(return_value=CollectionIdentity(999, callback_instance_id))
+    tracker = ListenTracker(writer, recover_collection_instance=recovery)
+    session = _latched_session()
+
+    await tracker._credit_completed_album(session)
+
+    recovery.assert_awaited_once_with(
+        ("sonic youth", "sister"), 999, 77, observed_instance_ids,
+    )
+    writer.set_play_count.assert_not_called()
+    writer.update_last_played.assert_not_called()
+    assert (session.album_release_id, session.album_instance_id) == (999, 77)
+
+
+@pytest.mark.asyncio
 async def test_second_definitive_missing_stops_both_field_writes():
     writer = make_writer_mock(last_played_field_name="Last Played")
     writer.read_play_count.side_effect = [
@@ -233,8 +269,62 @@ async def test_replacement_abort_skips_play_count_but_updates_last_played_once()
         writer, recover_collection_instance=AsyncMock(return_value=CollectionIdentity(999, 88)),
     )
 
-    await tracker._credit_completed_album(_latched_session())
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()) as sleep:
+        await tracker._credit_completed_album(_latched_session())
 
+    assert writer.read_play_count.call_count == 2
+    sleep.assert_not_awaited()
+    writer.set_play_count.assert_not_called()
+    writer.update_last_played.assert_called_once_with(999, 88)
+
+
+@pytest.mark.asyncio
+async def test_replacement_abort_never_continues_to_a_later_ready_read():
+    writer = make_writer_mock(last_played_field_name="Last Played")
+    writer.read_play_count.side_effect = [
+        PlayCountReadResult(
+            PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+            observed_instance_ids=(88,),
+        ),
+        PlayCountReadResult(PlayCountReadState.ABORT),
+        PlayCountReadResult(PlayCountReadState.READY, 3, 4),
+    ]
+    tracker = ListenTracker(
+        writer, recover_collection_instance=AsyncMock(return_value=CollectionIdentity(999, 88)),
+    )
+
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()) as sleep:
+        await tracker._credit_completed_album(_latched_session())
+
+    assert writer.read_play_count.call_count == 2
+    sleep.assert_not_awaited()
+    writer.set_play_count.assert_not_called()
+    writer.update_last_played.assert_called_once_with(999, 88)
+
+
+@pytest.mark.asyncio
+async def test_replacement_abort_never_continues_to_a_later_missing_read():
+    writer = make_writer_mock(last_played_field_name="Last Played")
+    writer.read_play_count.side_effect = [
+        PlayCountReadResult(
+            PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+            observed_instance_ids=(88,),
+        ),
+        PlayCountReadResult(PlayCountReadState.ABORT),
+        PlayCountReadResult(
+            PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+            observed_instance_ids=(),
+        ),
+    ]
+    tracker = ListenTracker(
+        writer, recover_collection_instance=AsyncMock(return_value=CollectionIdentity(999, 88)),
+    )
+
+    with patch("src.tracking.listen_tracker.asyncio.sleep", new=AsyncMock()) as sleep:
+        await tracker._credit_completed_album(_latched_session())
+
+    assert writer.read_play_count.call_count == 2
+    sleep.assert_not_awaited()
     writer.set_play_count.assert_not_called()
     writer.update_last_played.assert_called_once_with(999, 88)
 
