@@ -862,16 +862,30 @@ class DiscogsReader:
         DATABASE knows the album — the signature of a record the owner may have
         just added (the index is a snapshot from up to the TTL ago). It discards
         the cached index and re-runs :meth:`search_collection` against a freshly
-        built one, returning the owned release if it is now present, else None.
+        built one. It returns an immutable :class:`CollectionRefreshResult`:
+
+        * ``OWNED`` carries the validated owned-release mapping in ``result``.
+        * ``CLEAN_NO_MATCH`` carries no ``result`` and means the complete rebuild
+          succeeded but found no unambiguous owned match.
+        * ``COOLDOWN_SKIPPED`` carries no ``result`` and means no rebuild was
+          attempted because the global cooldown is active.
+
+        For ``COOLDOWN_SKIPPED``, ``cooldown_follows_successful_rebuild`` records
+        the provenance of the active cooldown. It is true only when the cooldown
+        follows a successfully completed full collection rebuild; it is false
+        after a failed or otherwise incomplete attempt. Other states always carry
+        false provenance. Transport, parsing, and index-build failures remain
+        exceptions rather than becoming refresh results.
 
         The cooldown is load-bearing, not cosmetic: the same "missed collection,
         hit database" signal fires on EVERY record the user genuinely does not
         own (the common database-tier case), so without it every unowned-record
         play would trigger a full collection re-page. Within the cooldown this
-        returns None immediately and re-pages nothing. The cooldown is stamped on
-        the ATTEMPT (before the re-page), so a transiently-failing refresh does
-        not hammer Discogs — search_collection's build error still propagates so
-        the resolver leaves the album uncached/retryable (B-4).
+        returns ``COOLDOWN_SKIPPED`` immediately and re-pages nothing. The
+        cooldown is stamped on the ATTEMPT (before the re-page), so a
+        transiently-failing refresh does not hammer Discogs — the build error
+        still propagates so the resolver leaves the album uncached/retryable
+        (B-4).
         """
         now = time.monotonic()
         if now - self._last_index_refresh_at < _INDEX_REFRESH_COOLDOWN_SECONDS:
