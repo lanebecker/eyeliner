@@ -15,7 +15,7 @@
 // hand-tuned data: muted-contrast is enforced by `src/display/palette.py`
 // (extract_palette / ensure_contrast); cross-album Hue-Diversity is the
 // ASPIRATIONAL A-1 (no cross-album OKLCH registry exists in code yet — see
-// CLAUDE.md / DESIGN.md §2).
+// DESIGN.md §2).
 
 const ALBUMS = [
   {

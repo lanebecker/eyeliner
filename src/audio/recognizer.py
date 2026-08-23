@@ -8,6 +8,7 @@ rejects the others at startup until they are built (see the TODO below).
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, TYPE_CHECKING
@@ -17,6 +18,7 @@ import numpy as np
 from src.audio.log_throttle import ThrottledLogger
 from src.config import IMPLEMENTED_BACKENDS
 from src.state.player_state import PlayerStatus
+from src.util.logthrottle import LogThrottle
 
 if TYPE_CHECKING:
     from src.config import RecognitionConfig
@@ -63,6 +65,13 @@ _SHAZAM_RETRY_MAX_TIMEOUT_SECONDS = 5
 # move the flood between WARNING and ERROR depending on the outage's shape.
 # 60s (vs capture's 30s) keeps at most ~1,440 lines/day worst case.
 _RECOGNITION_ERROR_LOG_INTERVAL_SECONDS = 60.0
+
+# R10-11 (#424): minimum wall-clock gap between "recognition queue lag" health
+# lines. When the backend stalls, the consumer drains stale backlog to the newest
+# chunk (see run()) and reports the lag; throttled on the #178 model so a
+# sustained slow-backend period logs one line then a periodic summary, not one
+# per hop.
+_QUEUE_LAG_LOG_INTERVAL_SECONDS = 60.0
 
 
 @dataclass
@@ -272,6 +281,7 @@ class RecognitionLoop:
         state: "PlayerState",
         on_confirmed: Callable[["RawRecognitionResult", int], Awaitable[object]],
         backend=None,
+        hop_seconds: Optional[float] = None,
     ):
         self.state = state
         # Called with a confirmed RawRecognitionResult; owns resolve → state →
@@ -279,6 +289,22 @@ class RecognitionLoop:
         # result — it no longer knows about the resolver/tracker/lastfm.
         self.on_confirmed = on_confirmed
         self.poll_interval: int = config.poll_interval_seconds
+        # R10-11 (#424): a queued chunk is "stale" once it has waited longer than
+        # ONE CAPTURE HOP (chunk_seconds − overlap_seconds) — the cadence at which
+        # fresh audio arrives — because past that the consumer has fallen behind.
+        # The hop lives in the AUDIO config, not recognition, so main() passes it
+        # in; a direct construction (tests) that omits it falls back to
+        # poll_interval, which still bounds the drain/telemetry.  This is the
+        # threshold both the drain-to-newest and the queue-age telemetry use, so
+        # lag is surfaced "when it exceeds one hop" (#424 acceptance) rather than
+        # only at the much coarser idle-poll interval.
+        # Defensive: a None or non-positive hop (a degenerate/misconfigured value)
+        # falls back to poll_interval so the threshold can never be ≤ 0 — which
+        # would make EVERY dequeued chunk "stale" and drain fresh audio every turn.
+        self._stale_after_seconds: float = (
+            hop_seconds if (hop_seconds is not None and hop_seconds > 0)
+            else self.poll_interval
+        )
         # PCONC-2: bound a single recognize() call, decoupled from poll_interval.
         self.recognize_timeout: float = _RECOGNIZE_TIMEOUT_SECONDS
         self.confirmation_required: int = config.confirmation_required
@@ -289,6 +315,11 @@ class RecognitionLoop:
         self.error_after_misses: int = config.error_after_misses
         self.backend_name: str = config.backend
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
+        # R10-11 (#424): throttled health signal for recognition-queue lag. Single
+        # key (the message carries the varying age/drop numbers, formatted at emit)
+        # so a sustained slow-backend stretch collapses to one line + a periodic
+        # summary rather than minting a throttle key per distinct age.
+        self._queue_lag_throttle = LogThrottle(interval=_QUEUE_LAG_LOG_INTERVAL_SECONDS)
         self._pending_result: Optional[RawRecognitionResult] = None
         self._pending_count: int = 0
         # REC-1 review: the session epoch the pending candidate was built under.
@@ -371,6 +402,11 @@ class RecognitionLoop:
         """
         # Bind the session epoch to the audio at capture time (PCONC-1).
         epoch = self.state.session_epoch
+        # R10-11 (#424): stamp the enqueue (≈ capture) time so run() can measure how
+        # stale a chunk is when it is finally dequeued and surface queue lag.
+        # Monotonic (not wall clock) so an NTP step during a pre-sync boot can't
+        # produce a negative or wildly wrong age.
+        enqueued_at = time.monotonic()
         if self._audio_queue.full():
             try:
                 self._audio_queue.get_nowait()  # Drop the OLDEST — recent audio wins
@@ -381,7 +417,7 @@ class RecognitionLoop:
                 )
             except asyncio.QueueEmpty:  # pragma: no cover — full() just said otherwise
                 pass
-        await self._audio_queue.put((audio, sample_rate, epoch))
+        await self._audio_queue.put((audio, sample_rate, epoch, enqueued_at))
 
     async def run(self):
         """Main recognition loop."""
@@ -396,11 +432,51 @@ class RecognitionLoop:
             # on a failing network with nothing in the journal. Keep that try around
             # the queue get alone.
             try:
-                audio, sample_rate, epoch = await asyncio.wait_for(
+                audio, sample_rate, epoch, enqueued_at = await asyncio.wait_for(
                     self._audio_queue.get(), timeout=self.poll_interval
                 )
             except asyncio.TimeoutError:
                 continue  # No audio queued within poll_interval — idle; poll again.
+
+            # R10-11 (#424): if the dequeued head chunk is already STALE — older
+            # than one capture hop (``_stale_after_seconds``), i.e. the consumer
+            # has fallen behind — drain the rest of the backlog and keep only the
+            # NEWEST chunk, so a post-stall resume acts on FRESH audio instead of
+            # grinding oldest-first through ~40–50s of history.  enqueue() already
+            # drops the OLDEST when the queue is FULL (#48); this is the
+            # consumer-side complement, gated on staleness so it is a NO-OP in
+            # steady state (a promptly-dequeued chunk has age ≈ 0 < one hop, so
+            # back-to-back fresh chunks are all processed and two-hit confirmation
+            # is unchanged).  The kept chunk still carries its OWN enqueue-time
+            # epoch (PCONC-1), and the hard maxsize bound is untouched.  The final
+            # policy (mailbox vs queue size vs this drain) is hardware-tuned on the
+            # Pi — #424 stays open.
+            age = time.monotonic() - enqueued_at
+            dropped_stale = 0
+            if age > self._stale_after_seconds:
+                while True:
+                    try:
+                        audio, sample_rate, epoch, enqueued_at = (
+                            self._audio_queue.get_nowait()
+                        )
+                        dropped_stale += 1
+                    except asyncio.QueueEmpty:
+                        break
+                # Age of the chunk we will ACTUALLY recognize, after draining.
+                age = time.monotonic() - enqueued_at
+                # Queue-age telemetry (throttled, #178 model): surface the lag and
+                # how many stale chunks were skipped so the #424 hardware tuning is
+                # evidence-driven.  Never changes control flow.
+                emit, suppressed = self._queue_lag_throttle.should_log(time.monotonic())
+                if emit:
+                    log.warning(
+                        "Recognition queue lag: recognizing audio ~%.0fs old; "
+                        "dropped %d stale backlog chunk(s) to resume on the "
+                        "freshest audio (recognition slower than capture).%s",
+                        age, dropped_stale,
+                        (" %d further lag report(s) suppressed since the last."
+                         % suppressed) if suppressed else "",
+                    )
 
             try:
                 # PCONC-2: bound the recognition call itself. Without this a
