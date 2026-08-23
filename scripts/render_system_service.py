@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,8 @@ from typing import Mapping, Sequence
 
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "deploy" / "vinyl-now-playing.service.in"
+# Intentional template edits must update this reviewed content-trust value.
+_TRUSTED_TEMPLATE_SHA256 = "717ed55031d2c02162522fade1332835d387cbafcb93c201829a1e6339e276cd"
 _PLACEHOLDER_COUNTS = {
     "@SERVICE_USER@": 1,
     "@APP_DIR@": 3,
@@ -203,8 +206,13 @@ def _render_template(
         or after_read.st_mtime_ns != expected.st_mtime_ns
     ):
         raise RenderError(f"system-service template changed while it was being read: {TEMPLATE}")
+    template_bytes = b"".join(chunks)
+    if hashlib.sha256(template_bytes).hexdigest() != _TRUSTED_TEMPLATE_SHA256:
+        raise RenderError(
+            f"system-service template does not match trusted template content: {TEMPLATE}"
+        )
     try:
-        template = b"".join(chunks).decode("utf-8")
+        template = template_bytes.decode("utf-8")
     except UnicodeDecodeError as error:
         raise RenderError(f"cannot decode system-service template as UTF-8: {TEMPLATE}") from error
 

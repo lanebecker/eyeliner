@@ -1,6 +1,7 @@
 """Contracts for the versioned system-service renderer (#419)."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -66,6 +67,16 @@ def _load_renderer_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _trust_test_template(renderer, monkeypatch, template: Path) -> None:
+    """Bind a disposable fixture to the renderer's explicit template trust contract."""
+    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    monkeypatch.setattr(
+        renderer,
+        "_TRUSTED_TEMPLATE_SHA256",
+        hashlib.sha256(template.read_bytes()).hexdigest(),
+    )
 
 
 def _render_direct(
@@ -248,7 +259,7 @@ ExecStart=@APP_DIR@/venv/bin/python3 @APP_DIR@/main.py
 """
     )
     original = template.read_bytes()
-    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    _trust_test_template(renderer, monkeypatch, template)
     monkeypatch.setattr(
         renderer.os,
         "read",
@@ -302,11 +313,11 @@ def test_renderer_rejects_template_swaps_before_the_template_descriptor_is_read(
     template = tmp_path / "template.service.in"
     template.write_text(_template_with_secret_marker("\n# trusted-template\n"))
     output = tmp_path / "vinyl-now-playing.service"
-    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    _trust_test_template(renderer, monkeypatch, template)
     original_open = renderer.os.open
     swapped = False
 
-    def swap_before_template_open(path, flags, mode=0o777):
+    def swap_before_template_open(path, flags, mode=0o777, **kwargs):
         nonlocal swapped
         if Path(path) == template and not swapped:
             swapped = True
@@ -315,7 +326,7 @@ def test_renderer_rejects_template_swaps_before_the_template_descriptor_is_read(
                 template.write_text(_template_with_secret_marker("\n# raced-template\n"))
             else:
                 template.symlink_to(config)
-        return original_open(path, flags, mode)
+        return original_open(path, flags, mode, **kwargs)
 
     monkeypatch.setattr(renderer.os, "open", swap_before_template_open)
 
@@ -394,6 +405,45 @@ def test_renderer_reads_the_template_only_from_its_verified_descriptor(tmp_path,
     assert output.exists()
 
 
+def test_renderer_rejects_changed_template_bytes_when_checked_metadata_is_identical(
+    tmp_path,
+):
+    """Content trust must not depend on inode, size, or timestamp uniqueness."""
+    renderer = _load_renderer_module()
+    trusted = renderer.TEMPLATE.read_bytes()
+    raced = trusted.replace(
+        b"Description=vinyl-now-playing",
+        b"Description=vinyl-now-pLaying",
+    )
+    assert raced != trusted
+    assert len(raced) == len(trusted)
+    template = tmp_path / "template.service.in"
+    template.write_bytes(trusted)
+    descriptor = os.open(template, os.O_RDONLY)
+    expected = os.fstat(descriptor)
+    try:
+        template.write_bytes(raced)
+        os.utime(
+            template,
+            ns=(expected.st_atime_ns, expected.st_mtime_ns),
+        )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+
+        with pytest.raises(renderer.RenderError, match="trusted template content"):
+            renderer._render_template(
+                descriptor,
+                expected,
+                {
+                    "@SERVICE_USER@": "pi",
+                    "@APP_DIR@": "/opt/vinyl-now-playing",
+                    "@DISPLAY@": ":0",
+                    "@XAUTHORITY@": "/home/pi/.Xauthority",
+                },
+            )
+    finally:
+        os.close(descriptor)
+
+
 def test_renderer_cli_normalizes_invalid_template_utf8_without_a_traceback(
     tmp_path, monkeypatch, capsys
 ):
@@ -403,7 +453,7 @@ def test_renderer_cli_normalizes_invalid_template_utf8_without_a_traceback(
     renderer = _load_renderer_module()
     template = tmp_path / "template.service.in"
     template.write_bytes(b"\xff\xfe")
-    monkeypatch.setattr(renderer, "TEMPLATE", template)
+    _trust_test_template(renderer, monkeypatch, template)
 
     exit_code = renderer.main(_arguments(app_dir, output))
     captured = capsys.readouterr()
