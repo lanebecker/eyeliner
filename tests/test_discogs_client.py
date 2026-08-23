@@ -353,6 +353,26 @@ def test_nonempty_garbage_value_aborts_without_writing(caplog):
     assert "not an integer" in caplog.text
 
 
+def test_noninteger_play_count_aborts_without_logging_note_content(caplog):
+    """A malformed field must not expose its user-entered note in error logs."""
+    client = make_client()
+    secret = "discogs-note-secret-8f7d0a"
+    raw_note = {"field_id": _FIELD_ID, "value": secret, "private": "do-not-log"}
+    client._http.session.get = MagicMock(return_value=make_get_response(
+        200,
+        {"releases": [{"instance_id": 42, "notes": [raw_note]}]},
+    ))
+    client._http.session.post = MagicMock(return_value=make_post_response(204))
+
+    with caplog.at_level(logging.ERROR):
+        result = client.increment_play_count(release_id=111, instance_id=42)
+
+    assert result is False
+    client._http.session.post.assert_not_called()
+    assert secret not in caplog.text
+    assert repr(raw_note) not in caplog.text
+
+
 def test_whitespace_only_value_treated_as_zero():
     """Whitespace-only string → treat as 0, post '1'."""
     client = make_client()
