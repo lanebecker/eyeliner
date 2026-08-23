@@ -267,19 +267,19 @@ hardware-success claims, unsafe write instructions, and stale file paths.
 
 **Files:** all intended Wave 1 files; no production edits by reviewer.
 
-- [ ] **Step 1: Run focused local verification**
+- [x] **Step 1: Run focused local verification**
 
 ```bash
 cd '/private/tmp/vnp-release-app-identity' && test "$(git branch --show-current)" = 'codex/r10-wave1-pi-preflight' && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m py_compile src/config.py scripts/check_audio_backend.py scripts/render_system_service.py scripts/discogs_live_check.py && '/Users/lanebecker-wmf/Documents/Claude.nosync/Projects/Vinyl Now Playing/.venv/bin/python' -m pytest -q tests/test_config.py tests/test_audio_backend_smoke.py tests/test_capture.py tests/test_main_wiring.py tests/test_ops_polish_r9.py tests/test_system_service.py tests/test_discogs_live_check.py tests/test_deployment_integrity_r10.py tests/test_workflow_integrity_r10.py && git diff --check
 ```
 
-- [ ] **Step 2: Run repository security/scope checks**
+- [x] **Step 2: Run repository security/scope checks**
 
 Verify no secret/private-key material, no tracked `config.yaml`, no user-service
 artifact, no unintended files, no staged files, and an explicit intended diff.
 Run workflow lint using the repository's pinned/cached actionlint procedure.
 
-- [ ] **Step 3: Independent broad adversarial review**
+- [x] **Step 3: Independent broad adversarial review**
 
 Review config TOCTOU/redaction, CI fake-package bypass, exact production API
 coverage, system-unit injection/partial writes/semantic drift, Discogs write
