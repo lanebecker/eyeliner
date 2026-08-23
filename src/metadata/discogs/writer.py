@@ -11,11 +11,14 @@ It has no knowledge of the read side (search/tracklist/year) — that lives in
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import date
-from typing import Optional, Union, TYPE_CHECKING
+from enum import Enum, auto
+from typing import Any, Optional, Union, TYPE_CHECKING
 from urllib.parse import quote
 
 from src.metadata.discogs.transport import DiscogsHttp, DiscogsRateLimited, _API_BASE, _as_id
+from src.metadata.discogs.outcomes import PlayCountReadResult, PlayCountReadState
 from src.util.clock import clock_is_trustworthy
 
 if TYPE_CHECKING:
@@ -43,6 +46,21 @@ class _ReadFailed:
 
 #: Singleton "current value is unknown" marker (see :class:`_ReadFailed`).
 _READ_FAILED = _ReadFailed()
+
+
+class _FieldValueReadState(Enum):
+    FOUND = auto()
+    DEFINITIVE_INSTANCE_MISSING = auto()
+    ABORT = auto()
+
+
+@dataclass(frozen=True)
+class _FieldValueRead:
+    """Private classification before field-value parsing."""
+
+    state: _FieldValueReadState
+    value: Any = None
+    observed_instance_ids: tuple[int, ...] = ()
 
 
 class DiscogsCollectionWriter:
@@ -80,11 +98,12 @@ class DiscogsCollectionWriter:
     # Public interface
     # -------------------------------------------------------------------------
 
-    def read_play_count(self, release_id: int, instance_id: int):
+    def read_play_count(self, release_id: int, instance_id: int) -> PlayCountReadResult:
         """Read the current Play Count and resolve the field id, in ONE step.
 
-        Returns ``(field_id, current_count)`` on success, or ``None`` when the
-        credit must be aborted WITHOUT writing:
+        Returns a typed state: ``READY`` with the resolved field/count,
+        ``DEFINITIVE_INSTANCE_MISSING`` only when a complete validated snapshot
+        proves the old instance is absent, or ``ABORT`` when writing is unsafe.
 
           * the ``Play Count`` custom field is not configured on the account;
           * the current value is UNKNOWN (``_READ_FAILED`` — the GET failed or the
@@ -111,25 +130,34 @@ class DiscogsCollectionWriter:
                 f"Custom field '{self.play_count_field_name}' not found in Discogs. "
                 f"Available fields: {list(fields.keys())}"
             )
-            return None
+            return PlayCountReadResult(PlayCountReadState.ABORT)
 
-        raw_value = self._get_field_value(release_id, instance_id, field_id)
-        if raw_value is _READ_FAILED:
+        field_read = self._read_field_value(release_id, instance_id, field_id)
+        if field_read.state is _FieldValueReadState.DEFINITIVE_INSTANCE_MISSING:
+            return PlayCountReadResult(
+                PlayCountReadState.DEFINITIVE_INSTANCE_MISSING,
+                observed_instance_ids=field_read.observed_instance_ids,
+            )
+        if field_read.state is _FieldValueReadState.ABORT:
             log.error(
                 f"Aborting Play Count increment for release {release_id} / instance "
                 f"{instance_id}: could not read the current value, so refusing to "
                 f"overwrite it (leaving the existing count intact)."
             )
-            return None
+            return PlayCountReadResult(PlayCountReadState.ABORT)
 
         # Coerce via str() before .strip(): a confirmed value is normally a
         # string, but Discogs can return it as a JSON number, and calling
         # .strip() on an int would raise (B-16). None / "" is a blank field.
+        raw_value = field_read.value
         text = str(raw_value).strip() if raw_value is not None else ""
         if not text:
-            return field_id, 0  # confirmed-blank field == zero plays
+            return PlayCountReadResult(PlayCountReadState.READY, field_id, 0)
         try:
-            return field_id, int(text)
+            count = int(text)
+            if count < 0:
+                raise ValueError("negative play count")
+            return PlayCountReadResult(PlayCountReadState.READY, field_id, count)
         except (ValueError, TypeError):
             # A present but non-integer value is real data we cannot safely
             # increment; overwriting it with an absolute 1 would destroy it
@@ -139,7 +167,7 @@ class DiscogsCollectionWriter:
                 f"{instance_id}: existing value {raw_value!r} is not an integer, so "
                 f"refusing to overwrite it with 1."
             )
-            return None
+            return PlayCountReadResult(PlayCountReadState.ABORT)
 
     def set_play_count(
         self, release_id: int, instance_id: int, field_id: int,
@@ -202,12 +230,12 @@ class DiscogsCollectionWriter:
         POST) for operator tooling and the unit tests.
         """
         try:
-            state = self.read_play_count(release_id, instance_id)
-            if state is None:
+            result = self.read_play_count(release_id, instance_id)
+            if result.state is not PlayCountReadState.READY:
                 return False
-            field_id, current_count = state
             return self.set_play_count(
-                release_id, instance_id, field_id, current_count, current_count + 1
+                release_id, instance_id, result.field_id, result.current_count,
+                result.current_count + 1,
             )
         except DiscogsRateLimited:
             # #229: must PROPAGATE, not be swallowed to False by the broad handler
@@ -333,23 +361,14 @@ class DiscogsCollectionWriter:
         log.debug(f"Collection fields loaded: {self._collection_fields}")
         return self._collection_fields
 
-    def _get_field_value(
+    def _read_field_value(
         self, release_id: int, instance_id: int, field_id: int
-    ) -> Union[str, None, _ReadFailed]:
-        """Read the current value of a custom field for a specific collection instance.
+    ) -> _FieldValueRead:
+        """Classify a field read without confusing absence with ambiguity.
 
-        GETs /users/{username}/collection/releases/{release_id}, finds the
-        matching instance_id, and returns the note value for field_id.
-
-        Three-state result, because the caller performs an absolute write and a
-        failed read must NOT be treated as 0 (META-1):
-
-          * ``str`` (possibly a JSON number the caller coerces) — the value is set.
-          * ``None`` — the instance was found but this field is unset: a
-            CONFIRMED-blank field, safe to treat as 0.
-          * :data:`_READ_FAILED` — the value is UNKNOWN and the caller must
-            abort: the GET failed, an exception was raised, or the instance was
-            not present in the 200 body (absent / paged / edited — ambiguous).
+        A found target can be read immediately: it does not need a full snapshot
+        proof.  When the target is absent, however, replacement evidence is
+        exposed only after validating every item in one complete response page.
         """
         try:
             # #229: this GET is the READ half of the credit's read-modify-write,
@@ -372,24 +391,40 @@ class DiscogsCollectionWriter:
                     f"_get_field_value: GET returned {resp.status_code} "
                     f"for release {release_id}; current value UNKNOWN (not writing)."
                 )
-                return _READ_FAILED
-            instances = resp.json().get("releases", [])
+                return _FieldValueRead(_FieldValueReadState.ABORT)
+            data = resp.json()
+            if not isinstance(data, dict):
+                return _FieldValueRead(_FieldValueReadState.ABORT)
+            instances = data.get("releases")
+            if not isinstance(instances, list):
+                return _FieldValueRead(_FieldValueReadState.ABORT)
             for inst in instances:
-                if inst.get("instance_id") == instance_id:
-                    for note in inst.get("notes", []):
+                if (isinstance(inst, dict)
+                        and type(inst.get("instance_id")) is int
+                        and inst["instance_id"] == instance_id):
+                    notes = inst.get("notes", [])
+                    if not isinstance(notes, list):
+                        return _FieldValueRead(_FieldValueReadState.ABORT)
+                    for note in notes:
+                        if not isinstance(note, dict):
+                            return _FieldValueRead(_FieldValueReadState.ABORT)
                         if note.get("field_id") == field_id:
-                            return note.get("value")
+                            return _FieldValueRead(_FieldValueReadState.FOUND, note.get("value"))
                     # Instance found but this field is unset — a CONFIRMED blank,
                     # safe to treat as 0.
-                    return None
-            # The instance is not in the response at all: ambiguous (genuinely
-            # absent, a paged response, or an edited collection), so the current
-            # value is UNKNOWN — not blank.
+                    return _FieldValueRead(_FieldValueReadState.FOUND)
+
+            observed_ids = self._validated_missing_instance_ids(data, release_id)
+            if observed_ids is not None:
+                return _FieldValueRead(
+                    _FieldValueReadState.DEFINITIVE_INSTANCE_MISSING,
+                    observed_instance_ids=observed_ids,
+                )
             log.debug(
                 f"_get_field_value: instance {instance_id} not found in "
                 f"release {release_id} response; current value UNKNOWN (not writing)."
             )
-            return _READ_FAILED
+            return _FieldValueRead(_FieldValueReadState.ABORT)
         except DiscogsRateLimited:
             # #229: propagate the honored-wait signal (the broad handler below
             # would otherwise swallow it to _READ_FAILED, aborting the credit
@@ -397,4 +432,50 @@ class DiscogsCollectionWriter:
             raise
         except Exception as e:
             log.debug(f"_get_field_value failed for release {release_id}: {e}")
-            return _READ_FAILED
+            return _FieldValueRead(_FieldValueReadState.ABORT)
+
+    @staticmethod
+    def _validated_missing_instance_ids(data: dict, release_id: int) -> Optional[tuple[int, ...]]:
+        """Return snapshot instance IDs only when absence is conclusively proven."""
+        pagination = data.get("pagination")
+        instances = data.get("releases")
+        if not isinstance(pagination, dict) or not isinstance(instances, list):
+            return None
+        try:
+            page = pagination["page"]
+            pages = pagination["pages"]
+            items = pagination["items"]
+            per_page = pagination["per_page"]
+        except KeyError:
+            return None
+        if (any(type(value) is not int for value in (page, pages, items, per_page))
+                or page != 1 or pages != 1 or items != len(instances)
+                or items < 0 or per_page < 1 or per_page < items):
+            return None
+
+        observed_ids = []
+        for instance in instances:
+            if not isinstance(instance, dict):
+                return None
+            instance_id = instance.get("instance_id")
+            folder_id = instance.get("folder_id")
+            basic_information = instance.get("basic_information")
+            if (type(instance_id) is not int or instance_id <= 0
+                    or type(folder_id) is not int or folder_id < 0
+                    or not isinstance(basic_information, dict)
+                    or type(basic_information.get("id")) is not int
+                    or basic_information["id"] != release_id):
+                return None
+            observed_ids.append(instance_id)
+        if len(set(observed_ids)) != len(observed_ids):
+            return None
+        return tuple(observed_ids)
+
+    def _get_field_value(
+        self, release_id: int, instance_id: int, field_id: int
+    ) -> Union[str, None, _ReadFailed]:
+        """Compatibility value-only facade for legacy callers and tests."""
+        result = self._read_field_value(release_id, instance_id, field_id)
+        if result.state is _FieldValueReadState.FOUND:
+            return result.value
+        return _READ_FAILED
