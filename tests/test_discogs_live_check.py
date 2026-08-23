@@ -531,6 +531,41 @@ def test_confirmed_write_fails_closed_without_complete_expected_identity(
     assert "expected release and instance IDs" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("resolved", "expected_release_id", "expected_instance_id"),
+    [
+        ({"release_id": 1, "instance_id": 456}, True, 456),
+        ({"release_id": 1, "instance_id": 456}, 1.0, 456),
+        ({"release_id": 1, "instance_id": 456}, "1", 456),
+        ({"release_id": 1, "instance_id": 456}, 0, 456),
+        ({"release_id": 1, "instance_id": 456}, -1, 456),
+        ({"release_id": 123, "instance_id": 1}, 123, True),
+        ({"release_id": 123, "instance_id": 1}, 123, 1.0),
+        ({"release_id": 123, "instance_id": 1}, 123, "1"),
+        ({"release_id": 123, "instance_id": 1}, 123, 0),
+        ({"release_id": 123, "instance_id": 1}, 123, -1),
+    ],
+)
+def test_confirmed_write_rejects_non_positive_or_non_integer_expected_ids(
+    capsys, resolved, expected_release_id, expected_instance_id
+):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+
+    assert dlc.check_increment_play_count(
+        client,
+        resolved,
+        "Artist",
+        "Album",
+        confirmed=True,
+        expected_release_id=expected_release_id,
+        expected_instance_id=expected_instance_id,
+        input_fn=lambda _prompt: pytest.fail("invalid --yes identity must not prompt"),
+    ) is False
+    client.increment_play_count.assert_not_called()
+    assert "positive integers" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("outcome", [False, RuntimeError("transport uncertain")])
 def test_failed_write_warns_inspect_before_rerun_and_never_retries(capsys, outcome):
     client = MagicMock()
