@@ -415,7 +415,34 @@ class MetadataResolver:
             or len(set(observed_instance_ids)) != len(observed_instance_ids)
             or any(type(value) is not int or value <= 0 for value in observed_instance_ids)
         ):
-            log.warning("Refusing invalid Discogs collection recovery evidence.")
+            safe_release_id = (
+                expected_release_id
+                if type(expected_release_id) is int and expected_release_id > 0
+                else None
+            )
+            safe_instance_id = (
+                expected_instance_id
+                if type(expected_instance_id) is int and expected_instance_id > 0
+                else None
+            )
+            if safe_release_id is not None and safe_instance_id is not None:
+                log.warning(
+                    "Discogs collection recovery stage=invalid-evidence "
+                    "expected_release_id=%d expected_instance_id=%d.",
+                    safe_release_id, safe_instance_id,
+                )
+            elif safe_release_id is not None:
+                log.warning(
+                    "Discogs collection recovery stage=invalid-evidence "
+                    "expected_release_id=%d.", safe_release_id,
+                )
+            elif safe_instance_id is not None:
+                log.warning(
+                    "Discogs collection recovery stage=invalid-evidence "
+                    "expected_instance_id=%d.", safe_instance_id,
+                )
+            else:
+                log.warning("Discogs collection recovery stage=invalid-evidence.")
             return None
 
         async with self._reader_gate:
