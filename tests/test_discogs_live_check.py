@@ -9,6 +9,7 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -145,3 +146,446 @@ def test_main_loads_config_from_repo_root_not_cwd(monkeypatch, tmp_path):
 
     expected = str(Path(dlc.__file__).resolve().parent.parent / "config.yaml")
     assert captured["path"] == expected
+
+
+# ---------------------------------------------------------------------------
+# #366 — explicit record selection and write authorization
+# ---------------------------------------------------------------------------
+
+def test_search_operations_use_selected_artist_and_album(capsys):
+    client = MagicMock()
+    client.search_collection.return_value = None
+    client.search_database.return_value = None
+
+    dlc.check_search_collection(client, "Selected Artist", "Selected Album")
+    dlc.check_search_database(client, "Selected Artist", "Selected Album")
+
+    client.search_collection.assert_called_once_with("Selected Artist", "Selected Album")
+    client.search_database.assert_called_once_with("Selected Artist", "Selected Album")
+    out = capsys.readouterr().out
+    assert "Selected Artist / Selected Album" in out
+
+
+@pytest.mark.parametrize("response", ["n", "", " yes", "yes ", "YES", "Yes"])
+def test_write_requires_exact_yes(response, capsys):
+    client = MagicMock()
+    result = {"release_id": 123, "instance_id": 456}
+
+    accepted = dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        input_fn=lambda _prompt: response,
+    )
+
+    assert accepted is False
+    client.increment_play_count.assert_not_called()
+    assert "Write declined" in capsys.readouterr().out
+
+
+def test_write_declines_on_eof(capsys):
+    client = MagicMock()
+    result = {"release_id": 123, "instance_id": 456}
+
+    def eof(_prompt):
+        raise EOFError
+
+    accepted = dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        input_fn=eof,
+    )
+
+    assert accepted is False
+    client.increment_play_count.assert_not_called()
+    assert "Write declined" in capsys.readouterr().out
+
+
+def test_write_prompt_contains_selection_and_ids_but_not_token(capsys):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+    client.increment_play_count.return_value = True
+    result = {"release_id": 123, "instance_id": 456}
+    prompts = []
+
+    def authorize(prompt):
+        prompts.append(prompt)
+        return "yes"
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        input_fn=authorize,
+    ) is True
+    client.increment_play_count.assert_called_once_with(123, 456)
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert "Selected Artist" in prompt
+    assert "Selected Album" in prompt
+    assert "Play Count" in prompt
+    assert "123" in prompt and "456" in prompt
+    assert "token" not in prompt.lower()
+    capsys.readouterr()
+
+
+def test_yes_requires_explicit_write_selection_and_expected_ids(monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--yes"])
+    assert ei.value.code == 2
+
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--test-write", "--artist", "Artist"])
+    assert ei.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "id_args",
+    [
+        [],
+        ["--release-id", "123"],
+        ["--instance-id", "456"],
+    ],
+)
+def test_yes_rejects_missing_one_or_both_expected_ids_before_config(
+    monkeypatch, id_args
+):
+    monkeypatch.setattr(
+        "src.config.load_config",
+        lambda _path: pytest.fail("incomplete authorization reached config loading"),
+    )
+    with pytest.raises(SystemExit) as ei:
+        dlc.main([
+            "--test-write", "--yes", "--artist", "Artist", "--album", "Album",
+            *id_args,
+        ])
+    assert ei.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--release-id", "0"),
+        ("--release-id", "-1"),
+        ("--release-id", "not-an-id"),
+        ("--instance-id", "0"),
+        ("--instance-id", "-1"),
+        ("--instance-id", "not-an-id"),
+    ],
+)
+def test_expected_ids_must_be_positive_integers_before_config(
+    monkeypatch, option, value
+):
+    monkeypatch.setattr(
+        "src.config.load_config",
+        lambda _path: pytest.fail("invalid authorization reached config loading"),
+    )
+    args = [
+        "--test-write", "--yes", "--artist", "Artist", "--album", "Album",
+        "--release-id", "123", "--instance-id", "456",
+    ]
+    args[args.index(option) + 1] = value
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(args)
+    assert ei.value.code == 2
+
+
+def test_yes_parser_accepts_complete_id_bound_authorization():
+    parser = dlc._build_parser()
+    args = parser.parse_args([
+        "--test-write", "--yes", "--artist", "Artist", "--album", "Album",
+        "--release-id", "123", "--instance-id", "456",
+    ])
+    assert args.yes is True
+    assert args.artist == "Artist"
+    assert args.album == "Album"
+    assert args.release_id == 123
+    assert args.instance_id == 456
+
+
+def test_parser_help_describes_id_bound_yes_without_error():
+    help_text = " ".join(dlc._build_parser().format_help().split())
+    assert "--release-id" in help_text
+    assert "--instance-id" in help_text
+    assert "required with --yes" in help_text
+
+
+def test_main_forwards_expected_ids_and_aborts_on_later_resolution_drift(
+    monkeypatch
+):
+    reader = MagicMock()
+    reader.username = "dummy-user"
+    writer = MagicMock()
+    writer.play_count_field_name = "Play Count"
+    config = SimpleNamespace(discogs=SimpleNamespace(user_token="dummy-token"))
+
+    monkeypatch.setattr("src.config.load_config", lambda _path: config)
+    monkeypatch.setattr("src.metadata.discogs.DiscogsHttp", lambda _token: object())
+    monkeypatch.setattr("src.metadata.discogs.DiscogsReader", lambda _http, _cfg: reader)
+    monkeypatch.setattr(
+        "src.metadata.discogs.DiscogsCollectionWriter", lambda _http, _cfg: writer
+    )
+    monkeypatch.setattr(
+        dlc,
+        "check_search_collection",
+        lambda _reader, _artist, _album: {"release_id": 123, "instance_id": 999},
+    )
+    monkeypatch.setattr(dlc, "check_search_database", lambda *_args: None)
+    monkeypatch.setattr(dlc, "check_get_tracklist", lambda *_args: None)
+    monkeypatch.setattr(dlc, "check_collection_fields", lambda *_args: None)
+
+    def unexpected_prompt(_prompt):
+        pytest.fail("valid --yes invocation must never prompt")
+
+    result = dlc.main(
+        [
+            "--test-write", "--yes", "--artist", "Artist", "--album", "Album",
+            "--release-id", "123", "--instance-id", "456",
+        ],
+        input_fn=unexpected_prompt,
+    )
+
+    assert result == 1
+    writer.increment_play_count.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_value", ["", "   ", "\t\t", "Artist\x1b[2J", "Album\x00"])
+def test_main_rejects_blank_or_control_target_values_before_config(monkeypatch, bad_value):
+    monkeypatch.setattr(
+        "src.config.load_config",
+        lambda _path: pytest.fail("invalid target reached config loading"),
+    )
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--artist", bad_value, "--album", "Album"])
+    assert ei.value.code == 2
+
+    with pytest.raises(SystemExit) as ei:
+        dlc.main(["--artist", "Artist", "--album", bad_value])
+    assert ei.value.code == 2
+
+
+def test_target_validation_allows_internal_spaces_without_changing_search_values():
+    client = MagicMock()
+    client.search_collection.return_value = None
+    artist = "The  Artist"
+    album = "An Album  With Spaces"
+    dlc.check_search_collection(client, artist, album)
+    client.search_collection.assert_called_once_with(artist, album)
+
+
+def test_write_target_and_prompt_redact_token_shaped_values(capsys):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count token=FIELD_SECRET"
+    client.increment_play_count.return_value = True
+    result = {"release_id": 123, "instance_id": 456}
+    prompts = []
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Artist token=ARTIST_SECRET",
+        "Album token=ALBUM_SECRET",
+        input_fn=prompts.append,
+    ) is False
+    # append returns None, which is intentionally a non-affirmative response.
+    client.increment_play_count.assert_not_called()
+    output = capsys.readouterr().out
+    assert "ARTIST_SECRET" not in output
+    assert "ALBUM_SECRET" not in output
+    assert "FIELD_SECRET" not in output
+    assert prompts and "ARTIST_SECRET" not in prompts[0]
+    assert "ALBUM_SECRET" not in prompts[0]
+    assert "FIELD_SECRET" not in prompts[0]
+
+
+def test_yes_writes_once_without_prompt_when_resolved_ids_match(capsys):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+    client.increment_play_count.return_value = True
+    result = {"release_id": 123, "instance_id": 456}
+
+    def unexpected_prompt(_prompt):
+        pytest.fail("valid --yes authorization must not prompt")
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Selected Artist",
+        "Selected Album",
+        confirmed=True,
+        expected_release_id=123,
+        expected_instance_id=456,
+        input_fn=unexpected_prompt,
+    ) is True
+    client.increment_play_count.assert_called_once_with(123, 456)
+    output = capsys.readouterr().out
+    assert "WRITE AUTHORIZED (--yes)" in output
+    assert "Selected Artist" in output
+    assert "Selected Album" in output
+    assert "Play Count" in output
+    assert "Release ID: 123" in output
+    assert "Instance ID: 456" in output
+
+
+@pytest.mark.parametrize(
+    ("resolved", "expected_release_id", "expected_instance_id"),
+    [
+        ({"release_id": 999, "instance_id": 456}, 123, 456),
+        ({"release_id": 123, "instance_id": 999}, 123, 456),
+    ],
+)
+def test_yes_aborts_without_prompt_or_write_when_later_resolution_drifts(
+    capsys, resolved, expected_release_id, expected_instance_id
+):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+
+    def unexpected_prompt(_prompt):
+        pytest.fail("--yes drift handling must not fall back to a prompt")
+
+    assert dlc.check_increment_play_count(
+        client,
+        resolved,
+        "Same Artist",
+        "Same Album",
+        confirmed=True,
+        expected_release_id=expected_release_id,
+        expected_instance_id=expected_instance_id,
+        input_fn=unexpected_prompt,
+    ) is False
+    client.increment_play_count.assert_not_called()
+    assert "does not match" in capsys.readouterr().out
+
+
+def test_yes_does_not_treat_same_artist_album_as_unique_collection_identity(capsys):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+    approved_copy = {"release_id": 123, "instance_id": 456}
+    duplicate_copy_resolved_later = {"release_id": 123, "instance_id": 789}
+
+    assert dlc.check_increment_play_count(
+        client,
+        duplicate_copy_resolved_later,
+        "Duplicate Artist",
+        "Duplicate Album",
+        confirmed=True,
+        expected_release_id=approved_copy["release_id"],
+        expected_instance_id=approved_copy["instance_id"],
+    ) is False
+    client.increment_play_count.assert_not_called()
+    assert "does not match" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        {"release_id": 0, "instance_id": 456},
+        {"release_id": -1, "instance_id": 456},
+        {"release_id": "123", "instance_id": 456},
+        {"release_id": 123, "instance_id": 0},
+        {"release_id": 123, "instance_id": -1},
+        {"release_id": 123, "instance_id": "456"},
+    ],
+)
+def test_write_rejects_non_positive_or_non_integer_resolved_ids(
+    capsys, resolved
+):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+
+    assert dlc.check_increment_play_count(
+        client,
+        resolved,
+        "Artist",
+        "Album",
+        input_fn=lambda _prompt: "yes",
+    ) is False
+    client.increment_play_count.assert_not_called()
+    assert "positive integer" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("expected_release_id", "expected_instance_id"),
+    [(None, None), (123, None), (None, 456)],
+)
+def test_confirmed_write_fails_closed_without_complete_expected_identity(
+    capsys, expected_release_id, expected_instance_id
+):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+
+    assert dlc.check_increment_play_count(
+        client,
+        {"release_id": 123, "instance_id": 456},
+        "Artist",
+        "Album",
+        confirmed=True,
+        expected_release_id=expected_release_id,
+        expected_instance_id=expected_instance_id,
+    ) is False
+    client.increment_play_count.assert_not_called()
+    assert "expected release and instance IDs" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("resolved", "expected_release_id", "expected_instance_id"),
+    [
+        ({"release_id": 1, "instance_id": 456}, True, 456),
+        ({"release_id": 1, "instance_id": 456}, 1.0, 456),
+        ({"release_id": 1, "instance_id": 456}, "1", 456),
+        ({"release_id": 1, "instance_id": 456}, 0, 456),
+        ({"release_id": 1, "instance_id": 456}, -1, 456),
+        ({"release_id": 123, "instance_id": 1}, 123, True),
+        ({"release_id": 123, "instance_id": 1}, 123, 1.0),
+        ({"release_id": 123, "instance_id": 1}, 123, "1"),
+        ({"release_id": 123, "instance_id": 1}, 123, 0),
+        ({"release_id": 123, "instance_id": 1}, 123, -1),
+    ],
+)
+def test_confirmed_write_rejects_non_positive_or_non_integer_expected_ids(
+    capsys, resolved, expected_release_id, expected_instance_id
+):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+
+    assert dlc.check_increment_play_count(
+        client,
+        resolved,
+        "Artist",
+        "Album",
+        confirmed=True,
+        expected_release_id=expected_release_id,
+        expected_instance_id=expected_instance_id,
+        input_fn=lambda _prompt: pytest.fail("invalid --yes identity must not prompt"),
+    ) is False
+    client.increment_play_count.assert_not_called()
+    assert "positive integers" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("outcome", [False, RuntimeError("transport uncertain")])
+def test_failed_write_warns_inspect_before_rerun_and_never_retries(capsys, outcome):
+    client = MagicMock()
+    client.play_count_field_name = "Play Count"
+    if isinstance(outcome, Exception):
+        client.increment_play_count.side_effect = outcome
+    else:
+        client.increment_play_count.return_value = outcome
+    result = {"release_id": 123, "instance_id": 456}
+
+    assert dlc.check_increment_play_count(
+        client,
+        result,
+        "Artist",
+        "Album",
+        confirmed=True,
+        expected_release_id=123,
+        expected_instance_id=456,
+    ) is False
+    client.increment_play_count.assert_called_once_with(123, 456)
+    output = capsys.readouterr().out
+    assert "inspect the current Discogs field value before rerunning" in output
+    assert "do not retry blindly" in output
