@@ -1,6 +1,6 @@
 # Wave 2 Metadata Recovery and Cache Coherence Design
 
-**Status:** Approved architecture; written-spec review pending
+**Status:** Approved for planning and implementation
 **Date:** 2026-08-22
 **Issues:** #420 (R10-05) and #421 (R10-12)
 **Decision authority:** `docs/decisions/remediation-guardrails.md`
@@ -172,7 +172,8 @@ behavior.
 `None` for every abort condition:
 
 - `READY`, with validated `field_id` and current integer count;
-- `DEFINITIVE_INSTANCE_MISSING`;
+- `DEFINITIVE_INSTANCE_MISSING`, carrying the complete validated tuple of
+  currently observed instance IDs for the requested release;
 - `ABORT`, for every other unsafe condition.
 
 The existing confirmed-blank field remains `READY` with count zero. Missing
@@ -215,22 +216,30 @@ Recovery requires:
 
 - a non-empty latched resolver key;
 - exact positive-integer expected release and instance IDs;
-- a fresh, complete, multiplicity-preserving collection result for that key;
+- a fresh, complete collection rebuild that unambiguously matches the expected
+  release for that key;
+- the writer-proven complete instance tuple containing exactly one eligible
+  replacement;
 - the same Discogs `release_id` as the stale identity; and
 - exactly one eligible positive replacement `instance_id`, different from the
   stale instance.
 
 Restricting the current credit to the same release prevents an automatic write
-to a different pressing selected only by artist/album text. A successful fresh
-match for a different release may become the positive cache value for future
-sessions, but the current stale session is not credited. Broader cross-release
-recovery requires a new owner decision and stronger identity evidence.
+to a different pressing selected only by artist/album text. A recovery rebuild
+that matches a different release leaves this key uncached; a later ordinary
+resolve may establish that release under the normal rules, but the current
+stale session is not credited. Broader cross-release recovery requires a new
+owner decision and stronger identity evidence.
 
 The ordinary collection index deliberately collapses duplicate copies of a
 release to one first-seen instance. Recovery may not use that collapsed value
-as identity proof. Its recovery-specific rebuild/match preserves all instances
-for the expected release long enough to prove that exactly one eligible new
-copy exists. Zero or multiple surviving/replacement copies refuse the current
+as identity or multiplicity proof. The writer's strict, single-page
+collection-items-by-release read supplies the complete validated instance tuple
+from the same response that proves the stale instance absent. The resolver's
+recovery rebuild independently proves that the expected release remains the
+fresh, unambiguous album match. Recovery is authorized only when the writer's
+tuple contains exactly one eligible new instance and the reader resolves that
+same release. Zero or multiple surviving/replacement copies refuse the current
 credit; collection order never selects a write target.
 
 ### Narrow recovery port
@@ -242,6 +251,7 @@ async def recover_collection_instance(
     resolve_key: tuple[str, str],
     expected_release_id: int,
     expected_instance_id: int,
+    observed_instance_ids: tuple[int, ...],
 ) -> CollectionIdentity | None: ...
 ```
 
@@ -257,21 +267,24 @@ While holding the resolver's reader/cache gate, recovery:
 1. inspects the cache entry for the key: an exact stale positive entry is
    removed; an absent entry requires no deletion and remains recoverable from
    the session's latched identity; a present nonmatching entry is never erased;
-2. invokes a distinct recovery refresh that bypasses the speculative cooldown,
-   while retaining swap-on-success, strict pagination completeness,
-   multiplicity, and all normal album-matching safeguards;
+2. validates the writer-proven `observed_instance_ids` as a unique positive
+   tuple that excludes the stale instance, then invokes a distinct recovery
+   refresh that bypasses the speculative cooldown while retaining
+   swap-on-success, strict pagination completeness, and all normal
+   release-level album-matching safeguards;
 3. stores a fresh positive result for future resolves only when the
-   multiplicity-preserving result contains exactly one eligible instance; zero
-   or multiple instances leave the key uncached rather than storing a collapsed
-   first-seen instance; and
+   writer-proven tuple contains exactly one eligible instance and the fresh
+   reader match has the expected release ID; it replaces any collapsed
+   `instance_id` in the reader payload with that proven singleton; zero or
+   multiple instances leave the key uncached; and
 4. returns an identity only when the same-release/exactly-one-new-instance rules
    pass.
 
 If another task has already replaced the cache entry, recovery must not erase
-it. It may use that newer entry only when it independently satisfies the same
-identity and multiplicity rules; otherwise it stops. An LRU-evicted or otherwise
-absent key does not block the one serialized fresh recovery because there is no
-newer cache value to overwrite.
+it. It may use that newer entry only when its exact release/instance pair equals
+the writer-proven singleton replacement; otherwise it stops. An LRU-evicted or
+otherwise absent key does not block the one serialized fresh recovery because
+there is no newer cache value to overwrite.
 
 If rebuilding fails, the reader retains its prior complete index under #242,
 but the resolver does not restore the known-stale positive album-cache entry.
@@ -283,8 +296,9 @@ refresh cooldown and does not change its success provenance. Even after a
 successful recovery rebuild, an active cooldown left by a failed speculative
 attempt remains conservatively uncacheable until the speculative state itself
 changes. Recovery's positive result may still populate the exact positive
-album entry only when its multiplicity proof found exactly one eligible
-instance. Recovery failure does stamp the separate build-failure backoff.
+album entry only when the writer-proven multiplicity tuple contains exactly one
+eligible instance. Recovery failure does stamp the separate build-failure
+backoff.
 
 ## Serialization and concurrency
 
@@ -308,7 +322,8 @@ coordination.
 When the first Play Count read returns `DEFINITIVE_INSTANCE_MISSING`:
 
 1. spend the session's single identity-recovery budget;
-2. call the recovery port with the latched key and exact stale pair;
+2. call the recovery port with the latched key, exact stale pair, and complete
+   validated instance tuple carried by the missing result;
 3. stop if no safe identity is returned;
 4. update only the detached session's album release/instance identity;
 5. read the replacement instance once and compute one new absolute target;
@@ -365,6 +380,8 @@ One shared table-driven state matrix covers:
 - complete enumeration of a removed/replaced instance;
 - incomplete, malformed, multi-page, non-200, duplicate-ID, wrong-release, and
   transport-ambiguous reads;
+- missing-instance results carrying the exact validated replacement tuple and
+  no tuple escaping from an ambiguous read;
 - same-release/new-instance recovery;
 - same instance, changed release, duplicate instances of the same release, and
   no-match refusal;
