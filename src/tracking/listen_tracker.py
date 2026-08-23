@@ -938,6 +938,38 @@ class ListenTracker:
                         _FINALIZE_WRITE_ATTEMPTS,
                     )
 
+    async def _run_writer_cancellation_safe(self, fn, *args):
+        """Run one Discogs writer operation without releasing on cancellation.
+
+        Cancelling a ``run_in_executor`` await does not stop an already-running
+        worker.  Every caller is under ``_finalize_lock``; keep that caller alive
+        until the submitted writer operation has actually finished, retrieve a
+        late success or exception, then re-propagate the original cancellation.
+        This prevents a second finalizer from entering the shared writer while
+        the cancelled finalizer's worker still owns it.
+        """
+        writer_task = asyncio.ensure_future(self.writer.run(fn, *args))
+        try:
+            return await asyncio.shield(writer_task)
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+            while not writer_task.done():
+                try:
+                    await asyncio.shield(writer_task)
+                except asyncio.CancelledError:
+                    if current_task is not None:
+                        current_task.uncancel()
+                    continue
+                except BaseException:
+                    break
+            try:
+                writer_task.result()
+            except BaseException:
+                pass
+            raise asyncio.CancelledError
+
     async def _finalize_write_with_retry(self, label: str, attempt) -> bool:
         """Run one end-of-session write with a BOUNDED retry (#163).
 
@@ -1039,7 +1071,7 @@ class ListenTracker:
 
         async def _read_replacement() -> None:
             """Perform the replacement read without opening another recovery path."""
-            result = await self.writer.run(
+            result = await self._run_writer_cancellation_safe(
                 self.writer.read_play_count,
                 session.album_release_id,
                 session.album_instance_id,
@@ -1066,7 +1098,7 @@ class ListenTracker:
                     # spent and the established pair cannot change.
                     await _read_replacement()
                 else:
-                    result = await self.writer.run(
+                    result = await self._run_writer_cancellation_safe(
                         self.writer.read_play_count,
                         session.album_release_id,
                         session.album_instance_id,
@@ -1131,7 +1163,7 @@ class ListenTracker:
                         plan["field_id"] = result.field_id
                         plan["current"] = result.current_count
                         plan["target"] = result.current_count + 1
-            return await self.writer.run(
+            return await self._run_writer_cancellation_safe(
                 self.writer.set_play_count,
                 session.album_release_id,
                 session.album_instance_id,
@@ -1194,7 +1226,7 @@ class ListenTracker:
             # pre-NTP boot returns False on purpose and must not be retried). It
             # still inherits the crediting/committed split — it runs inside the
             # in-flight-guarded credit path.
-            last_played_success = await self.writer.run(
+            last_played_success = await self._run_writer_cancellation_safe(
                 self.writer.update_last_played,
                 session.album_release_id,
                 session.album_instance_id,

@@ -14,6 +14,8 @@ work, so moving it off the lifecycle lock does not let two detached sessions hit
 the shared Discogs `requests.Session` (max_workers=2 pool) concurrently.
 """
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -24,6 +26,61 @@ from src.metadata.discogs.outcomes import (
 from src.metadata.models import PlaySession
 from src.tracking.listen_tracker import ListenTracker
 from tests.test_listen_tracker import make_tracker, make_track
+
+
+class _CancellationBarrierWriter:
+    """Real executor seam whose first Discogs write survives cancellation."""
+
+    def __init__(self, *, raise_first: bool = False):
+        self._executor = ThreadPoolExecutor(max_workers=2)
+        self._state_lock = threading.Lock()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.raise_first = raise_first
+        self.calls = []
+        self.active = 0
+        self.maximum_active = 0
+
+    async def run(self, fn, *args):
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor, fn, *args
+        )
+
+    def set_play_count(self, *args):
+        with self._state_lock:
+            call_number = len(self.calls) + 1
+            self.calls.append(args)
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+        try:
+            if call_number == 1:
+                self.started.set()
+                self.release.wait(timeout=5)
+                if self.raise_first:
+                    raise RuntimeError("late writer failure")
+            return True
+        finally:
+            with self._state_lock:
+                self.active -= 1
+
+    def close(self):
+        self.release.set()
+        self._executor.shutdown(wait=True)
+
+
+def _detached_creditable_session(release_id: int, instance_id: int) -> PlaySession:
+    session = PlaySession()
+    session.log_track(
+        make_track("Cotton Crown", release_id=release_id, instance_id=instance_id)
+    )
+    session.log_track(
+        make_track("Master-Dik", release_id=release_id, instance_id=instance_id)
+    )
+    return session
+
+
+async def _wait_for_thread_event(event: threading.Event):
+    await asyncio.get_running_loop().run_in_executor(None, event.wait)
 
 
 @pytest.mark.asyncio
@@ -138,6 +195,59 @@ async def test_conc2_finalizes_are_serialized_no_concurrent_writer_calls():
     assert max_inside == 1                    # never two writer calls at once
     assert writer.increment_play_count.call_count == 2  # both did credit, serially
     assert writer.set_play_count.call_count == 2            # the serialized write ran twice
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raise_first", [False, True])
+async def test_cancelled_finalize_keeps_lock_until_executor_writer_finishes(
+    raise_first,
+):
+    """Cancellation must not admit another finalizer while its writer lives.
+
+    Removing the cancellation-safe writer drain should make ``first`` finish
+    immediately and let the second executor worker overlap the blocked first.
+    Both late success and late failure must instead preserve the original
+    cancellation after the worker exits.
+    """
+    tracker, writer = make_tracker()
+    runner = _CancellationBarrierWriter(raise_first=raise_first)
+    writer.run = runner.run
+    writer.set_play_count = runner.set_play_count
+    writer.read_play_count.return_value = PlayCountReadResult(
+        PlayCountReadState.READY, 3, 0
+    )
+    first_session = _detached_creditable_session(111, 222)
+    second_session = _detached_creditable_session(333, 444)
+    first = asyncio.create_task(tracker._finalize_detached(first_session))
+    second = None
+    try:
+        await asyncio.wait_for(_wait_for_thread_event(runner.started), timeout=1)
+        first.cancel()
+        await asyncio.sleep(0)
+        assert not first.done()
+        first.cancel()  # repeated cancellation must not punch through the drain
+        await asyncio.sleep(0)
+        second = asyncio.create_task(tracker._finalize_detached(second_session))
+        await asyncio.sleep(0.05)
+
+        assert runner.active == 1
+        assert len(runner.calls) == 1
+        assert not first.done()
+        assert not second.done()
+
+        runner.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+
+        assert runner.maximum_active == 1
+        assert len(runner.calls) == 2
+        assert [call[:2] for call in runner.calls] == [(111, 222), (333, 444)]
+    finally:
+        runner.close()
+        if second is not None and not second.done():
+            second.cancel()
+            await asyncio.gather(second, return_exceptions=True)
 
 
 @pytest.mark.asyncio
