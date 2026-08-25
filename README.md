@@ -1,8 +1,8 @@
-# vinyl-now-playing
+# eyeliner
 
 [![version](https://img.shields.io/badge/version-1.5.35-blueviolet)](VERSION)
 
-A Raspberry Pi app that listens to a vinyl record playing through a USB audio interface, identifies the current track via audio fingerprinting, enriches it with metadata from your Discogs collection, and displays the artist, album, track name, and cover art on an HDMI-connected LCD screen.
+**eyeliner** is a Raspberry Pi app that listens to a vinyl record playing through a USB audio interface, identifies the current track via audio fingerprinting, enriches it with metadata from your Discogs collection, and displays the artist, album, track name, and cover art on an HDMI-connected LCD screen.
 
 When the last track of an album finishes, it automatically increments the Play Count and records the Last Played date for that record in your Discogs collection. When Last.fm scrobbling is enabled, each identified track is scrobbled to your listening history on a best-effort basis (transient failures are retried briefly; scrobbling is not guaranteed).
 
@@ -32,8 +32,8 @@ When the last track of an album finishes, it automatically increments the Play C
 ## Setup
 
 ```bash
-git clone https://github.com/lanebecker/vinyl-now-playing.git
-cd vinyl-now-playing
+git clone https://github.com/lanebecker/eyeliner.git
+cd eyeliner
 
 # Recommended: use a virtual environment so requirements stay isolated
 python3 -m venv venv
