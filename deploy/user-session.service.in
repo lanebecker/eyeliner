@@ -1,0 +1,46 @@
+# User-session autostart unit — SDL Wayland or X11 *desktop* backends (Case A).
+#
+# See docs/autostart.md to confirm which case your Pi is. Use this unit when the
+# app renders as a Wayland or X11 CLIENT inside a logged-in graphical session
+# (SDL driver `wayland` or `x11`). For a console/KMSDRM kiosk use the system
+# service instead (Case B, planned); for a legacy X11 system service see
+# deploy/vinyl-now-playing.service.in (Case C).
+#
+# Install as a *user* unit (NOT in /etc):
+#   ~/.config/systemd/user/<name>.service
+# and start it from the compositor's autostart so it inherits the session, e.g.
+# labwc:  ~/.config/labwc/autostart  ->  `systemctl --user start <name>.service &`
+#
+# Placeholders substituted at install time:
+#   @APP_DIR@          absolute path to the checkout (e.g. /home/pi/eyeliner)
+#   @WAYLAND_DISPLAY@  the compositor's socket (labwc default: wayland-0)
+# On an X11 desktop, replace the WAYLAND_DISPLAY line with:
+#   Environment=DISPLAY=@DISPLAY@
+
+[Unit]
+Description=vinyl-now-playing (user-session display service)
+After=graphical-session.target
+PartOf=graphical-session.target
+# Restart-limit tuning carried over from the ratified system unit (#201): a slow
+# session bring-up must not exhaust retries and drop to failed.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_DIR@
+# Wayland desktop (default). For X11, swap for: Environment=DISPLAY=@DISPLAY@
+Environment=WAYLAND_DISPLAY=@WAYLAND_DISPLAY@
+ExecStart=@APP_DIR@/venv/bin/python3 @APP_DIR@/main.py
+Restart=on-failure
+# main.py exits 78 (EX_CONFIG) on an unrecoverable config error (R9-13/#396);
+# do not crash-loop a fault that can never self-heal — park in failed instead.
+RestartPreventExitStatus=78
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+# Enables `systemctl --user enable` where the compositor reaches
+# graphical-session.target. The reliable trigger across compositors is the
+# compositor autostart line above; keep both.
+WantedBy=graphical-session.target
