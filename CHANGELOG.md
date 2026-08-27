@@ -9,6 +9,12 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+## [1.5.36] — 2026-08-26
+
+> The `v1.5.35` tag and its GitHub Release were removed during a one-time
+> repository history cleanup; all of v1.5.35's changes are included in this
+> release. This is why the numbering skips from 1.5.34 to 1.5.36.
+
 ### Recognition and scrobbling reliability
 
 - **Last.fm scrobbling no longer blocks recognition, and failed scrobbles are
@@ -59,6 +65,20 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
   custom-folder record plus an interactive exact `yes` (or pre-authorized
   `--yes`) before one write. The live folder result remains pending; no
   folder-ID propagation change is implied or closed yet.
+
+### Project and packaging
+
+- **The project was renamed to `eyeliner`** (repository and README, #450). Internal
+  package/module names remain `vinyl-now-playing` for now; a full internal rebrand is deferred.
+- **Multi-environment autostart is documented (#419, #451).** `docs/autostart.md` is a
+  detect-your-backend guide covering Wayland/X11 desktop (user service), console/KMSDRM
+  (system service, planned), and the legacy X11 system-service path; `deploy/user-session.service.in`
+  ships the Wayland/X11 user-service unit proven on the live Pi. Detection tooling and the §12
+  rewrite remain in #451.
+- **Dependency floors bumped for current Raspberry Pi OS / Python 3.13 (#444)** — numpy, pygame,
+  fonttools, certifi, audioop-lts and others raised to versions with prebuilt wheels on the Pi.
+- **AI-assistant and development-process files are no longer tracked (#443).** `CLAUDE.md`, agent
+  config, and audit working-notes are gitignored; the public repository tracks product artifacts only.
 
 ## [1.5.35] — 2026-08-22
 
