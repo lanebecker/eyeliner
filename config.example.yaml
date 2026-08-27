@@ -57,9 +57,13 @@ lastfm:
   love_on_completion: false
 
 recognition:
-  # Currently the only implemented backend is "shazamio". ("acrcloud" and "audd"
-  # are planned — the sub-sections below reserve their config — but selecting
-  # them is rejected at startup until they are built.)
+  # Recognition backend — two are implemented:
+  #   "shazamio" (default) — free, no signup; unofficial/reverse-engineered, so it
+  #     can miss tracks and drift when Shazam changes server-side. Best on popular music.
+  #   "audd" (recommended) — a commercial, maintained API; more reliable. Get a token
+  #     at https://audd.io and set recognition.audd.api_token below.
+  # ("acrcloud" is planned; selecting it is rejected at startup until built.)
+  # See docs/recognition-backends.md.
   backend: "shazamio"
   poll_interval_seconds: 30
   # How many consecutive matching results before we commit a track change
@@ -74,6 +78,7 @@ recognition:
     access_secret: "YOUR_ACRCLOUD_SECRET"
     host: "identify-eu-west-1.acrcloud.com"
 
-  # Only needed if backend is "audd"
+  # Required when backend is "audd" (get a token at https://audd.io). It is a
+  # secret — keep config.yaml mode 600 and never commit it.
   audd:
     api_token: "YOUR_AUDD_TOKEN"

@@ -1,9 +1,9 @@
 """Recognition loop — polls for track identity while music plays.
 
 Abstracts the recognition backend behind RecognizerBackend so a backend
-(ShazamIO today; ACRCloud and AudD planned) can be swapped via config without
-touching this file. Only "shazamio" is implemented — config.py's CRIT-2 gate
-rejects the others at startup until they are built (see the TODO below).
+(ShazamIO and AudD implemented; ACRCloud planned) can be swapped via config
+without touching this file. config.py's CRIT-2 gate rejects an unimplemented
+backend (e.g. ACRCloud) at startup until it is built.
 """
 
 import asyncio
@@ -268,6 +268,107 @@ class ShazamIOBackend(RecognizerBackend):
         return buf.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# AudD backend (#453) — a commercial, maintained recognition API and the
+# recommended user-selectable alternative to ShazamIO (which stays the free,
+# zero-config default). Needs a token in recognition.audd.api_token.
+# ---------------------------------------------------------------------------
+
+_AUDD_API_URL = "https://api.audd.io/"
+# Internal per-request bound. run()'s wait_for(recognize_timeout, default 30s) is
+# the hard backstop; this keeps one stuck HTTP call from riding that full budget
+# (mirrors ShazamIO's pinned retry bound).
+_AUDD_HTTP_TIMEOUT_SECONDS = 20
+
+
+class _AuddApiError(Exception):
+    """AudD returned status=error (bad token, exhausted quota, etc.). Raised
+    inside the pure parser so recognize()'s one broad except routes it through the
+    throttled failure log and counts it as a miss — a bad key or quota can never
+    crash the recognition loop."""
+
+
+class AuddBackend(RecognizerBackend):
+    """Recognition via the AudD API (https://audd.io).
+
+    recognize() reuses ShazamIOBackend._encode_wav for the identical in-memory
+    WAV serialization, then POSTs the clip to AudD. The aiohttp import in
+    _call_audd is lazy on purpose (as with shazamio) so this module stays
+    importable — and _parse_audd unit-testable — without the HTTP stack.
+    """
+
+    def __init__(self, api_token: str):
+        self._api_token = api_token or ""
+        # #197 model: throttle the per-chunk failure WARNING (a bad token or a
+        # network outage fails every ~10s hop otherwise — the #178 flood class).
+        self._error_log = ThrottledLogger(
+            log, _RECOGNITION_ERROR_LOG_INTERVAL_SECONDS, level=logging.WARNING
+        )
+
+    async def recognize(
+        self, audio: np.ndarray, sample_rate: int
+    ) -> Optional[RawRecognitionResult]:
+        try:
+            loop = asyncio.get_running_loop()
+            wav_bytes = await loop.run_in_executor(
+                None, ShazamIOBackend._encode_wav, audio, sample_rate
+            )
+            result = await self._call_audd(wav_bytes)
+            parsed = self._parse_audd(result)
+            self._error_log.reset()
+            return parsed
+        except Exception as e:
+            self._error_log.error(f"AudD recognition failed: {e}")
+            return None
+
+    async def _call_audd(self, wav_bytes: bytes) -> dict:
+        """Transport-only: POST the WAV to AudD. aiohttp import kept lazy (A-13)."""
+        import aiohttp
+
+        data = aiohttp.FormData()
+        data.add_field("api_token", self._api_token)
+        data.add_field(
+            "file", wav_bytes, filename="audio.wav", content_type="audio/wav"
+        )
+        timeout = aiohttp.ClientTimeout(total=_AUDD_HTTP_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(_AUDD_API_URL, data=data) as resp:
+                # content_type=None: AudD replies application/json; stay lenient if
+                # a proxy mislabels it rather than raising on the content type.
+                return await resp.json(content_type=None)
+
+    @staticmethod
+    def _parse_audd(result) -> Optional[RawRecognitionResult]:
+        """Pure parse of an AudD JSON response -> RawRecognitionResult or None.
+
+        success + track -> result; success + null (no match) -> None;
+        status=error -> raise _AuddApiError so recognize() logs it (throttled) and
+        counts a miss. Every field is str()-coerced and null-guarded, mirroring
+        _parse_shazam (untrusted external JSON; REC-2/REC-3/R5-10)."""
+        if not isinstance(result, dict):
+            return None
+        status = result.get("status")
+        if status == "error":
+            err = result.get("error")
+            msg = err.get("error_message") if isinstance(err, dict) else None
+            raise _AuddApiError(str(msg or "AudD API returned an error"))
+        if status != "success":
+            return None
+        res = result.get("result")
+        # A null result is a clean no-match; a non-dict result is malformed -> miss.
+        if not isinstance(res, dict):
+            return None
+        title = str(res.get("title") or "")
+        if not title.strip():
+            return None
+        return RawRecognitionResult(
+            title=title,
+            artist=str(res.get("artist") or ""),
+            album=str(res.get("album") or ""),
+            isrc=None,
+        )
+
+
 class RecognitionLoop:
     """Manages the async recognition polling loop.
 
@@ -314,6 +415,8 @@ class RecognitionLoop:
         # music that ShazamIO can't identify.
         self.error_after_misses: int = config.error_after_misses
         self.backend_name: str = config.backend
+        # AudD backend credential (validated required-when-audd in config.py).
+        self._audd_api_token: str = config.audd_api_token
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
         # R10-11 (#424): throttled health signal for recognition-queue lag. Single
         # key (the message carries the varying age/drop numbers, formatted at emit)
@@ -371,9 +474,11 @@ class RecognitionLoop:
             )
         if self.backend_name == "shazamio":
             return ShazamIOBackend()
+        if self.backend_name == "audd":
+            return AuddBackend(self._audd_api_token)
         # A name that is in IMPLEMENTED_BACKENDS but has no constructor branch
         # above is a programming error — someone widened the set but not this
-        # method. (TODO: add AcrcloudBackend, AuddBackend when implemented.)
+        # method. (TODO: add AcrcloudBackend when implemented.)
         raise ValueError(  # pragma: no cover
             f"recognition backend {self.backend_name!r} is allowed but has no "
             f"constructor in _init_backend."
