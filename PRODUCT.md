@@ -35,9 +35,10 @@ Warm, obsessive, physical. Like the handwritten notes on an inner sleeve, or a w
 
 ## Planned Features
 
-- **v1.6.0 — Idle Screen:** When no record is playing, the display currently shows a minimal stripe placeholder. The planned redesign shows a grid of recently played album covers, optional clock/date, and a random collection suggestion during extended idle. Design spec TBD. (Originally slated for v1.4.0 and then v1.5.0; both slots went to other releases — the design-fidelity work and the code-review hardening release — see `docs/roadmap.md`.)
-- **v1.7.0 — Side A/B Awareness:** Flip reminder on idle screen after Side A ends; Play Count will require both sides to complete before incrementing.
-- **v1.8.0 — Web Dashboard:** Minimal HTTP server at port 8080 for checking now-playing from any device on the local network.
+- **v1.6.0 — Pluggable Recognition Backends (AudD):** Recognition becomes a user-selectable backend. ShazamIO (free, unofficial) stays the zero-config default but proved unreliable in the field; **AudD** is added as the recommended engine, with per-track polling for cost control. See #453, #454.
+- **v1.7.0 — Idle Screen:** When no record is playing, the display currently shows a minimal stripe placeholder. The planned redesign shows a grid of recently played album covers, optional clock/date, and a random collection suggestion during extended idle. Design spec TBD. (Originally slated for v1.4.0, then v1.5.0, then v1.6.0; each slot went to other releases — the design-fidelity work, the code-review hardening release, and the pluggable recognition backends — see `docs/roadmap.md`.)
+- **v1.8.0 — Side A/B Awareness:** Flip reminder on idle screen after Side A ends; Play Count will require both sides to complete before incrementing.
+- **v1.9.0 — Web Dashboard:** Minimal HTTP server at port 8080 for checking now-playing from any device on the local network.
 
 ## Accessibility & Inclusion
 

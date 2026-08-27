@@ -46,7 +46,7 @@ The complete core loop: turntable audio → Shazam recognition → Discogs metad
 A comprehensive visual overhaul based on the "Museum Card" layout from Claude
 Design mockups. Absorbed the color theming work originally planned for a later
 release, and laid the tracklist-parsing groundwork that makes the planned
-v1.7.0 Side A/B behavioral logic significantly lighter to implement.
+v1.8.0 Side A/B behavioral logic significantly lighter to implement.
 
 **192-test unit suite** (+44 tests covering side-awareness properties, new layout
 geometry, and genres passthrough).
@@ -75,7 +75,7 @@ geometry, and genres passthrough).
 - Smooth color transition when the track changes (lerp over ~1 second)
 - New `display.dynamic_theming` config boolean (default `true`)
 
-*Tracklist parsing (foundation for the planned v1.7.0 side awareness):*
+*Tracklist parsing (foundation for the planned v1.8.0 side awareness):*
 - Full tracklist fetched from the existing Discogs release response — no new API
   calls; the data is already returned, just not previously extracted
 - Track positions parsed to determine current side (`A`, `B`, etc.), position
@@ -281,7 +281,7 @@ auditing the previous two sweeps' own work; see `CHANGELOG.md` for detail.
 (`DESIGN.md`, `design/DirectionA.jsx`) that the production renderer only
 partially implemented. This release closes the visual gap and pays the
 render-loop tax down at the same time. (This slot was previously reserved
-for the idle screen, which shifts to v1.6.0 — see the CHANGELOG versioning
+for the idle screen, which shifts to v1.7.0 — see the CHANGELOG versioning
 note.)
 
 **What shipped:**
@@ -311,7 +311,7 @@ per DESIGN.md §5; see `CHANGELOG.md` for full detail.
   label (WARMING UP → STILL LISTENING… → IDENTIFYING… M:SS), hero
   "Listening…" at 48px
 - Idle: 135° diagonal-stripe cover + "NO RECORD ON PLATTER", hero "Waiting
-  for a record" (still the minimal placeholder; rich redesign is v1.6.0)
+  for a record" (still the minimal placeholder; rich redesign is v1.7.0)
 - All empty states: fallback palette (smoothly lerped to), metadata fully
   suppressed, state-mapped dot, Cover Lift shadow retained; idle and error
   are fully static so the render loop goes quiet
@@ -406,7 +406,7 @@ mutation-check → independent cold-review discipline:
   invariant (#217), and `BoundedCache` + `LogThrottle` extracted to `src/util/`
   (#220/#221).
 
-#218 and #219 (the v1.6 / v1.7 roadmap seams) are intentionally deferred with
+#218 and #219 (the v1.7 / v1.8 roadmap seams) are intentionally deferred with
 triggers — they land with the features that need them. See `CHANGELOG.md` for the
 full per-issue breakdown.
 
@@ -471,7 +471,29 @@ per-issue breakdown of every wave.
 
 ---
 
-## v1.6.0 — Idle Screen & Recent Plays
+## v1.6.0 — Pluggable Recognition Backends (AudD)
+
+**Why next:** ShazamIO (free, unofficial, reverse-engineered) is the current
+recognition engine, and it proved unreliable on the live Pi — returning
+no-match on vocal audio that both AudD and the official Shazam app matched, and
+drifting out of sync with Shazam's servers ("worked yesterday, broke today").
+Recognition is the core of the appliance, so it needs a dependable engine.
+
+**What it adds:**
+- Recognition becomes a **user-selectable backend** via `recognition.backend`.
+  ShazamIO stays the **zero-config default** (free, no signup) with documented
+  caveats; **AudD** is added as the recommended engine (`AuddBackend`), with the
+  API token in gitignored `config.yaml`.
+- **Per-track polling** — recognize once per track (on a detected boundary)
+  instead of every ~10s, so a paid backend stays inside a small monthly quota.
+- The `RecognizerBackend` ABC is already in place; ACRCloud remains a future
+  drop-in.
+
+See #453 (backend) and #454 (per-track polling).
+
+---
+
+## v1.7.0 — Idle Screen & Recent Plays
 
 **Why next:** the idle screen is currently a minimal stripe placeholder on the
 fallback palette — no album, no content. This is the most visible gap in the
@@ -491,7 +513,7 @@ room-monitor vocabulary.)
 
 ---
 
-## v1.7.0 — Side A / Side B Awareness
+## v1.8.0 — Side A / Side B Awareness
 
 **Why after that:** makes the listening completion logic meaningfully more accurate.
 Right now the tracker treats every needle-drop-to-lift session the same way,
@@ -512,7 +534,7 @@ groundwork required.
 
 ---
 
-## v1.8.0 — Local Web Dashboard
+## v1.9.0 — Local Web Dashboard
 
 **Why last:** optional quality-of-life for multi-room or phone-checking use
 cases. Runs alongside the main app as a lightweight HTTP server.
@@ -542,9 +564,8 @@ commits, using the AT Protocol or Mastodon API. Opt-in, obviously.
 every play session with timestamps, tracks identified, and whether the full side
 completed. Useful even without Discogs.
 
-**AudD / ACRCloud backend** — the `RecognizerBackend` ABC is already in place;
-these are drop-in alternatives to ShazamIO for users who want a commercial
-recognition service with higher accuracy or rate limits.
+**ACRCloud backend** — a further `RecognizerBackend` drop-in beyond the v1.6.0
+AudD support, for users who want a different commercial recognition service.
 
 **Hardware buttons** — GPIO-connected physical buttons on the Pi for
 display brightness, skip to idle screen, or triggering a "loved" mark
