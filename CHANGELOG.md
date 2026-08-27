@@ -9,7 +9,9 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
-### Recognition backends (v1.6.0)
+## [1.6.0] — 2026-08-27
+
+### Recognition backends
 
 - **Recognition is now a user-selectable backend (#453).** `recognition.backend`
   selects `shazamio` (free, unofficial — the zero-config default, with documented
