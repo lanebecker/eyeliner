@@ -67,10 +67,14 @@ def test_go_idle_uses_safety_interval_without_duration():
     loop._go_idle_until_boundary(SimpleNamespace(match_offset=None), now=100.0)
     assert loop._reactivate_at == 340.0 and loop._recognition_active is False
 
-def test_back_off_after_error_uses_safety_interval():
+def test_back_off_after_error_uses_short_error_retry():
+    # #460: ERROR backs off to the SHORT error retry, not the (long) safety interval —
+    # 240s exceeds a track and could never confirm a later one.
+    from src.audio.recognizer import _ERROR_RETRY_SECONDS
     loop = _loop(max_idle_recheck_seconds=120.0)
     loop._back_off_after_error(now=5.0)
-    assert loop._reactivate_at == 125.0 and loop._recognition_active is False
+    assert loop._reactivate_at == 5.0 + _ERROR_RETRY_SECONDS
+    assert loop._recognition_active is False
 
 def test_reidle_same_track_is_a_short_beat():
     loop = _loop()
@@ -180,3 +184,42 @@ async def test_same_track_reidle_only_when_not_building():
     loop2._recognition_active = True
     await loop2._handle_result(a)                      # building B -> stray A hit stays active
     assert loop2._recognition_active is True
+
+
+# --- #460: a failed opener must not block later-track recognition on a gapless side ---
+from src.state.player_state import PlayerStatus  # noqa: E402,F811
+import asyncio as _asyncio  # noqa: E402
+
+def test_error_backoff_uses_short_retry_not_safety_interval():
+    from src.audio.recognizer import _ERROR_RETRY_SECONDS
+    loop = _loop(max_idle_recheck_seconds=240.0)
+    loop._back_off_after_error(now=0.0)
+    assert loop._reactivate_at == _ERROR_RETRY_SECONDS
+    assert _ERROR_RETRY_SECONDS < 240.0
+
+async def test_later_track_confirms_across_error_retries():
+    """#460: in ERROR, a later recognizable track confirms across two short-retry
+    wakes ~30s apart (no needle lift). Hunk 1 (30s retry) is the fix; each wake is one
+    recognition, and two consecutive same-track hits reach confirmation_required."""
+    import src.audio.recognizer as rec
+    loop = _loop(confirmation_required=2)
+    loop.state.status = PlayerStatus.ERROR
+    loop.state.current_raw = None
+    loop.state.current_track = None
+    loop._last_seen_session_epoch = 5
+    peddler = RawRecognitionResult("Peddler", "Lunar Vacation", "X")
+
+    # wake 1 @ t=100: reactivates (timer), recognizes -> pending 1, backs off to t=130
+    loop._recognition_active = False
+    loop._reactivate_at = 100.0
+    assert loop._wants_recognition(epoch=5, now=100.0) is True
+    with patch.object(rec.time, "monotonic", return_value=100.0):
+        await loop._handle_result(peddler)
+    assert loop.on_confirmed.await_count == 0
+    assert loop._recognition_active is False and loop._reactivate_at == 130.0
+
+    # wake 2 @ t=131 (>= 130): reactivates, recognizes same track -> pending 2 -> confirm
+    assert loop._wants_recognition(epoch=5, now=131.0) is True
+    with patch.object(rec.time, "monotonic", return_value=131.0):
+        await loop._handle_result(peddler)
+    assert loop.on_confirmed.await_count == 1

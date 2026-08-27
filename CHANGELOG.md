@@ -9,6 +9,18 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed opener no longer blocks recognition of later tracks on a gapless side
+  (#460).** When an unrecognizable track (e.g. a short instrumental opener) latched
+  `NO MATCH FOUND`, per-track polling (#454) backed off to the full safety interval
+  (240s) — longer than a track — so it could never accumulate the two consecutive
+  matches needed to confirm a later, recognizable track: the whole side stayed stuck.
+  Recognition now retries at a short interval (~30s) while unidentified, so two
+  consecutive wakes land inside the same later track and reach the two-match
+  confirmation — later tracks are caught within ~60s; a genuinely all-instrumental
+  side remains bounded (~2 requests/min). A v1.6.0 regression.
+
 ## [1.6.0] — 2026-08-27
 
 ### Recognition backends
