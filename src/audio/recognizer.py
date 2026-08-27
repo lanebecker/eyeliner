@@ -82,6 +82,12 @@ _MIN_REACTIVATE_SECONDS = 10.0
 # When a reactivation finds the SAME track still playing (prediction ran early, or
 # the turntable is a touch slow), re-idle this long instead of polling every hop.
 _SAME_TRACK_RECHECK_SECONDS = 20.0
+# #460: while UNIDENTIFIED (NO MATCH FOUND latched), retry this often — short enough
+# that two consecutive wakes land inside the same later track, so it reaches the
+# 2-match confirmation and a failed opener no longer strands the rest of a gapless
+# side. Distinct from the (longer) between-known-tracks safety interval; still far
+# above the ~10s hop, so an all-instrumental side stays bounded (~2 requests/min).
+_ERROR_RETRY_SECONDS = 30.0
 
 
 def _parse_mmss(value) -> Optional[float]:
@@ -880,9 +886,11 @@ class RecognitionLoop:
         self._recognition_active = False
 
     def _back_off_after_error(self, now: float) -> None:
-        """NO MATCH FOUND — back recognition off to the safety interval so an
-        unrecognizable side can't hammer the backend (#454)."""
-        self._reactivate_at = now + self._safety_recheck_seconds
+        """NO MATCH FOUND — back recognition off so an unrecognizable side can't
+        hammer the backend, but only to the SHORT ERROR retry (#460), not the long
+        between-known-tracks safety interval: 240s exceeds a track, so it could never
+        accumulate the two consecutive matches needed to confirm a later track."""
+        self._reactivate_at = now + _ERROR_RETRY_SECONDS
         self._recognition_active = False
 
     def _wants_recognition(self, epoch: int, now: float) -> bool:
