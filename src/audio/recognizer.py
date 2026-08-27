@@ -73,6 +73,32 @@ _RECOGNITION_ERROR_LOG_INTERVAL_SECONDS = 60.0
 # per hop.
 _QUEUE_LAG_LOG_INTERVAL_SECONDS = 60.0
 
+# #454: per-track recognition scheduling. Recognize a few seconds PAST a predicted
+# boundary so we sample INTO the new track (past the old track's tail).
+_BOUNDARY_MARGIN_SECONDS = 3.0
+# Floor on the idle wait, so a match near a track's end (or slightly-off duration
+# data) still waits a beat rather than re-recognizing on the very next hop.
+_MIN_REACTIVATE_SECONDS = 10.0
+# When a reactivation finds the SAME track still playing (prediction ran early, or
+# the turntable is a touch slow), re-idle this long instead of polling every hop.
+_SAME_TRACK_RECHECK_SECONDS = 20.0
+
+
+def _parse_mmss(value) -> Optional[float]:
+    """Parse a Discogs duration / AudD timecode ("M:SS" or "H:MM:SS") to seconds.
+
+    Returns None for empty, non-string, or malformed input so callers fall back to
+    gap-detection / the safety timer rather than trusting a bogus boundary time."""
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if not (2 <= len(parts) <= 3) or not all(p.isascii() and p.isdigit() for p in parts):
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return float(secs)
+
 
 @dataclass
 class RawRecognitionResult:
@@ -82,6 +108,10 @@ class RawRecognitionResult:
     album: str
     isrc: Optional[str] = None
     confidence: Optional[float] = None
+    # Seconds into the track where recognition matched (AudD's ``timecode``); None
+    # when the backend doesn't report one (ShazamIO). #454 uses it with the Discogs
+    # track duration to predict the next track boundary.
+    match_offset: Optional[float] = None
 
 
 class RecognizerBackend(ABC):
@@ -366,6 +396,7 @@ class AuddBackend(RecognizerBackend):
             artist=str(res.get("artist") or ""),
             album=str(res.get("album") or ""),
             isrc=None,
+            match_offset=_parse_mmss(res.get("timecode")),
         )
 
 
@@ -417,6 +448,13 @@ class RecognitionLoop:
         self.backend_name: str = config.backend
         # AudD backend credential (validated required-when-audd in config.py).
         self._audd_api_token: str = config.audd_api_token
+        # #454: per-track recognition gating. Recognition is "active" until a track
+        # confirms, then idles until the predicted next-track boundary (or a needle
+        # drop). Gates the COSTLY backend call only — capture/silence run unchanged.
+        self._recognition_active: bool = True
+        self._reactivate_at: float = 0.0
+        self._safety_recheck_seconds: float = config.max_idle_recheck_seconds
+        self._last_seen_session_epoch: int = 0
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
         # R10-11 (#424): throttled health signal for recognition-queue lag. Single
         # key (the message carries the varying age/drop numbers, formatted at emit)
@@ -583,6 +621,13 @@ class RecognitionLoop:
                          % suppressed) if suppressed else "",
                     )
 
+            # #454: per-track gating — skip the (costly) backend call while idling
+            # between tracks. A fresh needle drop (new session epoch) still
+            # recognizes at once; everything above (dequeue, staleness drain) has
+            # already run, so capture never blocks.
+            if not self._wants_recognition(epoch, time.monotonic()):
+                continue
+
             try:
                 # PCONC-2: bound the recognition call itself. Without this a
                 # degraded shazamio call (its default retry is attempts=20 ×
@@ -743,8 +788,15 @@ class RecognitionLoop:
             # the pending, preserving hit/miss/hit accumulation of the SAME track;
             # a confirmed different current track is a stronger signal than a lone
             # stale competitor and legitimately resets it.
+            was_building = self._pending_count > 0
             self._pending_result = None
             self._pending_count = 0
+            # #454: same track still playing at reactivation (prediction early /
+            # turntable slow) — re-idle a short beat. If a NEW-track candidate was
+            # mid-confirmation, a stray current-track hit shouldn't send us idle
+            # (cold-review LOW) — keep recognizing to confirm the change.
+            if not was_building:
+                self._reidle_same_track(time.monotonic())
             return  # Same track still playing
 
         if self._same_track(result, self._pending_result):
@@ -765,6 +817,9 @@ class RecognitionLoop:
             await self.on_confirmed(result, epoch)
             self._pending_result = None
             self._pending_count = 0
+            # #454: track confirmed — idle recognition until the predicted next
+            # boundary (reads the just-committed state.current_track duration).
+            self._go_idle_until_boundary(result, time.monotonic())
         else:
             # A non-None result that neither matches the current track nor (yet)
             # confirms — unconfirmable churn (a noisy room, two records bleeding
@@ -785,6 +840,70 @@ class RecognitionLoop:
                 )
             self._register_miss()
 
+    def _current_track_duration_seconds(self) -> Optional[float]:
+        """Duration (seconds) of the currently-committed track from its Discogs
+        tracklist row, or None when unknown (no track, unmatched row, a row with no
+        duration string, or any malformed metadata — all fall back to the safety
+        timer)."""
+        try:
+            track = self.state.current_track
+            if track is None:
+                return None
+            idx = track.side_index.global_index
+            if idx is None or not (0 <= idx < len(track.tracklist)):
+                return None
+            return _parse_mmss(track.tracklist[idx].duration)
+        except Exception:
+            return None
+
+    def _go_idle_until_boundary(self, result: "RawRecognitionResult", now: float) -> None:
+        """A track just confirmed — idle recognition until the predicted next-track
+        boundary (Discogs duration minus the AudD match offset), or the safety
+        re-check interval when no duration is available (#454)."""
+        duration = self._current_track_duration_seconds()
+        if duration is not None:
+            remaining = duration - (result.match_offset or 0.0)
+            wait = max(remaining, _MIN_REACTIVATE_SECONDS) + _BOUNDARY_MARGIN_SECONDS
+        else:
+            wait = self._safety_recheck_seconds
+        # #454 (cold-review MEDIUM): never idle longer than the safety interval, so a
+        # garbage Discogs duration ("99:00" -> 99 min) can't freeze the display for a
+        # whole side; the display lag is universally bounded.
+        wait = min(wait, self._safety_recheck_seconds)
+        self._reactivate_at = now + wait
+        self._recognition_active = False
+
+    def _reidle_same_track(self, now: float) -> None:
+        """Reactivation found the same track still playing — re-idle a short beat
+        rather than recognizing every hop until it actually changes (#454)."""
+        self._reactivate_at = now + _SAME_TRACK_RECHECK_SECONDS
+        self._recognition_active = False
+
+    def _back_off_after_error(self, now: float) -> None:
+        """NO MATCH FOUND — back recognition off to the safety interval so an
+        unrecognizable side can't hammer the backend (#454)."""
+        self._reactivate_at = now + self._safety_recheck_seconds
+        self._recognition_active = False
+
+    def _wants_recognition(self, epoch: int, now: float) -> bool:
+        """Whether to run the (costly) backend on the just-dequeued chunk (#454).
+
+        A new session (needle drop → epoch bump) always recognizes immediately —
+        even mid-idle — so a fresh record is identified at once. Otherwise, while
+        idling between tracks, recognize only once the reactivation time arrives.
+        """
+        if epoch != self._last_seen_session_epoch:
+            self._last_seen_session_epoch = epoch
+            self._recognition_active = True
+        # #454 (cold-review HIGH): LISTENING means no track is up yet — always try,
+        # so a needle reposition out of ERROR/IDLE recovers at once (its brief
+        # silence does NOT bump session_epoch), instead of waiting out the idle timer.
+        if self.state.status == PlayerStatus.LISTENING:
+            self._recognition_active = True
+        if not self._recognition_active and now >= self._reactivate_at:
+            self._recognition_active = True
+        return self._recognition_active
+
     def _register_miss(self):
         """Count a failed recognition; surface ERROR after enough of them.
 
@@ -804,5 +923,13 @@ class RecognitionLoop:
                 )
                 self._miss_count = 0
                 self.state.set_status(PlayerStatus.ERROR)
+                # #454: back off after NO MATCH FOUND so an unrecognizable side
+                # can't hammer the backend; a needle move / the safety timer retries.
+                self._back_off_after_error(time.monotonic())
         else:
             self._miss_count = 0
+            # #454 (cold-review MEDIUM): a miss while ERROR is latched must re-back-off,
+            # not fall through to recognizing every hop — each still-unmatched wake
+            # from the safety timer re-idles again (bounded requests, not a flood).
+            if self.state.status == PlayerStatus.ERROR:
+                self._back_off_after_error(time.monotonic())

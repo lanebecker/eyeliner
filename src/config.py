@@ -418,6 +418,9 @@ class RecognitionConfig:
     # ``recognition.audd.api_token`` sub-section (see from_dict). Required only
     # when backend == "audd". A secret — never echoed in a ConfigError.
     audd_api_token: str = ""
+    # #454: upper bound on how long recognition idles between tracks when it has
+    # no Discogs duration to predict the next boundary from (the safety re-check).
+    max_idle_recheck_seconds: float = 240.0
 
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "RecognitionConfig":
@@ -430,6 +433,7 @@ class RecognitionConfig:
         backend = _field(data, "backend", str, "shazamio", section=s, errors=errors)
         confirmation_required = _field(data, "confirmation_required", int, 2, section=s, errors=errors)
         error_after_misses = _field(data, "error_after_misses", int, 6, section=s, errors=errors)
+        max_idle_recheck_seconds = _field(data, "max_idle_recheck_seconds", float, 240.0, section=s, errors=errors)
         # The "audd" backend's token lives in the nested ``recognition.audd``
         # sub-section (schema advertised in config.example.yaml). Read it directly
         # rather than through _field, so the secret VALUE is never echoed into a
@@ -448,6 +452,8 @@ class RecognitionConfig:
                f"  • {s}.confirmation_required: must be >= 1, got {confirmation_required!r}", errors)
         _check(error_after_misses is None or error_after_misses >= 1,
                f"  • {s}.error_after_misses: must be >= 1, got {error_after_misses!r}", errors)
+        _check(max_idle_recheck_seconds is None or max_idle_recheck_seconds > 0,
+               f"  • {s}.max_idle_recheck_seconds: must be > 0, got {max_idle_recheck_seconds!r}", errors)
         # CRIT-2: a type-valid but UNIMPLEMENTED backend (acrcloud/audd) would pass
         # here and then crash RecognitionLoop.__init__ outside main()'s try/except.
         # (A type error already fell back to the valid "shazamio" default, so this
@@ -470,6 +476,7 @@ class RecognitionConfig:
             confirmation_required=confirmation_required,
             error_after_misses=error_after_misses,
             audd_api_token=audd_api_token,
+            max_idle_recheck_seconds=max_idle_recheck_seconds,
         )
 
 

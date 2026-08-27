@@ -756,3 +756,18 @@ def test_audd_placeholder_token_is_rejected():
         AppConfig.from_dict(raw)
     assert "audd.api_token" in str(exc.value)
     assert "placeholder" in str(exc.value)
+
+
+def test_max_idle_recheck_seconds_default_and_override():
+    cfg = AppConfig.from_dict(_valid_raw())
+    assert cfg.recognition.max_idle_recheck_seconds == 240.0
+    raw = _valid_raw()
+    raw["recognition"]["max_idle_recheck_seconds"] = 90
+    assert AppConfig.from_dict(raw).recognition.max_idle_recheck_seconds == 90.0
+
+def test_max_idle_recheck_seconds_must_be_positive():
+    raw = _valid_raw()
+    raw["recognition"]["max_idle_recheck_seconds"] = 0
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert "max_idle_recheck_seconds" in str(exc.value)
