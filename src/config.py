@@ -17,9 +17,10 @@ attributes — no dict indexing, no ``.get()`` defaults scattered around.
 Validation is **aggregating**: a bad config reports *every* problem at once in
 one :class:`ConfigError` (missing required keys, wrong types, non-mapping
 sections), rather than failing on the first ``KeyError`` and hiding the rest.
-Unknown keys are tolerated (e.g. the ``recognition.acrcloud`` / ``audd``
-sub-sections in ``config.example.yaml`` that no implemented backend reads yet),
-so the schema can stay ahead of the code.
+Unknown keys are tolerated (e.g. the reserved ``recognition.acrcloud``
+sub-section in ``config.example.yaml`` that no implemented backend reads yet;
+``recognition.audd.api_token`` IS read now), so the schema can stay ahead of the
+code.
 
 Field defaults here are the authoritative copies of what used to be inline
 ``.get(key, default)`` calls in each constructor; the per-key mapping is
@@ -388,15 +389,22 @@ class LastFmConfig:
 
 
 # CRIT-2: the recognition backends this build actually IMPLEMENTS — the allowed
-# values for ``recognition.backend``. config.example.yaml advertises "acrcloud"
-# and "audd" as future options, but only "shazamio" is built; selecting an
+# values for ``recognition.backend``. "shazamio" and "audd" are built;
+# config.example.yaml also advertises "acrcloud" as a future option; selecting an
 # unimplemented one used to pass config's type check and then raise ValueError
 # from RecognitionLoop.__init__ (constructed outside main()'s try/except) into a
 # systemd crash loop. This is the SINGLE SOURCE OF TRUTH: RecognitionConfig
 # validates against it here, and recognizer._init_backend constructs against it,
 # so the two can never drift. Add a backend by adding its name here AND a
 # constructor branch in _init_backend.
-IMPLEMENTED_BACKENDS = frozenset({"shazamio"})
+IMPLEMENTED_BACKENDS = frozenset({"shazamio", "audd"})
+
+# R7-17 (extended for AudD): the literal token placeholder shipped in
+# config.example.yaml. Like the Discogs placeholders, an unedited value passes the
+# non-empty gate and then fails every AudD call — reject it at config time so the
+# startup ConfigError names it (value-free) instead of a silent runtime miss.
+# Only checked when backend == "audd".
+_AUDD_TOKEN_PLACEHOLDER = "YOUR_AUDD_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -406,6 +414,10 @@ class RecognitionConfig:
     backend: str = "shazamio"
     confirmation_required: int = 2
     error_after_misses: int = 6
+    # Credential for the "audd" backend, read from the nested
+    # ``recognition.audd.api_token`` sub-section (see from_dict). Required only
+    # when backend == "audd". A secret — never echoed in a ConfigError.
+    audd_api_token: str = ""
 
     @classmethod
     def from_dict(cls, data: dict, errors: list) -> "RecognitionConfig":
@@ -418,6 +430,15 @@ class RecognitionConfig:
         backend = _field(data, "backend", str, "shazamio", section=s, errors=errors)
         confirmation_required = _field(data, "confirmation_required", int, 2, section=s, errors=errors)
         error_after_misses = _field(data, "error_after_misses", int, 6, section=s, errors=errors)
+        # The "audd" backend's token lives in the nested ``recognition.audd``
+        # sub-section (schema advertised in config.example.yaml). Read it directly
+        # rather than through _field, so the secret VALUE is never echoed into a
+        # ConfigError (which main.py logs to the journal). A missing sub-section,
+        # missing key, or non-string value all coerce to "" — the single
+        # value-free required-when-audd gate below then reports it.
+        _audd = data.get("audd")
+        _audd_token = _audd.get("api_token") if isinstance(_audd, dict) else None
+        audd_api_token = _audd_token if isinstance(_audd_token, str) else ""
 
         # CRIT-1: a zero poll interval busy-loops the recognition leg; fewer than
         # one confirmation or one miss-to-error is nonsensical thresholding.
@@ -434,12 +455,21 @@ class RecognitionConfig:
         _check(backend is None or backend in IMPLEMENTED_BACKENDS,
                f"  • {s}.backend: must be one of {sorted(IMPLEMENTED_BACKENDS)}, "
                f"got {backend!r}", errors)
+        # The audd backend cannot work without a token; require it here rather than
+        # fail opaquely at the first recognize(). Value-free message (secret).
+        _check(backend != "audd" or bool(audd_api_token.strip()),
+               f"  • {s}.audd.api_token: required when {s}.backend is 'audd' "
+               f"(get one at https://audd.io)", errors)
+        _check(backend != "audd" or audd_api_token != _AUDD_TOKEN_PLACEHOLDER,
+               f"  • {s}.audd.api_token: still the config.example.yaml placeholder "
+               f"— get one at https://audd.io", errors)
 
         return cls(
             poll_interval_seconds=poll_interval_seconds,
             backend=backend,
             confirmation_required=confirmation_required,
             error_after_misses=error_after_misses,
+            audd_api_token=audd_api_token,
         )
 
 

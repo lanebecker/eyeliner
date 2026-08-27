@@ -699,3 +699,60 @@ def test_r6_24_reserved_recognition_subsections_do_not_warn(caplog):
         AppConfig.from_dict(raw)
     assert not any("acrcloud" in m.getMessage() or "audd" in m.getMessage()
                    for m in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# AudD backend (#453) — backend selection + nested token, secret never leaked
+# ---------------------------------------------------------------------------
+
+def test_audd_is_an_implemented_backend():
+    from src.config import IMPLEMENTED_BACKENDS
+    assert "audd" in IMPLEMENTED_BACKENDS
+
+
+def test_audd_backend_with_token_parses():
+    raw = _valid_raw()
+    raw["recognition"]["backend"] = "audd"
+    raw["recognition"]["audd"] = {"api_token": "tok-123"}
+    cfg = AppConfig.from_dict(raw)
+    assert cfg.recognition.backend == "audd"
+    assert cfg.recognition.audd_api_token == "tok-123"
+
+
+def test_audd_backend_without_token_is_rejected():
+    raw = _valid_raw()
+    raw["recognition"]["backend"] = "audd"  # no recognition.audd.api_token
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert "audd.api_token" in str(exc.value)
+
+
+def test_audd_token_value_is_never_leaked_in_config_error():
+    raw = _valid_raw()
+    raw["recognition"]["backend"] = "audd"
+    raw["recognition"]["audd"] = {"api_token": "SECRET-TOKEN-XYZ"}
+    raw["recognition"]["poll_interval_seconds"] = 0  # force a separate error
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert "SECRET-TOKEN-XYZ" not in str(exc.value)
+
+
+def test_shazamio_default_ignores_a_present_audd_token():
+    raw = _valid_raw()
+    raw["recognition"]["audd"] = {"api_token": "unused"}
+    cfg = AppConfig.from_dict(raw)  # backend defaults to shazamio; must not raise
+    assert cfg.recognition.backend == "shazamio"
+    assert cfg.recognition.audd_api_token == "unused"
+
+
+def test_audd_placeholder_token_is_rejected():
+    """LOW-2: the config.example.yaml placeholder is non-empty, so it passes the
+    required-when-audd gate but then fails every AudD call. Reject it at config
+    time (value-free), mirroring the Discogs placeholder rejection (R7-17)."""
+    raw = _valid_raw()
+    raw["recognition"]["backend"] = "audd"
+    raw["recognition"]["audd"] = {"api_token": "YOUR_AUDD_TOKEN"}
+    with pytest.raises(ConfigError) as exc:
+        AppConfig.from_dict(raw)
+    assert "audd.api_token" in str(exc.value)
+    assert "placeholder" in str(exc.value)

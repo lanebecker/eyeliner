@@ -12,7 +12,7 @@ When the last track of an album finishes, it automatically increments the Play C
 
 ## Features
 
-- 🎵 Real-time audio fingerprinting via ShazamIO (no manual input needed)
+- 🎵 Real-time audio fingerprinting — **ShazamIO** (free, default) or **AudD** (recommended, more reliable); no manual input needed
 - 💿 Discogs collection-first metadata — pulls your specific pressing's details
 - 🖼️ "Museum Card" display layout: large cover art, hero track title, artist, italic album name, genre/style chip badges, side indicator, prev/next track footer
 - 🎨 Dynamic color theming — palette extracted from each album's cover art; background, accent, and text colors shift per record with a smooth 1-second transition
@@ -21,7 +21,7 @@ When the last track of an album finishes, it automatically increments the Play C
 - 🎧 Last.fm scrobbling (opt-in) — when enabled, every identified track is posted to your listening history automatically
 - ❤️ Optional Last.fm "Loved" mark when a full album side completes (configurable, off by default)
 - 🔄 Graceful fallback: Discogs collection → Discogs database → MusicBrainz
-- 🔧 Swappable recognition backend (ShazamIO today; ACRCloud/AudD planned)
+- 🔧 Swappable recognition backend — ShazamIO and AudD implemented, ACRCloud planned (see [docs/recognition-backends.md](docs/recognition-backends.md))
 
 ## Hardware
 
@@ -55,12 +55,14 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 - `audio.device_name` — run `python -c "import sounddevice; print(sounddevice.query_devices())"` to find your USB interface name
 - `discogs.play_count_field_name` — the exact name of your Play Count custom field (default: `"Play Count"`)
 - `discogs.last_played_field_name` — optional; the exact name of a Last Played custom field in your Discogs collection. If set, today's date is written in `YYYY-MM-DD` format on each album completion.
+- `recognition.backend` — `"shazamio"` (free, default) or `"audd"` (recommended for reliability; set `recognition.audd.api_token`, get a token at https://audd.io). See [docs/recognition-backends.md](docs/recognition-backends.md).
 - `lastfm.scrobble_enabled` — set to `true` to enable Last.fm scrobbling; also fill in `api_key`, `api_secret`, and `session_key`. Run `python get_lastfm_session_key.py` to generate your session key.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md) — full system design, component reference, data flows
 - [Roadmap](docs/roadmap.md) — planned features and versioning
+- [Recognition backends](docs/recognition-backends.md) — choosing ShazamIO vs AudD, setup, and caveats
 - [Changelog](CHANGELOG.md) — what changed in each version
 - [Testing guide](docs/testing-guide.md) — running the unit and integration test suites
 - [Pi setup guide](docs/pi-setup-guide.md) — hardware bring-up from bare Pi to running app
