@@ -9,6 +9,24 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ## [Unreleased]
 
+### Recognition backends (v1.6.0)
+
+- **Recognition is now a user-selectable backend (#453).** `recognition.backend`
+  selects `shazamio` (free, unofficial — the zero-config default, with documented
+  caveats) or **`audd`** (a commercial API; recommended for reliability after
+  ShazamIO proved unreliable in the field, returning no-match on audio AudD and the
+  official Shazam app matched). The AudD token lives in `recognition.audd.api_token`
+  (secret, gitignored) and is validated fail-fast at startup. See
+  `docs/recognition-backends.md`.
+- **Per-track recognition polling (#454).** Recognition now fires roughly **once per
+  track** instead of on every ~10 s hop: after a track confirms it idles until the
+  predicted next-track boundary — the Discogs track **duration** minus the AudD match
+  **offset** — reactivating on a needle drop or a configurable
+  `recognition.max_idle_recheck_seconds` safety re-check when no duration is
+  available. This cuts backend requests ~15–20×, keeping a paid backend (AudD) inside
+  a small monthly quota. Entirely internal — no on-screen progress/elapsed (the
+  display stays static).
+
 ## [1.5.36] — 2026-08-26
 
 > The `v1.5.35` tag and its GitHub Release were removed during a one-time

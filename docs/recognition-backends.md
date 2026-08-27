@@ -40,9 +40,17 @@ The token is a secret — keep `config.yaml` mode `600` and never commit it (it 
 gitignored). Startup **fails fast** with a clear error if `backend: audd` is set
 without a token.
 
-**Cost note:** AudD bills per request. Today the app recognizes on every capture hop
-(~10 s); on a paid plan you will want per-track polling (roadmap #454) to keep usage
-low — until that lands, expect higher request counts on busy listening days.
+**Cost note:** AudD bills per request. As of v1.6.0, recognition runs **~once per
+track** — it identifies a track, then idles until the predicted next-track boundary
+(Discogs track duration minus the AudD match offset), so a normal listening month
+stays well inside a small quota. A track with no Discogs duration falls back to a
+re-check every `recognition.max_idle_recheck_seconds` (default 240 s), which also
+caps the idle between tracks so a bad duration never freezes the display.
+
+**ShazamIO note:** ShazamIO reports no match offset, so boundary prediction is less
+precise on it (it idles a full duration and may reactivate a little late); AudD
+reports the offset and lands the boundary accurately. Either way the re-check cap
+bounds the drift.
 
 ## Adding another backend
 

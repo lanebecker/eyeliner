@@ -71,6 +71,10 @@ recognition:
   # Consecutive failed recognitions (while awaiting the first identification)
   # before the display shows "NO MATCH FOUND". Reposition the needle to retry.
   error_after_misses: 6
+  # #454: when a track has no Discogs duration to predict the next boundary from,
+  # re-check for a track change at most this often (seconds). Lower = snappier on
+  # gapless / unknown-duration tracks, but more recognition requests.
+  max_idle_recheck_seconds: 240
 
   # Only needed if backend is "acrcloud"
   acrcloud:

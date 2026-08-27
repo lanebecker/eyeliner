@@ -87,3 +87,18 @@ def test_init_backend_selects_audd_with_token():
     loop = RecognitionLoop(cfg, MagicMock(), MagicMock())
     assert isinstance(loop.backend, AuddBackend)
     assert loop.backend._api_token == "tok"
+
+
+# --- #454 step 1: surface AudD match offset (timecode) ---
+
+def test_parse_populates_match_offset_from_timecode():
+    r = AuddBackend._parse_audd({"status": "success", "result": {"title": "T", "timecode": "01:33"}})
+    assert r.match_offset == 93.0
+
+def test_parse_missing_timecode_offset_is_none():
+    assert AuddBackend._parse_audd({"status": "success", "result": {"title": "T"}}).match_offset is None
+
+def test_parse_malformed_timecode_offset_is_none():
+    for bad in ("xx", "", "1", "1:2:3:4", "a:b"):
+        r = AuddBackend._parse_audd({"status": "success", "result": {"title": "T", "timecode": bad}})
+        assert r.match_offset is None, bad
