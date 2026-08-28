@@ -89,6 +89,18 @@ _SAME_TRACK_RECHECK_SECONDS = 20.0
 # above the ~10s hop, so an all-instrumental side stays bounded (~2 requests/min).
 _ERROR_RETRY_SECONDS = 30.0
 
+# #464: while a candidate is mid-confirmation we poll at the fast chunk rate to catch
+# its confirming second hit before the track ends. Cap the burst: after this many
+# non-confirming attempts (misses OR unconfirmable churn) void the candidate and
+# resume the slow back-off, so a stray/one-off misrecognition can't fast-poll the
+# backend forever. The FIRST hit consumes one attempt (it goes through the churn
+# branch), so a cap of 7 leaves ~6 chunk hops (~60s at a 10s hop) for the confirming
+# second hit — comfortably longer than the gap between two real hits of a playing
+# track — while bounding a stray's burst to ~7 fast polls before the 30s back-off
+# resumes. (A sustained fresh-misrecognition-every-window side is still bounded, at
+# ~2.25x the idle rate — acceptably rare and far under the AudD quota.)
+_CANDIDATE_CONFIRM_ATTEMPTS = 7
+
 
 def _parse_mmss(value) -> Optional[float]:
     """Parse a Discogs duration / AudD timecode ("M:SS" or "H:MM:SS") to seconds.
@@ -474,6 +486,9 @@ class RecognitionLoop:
         # session_epoch via clear()), so a leftover count can't let a single
         # spurious hit confirm a stale track into the NEXT record's session.
         self._pending_epoch: int = 0
+        # #464: non-confirming recognition attempts spent on the current candidate
+        # burst; bounds the fast-poll so a stray pending can't hammer the backend.
+        self._confirm_attempts: int = 0
         # PCONC-3: the epoch of the last chunk _handle_result saw, so a session
         # boundary (needle lift → session_epoch bump) can reset the per-session
         # health counters below. Epochs only increase and chunks are handled
@@ -763,6 +778,7 @@ class RecognitionLoop:
         if self._pending_result is not None and epoch != self._pending_epoch:
             self._pending_result = None
             self._pending_count = 0
+            self._confirm_attempts = 0
 
         if result is None:
             # REC-1: a None (unrecognized-audio) result carries NO recognition
@@ -779,6 +795,10 @@ class RecognitionLoop:
             # confirms first, so ERROR fires only when the side is genuinely
             # unrecognizable (and a later reappearance still recovers).
             self._register_miss()
+            if self._pending_count > 0:
+                self._confirm_attempts += 1
+                if self._confirm_attempts >= _CANDIDATE_CONFIRM_ATTEMPTS:
+                    self._void_stale_candidate(time.monotonic())
             return
 
         if self._same_track(result, self.state.current_raw):
@@ -797,6 +817,7 @@ class RecognitionLoop:
             was_building = self._pending_count > 0
             self._pending_result = None
             self._pending_count = 0
+            self._confirm_attempts = 0
             # #454: same track still playing at reactivation (prediction early /
             # turntable slow) — re-idle a short beat. If a NEW-track candidate was
             # mid-confirmation, a stray current-track hit shouldn't send us idle
@@ -823,6 +844,7 @@ class RecognitionLoop:
             await self.on_confirmed(result, epoch)
             self._pending_result = None
             self._pending_count = 0
+            self._confirm_attempts = 0
             # #454: track confirmed — idle recognition until the predicted next
             # boundary (reads the just-committed state.current_track duration).
             self._go_idle_until_boundary(result, time.monotonic())
@@ -845,6 +867,9 @@ class RecognitionLoop:
                     self._churn_count, result.artist, result.title,
                 )
             self._register_miss()
+            self._confirm_attempts += 1
+            if self._confirm_attempts >= _CANDIDATE_CONFIRM_ATTEMPTS:
+                self._void_stale_candidate(time.monotonic())
 
     def _current_track_duration_seconds(self) -> Optional[float]:
         """Duration (seconds) of the currently-committed track from its Discogs
@@ -893,6 +918,16 @@ class RecognitionLoop:
         self._reactivate_at = now + _ERROR_RETRY_SECONDS
         self._recognition_active = False
 
+    def _void_stale_candidate(self, now: float) -> None:
+        """#464: a candidate never got its confirming second hit within the fast-poll
+        burst (the track ended, or it was a stray/one-off misrecognition) — discard it
+        and resume the slow back-off, so a stranded pending can't fast-poll forever."""
+        self._pending_result = None
+        self._pending_count = 0
+        self._confirm_attempts = 0
+        self._reactivate_at = now + _ERROR_RETRY_SECONDS
+        self._recognition_active = False
+
     def _wants_recognition(self, epoch: int, now: float) -> bool:
         """Whether to run the (costly) backend on the just-dequeued chunk (#454).
 
@@ -907,6 +942,12 @@ class RecognitionLoop:
         # so a needle reposition out of ERROR/IDLE recovers at once (its brief
         # silence does NOT bump session_epoch), instead of waiting out the idle timer.
         if self.state.status == PlayerStatus.LISTENING:
+            self._recognition_active = True
+        # #464: a candidate is mid-confirmation — poll at the fast chunk rate,
+        # ignoring the ERROR/idle back-off timer, so its confirming second hit is
+        # caught while the same track is still playing. Bounded by _confirm_attempts
+        # in _handle_result (a stale candidate is voided), so this can't hammer.
+        if self._pending_count > 0:
             self._recognition_active = True
         if not self._recognition_active and now >= self._reactivate_at:
             self._recognition_active = True

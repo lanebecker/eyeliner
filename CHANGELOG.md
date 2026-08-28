@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A side that starts with an unidentifiable track no longer stays stuck on "NO
+  MATCH FOUND" (#464).** After an unfingerprintable opener latched the ERROR state,
+  recognition polled only every ~40s, but committing a track needs two consecutive
+  same-track matches — and AudD identifies a given track only intermittently, so a
+  later, recognizable track could never land twice before it ended. Once a candidate
+  is building, recognition now polls at the fast chunk rate to catch its confirming
+  second hit while the track is still playing, bounded so a stray misrecognition
+  can't keep polling the backend (a genuinely unrecognizable side stays at ~2
+  requests/min). Two-match confirmation is retained. A v1.6.0 regression, surfaced
+  by v1.6.1 hardware testing.
+
 ## [1.6.1] — 2026-08-27
 
 ### Fixed
