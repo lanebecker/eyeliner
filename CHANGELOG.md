@@ -11,6 +11,16 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ### Fixed
 
+- **The same album no longer splits the listening session when it resolves to two
+  different Discogs releases mid-side (#468).** AudD returns slightly varying album
+  strings per track, so the resolver's album-cache key varied and a track could
+  re-resolve to a different release (a collection↔database tier flip) — which the
+  session-split detector saw as a new record and split on, distorting play-count and
+  scrobble grouping. The detector now recognises two releases that share the album's
+  **master** as the same album (in both directions, independent of the resolve_key
+  the #184 guard relied on) and continues the session. A genuinely different album
+  (different master, or no master to vouch sameness) still splits.
+
 - **Tracks no longer get skipped when the resolved release has no Discogs durations
   (#467).** Some releases (a user's exact pressing included) carry no per-track
   durations, so the per-track polling scheduler fell back to the 240s safety idle,

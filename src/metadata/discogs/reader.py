@@ -1094,6 +1094,7 @@ class DiscogsReader:
             "catalog_number": catno,
             "release_id": release.id,
             "instance_id": instance_id,
+            "master_id": self._master_id_of(release),   # #468
             "cover_art_url": cover_url,
             "tracklist": tracklist,
             "genres": genres,
