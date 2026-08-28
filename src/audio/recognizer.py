@@ -8,6 +8,7 @@ backend (e.g. ACRCloud) at startup until it is built.
 
 import asyncio
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -100,6 +101,17 @@ _ERROR_RETRY_SECONDS = 30.0
 # resumes. (A sustained fresh-misrecognition-every-window side is still bounded, at
 # ~2.25x the idle rate — acceptably rare and far under the AudD quota.)
 _CANDIDATE_CONFIRM_ATTEMPTS = 7
+
+# #472: opt-in per-poll recognition diagnostics — each backend result (with its
+# match offset + the confirmation state) and each predicted next-track boundary.
+# For debugging track skips / mis-timing on real hardware WITHOUT hand-patching the
+# source. Off by default: one bool check per poll, zero output. Enable by setting
+# EYELINER_DEBUG_RECOGNITION to a truthy value (1/true/yes/on) in the environment
+# (e.g. the systemd unit's Environment=). Emitted at INFO so it shows under the
+# default log level. See docs/recognition-backends.md ("Debugging recognition").
+_DEBUG_RECOGNITION = os.environ.get(
+    "EYELINER_DEBUG_RECOGNITION", ""
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_mmss(value) -> Optional[float]:
@@ -747,6 +759,16 @@ class RecognitionLoop:
         ``audio_epoch`` and fails safe, so the worst case is the guard discarding
         live commits (loud missed identifications), never a silent bad write.
         """
+        if _DEBUG_RECOGNITION:  # #472
+            log.info(
+                "recognition-debug poll: result=%s off=%s status=%s cur=%s pending=%s x%d",
+                (f"{result.artist} — {result.title}" if result else None),
+                getattr(result, "match_offset", None),
+                self.state.status.name,
+                (self.state.current_raw.title if self.state.current_raw else None),
+                (self._pending_result.title if self._pending_result else None),
+                self._pending_count,
+            )
         # PCONC-3: on a session boundary (the epoch changed since the last chunk),
         # reset the per-session HEALTH counters. `_miss_count` gates the LISTENING
         # "NO MATCH FOUND" screen and `_churn_count` the churn breadcrumb; both are
@@ -901,6 +923,11 @@ class RecognitionLoop:
         # garbage Discogs duration ("99:00" -> 99 min) can't freeze the display for a
         # whole side; the display lag is universally bounded.
         wait = min(wait, self._safety_recheck_seconds)
+        if _DEBUG_RECOGNITION:  # #472
+            log.info(
+                "recognition-debug idle: dur=%s off=%s wait=%.1fs (until next-track boundary)",
+                duration, (result.match_offset or 0.0), wait,
+            )
         self._reactivate_at = now + wait
         self._recognition_active = False
 

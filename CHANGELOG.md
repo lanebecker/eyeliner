@@ -7,6 +7,16 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`EYELINER_DEBUG_RECOGNITION` opt-in recognition diagnostics (#472).** Set it to a
+  truthy value to log each backend poll (result, match offset, status, pending
+  candidate) and each predicted next-track boundary — for debugging track skips /
+  mis-timing on real hardware without hand-patching the source. Off by default (one
+  bool check per poll, no output). See docs/recognition-backends.md.
+
 ## [1.6.3] — 2026-08-28
 
 ### Fixed
