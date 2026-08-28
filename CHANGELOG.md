@@ -7,7 +7,7 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
-## [Unreleased]
+## [1.6.2] — 2026-08-28
 
 ### Fixed
 
