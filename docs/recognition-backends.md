@@ -59,3 +59,38 @@ planned drop-in). A new backend needs a `RecognizerBackend` subclass, its name a
 `IMPLEMENTED_BACKENDS` in `src/config.py`, and a branch in
 `RecognitionLoop._init_backend` — config validation and construction both check the same
 set, so they can never drift.
+
+## Debugging recognition (track skips / mis-timing)
+
+Set `EYELINER_DEBUG_RECOGNITION=1` to log, at INFO, two diagnostics per side: each
+backend poll (`recognition-debug poll: result=… off=… status=… cur=… pending=… xN`)
+and each predicted next-track boundary (`recognition-debug idle: dur=… off=… wait=…`).
+Off by default — normal runs emit nothing. It's the built-in replacement for
+hand-patching debug lines; use it to see whether a skipped track was a boundary
+overshoot (the `idle` wait landed past the track) or the backend simply not
+returning that track (`poll result=None` throughout it).
+
+**Manual run** (foreground, headless — audio + recognition still work over SSH):
+
+```bash
+systemctl --user stop eyeliner.service
+cd ~/eyeliner && SDL_VIDEODRIVER=dummy EYELINER_DEBUG_RECOGNITION=1 \
+  venv/bin/python main.py 2>&1 | tee ~/eyeliner-debug.log
+# ...play the side, Ctrl+C...
+systemctl --user restart eyeliner.service
+grep -E 'recognition-debug|Track confirmed|churning|NO MATCH' ~/eyeliner-debug.log
+```
+
+**Autostart service** (to capture without a manual run): add to the user unit
+`~/.config/systemd/user/eyeliner.service`, under `[Service]`:
+
+```ini
+Environment=EYELINER_DEBUG_RECOGNITION=1
+StandardOutput=append:%h/eyeliner-debug.log
+StandardError=append:%h/eyeliner-debug.log
+```
+
+then `systemctl --user daemon-reload && systemctl --user restart eyeliner.service`.
+The explicit logfile is the reliable path because `journalctl --user` can come back
+empty when the user journal isn't persisted (default on some Pi OS images). Remove
+those three lines (and `daemon-reload` + restart) to turn diagnostics back off.
