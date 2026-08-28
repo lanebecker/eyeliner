@@ -378,6 +378,10 @@ class TrackMetadata:
     catalog_number: Optional[str] = None
     discogs_release_id: Optional[int] = None
     discogs_instance_id: Optional[int] = None  # Needed for collection field updates
+    # #468: the album's Discogs MASTER id (shared across every pressing). Lets the
+    # split detector see that two different release_ids are the SAME album (a
+    # collection/database tier flip) and suppress the spurious 'album change' split.
+    discogs_master_id: Optional[int] = None
     cover_art_url: Optional[str] = None
     tracklist: list["TracklistEntry"] = field(default_factory=list)
     genres: list[str] = field(default_factory=list)
@@ -484,6 +488,10 @@ class PlaySession:
     # and suppress the spurious split.
     last_release_source: Optional[MetadataSource] = None
     last_release_resolve_key: Optional[tuple] = None
+    # #468: the master id recorded beside last_release_id, so a flip to a DIFFERENT
+    # release_id that shares this master is recognised as the same album and does
+    # NOT split the session (robust to the resolve_key variance #184 relies on).
+    last_master_id: Optional[int] = None
     # Set True once this session's Play Count has actually been credited
     # (the write LANDED), so a re-entrant end (the B-2 race, or a split misfire
     # that finalizes the same session twice) cannot double-increment the same
@@ -757,6 +765,7 @@ class PlaySession:
             self.last_release_id = track.discogs_release_id
             self.last_release_source = track.source          # #184
             self.last_release_resolve_key = track.resolve_key
+            self.last_master_id = track.discogs_master_id    # #468
         # Latch the release/instance IDs from the first collection-sourced track.
         # We require BOTH release_id and instance_id to be set — a release_id alone
         # (which is what DISCOGS_DATABASE returns) is not enough to call the

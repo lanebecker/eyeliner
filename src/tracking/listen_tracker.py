@@ -1366,6 +1366,20 @@ class ListenTracker:
                 # swap changes the key, and collection→database (unreachable —
                 # collection results are cached) stays a conservative split.
                 if (
+                    # #468: a DIFFERENT release_id that shares the album's MASTER is
+                    # just another pressing (a collection/database tier flip from the
+                    # AudD album-string variance that breaks the #184 resolve_key
+                    # match, in EITHER direction) — the same album, not a swap.
+                    track.discogs_master_id is not None
+                    and track.discogs_master_id == self._session.last_master_id
+                ):
+                    log.info(
+                        f"Same album master {track.discogs_master_id} — release "
+                        f"{self._session.last_release_id} → {track.discogs_release_id} "
+                        f"is a different pressing of the same album (#468), not an "
+                        f"album change; continuing the session."
+                    )
+                elif (
                     self._session.last_release_source is MetadataSource.DISCOGS_DATABASE
                     and track.source is MetadataSource.DISCOGS_COLLECTION
                     and track.resolve_key is not None

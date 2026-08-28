@@ -567,6 +567,7 @@ class MetadataResolver:
             catalog_number=discogs_result.get("catalog_number"),
             discogs_release_id=discogs_result.get("release_id"),
             discogs_instance_id=discogs_result.get("instance_id"),
+            discogs_master_id=discogs_result.get("master_id"),   # #468
             cover_art_url=discogs_result.get("cover_art_url"),
             # Shallow-copy the cached tracklist so each track of an album gets
             # its own list object — a defensive .sort()/append on one track's
