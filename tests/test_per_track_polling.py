@@ -223,3 +223,108 @@ async def test_later_track_confirms_across_error_retries():
     with patch.object(rec.time, "monotonic", return_value=131.0):
         await loop._handle_result(peddler)
     assert loop.on_confirmed.await_count == 1
+
+
+# --- #464: fast-poll to confirm a candidate in ERROR, bounded so a stray can't hammer ---
+
+@pytest.mark.asyncio
+async def test_wants_recognition_fast_polls_while_candidate_building():
+    """#464: a pending candidate forces recognition active, ignoring the ERROR
+    back-off timer, so the confirming second hit is caught while the track plays."""
+    loop = _loop()
+    loop.state.status = PlayerStatus.ERROR
+    loop._recognition_active = False
+    loop._reactivate_at = 1e12          # far future — the timer alone would say "wait"
+    loop._last_seen_session_epoch = 0
+    loop._pending_result = RawRecognitionResult("Peddler", "Lunar Vacation", "X")
+    loop._pending_count = 1
+    assert loop._wants_recognition(epoch=0, now=0.0) is True
+
+def test_all_none_side_never_fast_polls():
+    """A genuinely unrecognizable side never builds a candidate, so it never
+    fast-polls — the slow ERROR back-off (cost bound, ~2 req/min) is preserved."""
+    loop = _loop()
+    loop.state.status = PlayerStatus.ERROR
+    loop._recognition_active = False
+    loop._reactivate_at = 1e12
+    loop._last_seen_session_epoch = 0
+    assert loop._pending_count == 0
+    assert loop._wants_recognition(epoch=0, now=0.0) is False
+
+@pytest.mark.asyncio
+async def test_intermittent_track_confirms_via_fast_poll_in_error():
+    """#464 core: after ERROR latches on an unfingerprintable opener, a later track
+    AudD identifies (with a miss between the two hits) reaches the two-match
+    confirmation via fast-polling — no wall-clock wait needed."""
+    loop = _loop(confirmation_required=2)
+    loop.state.status = PlayerStatus.ERROR
+    loop.state.current_raw = None
+    loop._last_seen_session_epoch = 0
+    peddler = RawRecognitionResult("Peddler", "Lunar Vacation", "X")
+    await loop._handle_result(peddler)
+    assert loop._pending_count == 1 and loop.on_confirmed.await_count == 0
+    assert loop._wants_recognition(epoch=0, now=0.0) is True     # fast-poll armed
+    await loop._handle_result(None)                              # a miss between hits
+    assert loop._pending_count == 1                              # REC-1: miss keeps pending
+    await loop._handle_result(peddler)
+    assert loop.on_confirmed.await_count == 1                    # confirmed via fast-poll
+
+@pytest.mark.asyncio
+async def test_stray_candidate_voided_after_cap_then_slow_backoff():
+    """A stray hit that never gets a confirming second hit is voided after the attempt
+    cap, and recognition drops back to the slow back-off — a stranded pending cannot
+    fast-poll the backend forever (the cost guard)."""
+    from src.audio.recognizer import _CANDIDATE_CONFIRM_ATTEMPTS
+    loop = _loop(confirmation_required=2)
+    loop.state.status = PlayerStatus.ERROR
+    loop.state.current_raw = None
+    stray = RawRecognitionResult("I'll Stick With The Old Stuff", "Claybank", "Y")
+    await loop._handle_result(stray)
+    for _ in range(_CANDIDATE_CONFIRM_ATTEMPTS):
+        await loop._handle_result(None)
+    assert loop._pending_count == 0
+    assert loop.on_confirmed.await_count == 0
+    loop._recognition_active = False
+    assert loop._wants_recognition(epoch=0, now=0.0) is False
+
+@pytest.mark.asyncio
+async def test_flip_flopping_candidates_are_voided():
+    """One-off misrecognitions in a row never confirm and never reset the burst
+    counter, so they are voided rather than fast-polled indefinitely."""
+    loop = _loop(confirmation_required=2)
+    loop.state.status = PlayerStatus.ERROR
+    loop.state.current_raw = None
+    voided = False
+    for t in ["A","B","C","D","E","F","G","H"]:
+        await loop._handle_result(RawRecognitionResult(t, t + "-artist", "id"))
+        if loop._pending_count == 0:
+            voided = True
+            break
+    assert voided and loop.on_confirmed.await_count == 0
+
+@pytest.mark.asyncio
+async def test_confirm_tolerance_boundary_tracks_the_cap():
+    """#464 (cold-review #3): document the confirm-tolerance edge and tie it to the
+    cap. A real track whose two hits are within the burst budget confirms; one hit
+    beyond it is voided before the second hit lands."""
+    from src.audio.recognizer import _CANDIDATE_CONFIRM_ATTEMPTS as CAP
+    A = RawRecognitionResult("A", "artist", "id")
+    # within tolerance: (CAP-2) misses between the two hits still confirms
+    loop = _loop(confirmation_required=2)
+    loop.state.status = PlayerStatus.ERROR
+    loop.state.current_raw = None
+    await loop._handle_result(A)                        # attempt 1 (first hit)
+    for _ in range(CAP - 2):                            # misses keep attempts < CAP
+        await loop._handle_result(None)
+    await loop._handle_result(A)                        # confirming second hit
+    assert loop.on_confirmed.await_count == 1
+    # just beyond: (CAP-1) misses void the candidate before the second hit
+    loop2 = _loop(confirmation_required=2)
+    loop2.state.status = PlayerStatus.ERROR
+    loop2.state.current_raw = None
+    await loop2._handle_result(A)                       # attempt 1
+    for _ in range(CAP - 1):                            # attempts reaches CAP -> void
+        await loop2._handle_result(None)
+    assert loop2._pending_count == 0
+    await loop2._handle_result(A)                       # a lone hit -> pending 1, unconfirmed
+    assert loop2.on_confirmed.await_count == 0
