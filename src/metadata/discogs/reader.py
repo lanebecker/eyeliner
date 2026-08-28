@@ -650,6 +650,92 @@ class DiscogsReader:
             log.debug(f"Master year lookup failed for master {master_id}: {e}")
         return None
 
+    @staticmethod
+    def _master_id_of(release) -> Optional[int]:
+        """The release's master id, or None when it has no master / the attribute
+        access raises. Defensive like get_original_year: master data is best-effort
+        enrichment, never credit-critical."""
+        try:
+            master = release.master
+            return master.id if master else None
+        except Exception:
+            return None
+
+    def get_master_tracklist(self, release) -> list:
+        """The album MASTER's playable tracklist rows (position + duration), or []
+        when there is no master or the fetch fails. One GET per album, routed
+        through the rate-limited transport; only called when a release row is
+        missing its duration (see _overlay_master_durations)."""
+        master_id = self._master_id_of(release)
+        if not master_id:
+            return []
+        try:
+            resp = self._http.request("GET", f"{_API_BASE}/masters/{master_id}")
+            resp.raise_for_status()
+            rows = resp.json().get("tracklist") or []
+        except Exception as e:
+            # Best-effort enrichment with a graceful fallback (the scheduler's
+            # safety idle), so a transient master blip degrades rather than aborts
+            # the credit-capable resolve — mirrors get_original_year (#188).
+            log.debug(f"Master tracklist lookup failed for master {master_id}: {e}")
+            return []
+        out = []
+        for t in rows:
+            if not isinstance(t, dict):
+                continue
+            if (t.get("type_") or t.get("type")) == "heading":
+                continue
+            pos = t.get("position")
+            if not pos:
+                continue
+            out.append(TracklistEntry(
+                position=pos, title=t.get("title") or "", duration=t.get("duration") or None,
+            ))
+        return out
+
+    def _overlay_master_durations(self, release, tracklist: list) -> list:
+        """Return `tracklist` with any missing durations filled from the master.
+
+        No-ops (and skips the master GET) when every row already has a duration —
+        the common case, zero added cost. Matches master -> release rows by POSITION
+        first, then by unique normalized TITLE (handles a master whose position
+        scheme differs from the vinyl pressing's, or a side-balanced reorder — titles
+        are stable across pressings, order is not). Fails safe: a row that matches
+        neither, or whose title is ambiguous (duplicated in the master), keeps its
+        None duration and falls back to the scheduler's safety idle rather than
+        borrowing a wrong one — never an ordinal/index guess."""
+        if not tracklist or all(e.duration for e in tracklist):
+            return tracklist
+        master = self.get_master_tracklist(release)
+        if not master:
+            return tracklist
+
+        def _tkey(title):
+            return (title or "").strip().lower()
+
+        by_pos = {m.position: m.duration for m in master if m.duration}
+        # Title map: only titles that are UNIQUE in the master carry a duration, so a
+        # duplicated title never assigns a (possibly wrong) borrowed duration.
+        title_dur, title_seen = {}, {}
+        for m in master:
+            if not m.duration:
+                continue
+            k = _tkey(m.title)
+            title_seen[k] = title_seen.get(k, 0) + 1
+            title_dur[k] = m.duration
+        by_title = {k: d for k, d in title_dur.items() if title_seen[k] == 1}
+
+        out = []
+        for e in tracklist:
+            if e.duration:
+                out.append(e)
+                continue
+            d = by_pos.get(e.position) or by_title.get(_tkey(e.title))
+            out.append(
+                TracklistEntry(position=e.position, title=e.title, duration=d) if d else e
+            )
+        return out
+
     # -------------------------------------------------------------------------
     # Private helpers
     # -------------------------------------------------------------------------
@@ -979,6 +1065,13 @@ class DiscogsReader:
             _reraise_if_transient(e)
             log.warning(f"Failed to parse tracklist for release {release.id}: {e}")
             tracklist = []
+        # #467: fill any MISSING per-track durations from the album MASTER. Some
+        # Discogs release entries (a user's exact pressing included) carry no
+        # durations; without them the per-track polling scheduler falls back to the
+        # 240s safety idle and OVERSHOOTS the next track (measured: skips). The
+        # master is shared across pressings, so its durations are the release-
+        # agnostic source of truth. Only fetched when a row is actually missing one.
+        tracklist = self._overlay_master_durations(release, tracklist)
 
         # Genres and styles — styles are more specific so they come first.
         # Both are already present in the release object; no extra API call needed.

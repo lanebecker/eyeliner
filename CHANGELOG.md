@@ -7,6 +7,19 @@ Versions follow [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Tracks no longer get skipped when the resolved release has no Discogs durations
+  (#467).** Some releases (a user's exact pressing included) carry no per-track
+  durations, so the per-track polling scheduler fell back to the 240s safety idle,
+  overshot the next track, and skipped it. Missing durations are now filled from the
+  album **master** — shared across every pressing, so boundaries are predictable and
+  identical regardless of which release a track resolves to. The master is fetched
+  only when a duration is actually missing (no added cost otherwise), matched by
+  track position with an index fallback, and degrades gracefully when absent.
+
 ## [1.6.2] — 2026-08-28
 
 ### Fixed

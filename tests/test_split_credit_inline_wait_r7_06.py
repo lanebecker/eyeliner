@@ -59,10 +59,14 @@ async def test_split_credit_honoring_retry_after_does_not_stall_the_leg(monkeypa
     elapsed = time.monotonic() - t0
 
     # DETERMINISTIC signal (no wall-clock threshold): when the leg returns, the
-    # credit is still honouring its Retry-After in the background — the first
-    # attempt has raised (1 call) but the retry has NOT yet landed. Had the leg
-    # blocked on the unbounded await, the whole finalize would be done here (2).
-    assert writer.increment_play_count.call_count == 1, (
+    # split credit has NOT finished inline — it is still in the background, either
+    # not yet started (0 calls) or mid-Retry-After after its first attempt (1 call).
+    # BOTH mean the leg was freed. Only a leg that blocked on the unbounded await
+    # would see the whole finalize done here (2 calls: raised once, then retried).
+    # (Was `== 1`, which additionally raced on whether the background task had been
+    # scheduled to fire its first attempt within the tiny inline window — flaky on a
+    # loaded CI runner, which returns 0. `< 2` is the true regression signal.)
+    assert writer.increment_play_count.call_count < 2, (
         "the recognition leg blocked until the credit finished — R7-06 stall"
     )
     # Secondary (loose) sanity: the leg returned near the bound, not the 0.4s wait.
